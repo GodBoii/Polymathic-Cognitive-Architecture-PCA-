@@ -1,17 +1,19 @@
 import math
-from typing import Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model_core import ModelConfig
+import torch
 
 from .rope import RotaryEmbedding, apply_rotary_pos_emb
 
+if TYPE_CHECKING:
+    from model_core.config import ModelConfig
+
 
 class GQAAttention(nn.Module):
-    def __init__(self, cfg: ModelConfig, bias: bool = False) -> None:
+    def __init__(self, cfg: "ModelConfig", bias: bool = False) -> None:
         super().__init__()
         self.cfg = cfg
         self.n_heads = cfg.n_heads

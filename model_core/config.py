@@ -27,6 +27,9 @@ class ModelConfig:
     unk_token_id: int = 0
 
     cognitive_loops: int = 5
+    gqa_layers: int = 4
+    lightning_end_layer: int = 16
+    mla_latent_dim: int = 512
 
     def __post_init__(self) -> None:
         self.validate()
@@ -70,6 +73,14 @@ class ModelConfig:
             raise ValueError("dropout must be in [0.0, 1.0)")
         if self.cognitive_loops <= 0:
             raise ValueError("cognitive_loops must be > 0")
+        if self.gqa_layers < 0:
+            raise ValueError("gqa_layers must be >= 0")
+        if self.lightning_end_layer < 0:
+            raise ValueError("lightning_end_layer must be >= 0")
+        if self.gqa_layers > self.lightning_end_layer:
+            raise ValueError("gqa_layers must be <= lightning_end_layer")
+        if self.mla_latent_dim <= 0:
+            raise ValueError("mla_latent_dim must be > 0")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
