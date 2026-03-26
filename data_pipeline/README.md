@@ -9,6 +9,7 @@
   --output-dir .\data_pipeline\artifacts\phase1 `
   --seq-len 8192 `
   --shard-sequences 1024 `
+  --workers 8 `
   --factual-filter
 ```
 

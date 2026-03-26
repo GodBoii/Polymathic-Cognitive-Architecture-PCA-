@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from model_core.config import ModelConfig
 from model_core.model import PCAModel
-from data_pipeline.dataset_loader import create_packed_dataloader
+from data_pipeline.dataset_loader import CUDAPrefetchLoader, create_packed_dataloader
 from train.muon import Muon
 
 
@@ -42,6 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--train-manifest", type=Path, default=None, help="Use packed dataset manifest instead of random synthetic batches.")
     parser.add_argument("--data-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--persistent-workers", action="store_true")
+    parser.add_argument("--prefetch-to-device", action="store_true", help="Use CUDA stream prefetch wrapper for dataloader batches.")
     parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
 
@@ -204,6 +207,7 @@ def main() -> None:
 
     train_loader = None
     train_iter = None
+    batches_on_device = False
     if args.train_manifest is not None:
         train_loader = create_packed_dataloader(
             manifest_path=args.train_manifest,
@@ -212,7 +216,12 @@ def main() -> None:
             num_workers=args.data_workers,
             pin_memory=device.startswith("cuda"),
             drop_last=True,
+            prefetch_factor=args.prefetch_factor,
+            persistent_workers=args.persistent_workers,
         )
+        if args.prefetch_to_device and device.startswith("cuda"):
+            train_loader = CUDAPrefetchLoader(train_loader, device=device)
+            batches_on_device = True
         train_iter = iter(train_loader)
 
     for step in range(start_step, args.steps):
@@ -225,8 +234,11 @@ def main() -> None:
         running_router_entropy = 0.0
         agg_expert_usage = None
         agg_co_activation = None
+        running_data_wait_sec = 0.0
+        running_compute_sec = 0.0
 
         for _ in range(args.grad_accum_steps):
+            t_data0 = time.perf_counter()
             batch = make_batch(
                 batch_size=args.micro_batch_size,
                 seq_len=args.seq_len,
@@ -239,8 +251,13 @@ def main() -> None:
                 except StopIteration:
                     train_iter = iter(train_loader)
                     batch = next(train_iter)
-                batch = to_device(batch, device=device)
+                if not batches_on_device:
+                    batch = to_device(batch, device=device)
+            t_data1 = time.perf_counter()
+            running_data_wait_sec += t_data1 - t_data0
+
             want_router_stats = args.log_router_stats_every > 0 and ((step + 1) % args.log_router_stats_every == 0)
+            t_comp0 = time.perf_counter()
             with autocast_context(device=device, precision=args.precision):
                 out = model(
                     input_ids=batch["input_ids"],
@@ -259,6 +276,9 @@ def main() -> None:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+            t_comp1 = time.perf_counter()
+            running_compute_sec += t_comp1 - t_comp0
+
             running_loss += float(total_loss.item())
             running_main_loss += float(main_loss.item())
             running_moe_aux_loss += float(moe_aux_loss.item())
@@ -300,6 +320,9 @@ def main() -> None:
                 "tokens_per_sec": tokens_per_sec,
                 "total_tokens": total_tokens,
                 "step_time_sec": dt,
+                "data_wait_sec": running_data_wait_sec,
+                "compute_sec": running_compute_sec,
+                "data_wait_pct": (running_data_wait_sec / max(dt, 1e-9)) * 100.0,
                 "gpu_mem_gb": (
                     torch.cuda.max_memory_allocated() / (1024**3)
                     if torch.cuda.is_available()
