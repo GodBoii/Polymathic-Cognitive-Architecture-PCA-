@@ -1,9 +1,10 @@
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -32,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aux-alpha-decay", type=float, default=0.95)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("train/checkpoints"))
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument(
+        "--fast-forward-on-resume",
+        action="store_true",
+        help="When using packed manifests, skip already-consumed micro-batches after resume.",
+    )
 
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
@@ -41,6 +47,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--micro-batch-size", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--train-manifest", type=Path, default=None, help="Use packed dataset manifest instead of random synthetic batches.")
+    parser.add_argument("--eval-manifest", type=Path, default=None)
+    parser.add_argument("--eval-every", type=int, default=0, help="0 disables eval.")
+    parser.add_argument("--eval-batches", type=int, default=50)
+    parser.add_argument("--eval-batch-size", type=int, default=2)
     parser.add_argument("--data-workers", type=int, default=0)
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--persistent-workers", action="store_true")
@@ -49,6 +59,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-grad-norm", type=float, default=1.0)
 
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1, help="Final LR ratio after cosine decay.")
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--warmup-ratio", type=float, default=0.05, help="Used when warmup-steps is 0.")
     parser.add_argument("--weight-decay", type=float, default=0.01)
 
     parser.add_argument("--vocab-size", type=int, default=32000)
@@ -88,19 +101,71 @@ def make_model_config(args: argparse.Namespace) -> ModelConfig:
     )
 
 
-def build_optimizer(model: PCAModel, args: argparse.Namespace) -> torch.optim.Optimizer:
+def _split_muon_param_groups(model: PCAModel) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    muon_params: list[torch.nn.Parameter] = []
+    adamw_params: list[torch.nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_embedding = "embed_tokens" in name or "lm_head" in name
+        if param.ndim == 2 and not is_embedding:
+            muon_params.append(param)
+        else:
+            adamw_params.append(param)
+    return muon_params, adamw_params
+
+
+def build_optimizers(model: PCAModel, args: argparse.Namespace) -> List[torch.optim.Optimizer]:
     if args.optimizer == "muon":
-        return Muon(
+        muon_params, adamw_params = _split_muon_param_groups(model)
+        optimizers: list[torch.optim.Optimizer] = []
+        if muon_params:
+            optimizers.append(
+                Muon(
+                    muon_params,
+                    lr=args.lr,
+                    weight_decay=args.weight_decay,
+                )
+            )
+        if adamw_params:
+            optimizers.append(
+                torch.optim.AdamW(
+                    adamw_params,
+                    lr=args.lr,
+                    weight_decay=args.weight_decay,
+                    betas=(0.9, 0.95),
+                )
+            )
+        return optimizers
+    return [
+        torch.optim.AdamW(
             model.parameters(),
             lr=args.lr,
             weight_decay=args.weight_decay,
+            betas=(0.9, 0.95),
         )
-    return torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.95),
-    )
+    ]
+
+
+def build_schedulers(optimizers: List[torch.optim.Optimizer], args: argparse.Namespace) -> List[torch.optim.lr_scheduler.LambdaLR]:
+    total_steps = max(int(args.steps), 1)
+    warmup_steps = int(args.warmup_steps)
+    if warmup_steps <= 0:
+        warmup_steps = int(total_steps * float(args.warmup_ratio))
+    warmup_steps = max(0, min(warmup_steps, total_steps - 1))
+    min_lr_ratio = float(args.min_lr_ratio)
+
+    def lr_lambda(step_idx: int) -> float:
+        if warmup_steps > 0 and step_idx < warmup_steps:
+            return float(step_idx + 1) / float(max(warmup_steps, 1))
+        if total_steps <= warmup_steps:
+            return min_lr_ratio
+        progress = float(step_idx - warmup_steps) / float(max(total_steps - warmup_steps, 1))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return [torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda) for opt in optimizers]
 
 
 def autocast_context(device: str, precision: str):
@@ -115,10 +180,12 @@ def autocast_context(device: str, precision: str):
 def save_checkpoint(
     path: Path,
     model: PCAModel,
-    optimizer: torch.optim.Optimizer,
+    optimizers: List[torch.optim.Optimizer],
+    schedulers: List[torch.optim.lr_scheduler.LambdaLR],
     scaler: torch.cuda.amp.GradScaler,
     step: int,
     total_tokens: int,
+    micro_batches_seen: int,
     cfg: ModelConfig,
     current_aux_alpha: float,
     base_aux_alpha: float,
@@ -127,8 +194,10 @@ def save_checkpoint(
     payload = {
         "step": step,
         "total_tokens": total_tokens,
+        "micro_batches_seen": micro_batches_seen,
         "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
+        "optimizer_states": [opt.state_dict() for opt in optimizers],
+        "scheduler_states": [sch.state_dict() for sch in schedulers],
         "scaler_state": scaler.state_dict(),
         "model_config": cfg.to_dict(),
         "current_aux_alpha": current_aux_alpha,
@@ -140,17 +209,31 @@ def save_checkpoint(
 def load_checkpoint(
     path: Path,
     model: PCAModel,
-    optimizer: torch.optim.Optimizer,
+    optimizers: List[torch.optim.Optimizer],
+    schedulers: List[torch.optim.lr_scheduler.LambdaLR],
     scaler: torch.cuda.amp.GradScaler,
     device: str,
-) -> Tuple[int, int, float | None, float | None]:
-    payload = torch.load(path, map_location=device)
+) -> Tuple[int, int, int, float | None, float | None]:
+    try:
+        payload = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        payload = torch.load(path, map_location=device)
     model.load_state_dict(payload["model_state"])
-    optimizer.load_state_dict(payload["optimizer_state"])
+    states = payload.get("optimizer_states")
+    if states is None and "optimizer_state" in payload:
+        states = [payload["optimizer_state"]]
+    if states is not None:
+        for opt, state in zip(optimizers, states):
+            opt.load_state_dict(state)
+    scheduler_states = payload.get("scheduler_states")
+    if scheduler_states is not None:
+        for scheduler, state in zip(schedulers, scheduler_states):
+            scheduler.load_state_dict(state)
     scaler.load_state_dict(payload["scaler_state"])
     return (
         int(payload["step"]),
         int(payload["total_tokens"]),
+        int(payload.get("micro_batches_seen", int(payload["step"]))),
         payload.get("current_aux_alpha"),
         payload.get("base_aux_alpha"),
     )
@@ -172,6 +255,42 @@ def to_device(batch: Dict[str, torch.Tensor], device: str) -> Dict[str, torch.Te
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
+@torch.no_grad()
+def run_eval(
+    model: PCAModel,
+    eval_loader,
+    device: str,
+    precision: str,
+    max_batches: int,
+) -> tuple[float, float]:
+    if max_batches <= 0 or len(eval_loader) == 0:
+        return float("nan"), float("nan")
+    model.eval()
+    losses: list[float] = []
+    eval_iter = iter(eval_loader)
+    for _ in range(max_batches):
+        try:
+            batch = next(eval_iter)
+        except StopIteration:
+            eval_iter = iter(eval_loader)
+            try:
+                batch = next(eval_iter)
+            except StopIteration:
+                break
+        batch = to_device(batch, device=device)
+        with autocast_context(device=device, precision=precision):
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"],
+            )
+        losses.append(float(out["loss"].item()))
+    model.train()
+    eval_loss = sum(losses) / max(len(losses), 1)
+    eval_ppl = math.exp(min(eval_loss, 20.0))
+    return eval_loss, eval_ppl
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -183,7 +302,8 @@ def main() -> None:
     device = args.device
     cfg = make_model_config(args)
     model = PCAModel(cfg).to(device)
-    optimizer = build_optimizer(model, args)
+    optimizers = build_optimizers(model, args)
+    schedulers = build_schedulers(optimizers, args)
     base_aux_alpha = float(cfg.cognitive_aux_alpha)
     current_aux_alpha = float(cfg.cognitive_aux_alpha)
 
@@ -192,23 +312,30 @@ def main() -> None:
 
     start_step = 0
     total_tokens = 0
+    micro_batches_seen = 0
     if args.resume is not None:
-        start_step, total_tokens, ckpt_current_aux_alpha, ckpt_base_aux_alpha = load_checkpoint(
-            args.resume, model, optimizer, scaler, device=device
+        start_step, total_tokens, micro_batches_seen, ckpt_current_aux_alpha, ckpt_base_aux_alpha = load_checkpoint(
+            args.resume, model, optimizers, schedulers, scaler, device=device
         )
+        if micro_batches_seen <= start_step:
+            micro_batches_seen = start_step * args.grad_accum_steps
         if ckpt_base_aux_alpha is not None:
             base_aux_alpha = float(ckpt_base_aux_alpha)
         if ckpt_current_aux_alpha is not None:
             current_aux_alpha = float(ckpt_current_aux_alpha)
 
     model.train()
-    optimizer.zero_grad(set_to_none=True)
+    for optimizer in optimizers:
+        optimizer.zero_grad(set_to_none=True)
     run_start = time.perf_counter()
 
     train_loader = None
     train_iter = None
     batches_on_device = False
+    train_seq_len = args.seq_len
     if args.train_manifest is not None:
+        train_manifest = json.loads(args.train_manifest.read_text(encoding="utf-8"))
+        train_seq_len = int(train_manifest["config"]["seq_len"])
         train_loader = create_packed_dataloader(
             manifest_path=args.train_manifest,
             batch_size=args.micro_batch_size,
@@ -223,6 +350,29 @@ def main() -> None:
             train_loader = CUDAPrefetchLoader(train_loader, device=device)
             batches_on_device = True
         train_iter = iter(train_loader)
+        if args.fast_forward_on_resume and micro_batches_seen > 0:
+            print(f"[INFO] Fast-forwarding dataloader by {micro_batches_seen} micro-batches...")
+            skipped = 0
+            while skipped < micro_batches_seen:
+                try:
+                    _ = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    _ = next(train_iter)
+                skipped += 1
+
+    eval_loader = None
+    if args.eval_manifest is not None and args.eval_every > 0 and args.eval_batches > 0:
+        eval_loader = create_packed_dataloader(
+            manifest_path=args.eval_manifest,
+            batch_size=args.eval_batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=device.startswith("cuda"),
+            drop_last=False,
+            prefetch_factor=args.prefetch_factor,
+            persistent_workers=False,
+        )
 
     for step in range(start_step, args.steps):
         step_start = time.perf_counter()
@@ -236,6 +386,7 @@ def main() -> None:
         agg_co_activation = None
         running_data_wait_sec = 0.0
         running_compute_sec = 0.0
+        active_seq_len = train_seq_len if train_iter is not None else args.seq_len
 
         for _ in range(args.grad_accum_steps):
             t_data0 = time.perf_counter()
@@ -253,6 +404,7 @@ def main() -> None:
                     batch = next(train_iter)
                 if not batches_on_device:
                     batch = to_device(batch, device=device)
+                active_seq_len = int(batch["input_ids"].shape[1])
             t_data1 = time.perf_counter()
             running_data_wait_sec += t_data1 - t_data0
 
@@ -278,12 +430,13 @@ def main() -> None:
                 loss.backward()
             t_comp1 = time.perf_counter()
             running_compute_sec += t_comp1 - t_comp0
+            micro_batches_seen += 1
 
-            running_loss += float(total_loss.item())
-            running_main_loss += float(main_loss.item())
-            running_moe_aux_loss += float(moe_aux_loss.item())
-            running_moe_lb_loss += float(out["aux_losses"]["moe_load_balance_loss"].item())
-            running_moe_entropy_reg_loss += float(out["aux_losses"]["moe_entropy_reg_loss"].item())
+            running_loss += float(total_loss.item()) / args.grad_accum_steps
+            running_main_loss += float(main_loss.item()) / args.grad_accum_steps
+            running_moe_aux_loss += float(moe_aux_loss.item()) / args.grad_accum_steps
+            running_moe_lb_loss += float(out["aux_losses"]["moe_load_balance_loss"].item()) / args.grad_accum_steps
+            running_moe_entropy_reg_loss += float(out["aux_losses"]["moe_entropy_reg_loss"].item()) / args.grad_accum_steps
             if want_router_stats:
                 running_router_entropy += float(out["router_stats"]["avg_router_entropy"])
                 usage = torch.tensor(out["router_stats"]["expert_usage"], dtype=torch.float64)
@@ -292,17 +445,23 @@ def main() -> None:
                 agg_co_activation = co_act if agg_co_activation is None else (agg_co_activation + co_act)
 
         if scaler.is_enabled():
-            scaler.unscale_(optimizer)
+            for optimizer in optimizers:
+                scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad_norm)
 
         if scaler.is_enabled():
-            scaler.step(optimizer)
+            for optimizer in optimizers:
+                scaler.step(optimizer)
             scaler.update()
         else:
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+            for optimizer in optimizers:
+                optimizer.step()
+        for scheduler in schedulers:
+            scheduler.step()
+        for optimizer in optimizers:
+            optimizer.zero_grad(set_to_none=True)
 
-        tokens_step = args.micro_batch_size * args.seq_len * args.grad_accum_steps
+        tokens_step = args.micro_batch_size * active_seq_len * args.grad_accum_steps
         total_tokens += tokens_step
         dt = time.perf_counter() - step_start
         tokens_per_sec = tokens_step / max(dt, 1e-9)
@@ -316,7 +475,7 @@ def main() -> None:
                 "moe_load_balance_loss": running_moe_lb_loss,
                 "moe_entropy_reg_loss": running_moe_entropy_reg_loss,
                 "grad_norm": float(grad_norm.item()),
-                "lr": args.lr,
+                "lr": float(optimizers[0].param_groups[0]["lr"]),
                 "tokens_per_sec": tokens_per_sec,
                 "total_tokens": total_tokens,
                 "step_time_sec": dt,
@@ -330,6 +489,16 @@ def main() -> None:
                 ),
                 "current_aux_alpha": current_aux_alpha,
             }
+            if eval_loader is not None and (step + 1) % args.eval_every == 0:
+                eval_loss, eval_perplexity = run_eval(
+                    model=model,
+                    eval_loader=eval_loader,
+                    device=device,
+                    precision=args.precision,
+                    max_batches=args.eval_batches,
+                )
+                payload["eval_loss"] = eval_loss
+                payload["eval_perplexity"] = eval_perplexity
             if agg_expert_usage is not None:
                 mean_entropy = running_router_entropy / max(args.grad_accum_steps, 1)
                 usage_mean = float(agg_expert_usage.mean().item())
@@ -372,10 +541,12 @@ def main() -> None:
             save_checkpoint(
                 path=ckpt_path,
                 model=model,
-                optimizer=optimizer,
+                optimizers=optimizers,
+                schedulers=schedulers,
                 scaler=scaler,
                 step=step + 1,
                 total_tokens=total_tokens,
+                micro_batches_seen=micro_batches_seen,
                 cfg=cfg,
                 current_aux_alpha=current_aux_alpha,
                 base_aux_alpha=base_aux_alpha,
@@ -385,10 +556,12 @@ def main() -> None:
     save_checkpoint(
         path=final_ckpt,
         model=model,
-        optimizer=optimizer,
+        optimizers=optimizers,
+        schedulers=schedulers,
         scaler=scaler,
         step=args.steps,
         total_tokens=total_tokens,
+        micro_batches_seen=micro_batches_seen,
         cfg=cfg,
         current_aux_alpha=current_aux_alpha,
         base_aux_alpha=base_aux_alpha,
