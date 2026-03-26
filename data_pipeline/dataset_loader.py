@@ -45,8 +45,9 @@ class PackedSequenceDataset(Dataset):
 
         shard_idx, local_idx = self._locate(index)
         tokens = self._shards[shard_idx][local_idx].astype(np.int64, copy=False)
-        x = torch.from_numpy(tokens[:-1].copy())
-        y = torch.from_numpy(tokens[1:].copy())
+        # Return unshifted labels; model performs the standard causal shift internally.
+        x = torch.from_numpy(tokens.copy())
+        y = torch.from_numpy(tokens.copy())
         attn = torch.ones_like(x, dtype=torch.float32)
         return {"input_ids": x, "labels": y, "attention_mask": attn}
 

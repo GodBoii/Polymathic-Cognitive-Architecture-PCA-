@@ -40,23 +40,40 @@ class RecursiveCognitiveBlock(nn.Module):
         topk_vals: torch.Tensor,
         collect_stats: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # z: [B, S, D]
-        mixed = torch.zeros_like(z)
+        # z: [B, S, D], topk_idx/topk_vals: [B, S, K]
+        bsz, seq_len, d_model = z.shape
+        tokens = bsz * seq_len
+        mixed_flat = torch.zeros(tokens, d_model, device=z.device, dtype=z.dtype)
         usage = torch.zeros(self.num_experts, device=z.device, dtype=torch.long)
+        flat_z = z.reshape(tokens, d_model)
+        flat_idx = topk_idx.reshape(-1)
+        flat_weight = topk_vals.reshape(-1, 1)
+        token_index = (
+            torch.arange(tokens, device=z.device, dtype=torch.long)
+            .unsqueeze(-1)
+            .expand(tokens, self.top_k)
+            .reshape(-1)
+        )
+        # Group routed slots by expert id once to avoid per-expert boolean scans.
+        sorted_expert, sort_order = torch.sort(flat_idx)
+        sorted_token_index = token_index.index_select(0, sort_order)
+        sorted_weight = flat_weight.index_select(0, sort_order)
+        counts = torch.bincount(sorted_expert, minlength=self.num_experts)
 
-        for k_rank in range(self.top_k):
-            idx = topk_idx[..., k_rank]  # [B, S]
-            weight = topk_vals[..., k_rank].unsqueeze(-1)  # [B, S, 1]
-            for expert_id, expert in enumerate(self.experts):
-                mask = idx == expert_id
-                if not mask.any():
-                    continue
-                selected = z[mask]  # [N, D]
-                expert_out = expert(selected)
-                mixed[mask] += expert_out * weight[mask]
-                if collect_stats:
-                    usage[expert_id] += int(mask.sum().item())
-        return mixed, usage
+        start = 0
+        for expert_id, expert in enumerate(self.experts):
+            cnt = int(counts[expert_id].item())
+            if cnt == 0:
+                continue
+            end = start + cnt
+            selected_token_idx = sorted_token_index[start:end]
+            selected = flat_z.index_select(0, selected_token_idx)
+            expert_out = expert(selected) * sorted_weight[start:end]
+            mixed_flat.index_add_(0, selected_token_idx, expert_out)
+            if collect_stats:
+                usage[expert_id] += cnt
+            start = end
+        return mixed_flat.view(bsz, seq_len, d_model), usage
 
     def _router_scores(self, logits: torch.Tensor) -> torch.Tensor:
         if self.gate_type == "sigmoid":
