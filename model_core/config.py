@@ -100,4 +100,7 @@ class ModelConfig:
             raise ValueError("mla_latent_dim must be > 0")
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["head_dim"] = self.head_dim
+        payload["kv_repeat_factor"] = self.kv_repeat_factor
+        return payload
