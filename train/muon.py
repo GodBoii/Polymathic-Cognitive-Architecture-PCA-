@@ -63,7 +63,7 @@ class Muon(Optimizer):
 
                 g = grad.float()
                 if weight_decay != 0.0:
-                    g = g + weight_decay * p.data.float()
+                    p.data.mul_(1.0 - lr * weight_decay)
 
                 state = self.state[p]
                 if "momentum" not in state:
