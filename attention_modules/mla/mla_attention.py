@@ -9,8 +9,8 @@ from attention_modules.gqa_rope.rope import RotaryEmbedding, apply_rotary_pos_em
 
 class MLAAttention(nn.Module):
     """
-    Skeleton MLA block.
-    Compresses K/V into a latent space then up-projects for attention.
+    MLA-inspired attention block with a single shared KV latent.
+    Projects hidden states into one latent cache vector, then up-projects to K and V.
     """
 
     def __init__(self, cfg, bias: bool = False) -> None:
@@ -21,13 +21,8 @@ class MLAAttention(nn.Module):
         self.latent_dim = cfg.mla_latent_dim
 
         self.q_proj = nn.Linear(cfg.d_model, self.n_heads * self.head_dim, bias=bias)
-        self.k_proj = nn.Linear(cfg.d_model, self.n_kv_heads * self.head_dim, bias=bias)
-        self.v_proj = nn.Linear(cfg.d_model, self.n_kv_heads * self.head_dim, bias=bias)
-
-        kv_dim = self.n_kv_heads * self.head_dim
         q_dim = self.n_heads * self.head_dim
-        self.k_down = nn.Linear(kv_dim, self.latent_dim, bias=bias)
-        self.v_down = nn.Linear(kv_dim, self.latent_dim, bias=bias)
+        self.kv_down = nn.Linear(cfg.d_model, self.latent_dim, bias=bias)
         self.k_up = nn.Linear(self.latent_dim, q_dim, bias=bias)
         self.v_up = nn.Linear(self.latent_dim, q_dim, bias=bias)
 
@@ -49,13 +44,9 @@ class MLAAttention(nn.Module):
         bsz, seq_len, _ = x.shape
 
         q = self.q_proj(x).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-
-        k_raw = self.k_proj(x)
-        v_raw = self.v_proj(x)
-        k_latent = self.k_down(k_raw)
-        v_latent = self.v_down(v_raw)
-        k = self.k_up(k_latent).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_up(v_latent).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        kv_latent = self.kv_down(x)
+        k = self.k_up(kv_latent).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_up(kv_latent).view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = self.rope(seq_len=seq_len, device=x.device, dtype=q.dtype, position_ids=position_ids)
         q, k = apply_rotary_pos_emb(q, k, cos=cos, sin=sin)

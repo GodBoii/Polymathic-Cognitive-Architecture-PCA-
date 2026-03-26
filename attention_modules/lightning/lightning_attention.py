@@ -67,13 +67,39 @@ class LightningAttention(nn.Module):
             kf = kf * keep
             v = v * keep
 
-        kv = torch.einsum("bhse,bhsd->bhsed", kf, v)
-        kv_cum = kv.cumsum(dim=2)
-        k_cum = kf.cumsum(dim=2)
-
-        num = torch.einsum("bhse,bhsed->bhsd", qf, kv_cum)
-        den = torch.einsum("bhse,bhse->bhs", qf, k_cum).unsqueeze(-1) + 1e-6
-        out = num / den
+        # Recurrent causal linear attention to avoid allocating [B, H, S, D, D].
+        state = torch.zeros(
+            bsz,
+            self.n_heads,
+            self.head_dim,
+            self.head_dim,
+            device=x.device,
+            dtype=qf.dtype,
+        )
+        z_state = torch.zeros(
+            bsz,
+            self.n_heads,
+            self.head_dim,
+            device=x.device,
+            dtype=qf.dtype,
+        )
+        out = torch.empty(
+            bsz,
+            self.n_heads,
+            seq_len,
+            self.head_dim,
+            device=x.device,
+            dtype=qf.dtype,
+        )
+        for t in range(seq_len):
+            k_t = kf[:, :, t, :]  # [B, H, D]
+            v_t = v[:, :, t, :]   # [B, H, D]
+            q_t = qf[:, :, t, :]  # [B, H, D]
+            state = state + torch.einsum("bhe,bhd->bhed", k_t, v_t)
+            z_state = z_state + k_t
+            num_t = torch.einsum("bhe,bhed->bhd", q_t, state)
+            den_t = torch.einsum("bhe,bhe->bh", q_t, z_state).unsqueeze(-1) + 1e-6
+            out[:, :, t, :] = num_t / den_t
 
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_heads * self.head_dim)
         out = self.o_proj(out)
