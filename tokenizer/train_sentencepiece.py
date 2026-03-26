@@ -12,6 +12,8 @@ ALLOWED_PUNCT = set(
     r""" !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"""
 )
 
+ALLOWED_MATH_UNICODE = set("ΣΔπθαβγμλ≈≠≤≥∞∫∑∏∂∇√∈∉⊂⊆⊄∪∩∀∃⇒⇔±°×÷")
+
 
 def iter_text_files(root: Path, extensions: Iterable[str]) -> Iterable[Path]:
     ext_set = {ext.lower() for ext in extensions}
@@ -36,7 +38,12 @@ def english_ratio(line: str) -> float:
     return len(latin) / len(letters)
 
 
-def filter_line(line: str, min_english_ratio: float, ascii_only: bool) -> bool:
+def filter_line(
+    line: str,
+    min_english_ratio: float,
+    ascii_only: bool,
+    allowed_unicode_chars: set[str],
+) -> bool:
     if not line:
         return False
     if english_ratio(line) < min_english_ratio:
@@ -47,15 +54,17 @@ def filter_line(line: str, min_english_ratio: float, ascii_only: bool) -> bool:
                 continue
             if ord(ch) < 128:
                 continue
+            if ch in allowed_unicode_chars:
+                continue
             return False
     return True
 
 
-def sanitize_for_english_logic(line: str) -> str:
+def sanitize_for_english_logic(line: str, allowed_unicode_chars: set[str]) -> str:
     # Keep a constrained symbol space for English + JSON/API/code syntax.
     out = []
     for ch in line:
-        if ch.isalnum() or ch.isspace() or ch in ALLOWED_PUNCT:
+        if ch.isalnum() or ch.isspace() or ch in ALLOWED_PUNCT or ch in allowed_unicode_chars:
             out.append(ch)
     return "".join(out).strip()
 
@@ -67,6 +76,7 @@ def build_corpus(
     min_english_ratio: float,
     ascii_only: bool,
     min_line_len: int,
+    allowed_unicode_chars: set[str],
 ) -> dict:
     corpus_out.parent.mkdir(parents=True, exist_ok=True)
     files_seen = 0
@@ -82,11 +92,16 @@ def build_corpus(
                 continue
             normalized = normalize_text(raw)
             for line in normalized.split("\n"):
-                line = sanitize_for_english_logic(line)
+                line = sanitize_for_english_logic(line, allowed_unicode_chars=allowed_unicode_chars)
                 if len(line) < min_line_len:
                     lines_dropped += 1
                     continue
-                if not filter_line(line, min_english_ratio=min_english_ratio, ascii_only=ascii_only):
+                if not filter_line(
+                    line,
+                    min_english_ratio=min_english_ratio,
+                    ascii_only=ascii_only,
+                    allowed_unicode_chars=allowed_unicode_chars,
+                ):
                     lines_dropped += 1
                     continue
                 out_f.write(line + "\n")
@@ -114,6 +129,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-english-ratio", type=float, default=0.85, help="Min fraction of Latin letters per line.")
     parser.add_argument("--ascii-only", action="store_true", help="Keep only ASCII lines.")
+    parser.add_argument(
+        "--allow-math-unicode",
+        action="store_true",
+        help="Allow curated math/logic Unicode symbols even when --ascii-only is set.",
+    )
+    parser.add_argument(
+        "--extra-unicode-chars",
+        type=str,
+        default="",
+        help="Additional Unicode characters to preserve (literal string).",
+    )
     parser.add_argument("--min-line-len", type=int, default=8, help="Drop lines shorter than this.")
     parser.add_argument("--character-coverage", type=float, default=1.0, help="SentencePiece character coverage.")
     parser.add_argument("--input-sentence-size", type=int, default=2000000, help="Max sampled lines for training.")
@@ -136,6 +162,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    allowed_unicode_chars = set(args.extra_unicode_chars)
+    if args.allow_math_unicode:
+        allowed_unicode_chars |= ALLOWED_MATH_UNICODE
 
     corpus_path = args.output_dir / f"{args.model_prefix}.corpus.txt"
     stats = build_corpus(
@@ -145,6 +174,7 @@ def main() -> None:
         min_english_ratio=args.min_english_ratio,
         ascii_only=args.ascii_only,
         min_line_len=args.min_line_len,
+        allowed_unicode_chars=allowed_unicode_chars,
     )
 
     model_prefix_path = args.output_dir / args.model_prefix
@@ -173,6 +203,9 @@ def main() -> None:
             "character_coverage": args.character_coverage,
             "min_english_ratio": args.min_english_ratio,
             "ascii_only": args.ascii_only,
+            "allow_math_unicode": args.allow_math_unicode,
+            "extra_unicode_chars": args.extra_unicode_chars,
+            "allowed_unicode_chars": "".join(sorted(allowed_unicode_chars)),
             "min_line_len": args.min_line_len,
             "extensions": args.extensions,
             "special_tokens": args.special_tokens,

@@ -27,7 +27,14 @@ Supported extensions by default:
   --model-prefix pca_tokenizer `
   --vocab-size 32000 `
   --min-english-ratio 0.85 `
-  --ascii-only
+  --ascii-only `
+  --allow-math-unicode
+```
+
+To keep extra symbols beyond the curated math set, add:
+
+```powershell
+--extra-unicode-chars "∝∴⊕⊗"
 ```
 
 Outputs:
