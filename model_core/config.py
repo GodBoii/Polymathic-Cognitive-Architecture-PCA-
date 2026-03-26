@@ -27,6 +27,11 @@ class ModelConfig:
     unk_token_id: int = 0
 
     cognitive_loops: int = 5
+    cognitive_num_experts: int = 8
+    cognitive_top_k: int = 4
+    cognitive_gate_type: str = "sigmoid"
+    cognitive_aux_alpha: float = 0.01
+    cognitive_entropy_alpha: float = 0.001
     gqa_layers: int = 4
     lightning_end_layer: int = 16
     mla_latent_dim: int = 512
@@ -73,6 +78,18 @@ class ModelConfig:
             raise ValueError("dropout must be in [0.0, 1.0)")
         if self.cognitive_loops <= 0:
             raise ValueError("cognitive_loops must be > 0")
+        if self.cognitive_num_experts <= 0:
+            raise ValueError("cognitive_num_experts must be > 0")
+        if self.cognitive_top_k <= 0:
+            raise ValueError("cognitive_top_k must be > 0")
+        if self.cognitive_top_k > self.cognitive_num_experts:
+            raise ValueError("cognitive_top_k must be <= cognitive_num_experts")
+        if self.cognitive_gate_type not in {"softmax", "sigmoid"}:
+            raise ValueError("cognitive_gate_type must be 'softmax' or 'sigmoid'")
+        if self.cognitive_aux_alpha < 0.0:
+            raise ValueError("cognitive_aux_alpha must be >= 0")
+        if self.cognitive_entropy_alpha < 0.0:
+            raise ValueError("cognitive_entropy_alpha must be >= 0")
         if self.gqa_layers < 0:
             raise ValueError("gqa_layers must be >= 0")
         if self.lightning_end_layer < 0:
