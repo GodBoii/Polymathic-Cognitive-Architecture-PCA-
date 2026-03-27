@@ -1,0 +1,1784 @@
+GoldiCLIP: The Goldilocks Approach for
+Balancing Explicit Supervision for
+Language-Image Pretraining
+Deen Dayal Mohan*, Hossein Souri*, Vitali Petsiuk*,
+Juhong Min, Gopal Sharma, Luowei Zhou, and Suren Kumar†
+AI Center – Mountain View, Samsung Electronics
+{d.mohan1, h.souri, v.petsiuk, j.min2, gopal.sharma,
+luowei.zhuo}@samsung.com
+Abstract. Until recently, the success of large-scale vision-language mod-
+els (VLMs) has primarily relied on billion-sample datasets, posing a sig-
+nificant barrier to progress. Latest works have begun to close this gap by
+improving supervision quality, but each addresses only a subset of the
+weaknesses in contrastive pretraining. We present GoldiCLIP, a frame-
+work built on a Goldilocks principle of finding the right balance of su-
+pervision signals. Our multifaceted training framework synergistically
+combines three key innovations: (1) a text-conditioned self-distillation
+method to align both text-agnostic and text-conditioned features; (2)
+an encoder integrated decoder with Visual Question Answering (VQA)
+objective that enables the encoder to generalize beyond the caption-like
+queries; and (3) an uncertainty-based weighting mechanism that auto-
+matically balances all heterogeneous losses. Trained on just 30 million im-
+ages, 300× less data than leading methods, GoldiCLIP achieves state-of-
+the-art among data-efficient approaches, improving over the best compa-
+rable baseline by 2.2 points on MSCOCO retrieval, 2.0 on fine-grained re-
+trieval, and 5.9 on question-based retrieval, while remaining competitive
+with billion-scale models. Project page: https://petsi.uk/goldiclip.
+1
+Introduction
+Contrastively trained vision-language encoders like CLIP [25] have become foun-
+dational components for numerous vision tasks and serve as the backbone for
+integrating visual understanding into large language models [16]. Following the
+scaling paradigm established in NLP, the dominant approach to improving these
+models has been to increase dataset size. CLIP pioneered this direction with 400
+million image-text pairs, while recent state-of-the-art models such as SigLIP 2 [29]
+and Perception Encoder [2] leverage proprietary datasets of 5–10 billion images.
+Such data requirements pose a significant barrier, restricting progress to well-
+resourced industrial laboratories.
+* Equal contribution, order chosen randomly.
+† Work done while at Samsung Electronics.
+arXiv:2603.24804v1  [cs.CV]  25 Mar 2026
+2
+D. Mohan et al.
+Recent works have begun to challenge this paradigm by demonstrating that
+higher-quality data [3, 41] and supervision can partially compensate for lim-
+ited data. FLAIR [34] introduced the text-conditioned visual representations
+via cross-attention pooling, improving fine-grained retrieval. COSMOS [12] in-
+corporated cross-modal self-distillation to enhance spatial understanding. These
+methods have shown that models trained on 30 million images can approach the
+retrieval performance of billion-scale counterparts.
+Designed individually, these supervision objectives are studied in isolation
+or integrated via rigid training pipelines (e.g., staged training [29]). Effectively
+combining these disparate signals remains a non-trivial challenge: different losses
+often operate at different scales, target conflicting feature granularities, and re-
+quire extensive hyperparameter tuning to prevent one signal from dominating or
+degrading the others. Consequently, the potential synergy between these com-
+plementary forms of supervision remains largely untapped.
+In this work, we present GoldiCLIP, a unified training framework for data-
+efficient vision-language pretraining. The design principle behind GoldiCLIP is
+that supervision signals should not be treated as independent additions to a
+contrastive baseline. Instead, each component is carefully adapted to the overall
+architecture: we extend self-distillation to operate on text-conditioned features
+rather than only text-agnostic ones, route decoder tasks through the text encoder
+to improve its generalization beyond caption-like queries, and employ learned
+task balancing to ensure stable optimization across all objectives jointly. Our
+experiments demonstrate that these modifications have a positive contribution
+to the overall performance. Our key contributions can be summarized as follows:
+– Text-Conditioned Local-Global Distillation: We implement a novel
+self-distillation mechanism that establishes correspondences between local
+views and global representations while accounting for the textual context.
+This ensures that the learned visual features are not only spatially consistent
+but also semantically relevant to the associated text.
+– Encoder-integrated decoder with VQA supervision: We first extend
+[31] decoder by incorporating VQA objective. Further we route all decoder
+objectives through the text encoder, encouraging the encoder to generalize
+beyond the caption-like queries, a common failure mode in models trained
+using re-captioned dataset.
+– Automated Supervision Balancing: To avoid the complexities of manual
+weight tuning or multi-stage training schedules, we frame the integration as
+a multi-task learning problem. We employ uncertainty-based weighting [11]
+to automatically balance the contribution of each loss in real-time, ensuring
+stable optimization and seamless signal fusion.
+We evaluate GoldiCLIP extensively across six task categories: standard image-
+text retrieval, fine-grained-retrieval, long-text retrieval, question-based retrieval,
+zero-shot semantic segmentation and zero-shot classification. We further provide
+detailed ablations showing the contribution of the each components. Our frame-
+work is trained entirely on open-source data, providing a reproducible recipe
+GoldiCLIP
+3
+for the research community. Our results demonstrate that we achieve state-of-
+art results across models trained on similar scale of data. On standard text-
+to-image retrieval benchmark, MSCOCO [15], GoldiCLIP trained on just 30
+million unique images, outperforms FLAIR by 2.2 and COSMOS by 3 percent-
+age points (pp) on text-to-image retrieval. The gains are even more pronounced
+on fine-grained retrieval tasks. On the IIW-FG [8] benchmark, we improve over
+FLAIR and COSMOS by 2.9pp and 3.9pp respectively. Even when trained on
+only 30 Million images, our method improves over prior state-of-the-art models
+such as SigLIP 2, Perception Encoder etc., which are trained on large scale data
+(5-10 billion image) on many of these benchmarks.
+2
+Related Work
+Akin to LLM research, the field of large-scale vision-language pre-training has
+been dominated by the paradigm of scaling datasets and model sizes to improve
+performance. CLIP [25] pioneered this approach with a dual-encoder architec-
+ture trained contrastively on 400 million images paired with text, demonstrating
+remarkable zero-shot transfer cap abilities. ALIGN [10] scaled this to over 1 bil-
+lion images, while more recent models such as SigLIP 2 [29] and Perception
+Encoder [2] and MetaCLIP [36] leverage 2-10 billion images with paired text
+to achieve state-of-the-art performance. Eva-CLIP [27] explored the second di-
+mension of scaling, reaching 18 billion model parameters. However, both scaling
+approaches, dataset size and model parameters, remain inaccessible to most re-
+searchers due to computational and storage requirements.
+Auxiliary Supervision Objectives. Recognizing the limitations of sin-
+gle global vector-based contrastive learning, researchers have proposed various
+auxiliary objectives to enhance vision-language models. Generative decoders rep-
+resent one major direction. Inspired by image captioning methods like GiT [32]
+and LEMON [9], CoCa [37] unified text generation with contrastive learning.
+LocCa [31] introduced multi-task decoder objectives including captioning, refer-
+ring expressions, and grounded captioning to provide more granular supervision.
+SigLIP 2 [29] further extended this approach, combining multi-task decoders
+with self-supervised losses including self-distillation and masked prediction. How-
+ever, these methods have been primarily evaluated in data-rich settings, leaving
+their effectiveness in data-limited regimes unexplored.
+Self-distillation techniques represent another important category of aux-
+iliary supervision. Drawing inspiration from self-supervised learning methods
+like DINO [4], SLIP [19] integrated self-supervised learning (SSL) approaches
+into CLIP to improve transferability. SILC [20] applied self-distillation to es-
+tablish better local-global correspondences within image representations, using
+an exponential moving average (EMA) teacher to distill knowledge into a stu-
+dent encoder processing different views of the same image. TIPS [17] combined
+self-distillation with masked image modeling to encourage spatial coherence.
+Cross-attention pooling between image and text features to improve fine-grained
+alignment was introduced by [34]. The pooling creates a text-conditioned visual
+4
+D. Mohan et al.
+representations that adapt to specific queries. A concurrent work [12] incorpo-
+rated similar pooling mechanism into the self-supervision pipeline. However, a
+critical limitation of existing self-distillation methods is that they do not ex-
+plicitly supervise text-conditioned representations that have proven effective for
+fine-grained retrieval.
+Loss Balancing and Multi-Task Learning. As models incorporate mul-
+tiple auxiliary objectives, balancing the contribution of different loss terms be-
+comes a significant challenge. SigLIP 2 [29] manually chose both loss weights and
+training regimes (e.g., adding SSL losses at 80% of training completion), while
+CoCa [37] relied on grid search of hyperparameters. In the multi-task learning
+literature, Uncertainty-based weighting [11] proposes learning task-specific un-
+certainty parameters that automatically balance losses during training, avoiding
+expensive hyperparameter search. To the best of our knowledge, we are the first
+work to integrate this approach in application to vision-language pretraining,
+which helps mitigate the difference in scales (token-level generation vs. global
+contrastive matching).
+Synthetic Caption Generation. An alternative approach to reducing data
+requirements focuses on augmenting existing datasets with caption augmenta-
+tion leveraging LLMs and VLMs. [3, 7, 22, 33, 35, 40, 41]. Generation of extra
+captions is considered text-based data augmentation, as set of images used for
+training remains constant. While these approaches have proven effective for
+caption-like queries, performance degrades significantly when queries require
+deeper reasoning such as questions about specific objects, spatial relationships,
+or attributes [41]. This limitation suggests that diversifying the types of super-
+vision, not just augmenting captions, may be necessary to close the performance
+gap.
+3
+Method
+Motivated by the gaps identified in Section 2, we propose GoldiCLIP, a unified
+training framework that systematically integrates diverse supervision signals to
+dramatically improve data efficiency in vision-language pre-training. Figure 1
+provides a holistic overview of all components of our approach.
+We begin by describing our baseline architecture inspired by FLAIR [34]
+in Section 3.1. Section 3.2 presents our text-conditioned self-distillation
+method, which differs from existing approaches [20] by operating on both text-
+agnostic and text-conditioned visual representations. Section 3.3 introduces our
+enhanced multi-task decoder framework that extends prior work [29,31,37] with
+a VQA objective, which substantially improves performance on dense predic-
+tion tasks (e.g., semantic segmentation) and question-based retrieval.
+Finally, Section 3.4 describes our approach to automatically balancing our
+diverse set of training losses using uncertainty-based multi-task learning, elimi-
+nating the need for expensive grid-search hyperparameter tuning.
+GoldiCLIP
+5
+Task
+Balancing
+D
+Projection
+Centering
+SoftMax
+V
+T
+EMA
+Student
+Teacher
+Image
+global
+local
+Projection
+SoftMax
+Captions
+Auxiliary 
+Data
+Image tokens 
+Text tokens
+Text-conditioned image
+embedding 
+Global and local 
+image representations
+Text embedding 
+Image embedding 
+Image and Text
+encoders
+Multimodal decoder
+Legend
+Fig. 1: An overview of GoldiCLIP approach. Input images, captions, and auxiliary
+textual data (such as VQA) are processed by the student and teacher models, which
+consist of a text encoder and a vision encoder each. The teacher model is constructed
+as an EMA of a student, and is used to produce robust and stable global image rep-
+resentations which serve as a target for the local representations of the student model
+following the self-distillation approach (Sec 3.2). In our framework, the text embedding
+is contrastively aligned not only with the standard image embedding but also with the
+text-conditioned image embedding (Sec 3.1). Multimodal decoder uses image patch
+tokens along with the textual tokens from the text encoder to perform generative tasks
+(such as VQA) (Sec 3.3). Finally, all objectives are automatically weighted using a
+task-balancing approach (Sec 3.4).
+3.1
+Model Design
+Following the CLIP architecture [25], our framework consists of a ViT-based
+visual encoder Vθ that processes an image I into a global embedding vcls and a
+sequence of patch tokens, and a textual encoder Tθ that processes text T into a
+sentence embedding token teos:
+  V_{ \ theta }(I )  & =  [\ m athbf {v}_\
+textr m  {cl s }, \mathbf {v}_1, \ldots , \mathbf {v}_N] \in \mathbb {R}^{(N + 1) \times \textrm {dim}_v} \\ T_{\theta }(T) &= \mathbf {t}_\textrm {eos} \in \mathbb {R}^{\textrm {dim}_t}
+The design of the final visual feature used for contrastive alignment with teos
+critically impacts the learned representations. Traditional methods use the global
+image representation vcls [25, 38], which produces a fixed embedding efficient
+for retrieval but requires massive datasets to capture information relevant to
+diverse queries. FLAIR [34] proposed cross-attention pooling, where the visual
+representation is explicitly conditioned on text features teos:
+  \ m athbf  { v } _\t extrm {tc} = \omega ({\mathbf {v}_1, \ldots , \mathbf {v}_N}; \mathbf {t}_\textrm {eos}), 
+(1)
+where ω denotes a cross-attention operation with the text feature as query and
+projections of visual tokens as keys and values.
+We employ a sigmoid-based contrastive loss from FLAIR [34], denoted as
+Lret, computed as a sum of two terms comparing text representations with both
+text-conditioned and text-agnostic visual representations (vta = vcls). Following
+the text augmentation strategy described in [34], we sample K captions for each
+6
+D. Mohan et al.
+of the B images in a batch, yielding B × (B × K) image-caption pairs. For each
+pair of the i-th image and (j, k)-th caption (i, j ∈{1, . . . , B}, k ∈{1, . . . , K}),
+we define yi,j,k = +1 if the caption corresponds to the image (j = i) and −1
+otherwise. Denoting image representations as vi
+ta and vi,j,k
+tc
+, and text embeddings
+as tj,k, the loss for this pair is:
+  \mat
+hca
+l  {L}_\
+te
+x trm {r
+et
+}
+^
+{ i ,j,k} &= \mathcal {L
+}_
+\ textr m  {t
+c}^
+{
+i
+, j ,k} + \mathcal {
+L}_ \text r m {ta}^{i,j,k} \nonumber \\ &= \frac {1}{1 + \exp (y_{i,j,k}(-t\langle \mathbf {v}_\textrm {tc}^{i,j,k}, \mathbf {t}^{j,k}\rangle + b))} \label {eq:ret_loss} \\ &+ \frac {1}{1 + \exp (y_{i,j,k}(-t\langle \mathbf {v}_\textrm {ta}^{i}, \mathbf {t}^{j,k}\rangle + b))}, \nonumber
+where learnable parameters t and b represent temperature and bias, and ⟨·, ·⟩
+denotes cosine similarity.
+3.2
+Text-Conditioned Self-Distillation
+Improving local-to-global consistency enhances vision encoder performance on
+downstream applications, especially dense prediction tasks [20]. Self-distillation
+techniques like SILC [20] and TIPS [17] establish this consistency by distilling
+knowledge from a teacher to a student model. However, these methods operate
+exclusively on text-agnostic visual features (typically the [CLS] token), ignor-
+ing text-conditioned representations that have proven effective for fine-grained
+retrieval [34].
+Our Approach. We propose a novel self-distillation method that extends
+to both text-conditioned and text-agnostic representations. We maintain the
+teacher model’s weights θT as an exponential moving average (EMA) of the stu-
+dent’s weights θS with a momentum msd.
+To introduce local-to-global consistency, we generate multiple views of each
+image I: local views (smaller random crops) and global views (larger crops).
+The teacher processes only global views, providing stable global-level knowledge
+targets. The student processes both local and global views and learns to align its
+local representations with the teacher’s global ones. Specifically for batch size B,
+with K′ as the total number of captions in the batch (positive and negative) used
+to condition visual representations, and Nglob and Nloc as the local and global
+views, the text-conditioned representation vT
+tc and text-agnostic representation
+vT
+ta from the teacher have shapes of B ×K′ ×Nglob ×dimv and B ×Nglob ×dimv,
+respectively. The representations vS
+tc and vS
+ta from the student have the same
+shapes except for the number of views Nloc instead of Nglob.
+We linearly transform student and teacher features into a shared space using
+projection matrices WS and WT :
+  
+\ m at hb
+f {y}^{T}_{*} &= \mathbf {W}^T \mathbf {v}^{T}_{*}, \quad \mathbf {y}^{S}_{*} = \mathbf {W}^S \mathbf {v}^{S}_{*} ,
+(3)
+where ∗denotes all applicable indices. For the teacher, the projected features
+are centered and scaled by the learned temperature τT , for the student they are
+GoldiCLIP
+7
+scaled by temperature τS:
+  
+\m a thb
+f { z}^{T}_ \
+tex
+tr
+m {
+t
+a }
+ &
+= 
+(
+\ma
+t
+hb
+f 
+{
+y } ^{T
+}
+_ \te
+xtr
+m {ta} - \mathbf {c}_\textrm {ta}) / \tau _T, \\ \mathbf {z}^{T}_\textrm {tc} &= \left (\frac {1}{K'} \sum _{k=1}^{K'}\left [\mathbf {y}^{T}_\textrm {tc}\right ]_k - \mathbf {c}_\textrm {tc}\right ) / \tau _T \\ \mathbf {z}^{S}_\textrm {ta} &= \mathbf {y}^{S}_\textrm {ta} / \tau _S, \\ \mathbf {z}^{S}_\textrm {tc} &= \left (\frac {1}{K'} \sum _{k=1}^{K'}\left [\mathbf {y}^{S}_\textrm {tc}\right ]_k \right ) / \tau _S
+(7)
+Note that for text-conditioned representations, we average over all K′ captions
+before applying centering and temperature scaling. This is an important design
+choice: a local view captures only a small crop of the image and may contain
+little information relevant to a given caption. Conditioning these local views on
+individual captions can therefore produce noisy representations. Directly aligning
+these representations to the teacher’s global text-conditioned representations
+risks training instability or collapse. Averaging over captions smooths out this
+noise and ensures stable distillation dynamics.
+The logits z are transformed into probability distributions p using SoftMax.
+The student is trained by minimizing the distillation loss Lsd, which is a sum of
+cross-entropy terms between teacher target distributions and student predicted
+distributions across different views:
+  \ m
+athca
+l
+ {L
+}_\t
+e
+xtr
+m
+ 
+{sd}
+ =  \sum
+ _
+{
+i =
+1
+}^{N
+_\ t extr
+m 
+{glob}} \sum _{j=1}^{N_\textrm {loc}} H\left (p^{T,i}_\textrm {ta}, p^{S,j}_\textrm {ta}\right ) + H\left (p^{T,i}_\textrm {tc}, p^{S,j}_\textrm {tc}\right )
+,
+(8)
+where H is a cross-entropy function.
+The centers cta and ctc are updated with EMA momentum mc using batch
+means of the projected teacher features. We provide detailed formulation in
+supplementary material.
+3.3
+Decoder Objectives
+Prior work [29, 31, 37] demonstrates that incorporating generative objectives
+alongside contrastive learning produces more robust visual representations. Fol-
+lowing [31, 37], we introduce a transformer-based decoder Dθ that autoregres-
+sively generates text sequences conditioned on visual features from the image
+encoder. The textual prompt dictates one of multiple generation tasks proposed
+in [31]: image captioning, referring expression generation, or grounded caption-
+ing. For instance, for grounded captioning, the decoder receives a prompt “OBGR
+[x1, y1, x2, y2], grounded caption is” — a task identifier with bounding-box
+coordinates, and generates a caption describing that object region.
+VQA Objective. To further enrich the learned visual representations, we
+propose incorporating a Visual Question Answering (VQA) task into the decoder
+8
+D. Mohan et al.
+training framework. While descriptive objectives like caption generation are ef-
+fective, VQA provides a more rigorous training signal that directly enhances
+the underlying visual features. The compositional reasoning required to answer
+complex questions forces the model to learn a more robust feature space, where
+object identities, attributes, and spatial relationships are better encoded — capa-
+bilities not strictly required for caption generation alone. We generate auxiliary
+VQA data using open-world detector models [18] and large-scale VLMs.
+The loss for each of the four decoder tasks is a standard negative log-
+likelihood for next token prediction, where the model learns to predict the
+ground-truth text sequence T given the task prompt and conditioned on the
+visual token embeddings V = [v1, . . . , vN]:
+  \mathc a l
+ 
+{L} _\textrm
+ 
+{ task}
+(\ t het
+a )
+ &= -  \sum  \lo g P_ \theta (\mathbf {T}^\textrm {task}_{j} \mid \mathbf {T}^\textrm {task}_{<j}, \mathbf {V}),\\ \textrm {task} &\in \{\textrm {cap, ref, grd, vqa}\}. \nonumber
+Architecture Choice. Unlike LocCa [31] and SigLIP 2 [29], which feed
+tokenized text directly to the decoder Dθ, we adopt a CoCa-style [37] architecture
+where text is tokenized and then embedded using the text encoder Tθ. This
+design optimizes the text encoder on both the contrastive loss and all decoder
+objectives , encouraging it to generalize beyond caption-like queries and handle
+diverse textual structures. This generalization is particularly valuable when the
+model is integrated into retrieval-augmented vision-language systems with varied
+query distributions. By eliminating the additional tokenizer, this also reduces the
+number of model parameters by 10%, enabling larger batch sizes in training. Our
+text encoder employs causal self-attention to prevent the decoder from accessing
+future tokens, thereby avoiding information leakage.
+3.4
+Task Balancing
+Our model is optimized using a diverse set of six supervisory signals: contrastive
+retrieval (Lret), four generative decoder tasks (Lcap, Lref, Lgrd, Lvqa), and self-
+distillation (Lsd). Balancing these heterogeneous signals is crucial but manually
+tuning loss weights is computationally prohibitive.
+We frame training as a multi-task learning problem and employ uncertainty-
+based weighting [11]. Each loss term Ltask is associated with a learnable uncer-
+tainty parameter σ2
+task that represents task-dependent uncertainty. This allows
+the model to automatically down-weight tasks with higher uncertainty, balancing
+their influence on gradient updates. The final training objective jointly minimizes
+model weights and uncertainty parameters:
+  \mat h
+c
+al {
+L}_\t
+ex
+trm 
+{ to
+tal} 
+&= \
+sum _ {\tex trm {tas k}} \fra c {\mathcal {L}_\textrm {task}}{\sigma _{\textrm {task}}^2} + \sigma _{\textrm {task}}^2,\\ \textrm {task} &\in \{\textrm {ret, cap, ref, grd, vqa, sd}\}. \nonumber
+The σ2
+task term prevents the trivial solution of infinite uncertainty. This princi-
+pled approach eliminates expensive hyperparameter search and enables stable,
+GoldiCLIP
+9
+Table 1: Zero-shot image-text retrieval on (a) standard benchmarks (validation splits
+of MSCOCO [15], Flickr30k [24]), (b) fine-grained retrieval setting introduced by [34]
+(sentence-level on DOCCI [21], IIW [8]), and (c) long-text retrieval setting (DCI [30],
+Urban 1k [40]).
+(a) Standard Benchmarks
+(b) Fine-Grained
+(c) Long Text
+Method
+Data
+size
+MSCOCO
+Flickr30k
+DOCCI-FG IIW-FG
+DCI
+Urban 1k
+T2I
+I2T
+T2I
+I2T
+T2I
+I2T
+T2I I2T
+T2I I2T T2I I2T
+R1
+R5
+R1
+R5
+R1
+R5
+R1
+R5
+R1
+R1
+R1
+R1
+R1
+R1
+R1
+R1
+DreamLIP [41]
+3M
+29.8 55.4 40.8 68.4 53.6 78.4 69.2 91.5 10.3
+23.3
+22.7 59.2
+-
+-
+-
+-
+FLAIR [34]
+3M
+37.7 64.5 51.6 77.2 65.7 86.8 78.7 95.2 15.2
+35.7
+30.5 70.6 50.3 47.3 69.5 63.5
+COSMOS [12]
+3M
+40.1 66.8 53.1 78.3 68.6 88.7 84.1 96.5 14.2
+32.9
+28.9 70.9 52.5 50.2 73.2 67.1
+GoldiCLIP
+3M
+45.1 71.2 58.6 82.4 73.8 91.2 88.7 97.4 18.7
+43.0
+35.4 79.4 57.7 52.8 79.3 72.3
+SigLIP [38]
+30M 49.0 74.5 64.1 86.2 76.7 93.2 90.5 98.3
+-
+-
+-
+-
+-
+-
+-
+-
+DreamLIP [41] 30M 44.8 69.8 62.3 84.5 73.3 91.8 89.9 99.0 21.6
+51.2
+37.5 85.3
+-
+-
+-
+-
+COSMOS [12]
+30M 52.5 77.2 68.0 87.8 80.3 95.3 92.9 99.4 23.1
+57.3
+40.1 90.2 67.7 63.7 88.0 82.7
+FLAIR [34]
+30M 53.3 77.5 68.0 87.8 81.1 94.9 94.7 99.3 25.0
+59.0
+41.7 91.5 66.3 61.3 87.7 83.6
+GoldiCLIP
+30M 55.5 78.9 70.3 89.3 83.0 95.9 94.8 99.1 27.0 60.2 44.0 90.9 71.9 67.5 88.6 83.2
+LiT [39]
+100M 32.7 57.8 51.9 75.7 60.9 84.6 80.0 95.9
+-
+-
+-
+-
+40.9 41.7
+-
+-
+LoTLIP [33]
+100M 38.1 63.8 59.7 81.5 65.2 88.0 86.9 97.8
+-
+-
+-
+-
+61.0 62.1
+-
+-
+Long-CLIP [40] 400M 40.3 65.9 57.3 80.8 70.7 90.6 85.9 98.5
+-
+-
+-
+-
+44.1 47.4 79.5 78.9
+OpenCLIP [6]
+2B
+41.7 67.1 59.3 82.4 71.9 90.4 87.5 97.7 17.4
+49.7
+30.6 84.1 55.4 56.0 65.8 69.5
+PEcore [2]
+5B
+49.9 74.8 70.3 88.9 81.3 95.4 93.5 99.0 22.4
+61.8
+36.8 90.7 60.0 60.2 56.7 60.3
+SigLIP [38]
+10B
+47.2 72.1 65.5 86.2 75.6 92.8 89.1 98.6 20.6
+57.5
+33.8 83.7 56.2 57.7 62.1 62.7
+SigLIP 2 [29]
+10B
+52.5 76.6 70.0 88.3 80.0 94.5 91.8 98.8 23.2
+61.2
+37.0 91.3 55.7 55.7 57.8 60.3
+Fig. 2: Example from RetVQA [23], where the task is to retrieve relevant images for a
+question that can be used as context for generative models. For each query, there are
+two relevant images and a set of distractors. Unlike FLAIR [34], our model correctly
+retrieves images containing the door knob and the train that are relevant to the query.
+efficient optimization across diverse supervision signals operating at vastly dif-
+ferent scales (e.g., token-level generation vs. global contrastive matching).
+10
+D. Mohan et al.
+(a) Two people sitting, one on a wheelchair and the other on a bench.
+(b) A young man jumping to catch a frisbee in the front yard.
+Fig. 3: Attention maps indicate good vision-text alignment.
+4
+Experiments
+4.1
+Training Data
+We train our model on the Open-30M dataset, which consists of CC3M [26],
+CC12M [5], and YFCC15M [28], similar to prior work [3,12,34]. After accounting
+for broken URLs, the dataset contains 27 million images in total. We use the
+captions from [41], which employed three VLMs to generate three short and
+three long captions for each image. To obtain auxiliary data for each image, we
+process a DreamLIP-generated [41] caption by extracting object-centric phrases
+and using the OWL-V2 [18] model to detect bounding boxes corresponding to
+these phrases.
+4.2
+Implementation
+We use standard CLIP vision and text encoders with embedding dimensions of
+dimt = dimv = 512. Our vision encoder is based on ViT-B/16 and is trained
+with an input image resolution of 224 × 224. These parameters were applied
+across all experiments, including for comparison methods.
+To compute the retrieval loss Lret, we follow [34] and construct positive text
+pairs by first breaking the six available captions into individual sentences and
+then randomly combining one to three of them to obtain a total of K = 8
+captions per image. We use a batch size of 6400.
+For the multi-task decoder, the re-captioning objective is constructed by
+randomly sampling one of the three short full-length captions associated with
+an image. This strategy encourages the generation of coherent narratives. For
+other decoder objectives, such as grounded captioning and referring expression
+generation, we create localized training pairs by identifying an object-centric
+GoldiCLIP
+11
+phrase and its corresponding sentence within one of the original captions. VQA
+pairs are generated for each image using the Phi-3.5-mini-instruct [1] model.
+For self-distillation, we generate Nglob = 1 global and Nloc = 6 local views
+of each image. Projection matrices W S and W T map the model’s embeddings
+to a higher, 65,536-dimensional space before aligning the student and teacher
+representations via the self-distillation loss Lsd. The EMA momentum values are
+set to msd = 0.996 and mc = 0.9 for the teacher weights and centers updates,
+respectively. When combining all losses in our multi-task objective, the learnable
+task weighting parameters are all initialized to σtask = 1. We discard the teacher
+model and the multi-task decoder and report the performance using the vision
+and text encoder of the student model. Comprehensive implementation details,
+including all hyperparameters, are provided in the supplementary material.
+4.3
+Zero-Shot Retrieval
+In Table 1a, we compare the performance of our proposed approach against rele-
+vant methods on standard image-text retrieval benchmarks, including MSCOCO
+[15] and Flickr30k [24], where each image has 5 global captions associated with
+it. We follow the evaluation setup in [34]. Our method demonstrates significant
+improvements over existing state-of-the-art models on text-to-image retrieval.
+On the MSCOCO benchmark (T2I, R@1), our approach outperforms FLAIR
+[34] by 2.2pp and COSMOS [12] by 3pp. It also noteworthy that our method
+outperform SigLIP 2 [29] by 3pp and Perception Encoder [2] by 5.6pp, which
+are trained on 5-10 billion images with paired text.
+4.4
+Fine-Grained and Long-Text Retrieval
+To analyze the fine-grained understanding capabilities of our model, we adopt
+the zero-shot retrieval tasks proposed by [34] using DOCCI-FG [21] and IIW-
+FG [8]. These datasets are uniquely suited for this purpose, as they consist of
+densely annotated images where each caption is broken down into individual sen-
+tences. This compositional structure provides a challenging test, as it requires
+the model to comprehend specific, fine-grained details described in each sentence
+rather than general image-level descriptions found in MSCOCO and Flickr30k.
+Our model demonstrates superior fine-grained understanding by outperforming
+existing state-of-the-art methods on these benchmarks (see Table 1b). Specif-
+ically, on the DOCCI-FG benchmark, we improve text-to-image R@1 by 2pp,
+and by 2.3pp on the IIW-FG benchmark compared to FLAIR [34]. This result
+strongly indicates that our diverse supervision framework, enables the model
+to learn more granular and detailed visual representations compared to other
+approaches. We also provide qualitative results in Figure 3. We also benchmark
+our model’s performance on the challenging task of long text-to-image retrieval
+(Table 1c). While prior state-of-the-art methods often extend the text encoder’s
+sequence length to accommodate longer queries, we deliberately maintain the
+standard CLIP context length of 77 tokens to ensure a fair comparison with
+12
+D. Mohan et al.
+Table 2: R@2 for zero-shot retrieval for VQA task on [23] dataset build on top of
+VG [13]. The best and second-best results bolded and underlined respectively.
+Method
+Data
+T2I R2
+size Count Color Attribute Shape Relation Average
+FLAIR [34]
+30M
+57.6
+39.1
+44.4
+49.0
+47.7
+47.6
+COSMOS [41] 30M
+60.7
+42.4
+46.1
+51.6
+48.9
+49.9
+GoldiCLIP
+30M
+66.8
+48.5
+51.5
+56.4
+55.9
+55.8
+OpenCLIP [6]
+2B
+62.1
+45.0
+47.7
+51.3
+48.5
+50.9
+PEcore [2]
+5B
+65.1
+67.4
+48.9
+52.4
+57.5
+52.9
+SigLIP [38]
+10B
+64.1
+46.5
+51.1
+53.2
+53.5
+53.5
+SigLIP 2 [29]
+10B
+66.6
+49.1
+54.7
+56.7
+57.7
+57.0
+methods like FLAIR. Even with this constraint, our model demonstrates supe-
+rior performance. On the DCI dataset, it outperforms FLAIR by 4.2pp on text-
+to-image retrieval (R@1) and improves image-to-text retrieval (R@1) by 3.8pp.
+These results indicate that our model is inherently more adept at matching long,
+detailed textual queries to their relevant images without requiring architectural
+modifications for extended text inputs.
+4.5
+Zero-Shot Retrieval for VQA
+Traditionally, retrieval benchmarks have primarily been limited to textual queries
+that are descriptive captions, which fails to capture the full spectrum of real-
+world user interactions where queries are frequently phrased as questions in
+multi-modal RAG systems. State-of-the-art models trained on billion-scale datasets
+often exhibit robustness to such queries. We hypothesize that the sheer scale and
+noisy nature of their training datasets prevent the text encoder from overfitting
+to a rigid caption-like query structure. However, this is a common failure mode
+for models trained on smaller, curated re-captioned datasets. To validate our
+method’s robustness against this overfitting, we measure its performance on the
+Retrieval VQA task [23] built on top of the Visual Genome dataset [13]. The
+task is to retrieve relevant images that will provide correct context to answer a
+given question, as shown in Figure 2. We report R@2 numbers while showing
+our model’s performance on different question types in Table 2.
+Our method achieves an average performance improvement of 5pp over exist-
+ing approaches trained on comparable data scales (30M), while also outperform-
+ing models trained on larger datasets (SigLIP [38], PE [2]) and is comparable
+to SigLIP 2 [29]. This improved generalization can be attributed to our en-
+hanced multi-task decoder with VQA capabilities, which helps maintain robust
+performance across diverse query formats even when trained on caption-heavy
+datasets. By progressively bridging the gap to state-of-the-art models trained on
+large-scale datasets, our method demonstrates both superior performance and
+enhanced generalization capabilities.
+GoldiCLIP
+13
+Table 3: Mean intersection over union (mIoU) for zero-shot semantic segmentation.
+The best and second-best results are bolded and underlined. ∗No attention sink.
+Method
+Data
+size
+VOC20 Cityscapes Context59 ADE20K COCO-Stuff Average
+SigLIP [38]
+30M
+14.5
+5.5
+5.8
+2.2
+3.8
+6.4
+DreamLIP [41] 30M
+1.8
+0.9
+0.4
+0.1
+0.1
+0.7
+COSMOS [12]
+30M
+53.6
+13.9
+15.7
+8.5
+10.7
+20.0
+FLAIR [34]
+30M
+73.0
+13.6
+18.6
+10.4
+13.3
+25.8
+FLAIR∗[34]
+30M
+70.3
+26.2
+26.4
+14.7
+18.8
+31.3
+GoldiCLIP
+30M
+70.0
+28.9
+29.5
+16.4
+19.4
+32.8
+CLIP [25]
+400M
+41.8
+5.5
+9.2
+3.2
+4.4
+12.8
+OpenCLIP [6]
+2B
+47.2
+5.1
+9.0
+2.9
+5.0
+13.9
+MetaCLIP [34] 2.5B
+35.4
+5.0
+8.1
+2.2
+4.3
+11.0
+PEcore [2]
+5B
+74.3
+24.0
+30.1
+17.2
+20.0
+33.1
+SigLIP [38]
+10B
+66.1
+29.1
+26.4
+16.3
+18.0
+31.2
+SigLIP 2 [29]
+10B
+73.0
+27.9
+28.4
+17.8
+19.9
+33.4
+4.6
+Zero-Shot Semantic Segmentation
+In Table 3, we show the performance of our model on the zero-shot segmentation
+task. Similar to prior benchmarks, we compare our model against other meth-
+ods using similar data scales as well as state-of-the-art methods. To compute
+segmentation maps, we follow the approach used by [34]. Similar to [34], during
+training we add the zero vector to the keys and values matrices in the cross-
+attention pooling, which we call attention sinks. This is primarily done to help
+with cross-modal alignment in a contrastive setting. When computing zero-shot
+segmentation, we do not use this attention sink. To ensure a fair comparison,
+we report the [34] numbers without the attention sink. GoldiCLIP on average
+outperforms all models trained on comparable data, with a 1.5pp improvement
+over the previous best [34]. Additionally, GoldiCLIP is highly competitive with
+state-of-the-art models trained on much larger datasets. This performance can be
+attributed to our multi-task supervision framework that uses a text-conditioned
+self-distillation approach, which enables learning more robust and generalizable
+representations.
+4.7
+Zero-Shot Classification
+We present the results of zero-shot classification on 10 standard classification
+datasets in Table 4. While our performance is comparable to methods trained on
+similar data scales, there remains a significant performance gap when compared
+to state-of-the-art models such as SigLIP 2 [29] and PE [2]. We hypothesize
+that this gap arises primarily due to two factors. First, state-of-the-art models
+are trained on significantly larger datasets (5-10 billion image samples), which
+encompass a broader range of diverse concepts compared to the 30 million image
+samples in our dataset. Second, the re-captions generated using Vision-Language
+Models (VLMs) or Large Language Models (LLMs) tend to be more coarse-
+grained. This lack of fine-grained concepts in the re-captioned dataset limits its
+14
+D. Mohan et al.
+Table 4: Top-1 accuracy for zero-shot classification. The best and second-best results
+per section are bolded and underlined.
+Method
+Data
+size
+Food-101
+CIFAR-10
+CIFAR-100
+SUN397
+Cars
+Aircraft
+DTD
+Pets
+Flowers
+ImageNet
+Average
+CLIP [25]
+30M 61.3 92.2 66.9 62.2 19.3
+5.7
+30.9 49.3 43.4 50.0 48.1
+SigLIP [38]
+30M 64.2 91.0 67.6 64.0 22.0
+5.7
+33.5 53.3 43.6 51.0 49.6
+DreamLIP [41] 30M 75.4 92.3 70.7 63.7 22.7
+7.9
+33.9 64.1 51.1 58.1 54.0
+FLAIR [34]
+30M 72.5 93.1 69.6 66.9 31.1
+7.2
+37.3 55.6 48.4 56.6 53.8
+COSMOS [12]
+30M 73.9 93.4 72.3 67.8 31.2
+5.9
+37.3 62.9 54.6 57.6 55.7
+GoldiCLIP
+30M 74.0 92.9 70.7 67.2 34.5
+6.6
+33.9 62.7 51.4 57.4 55.1
+OpenCLIP [6]
+2B
+86.2 94.8 76.5 70.0 87.4 25.8 54.9 89.5 69.8 70.2 72.5
+MetaCLIP [36] 2.5B 88.3 95.7 79.0 68.5 82.9 30.3 62.1 91.7 73.9 72.1 74.5
+Llip [14]
+2.5B 89.0 95.7 81.4 70.9 88.2 41.5 63.7 93.5 74.9 75.3 77.4
+PEcore [2]
+5B
+92.5 97.0 83.1 74.0 92.1 57.0 66.4 94.6 86.5 78.4 82.2
+SigLIP [38]
+10B
+91.6 92.3 72.2 70.0 90.8 44.0 64.7 94.2 85.2 76.2 78.1
+SigLIP2 [29]
+10B 92.8 94.8 76.9 72.7 93.4 54.8 67.2 95.4 85.7 78.2 81.2
+ability to generalize effectively on the zero-shot classification task. These factors
+collectively contribute to the observed performance disparity.
+4.8
+Ablation Study
+In Table 5, we present a performance ablation study of our model across various
+components, with all models trained on the CC3M-recap dataset. The cross-
+attention pooling (row 1) aligns with previous work [34]. Notably, the addition
+of individual components provides complementary benefits. Specifically, enhanc-
+ing the multi-task decoder with VQA improves performance on question-based
+retrieval tasks and helps avoid overfitting to caption-like queries when trained
+on larger datasets. Similarly, the model’s segmentation performance enhances
+spatial understanding, as evidenced by the addition of self-distillation, which
+improves performance by 2.9pp. Furthermore, integrating all supervision com-
+ponents into a joint framework boosts the model’s performance by 7.4pp for
+MS-COCO text-to-image retrieval (R@1) and 3.6pp for fine-grained retrieval
+(T2I, R@1), among other tasks. To isolate the effect of our text-conditioned
+self-distillation, we apply it to FLAIR as standalone addition and observe im-
+provements of 4.9 and 4.3 pp on MSCOCO T2I and I2T retrieval respectively
+(Table 6), confirming that the gains stem from the proposed distillation mecha-
+nism rather than from the combination of other components. We discuss addi-
+tional details, including the experimental settings and design choices related to
+this ablation study in the supplementary material.
+5
+Conclusion
+GoldiCLIP achieves state-of-the-art performance among methods trained on
+comparable data scales across retrieval, fine-grained retrieval, question-based re-
+GoldiCLIP
+15
+Table 5: Ablation study on different components of our method on the CC3M-recap
+dataset. CA: Cross Attention Pooling, DC: Multi-Task Decoder without VQA objec-
+tive, VD: Multi-Task Decoder with VQA, UN: Uncertainty-based Task Weighting,
+SD: Text-Conditioned Self-Distillation.
+Method
+COCO
+DOCCI RVQA VOC20 ImageNet
+T2I I2T T2I I2T
+T2I
+mIOU
+Top-1
+CA
+37.7 51.6 15.1 35.7
+51.0
+59.0
+36.2
++DC
+42.1 56.4 16.7 40.3
+51.4
+50.6
+37.5
++VD
+42.1 56.9 16.7 39.0
+51.7
+53.9
+37.6
++UN
+42.9 58.2 17.6 42.3
+52.0
+55.1
+38.8
++SD
+45.1 58.6 18.7 43.0
+51.7
+62.9
+40.1
+Table 6: Comparison of Prior Self-distillation methods to our text conditioned self-
+distillation applied to FLAIR. All methods trained on CC3M-recap dataset. Recall @1
+reported for both I2T and T2I. Best results bolded.
+Method
+COCO
+Flickr30k
+T2I
+I2T
+T2I
+I2T
+SILC
+48.6 35.4 79.0 62.1
+COSMOS
+53.1 40.1 84.1 68.6
+FLAIR
+51.6 37.7 78.7 65.5
+FLAIR + TC-SD 56.5 42.0 87.5 70.3
+trieval, and semantic segmentation benchmarks. Among our contributions, text-
+conditioned self-distillation stands out as particularly impactful: by extending
+local-to-global consistency learning to text-conditioned features, it directly im-
+proves the representations that matter most for fine-grained retrieval, yielding
+substantial gains even when applied to existing frameworks. Routing decoder
+tasks through the text encoder, distilling both text-conditioned and text-agnostic
+features, and automatically balancing losses across scales are individually small
+design decisions, but together they account for the consistent improvements we
+observe across retrieval, fine-grained understanding, and dense prediction tasks.
+Our framework has clear limitations. Zero-shot classification remains constrained
+by the limited concept diversity in smaller datasets, a gap that richer supervi-
+sion alone does not close. Additionally, our experiments are limited to a single
+ViT-B/16 backbone; understanding how these supervision interactions behave
+at larger model scales is an open question. Our work suggests that how super-
+vision signals are adapted and integrated is a complementary research direction
+to the design of the signals themselves, and we hope that our findings encourage
+further research in this direction.
+16
+D. Mohan et al.
+References
+1. Abdin, M., Aneja, J., Behl, H., Bubeck, S., Eldan, R., Gunasekar, S., Harrison, M.,
+Hewett, R.J., Javaheripi, M., Kauffmann, P., et al.: Phi-4 technical report. arXiv
+preprint arXiv:2412.08905 (2024)
+2. Bolya, D., Huang, P.Y., Sun, P., Cho, J.H., Madotto, A., Wei, C., Ma, T., Zhi,
+J., Rajasegaran, J., Rasheed, H., et al.: Perception encoder: The best visual em-
+beddings are not at the output of the network. arXiv preprint arXiv:2504.13181
+(2025)
+3. Bulat, A., Ouali, Y., Tzimiropoulos, G.: Fff: Fixing flawed foundations in con-
+trastive pre-training results in very strong vision-language models. In: Proceedings
+of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp.
+14172–14182 (2024)
+4. Caron, M., Touvron, H., Misra, I., Jégou, H., Mairal, J., Bojanowski, P., Joulin,
+A.: Emerging properties in self-supervised vision transformers. In: Proceedings of
+the IEEE/CVF international conference on computer vision. pp. 9650–9660 (2021)
+5. Changpinyo, S., Sharma, P., Ding, N., Soricut, R.: Conceptual 12m: Pushing web-
+scale image-text pre-training to recognize long-tail visual concepts. In: Proceedings
+of the IEEE/CVF conference on computer vision and pattern recognition. pp.
+3558–3568 (2021)
+6. Cherti, M., Beaumont, R., Wightman, R., Wortsman, M., Ilharco, G., Gordon, C.,
+Schuhmann, C., Schmidt, L., Jitsev, J.: Reproducible scaling laws for contrastive
+language-image learning. In: Proceedings of the IEEE/CVF conference on com-
+puter vision and pattern recognition. pp. 2818–2829 (2023)
+7. Fan, L., Krishnan, D., Isola, P., Katabi, D., Tian, Y.: Improving clip training with
+language rewrites. Advances in Neural Information Processing Systems 36, 35544–
+35575 (2023)
+8. Garg, R., Burns, A., Ayan, B.K., Bitton, Y., Montgomery, C., Onoe, Y., Bunner,
+A., Krishna, R., Baldridge, J., Soricut, R.: Imageinwords: Unlocking hyper-detailed
+image descriptions. arXiv preprint arXiv:2405.02793 (2024)
+9. Hu, X., Gan, Z., Wang, J., Yang, Z., Liu, Z., Lu, Y., Wang, L.: Scaling up vision-
+language pre-training for image captioning. In: Proceedings of the IEEE/CVF
+conference on computer vision and pattern recognition. pp. 17980–17989 (2022)
+10. Jia, C., Yang, Y., Xia, Y., Chen, Y.T., Parekh, Z., Pham, H., Le, Q., Sung, Y.H.,
+Li, Z., Duerig, T.: Scaling up visual and vision-language representation learning
+with noisy text supervision. In: International conference on machine learning. pp.
+4904–4916. PMLR (2021)
+11. Kendall, A., Gal, Y., Cipolla, R.: Multi-task learning using uncertainty to weigh
+losses for scene geometry and semantics. In: Proceedings of the IEEE conference
+on computer vision and pattern recognition. pp. 7482–7491 (2018)
+12. Kim, S., Xiao, R., Georgescu, M.I., Alaniz, S., Akata, Z.: Cosmos: Cross-modality
+self-distillation for vision language pre-training. In: Proceedings of the Computer
+Vision and Pattern Recognition Conference. pp. 14690–14700 (2025)
+13. Krishna, R., Zhu, Y., Groth, O., Johnson, J., Hata, K., Kravitz, J., Chen, S.,
+Kalantidis, Y., Li, L.J., Shamma, D.A., et al.: Visual genome: Connecting language
+and vision using crowdsourced dense image annotations. International journal of
+computer vision 123(1), 32–73 (2017)
+14. Lavoie, S., Kirichenko, P., Ibrahim, M., Assran, M., Wilson, A.G., Courville, A.,
+Ballas, N.: Modeling caption diversity in contrastive vision-language pretraining.
+arXiv preprint arXiv:2405.00740 (2024)
+GoldiCLIP
+17
+15. Lin, T.Y., Maire, M., Belongie, S., Hays, J., Perona, P., Ramanan, D., Dollár, P.,
+Zitnick, C.L.: Microsoft coco: Common objects in context. In: European conference
+on computer vision. pp. 740–755. Springer (2014)
+16. Liu, H., Li, C., Wu, Q., Lee, Y.J.: Visual instruction tuning. Advances in neural
+information processing systems 36, 34892–34916 (2023)
+17. Maninis, K.K., Chen, K., Ghosh, S., Karpur, A., Chen, K., Xia, Y., Cao, B., Salz,
+D., Han, G., Dlabal, J., et al.: Tips: Text-image pretraining with spatial awareness.
+arXiv preprint arXiv:2410.16512 (2024)
+18. Minderer, M., Gritsenko, A., Houlsby, N.: Scaling open-vocabulary object detec-
+tion. Advances in Neural Information Processing Systems 36, 72983–73007 (2023)
+19. Mu, N., Kirillov, A., Wagner, D., Xie, S.: Slip: Self-supervision meets language-
+image pre-training. In: European conference on computer vision. pp. 529–544.
+Springer (2022)
+20. Naeem, M.F., Xian, Y., Zhai, X., Hoyer, L., Van Gool, L., Tombari, F.: Silc: Im-
+proving vision language pretraining with self-distillation. In: European Conference
+on Computer Vision. pp. 38–55. Springer (2024)
+21. Onoe, Y., Rane, S., Berger, Z., Bitton, Y., Cho, J., Garg, R., Ku, A., Parekh, Z.,
+Pont-Tuset, J., Tanzer, G., et al.: Docci: Descriptions of connected and contrast-
+ing images. In: European Conference on Computer Vision. pp. 291–309. Springer
+(2024)
+22. Patel, M., Kusumba, N.S.A., Cheng, S., Kim, C., Gokhale, T., Baral, C., et al.:
+Tripletclip: Improving compositional reasoning of clip via synthetic vision-language
+negatives. Advances in neural information processing systems 37, 32731–32760
+(2024)
+23. Penamakuri, A.S., Gupta, M., Gupta, M.D., Mishra, A.: Answer mining from a
+pool of images: towards retrieval-based visual question answering. arXiv preprint
+arXiv:2306.16713 (2023)
+24. Plummer, B.A., Wang, L., Cervantes, C.M., Caicedo, J.C., Hockenmaier, J., Lazeb-
+nik, S.: Flickr30k entities: Collecting region-to-phrase correspondences for richer
+image-to-sentence models. In: Proceedings of the IEEE international conference on
+computer vision. pp. 2641–2649 (2015)
+25. Radford, A., Kim, J.W., Hallacy, C., Ramesh, A., Goh, G., Agarwal, S., Sastry, G.,
+Askell, A., Mishkin, P., Clark, J., et al.: Learning transferable visual models from
+natural language supervision. In: International conference on machine learning. pp.
+8748–8763. PmLR (2021)
+26. Sharma, P., Ding, N., Goodman, S., Soricut, R.: Conceptual captions: A cleaned,
+hypernymed, image alt-text dataset for automatic image captioning. In: Proceed-
+ings of the 56th Annual Meeting of the Association for Computational Linguistics
+(Volume 1: Long Papers). pp. 2556–2565 (2018)
+27. Sun, Q., Wang, J., Yu, Q., Cui, Y., Zhang, F., Zhang, X., Wang, X.: Eva-clip-18b:
+Scaling clip to 18 billion parameters. arXiv preprint arXiv:2402.04252 (2024)
+28. Thomee, B., Shamma, D.A., Friedland, G., Elizalde, B., Ni, K., Poland, D., Borth,
+D., Li, L.J.: Yfcc100m: The new data in multimedia research. Communications of
+the ACM 59(2), 64–73 (2016)
+29. Tschannen, M., Gritsenko, A., Wang, X., Naeem, M.F., Alabdulmohsin, I.,
+Parthasarathy, N., Evans, T., Beyer, L., Xia, Y., Mustafa, B., et al.: Siglip 2:
+Multilingual vision-language encoders with improved semantic understanding, lo-
+calization, and dense features. arXiv preprint arXiv:2502.14786 (2025)
+30. Urbanek, J., Bordes, F., Astolfi, P., Williamson, M., Sharma, V., Romero-Soriano,
+A.: A picture is worth more than 77 text tokens: Evaluating clip-style models on
+18
+D. Mohan et al.
+dense captions. In: Proceedings of the IEEE/CVF Conference on Computer Vision
+and Pattern Recognition. pp. 26700–26709 (2024)
+31. Wan, B., Tschannen, M., Xian, Y., Pavetic, F., Alabdulmohsin, I.M., Wang, X.,
+Susano Pinto, A., Steiner, A., Beyer, L., Zhai, X.: Locca: Visual pretraining with
+location-aware captioners. Advances in Neural Information Processing Systems 37,
+116355–116387 (2024)
+32. Wang, J., Yang, Z., Hu, X., Li, L., Lin, K., Gan, Z., Liu, Z., Liu, C., Wang, L.: Git:
+A generative image-to-text transformer for vision and language. arXiv preprint
+arXiv:2205.14100 (2022)
+33. Wu, W., Zheng, K., Ma, S., Lu, F., Guo, Y., Zhang, Y., Chen, W., Guo, Q.,
+Shen, Y., Zha, Z.J.: Lotlip: Improving language-image pre-training for long text
+understanding. Advances in Neural Information Processing Systems 37, 64996–
+65019 (2024)
+34. Xiao, R., Kim, S., Georgescu, M.I., Akata, Z., Alaniz, S.: Flair: Vlm with fine-
+grained language-informed image representations. In: Proceedings of the Computer
+Vision and Pattern Recognition Conference. pp. 24884–24894 (2025)
+35. Xie, C., Wang, B., Kong, F., Li, J., Liang, D., Zhang, G., Leng, D., Yin, Y.: Fg-clip:
+Fine-grained visual and textual alignment. arXiv preprint arXiv:2505.05071 (2025)
+36. Xu, H., Xie, S., Tan, X.E., Huang, P.Y., Howes, R., Sharma, V., Li, S.W., Ghosh,
+G., Zettlemoyer, L., Feichtenhofer, C.: Demystifying clip data. arXiv preprint
+arXiv:2309.16671 (2023)
+37. Yu, J., Wang, Z., Vasudevan, V., Yeung, L., Seyedhosseini, M., Wu, Y.:
+Coca: Contrastive captioners are image-text foundation models. arXiv preprint
+arXiv:2205.01917 (2022)
+38. Zhai, X., Mustafa, B., Kolesnikov, A., Beyer, L.: Sigmoid loss for language im-
+age pre-training. In: Proceedings of the IEEE/CVF international conference on
+computer vision. pp. 11975–11986 (2023)
+39. Zhai, X., Wang, X., Mustafa, B., Steiner, A., Keysers, D., Kolesnikov, A., Beyer,
+L.: Lit: Zero-shot transfer with locked-image text tuning. In: Proceedings of the
+IEEE/CVF conference on computer vision and pattern recognition. pp. 18123–
+18133 (2022)
+40. Zhang, B., Zhang, P., Dong, X., Zang, Y., Wang, J.: Long-clip: Unlocking the long-
+text capability of clip. In: European conference on computer vision. pp. 310–325.
+Springer (2024)
+41. Zheng, K., Zhang, Y., Wu, W., Lu, F., Ma, S., Jin, X., Chen, W., Shen, Y.: Dream-
+lip: Language-image pre-training with long captions. In: European Conference on
+Computer Vision. pp. 73–90. Springer (2024)
+GoldiCLIP
+1
+GoldiCLIP: The Goldilocks Approach for Balancing Explicit
+Supervision for Language-Image Pretraining
+Supplementary Material
+6
+Training Data
+6.1
+Images
+Our training images are sourced from CC3M [26], CC12M [5], and YFCC15M
+[28]. We follow prior work and use these images directly without any additional
+filtering or modification.
+6.2
+Captions
+To construct a comprehensive and diverse caption set, we incorporate the raw
+captions as well as synthetic captions provided by DreamLIP [41]. Specifically,
+for each image we include one raw caption, three synthetic short captions, and
+three synthetic long captions.
+DreamLIP generates these captions using a combination of InstructBLIP,
+ShareGPT4V, and LLaVA-1.5. Their pipeline uses the following prompts:
+– “Describe the image in details” for long captions
+– “Describe the image in short:” for short captions.
+We refer readers to the DreamLIP paper for further details on their caption
+generation procedure.
+6.3
+Auxiliary Data
+To enrich visual supervision, we supplement the dataset with object bounding
+boxes, region-level caption phrases and synthetic visual questions and answers.
+Object Bounding Boxes. We leverage OWLv2 [18], an open-vocabulary
+detector, to predict bounding boxes. Following prior work [18,29], we first extract
+region-level phrases using named entity recognition (NER) applied to the long
+captions generated by LLaVA-1.5. These extracted region phrases serve as text
+queries for OWLv2. For each query, OWLv2 returns bounding boxes, confidence
+scores, and region captions.
+VQA Generation. We generate additional VQA supervision using Phi-3.5-
+mini-instruct [1] with the following prompt template:
+Given the following image caption:
+“ref_caption”
+Please generate five short questions and corresponding short answers that
+someone might ask about this image. The questions should be relevant to
+the content of the caption, and the answers be very short, concise, and factual
+based on the caption. Only generate questions and answers that are strictly
+answerable using the provided caption. Do not invent details or use outside
+knowledge.
+2
+D. Mohan et al.
+Table 7: Pre-training hyper-parameters for our method.
+Config
+CC3M-recap Open-30M
+Batch size
+2, 560
+6, 400
+Optimizer
+AdamW
+Learning rate
+5 × 10−4
+Weight decay
+0.5
+0.2
+Adam β
+β1 = 0.9, β2 = 0.98
+Adam ϵ
+1 × 10−8
+1 × 10−6
+Total epochs
+35
+Warm up
+2, 000 (steps)
+Learning rate scheduler
+cosine decay
+Teacher momentum msd
+0.996
+Center momentum mc
+0.9
+Here, ref_caption is replaced with the short caption produced by
+ShareGPT4V. We set the maximum generation length to 500 tokens. This re-
+sults in approximately 3–5 question–answer pairs per image. The creation of
+this additional VQA data is in the same spirit as the VLM based re-captioning
+used by prior methods and is considered as text augmentations, as no additional
+images are used.
+7
+Implementation in Detail
+As mentioned in Section 4.2, we use standard CLIP vision and text encoders.
+Text encoder has embedding dimensions of dimt = 512. Our vision encoder is
+based on ViT-B/16 and is trained with an input image resolution of 224 × 224.
+These parameters were applied across all experiments, including for compari-
+son methods. The hidden dimension of vision encoder is 768 (as in ViT-B/16).
+Similar to [34] we project this to dimv = 512. Additionally in order to perform
+the cross attention pooling we use a secondary projection, from the the vision
+encoder. This projected visual tokens are used as the key and value tokens, in
+creating the text conditioned representations. The multi-modal decoder used for
+training has hidden dimension of dimdec = 512. This is done so that the vision
+tokens after projection (corresponding to key projection mentioned above) can
+flow into the decoder without the need for additional projection. The decoder
+consists of 8 layers with 8 heads, with the same vocabulary as the text encoder.
+To compute the retrieval loss Lret, we follow [34] and construct positive text
+pairs by first breaking the six available captions into individual sentences and
+then randomly combining one to three of them to obtain a total of K = 8 captions
+per image. We use a batch size of 6,400 when training on Open-30M and 2,560
+for training on CC3M-recap. When creating text conditioned representation in
+a batch, it becomes computationally challenging to create text-conditioned rep-
+resentation on all the negative images for each image in a batch. We follow the
+techniques used by [34] to downsample the number of negatives in a batch, to
+only use one of negatives from the set of K captions associated with the negative
+image. We report all the other parameters related to training the model for the
+GoldiCLIP
+3
+main experiments as well as the ablations in Table 7. In the final experiments, we
+found that weighting caption loss with a value of 2 further boosts performance.
+This indicates that while task balancing provides significant benefits by largely
+mitigating the need for extensive hyperparameter searches, fine-tuning specific
+hyperparameters can still offer incremental improvements. All our experiments
+are run on MI300X AMD gpu’s.
+8
+Task Balancing
+Figure 4 demonstrates how the learnable task-balancing coefficients 1/σ2
+task
+change throughout training. In order to analyse the effect of task-balancing on fi-
+nal performance, we compare it with the model trained with uniform loss weights
+(while supervision remains the same). When trained on CC3M-recap dataset,
+we observe that with uniform weight the R@1 for text-to-image retrieval on
+MSCOCO dataset is 44.1 whereas with uncertainty task weighting it is 45.0
+Fig. 4: Values of task coefficients changing over training epochs.
+4
+D. Mohan et al.
+Table 8: Our model remains competetive on various retrieval benchmarks even when
+evaluated in text-agnostic mode, denoted as GoldiCLIPta.
+(a) Standard Benchmarks
+(b) Fine-Grained
+(c) Long Text
+Method
+Data
+size
+MSCOCO
+Flickr30k
+DOCCI-FG IIW-FG
+DCI
+Urban 1k
+T2I
+I2T
+T2I
+I2T
+T2I
+I2T
+T2I I2T
+T2I I2T T2I I2T
+R1
+R5
+R1
+R5
+R1
+R5
+R1
+R5
+R1
+R1
+R1
+R1
+R1
+R1
+R1
+R1
+DreamLIP [41]
+3M
+29.8 55.4 40.8 68.4 53.6 78.4 69.2 91.5 10.3
+23.3
+22.7 59.2
+-
+-
+-
+-
+FLAIR [34]
+3M
+37.7 64.5 51.6 77.2 65.7 86.8 78.7 95.2 15.2
+35.7
+30.5 70.6 50.3 47.3 69.5 63.5
+COSMOS [12]
+3M
+40.1 66.8 53.1 78.3 68.6 88.7 84.1 96.5 14.2
+32.9
+28.9 70.9 52.5 50.2 73.2 67.1
+GoldiCLIP
+3M
+45.1 71.2 58.6 82.4 73.8 91.2 88.7 97.4 18.7
+43.0
+35.4 79.4 57.7 52.8 79.3 72.3
+SigLIP [38]
+30M 49.0 74.5 64.1 86.2 76.7 93.2 90.5 98.3
+-
+-
+-
+-
+-
+-
+-
+-
+DreamLIP [41] 30M 44.8 69.8 62.3 84.5 73.3 91.8 89.9 99.0 21.6
+51.2
+37.5 85.3
+-
+-
+-
+-
+COSMOS [12]
+30M 52.5 77.2 68.0 87.8 80.3 95.3 92.9 99.4 23.1
+57.3
+40.1 90.2 67.7 63.7 88.0 82.7
+FLAIR [34]
+30M 53.3 77.5 68.0 87.8 81.1 94.9 94.7 99.3 25.0
+59.0
+41.7 91.5 66.3 61.3 87.7 83.6
+GoldiCLIP
+30M 55.5 78.9 70.3 89.3 83.0 95.9 94.8 99.1 27.0 60.2 44.0 90.9 71.9 67.5 88.6 83.2
+GoldiCLIPta
+30M 52.3 77.2 67.7 88.0 80.3 95.0 93.2 99.2 22.9
+55.0
+38.5 89.2 69.2 65.9 85.8 83.0
+LiT [39]
+100M 32.7 57.8 51.9 75.7 60.9 84.6 80.0 95.9
+-
+-
+-
+-
+40.9 41.7
+-
+-
+LoTLIP [33]
+100M 38.1 63.8 59.7 81.5 65.2 88.0 86.9 97.8
+-
+-
+-
+-
+61.0 62.1
+-
+-
+Long-CLIP [40] 400M 40.3 65.9 57.3 80.8 70.7 90.6 85.9 98.5
+-
+-
+-
+-
+44.1 47.4 79.5 78.9
+OpenCLIP [6]
+2B
+41.7 67.1 59.3 82.4 71.9 90.4 87.5 97.7 17.4
+49.7
+30.6 84.1 55.4 56.0 65.8 69.5
+PEcore [2]
+5B
+49.9 74.8 70.3 88.9 81.3 95.4 93.5 99.0 22.4
+61.8
+36.8 90.7 60.0 60.2 56.7 60.3
+SigLIP [38]
+10B
+47.2 72.1 65.5 86.2 75.6 92.8 89.1 98.6 20.6
+57.5
+33.8 83.7 56.2 57.7 62.1 62.7
+SigLIP 2 [29]
+10B
+52.5 76.6 70.0 88.3 80.0 94.5 91.8 98.8 23.2
+61.2
+37.0 91.3 55.7 55.7 57.8 60.3
+Table 9: Our model remains competetive on the retrieval for VQA task even when
+evaluated in text-agnostic mode, denoted as GoldiCLIPta.
+Method
+Data
+T2I R2
+size Count Color Attribute Shape Relation Average
+FLAIR [34]
+30M
+57.6
+39.1
+44.4
+49.0
+47.7
+47.6
+COSMOS [41] 30M
+60.7
+42.4
+46.1
+51.6
+48.9
+49.9
+GoldiCLIP
+30M
+66.8
+48.5
+51.5
+56.4
+55.9
+55.8
+GoldiCLIPta
+30M
+65.5
+46.9
+48.8
+55.0
+54.5
+54.1
+OpenCLIP [6]
+2B
+62.1
+45.0
+47.7
+51.3
+48.5
+50.9
+PEcore [2]
+5B
+65.1
+67.4
+48.9
+52.4
+57.5
+52.9
+SigLIP [38]
+10B
+64.1
+46.5
+51.1
+53.2
+53.5
+53.5
+SigLIP 2 [29]
+10B
+66.6
+49.1
+54.7
+56.7
+57.7
+57.0
+9
+Text-agnostic Performance
+In Tables 8 and 9 we report the performance of our model in text-agnostic mode.
+In this mode, instead of using the text-condition image representation vtc, we
+use the text-agnostic vta = vcls. This mode may come useful when storing all
+image patch embeddings v1, . . . , vN is not feasible. While text-conditioning step
+(cross-attention to the text) is critical for getting the best possible performance
+using our model, GoldiCLIP remains competitive in the text-agnostic mode.
+10
+Method pseudocode
+We provide PyTorch-like pseudocode describing the computation of supervision
+objectives in Listing 1.1 to offer a more detailed overview of our method.
+GoldiCLIP
+5
+1
+Inputs: batch of (images
+BxHxWx3 , captions BxK , aux_data
+Bx ...) , learnable
+params , momentums m_c , m_sd
+2
+3
+# Contrastive
+objectives
+4
+image_token , patch_tokens = params.student.V( global_views (images))
+5
+image_key , image_value = params.student.project_key ( patch_tokens ), params.student. project_value (
+patch_tokens )
+6
+text_tokens = params.student.T(captions)
+7
+v_ta = params.student. project_key ( image_token)
+8
+9
+L_ta , L_tc = 0, 0
+10
+for i in range(B):
+11
+for j in range(B):
+12
+for k in range(K):
+13
+ta_similarity = cosine(v_ta[i], text_tokens [j, k,
+-1])
+14
+ta_similarity = - params.student.t * ta_similarity + params.student.b
+15
+L_ta += 1 / (1 + exp(y(i, j, k) * ta_similarity ))
+16
+17
+v_tc[i, j, k] = params.student. cross_attend (
+18
+text_tokens [j, k,
+-1],
+19
+image_key[i],
+20
+image_value [i]
+21
+)
+22
+tc_similarity = cosine(v_tc[i, j, k], text_tokens [j, k,
+-1])
+23
+tc_similarity = - params.student.t * tc_similarity + params.student.b
+24
+L_tc += 1 / (1 + exp(y(i, j, k) * tc_similarity ))
+25
+L_ret = L_ta + L_tc
+26
+27
+# Decoder
+Objectives
+28
+prefix[task] = {
+29
+’caption ’: ...,
+30
+’grounding ’: ...
+31
+’referring ’: ...
+32
+’vqa ’: ...
+33
+}
+34
+for
+task in tasks:
+35
+task_tokens = params.student.T(prefix[task] + aux_data[task ])
+36
+preds = params.D(task_tokens , image_key)
+37
+L_dec[task] = NLL(preds , task_tokens)
+38
+Listing 1.1: GoldiCLIP pseudocode
+6
+D. Mohan et al.
+39
+# ... continued ...
+40
+# Self - Distillation
+Objective
+41
+teacher = m_sd * params.student + (1 - m_sd) * teacher
+42
+43
+student_image_token , student_patch_tokens = params.student.V( local_views(images))
+44
+teacher_image_token , teacher_patch_tokens = teacher.V( global_views (images))
+45
+46
+student_image_key = params.student.project_key ( student_patch_tokens )
+47
+student_image_value = params.student. project_value ( student_patch_tokens )
+48
+teacher_image_key = params.teacher.project_key ( teacher_patch_tokens )
+49
+teacher_image_value = params.teacher. project_value ( teacher_patch_tokens )
+50
+51
+student_vta = params.student. project_key( student_image_token )
+52
+teacher_vta = params.teacher. project_key( teacher_image_token )
+53
+54
+for i in range(B):
+55
+for j in range(B):
+56
+for k in range(K):
+57
+student_vtc[i, j, k] = params.student. cross_attend (
+58
+text_tokens [j, k,
+-1],
+59
+student_image_key [i],
+60
+student_image_value [i]
+61
+)
+62
+teacher_vtc[i, j, k] = teacher. cross_attend (
+63
+text_tokens [j, k,
+-1],
+64
+teacher_image_key [i],
+65
+teacher_image_value [i]
+66
+)
+67
+68
+# Project
+all
+features
+69
+student_vta = params.student.project( student_vta)
+70
+student_vtc = params.student.project( student_vtc)
+71
+teacher_vta = teacher.project(teacher_vta )
+72
+teacher_vtc = teacher.project(teacher_vtc )
+73
+74
+# Average
+TC
+features
+over
+captions K’
+75
+student_logits_vtc = student_vtc.mean(over=’captions ’)
+76
+teacher_logits_vtc = teacher_vtc.mean(over=’captions ’)
+77
+78
+# Center
+teacher
+features
+79
+teacher_logits_vta = teacher_vta
+- params.c_ta
+80
+teacher_logits_vtc = teacher_logits_vtc
+- params.c_tc
+81
+82
+# Scale
+features
+and
+compute
+probabilities
+83
+student_logits_vta
+/=
+params. student_tau
+84
+student_logits_vtc
+/=
+params. student_tau
+85
+teacher_logits_vta
+/=
+params. teacher_tau
+86
+teacher_logits_vtc
+/=
+params. teacher_tau
+87
+student_probs_vta = softmax( student_logits_vta )
+88
+student_probs_vtc = softmax( student_logits_vtc )
+89
+teacher_probs_vta = softmax( teacher_logits_vta )
+90
+teacher_probs_vtc = softmax( teacher_logits_vtc )
+91
+92
+L_sd = 0
+93
+for i in range(N_glob):
+94
+for j in range(N_loc):
+95
+L_sd +=
+cross_entropy ( teacher_probs_vta [i], student_probs_vta [j])
+96
+L_sd +=
+cross_entropy ( teacher_probs_vtc [i], student_probs_vtc [j])
+97
+98
+# Update
+centers
+99
+params.c_ta = m_c * params.c_ta + (1 - m_c) * teacher_vta.mean(over =[’batch ’])
+100
+params.c_tc = m_c * params.c_tc + (1 - m_c) * teacher_vtc.mean(over =[’batch ’, ’captions ’])
+101
+102
+# Task
+balancing
+103
+L = 1 / (params.sigma_ret
+** 2) * (L_ta + L_tc) + params.sigma_ret
+** 2
+104
++ 1 / (params.sigma_cap
+** 2) * L_dec[’captioning ’] + params.sigma_cap
+** 2
+105
++ 1 / (params.sigma_grd
+** 2) * L_dec[’grounding ’] + params.sigma_grd
+** 2
+106
++ 1 / (params.sigma_ref
+** 2) * L_dec[’referring ’] + params.sigma_ref
+** 2
+107
++ 1 / (params.sigma_vqa
+** 2) * L_dec[’vqa ’] + params.sigma_vqa
+** 2
+108
++ 1 / (params.sigma_sd
+** 2) * L_sd + params.sigma_sd
+** 2
+GoldiCLIP
+7
+11
+Improved alignment
+The figure below shows the attention visualization of GoldiCLIP model before
+(top row) and after applying our text-conditioned SD (bottom row), showing
+improved alignment behavior.
+(a) Two people sitting on a bench feeding birds.
+(b) Three horse drawn carriages in front of a castle with a clock on it.

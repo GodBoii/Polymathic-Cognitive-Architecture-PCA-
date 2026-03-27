@@ -1,0 +1,2422 @@
+Lagrangian Relaxation Score-based Generation for
+Mixed Integer linear Programming
+Ruobing Wang1
+Xin Li1,*
+Yujie Fang1
+Mingzhong Wang2
+Abstract
+Predict-and-search (PaS) methods have shown
+promise for accelerating mixed-integer linear pro-
+gramming (MILP) solving. However, existing
+approaches typically assume variable indepen-
+dence and rely on deterministic single-point pre-
+dictions, which limits solution diversity and of-
+ten necessitates extensive downstream search for
+high-quality solutions.
+In this paper, we pro-
+pose SRG, a generative framework based on La-
+grangian relaxation-guided stochastic differential
+equations (SDEs), with theoretical guarantees on
+solution quality. SRG leverages convolutional
+kernels to capture inter-variable dependencies
+while integrating Lagrangian relaxation to guide
+the sampling process toward feasible and near-
+optimal regions. Rather than producing a sin-
+gle estimate, SRG generates diverse, high-quality
+solution candidates that collectively define com-
+pact and effective trust-region subproblems for
+standard MILP solvers. Across multiple public
+benchmarks, SRG consistently outperforms exist-
+ing machine learning baselines in solution quality.
+Moreover, SRG demonstrates strong zero-shot
+transferability: on unseen cross-scale/problem in-
+stances, it achieves competitive optimality with
+state-of-the-art exact solvers while significantly
+reducing computational overhead through faster
+search and superior solution quality.
+1. Introduction
+Mixed Integer Linear Programming (MILP) can formulate
+a wide range of combinatorial optimization problems, many
+of which are NP-hard (Karp, 1972). MILP has been widely
+applied in production planning (Ye et al., 2023), resource
+allocation (Ejaz & Choudhury, 2025), and energy manage-
+ment (Pinzon et al., 2017), as well as in emerging applica-
+tions across advanced manufacturing. However, due to the
+1Beijing Institute of Technology, Beijing, China
+2University of the Sunshine Coast, Australia
+*Corresponding author: xinli@bit.edu.cn
+inherent NP-hardness of MILP, finding provably optimal
+solutions is computationally intractable for large instances.
+Although exact algorithms such as Branch and Bound and
+Cutting-Plane methods (Gomory, 1958) provide optimal-
+ity guarantees, they often incur prohibitive computational
+costs on large instances, limiting their practicality in time-
+sensitive real-world applications (Bengio et al., 2020).
+Recently, machine learning has shown great potential in
+accelerating MILP solving by leveraging structural similari-
+ties across problem instances and reusing decision knowl-
+edge (Gasse et al., 2019; Gupta et al., 2020; Ling et al.,
+2024). Among these approaches, Predict-and-Search (PaS)
+has emerged as a particularly effective paradigm (Han et al.,
+2023; Geng et al., 2025; Liu et al., 2025), which can sig-
+nificantly reduce the runtime of traditional MILP solvers.
+Specifically, PaS methods employ Graph Neural Networks
+(GNNs) over bipartite variable-constraint graphs to estimate
+the marginal probabilities of variable assignments, thereby
+identifying promising subspaces or critical structures where
+high-quality solutions are likely to reside. A conventional
+exact MILP solver (i.e. SCIP & Gurobi) is then invoked
+to search within these reduced regions to efficiently find
+near-optimal solutions.
+Despite their success, existing PaS frameworks exhibit fun-
+damental limitations. Their predictive models inherently
+rely on imitating labels without explicitly enforcing global
+feasibility or optimality conditions. Furthermore, by pre-
+dicting variables in isolation rather than modeling their
+joint dependencies, these models struggle to respect the
+complex coupling constraints inherent in MILP (Wolsey &
+Nemhauser, 1999). Consequently, the raw predictions may
+lack structural validity, resulting in imprecise trust regions
+(Han et al., 2023), which can increase computational over-
+head and degrade solution quality in the subsequent search
+phase.
+Motivated by these limitations, we propose a novel frame-
+work that moves beyond purely supervised prediction by
+explicitly incorporating feasibility and optimality into the
+solution generation process. Our core contribution lies in
+formulating the training objective with Lagrangian relax-
+ations, which explicitly penalizes constraint violations and
+suboptimality. We theoretically demonstrate that optimizing
+1
+arXiv:2603.24033v1  [cs.LG]  25 Mar 2026
+Figure 1. Generation trajectory of our method on a 2D Linear Programming toy experiment (a special case of MILP). As the denoising
+process evolves, the learned score density (yellow heatmap) progressively concentrates toward the optimal solution (red star),
+effectively steering the samples (blue dots) from an initially scattered state into a tight cluster near the optimum. Additional
+experiment details are provided in Appx. B.
+this regularized objective is mathematically equivalent to
+aligning the generative process with a refined target distri-
+bution, where probability mass is exponentially re-weighted
+towards feasible and high-quality regions. This formula-
+tion naturally motivates the use of a guided reverse-time
+Stochastic Differential Equation (SDE) (Song et al., 2021;
+Karras et al., 2024). This choice is both principled and ef-
+fective. Theoretically, the SDE is constructed such that its
+stationary distribution converges to the refined target, while
+its iterative denoising process provides a direct mechanism
+to incorporate gradient guidance from constraint and objec-
+tive terms. Starting from a Gaussian distribution, the model
+progressively denoises toward feasible and high-quality re-
+gions (Figure 1). Crucially, this SDE-based formulation
+enables joint modeling of all decision variables, overcoming
+the independence assumptions of marginal-based predic-
+tions. Furthermore, once trained, the sampler can generate
+multiple diverse solution candidates via repeated sampling,
+substantially improving robustness over conventional single-
+shot predictions. Overall, our generative framework encour-
+ages structurally valid solutions and minimizes search effort,
+while its joint modeling and diverse sampling capabilities
+provide a robust foundation for efficient MILP solving. Our
+key contributions are as follows:
+1) We show that optimizing Lagrangian-relaxation objec-
+tive in probabilistic modeling is theoretically equivalent to
+learning a refined target distribution, forming a principled
+basis for feasibility- and optimality-aware generation.
+2) We propose a guided reverse-time SDE sampler that
+jointly generates all decision variables, addressing indepen-
+dence issues inherent in marginal-based predictions.
+3) We enable diverse candidate generation via parallel
+sampling from a Gaussian distribution to a Lagrangian-
+relaxation guided distribution, improving robustness over
+conventional single-shot predictions.
+2. Related Work
+Mixed Integer Linear Programming (MILP) problems rank
+among the most challenging combinatorial optimization
+tasks due to their hybrid decision spaces involving both
+continuous and discrete variables. Exact solvers, such as
+branch-and-bound and cutting-plane algorithms (Land &
+Doig, 1960), solve MILPs with guaranteed solution optimal-
+ity by MILP problem reduction. In recent years, machine
+learning-based methods have emerged as a promising direc-
+tion for accelerating MILP solving. Diffusion model based
+solvers that exploit specific structural properties of MILP in-
+stances (e.g., TSP problems with Hamiltonian cycles) (Sun
+& Yang, 2023), Predict-and-Search (PaS) frameworks (Han
+et al., 2023; Huang et al., 2024) has effectively solved
+the MILPs by construction powerful solutions. Among
+these, PaS and its downstream methods have proven par-
+ticularly effective by learning the marginal distributions
+of end-to-end solutions to construct high-quality search re-
+gions, thereby significantly improving solver efficiency for
+large-scale MILPs.
+3. Preliminaries
+Mixed Integer Linear Programming (MILP) optimizes
+a linear objective subject to linear constraints and integral-
+ity restrictions. For an instance with m constraints and n
+variables, the standard MILP formulation is:
+minx∈Rn cx
+s.t.
+Ax ≥b, l ≤x ≤u, xj ∈Z, ∀j ∈I (1)
+where A ∈Rm×n, cT ∈Rn, b ∈Rm, l, u ∈(R ∪{±/})n,
+and I ⊆{1, . . . , n} denotes the set of indices for integer-
+constrained variables. The feasible region is:
+D =
+n
+x ∈Rn  Ax ≥b, l ≤x ≤u, xj ∈Z, ∀j ∈I
+o
+.
+MILP Bipartite Graph Representation. Following Gasse
+et al. (2019), any MILP instance (A, b, c) can be represented
+2
+as a bipartite graph G = (V, C, E), where V and C denote
+variable and constraint nodes, respectively. This graph is
+then encoded into an embedding g = τϕ(A, b, c) via a 2-
+layer GNN encoder τϕ, which captures variable–constraint
+interactions in a compact form. The embedding g is then
+used as the structural conditioning input for downstream
+learning modules.
+Lagrangian Relaxation. For the MILP in Eq. (1) with opti-
+mal value z∗
+MILP, suppose the constraints are partitioned into
+“complicating” constraints Ax ≥b and “easy” constraints
+x ∈X (e.g., integrality and bound constraints). The La-
+grangian relaxation dualizes the complicating constraints
+with multipliers:
+L(λ) = min
+x∈X
+
+cx + λ⊤(b −Ax)
+	
+.
+(2)
+It is well-established that for any λi ≥0(i = 1, 2, ..., m),
+L(λ) ≤z∗
+MILP, providing a valid lower bound.
+Theorem 1 (Subgradient Convergence (Shor, 1985)). Con-
+sider the Lagrangian dual problem:
+zLD = max
+λ≥0 L(λ).
+(3)
+Let {λ(k)} be the sequence of multipliers generated by the
+subgradient method:
+λ(k+1) = max
+ 0, λ(k) + αk(b −Ax(k))
+
+,
+(4)
+where x(k) ∈arg minx∈X{cx+(λ(k))⊤(b−Ax)}, and the
+step sizes {αk} satisfy:
+αk > 0,
+∞
+X
+k=1
+αk = ∞,
+∞
+X
+k=1
+α2
+k < ∞.
+(5)
+Then the sequence of dual values converges to the optimal
+dual value:
+lim
+k→∞L(λ(k)) = zLD ≤z∗
+MILP.
+(6)
+The Lagrangian relaxation solution x∗(λ) preserves the com-
+binatorial structure of the original MILP while relaxing
+complicating constraints. It provides valuable structural
+information that can guide the search process by identifying
+promising regions in the solution space (Fisher, 1981).
+4. Our Method
+We propose SRG (Score-based generative framework with
+Lagrangian Relaxation Guidance), which formulates MILP
+solution prediction as sampling from a refined target distri-
+bution. The framework consists of two core components:
+(1) Target Formulation, which incorporates Lagrangian re-
+laxation to construct a probability density that concentrates
+mass on feasible and high-quality solutions; and (2) Guided
+Sampling, which samples from this target distribution via
+a reverse-time SDE. By injecting gradients derived from
+feasibility and objective-quality terms into the denoising dy-
+namics, SRG captures joint dependencies among variables
+while steering generation toward desirable solution regions.
+4.1. Lagrangian Relaxation-guided SDEs
+Leveraging the bipartite graph embedding g as the structural
+condition, we formulate MILP solution prediction as a con-
+ditional generative task. Our goal is to learn a parameterized
+distribution qθ(x|g) that approximates the target distribu-
+tion of optimal solutions p(x∗|g). Unlike deterministic
+approaches that output a single prediction, this probabilistic
+formulation enables sampling of diverse candidate solutions
+from the learned distribution, thereby increasing the likeli-
+hood of finding high-quality solutions. A standard approach
+to achieve this is to minimize the KL divergence:
+min
+q
+DKL (qθ(x|g)∥p(x∗|g))
+(7)
+However, directly minimizing Eq. (7) remains a purely data-
+driven approach that does not explicitly leverage feasibility
+or objective-quality signals intrinsic to the MILP structure,
+potentially causing generated solutions to deviate from fea-
+sible and near-optimal regions. Moreover, relying solely on
+data-driven alignment can make the model overly dependent
+on dataset-specific correlations, increasing susceptibility to
+dataset bias. Motivated by Theorem 1, which establishes
+that Lagrangian relaxed solutions possess desirable feasi-
+bility and optimality guarantees for MILP problems, we
+propose to integrate Lagrangian relaxation as explicit guid-
+ance into probability distribution modeling.
+Specifically, we introduce an optimality term O(x) = ∥c ⊙
+(x −x∗)∥1, where ⊙denotes element-wise product, and a
+feasibility term P(x) = λ∥max{b −Ax, 0}∥1. Unlike the
+classical Lagrangian penalty maxλ≥0 λ⊤(b −Ax) , which
+becomes unbounded on infeasible points (as the term −→
+∞when Ax ̸≥b), our P(x) provides a finite-valued and
+differentiable gradient signal. Incorporating these terms
+yields the following training objective:
+minq [DKL(q(x|g)∥p(x∗|g)) + Ex∼q [γoO(x) + γcP(x)]] (8)
+where γo, γc ∈R+ are guidance coefficients. The following
+theorem establishes that optimizing Eq. (8) is theoretically
+equivalent to performing KL alignment toward a refined
+target distribution ˜p(x | g).
+Theorem 2 (Optimization Equivalence). Minimizing the
+regularized objective in Eq. (8) is equivalent to minimizing
+min
+q
+DKL (q(x|g)∥˜p(x|g))
+(9)
+3
+where the refined target distribution is
+˜p(x|g) := 1
+Z p(x∗|g) exp (−γoO(x) −γcP(x))
+(10)
+and Z is the normalization constant.
+Proof. See Appx. A. Notably, the Eq10 can be defined for
+any timestep t. We further show that the refined target dis-
+tribution ˜p concentrates probability mass on a tighter high-
+quality region of p(x∗|g) as pL exponentially downweights
+solutions with suboptimal objective values or constraint vio-
+lations, when the optimization problem shows in the Eq10
+converged to the pL.
+Theorem 3 (Conditional Tighter Solution Region). Assume
+the x∗is the local optimal solution for the MILP embedding
+g. Let γo, γc ≥0 and x′ ∼p0(x|g) where we define
+p0(x|g) = {p(x)|x ∼p(x∗|g)}. Then we define
+Ω1 = {x′ : p(x′|g) ≥α max
+x′′ p(x′′|g)}
+For the target distribution pL and x′ ∼˜p(x|g),we define:
+Ω2 = {x′ : ˜p(x′|g) ≥α max
+x′′ pL(x′′|g)}
+For some 0 < α < 1, where pL(x′|g) ∝p(x′|g) w(x′) with
+quality weight w(x′) = exp(−γoO(x′)−γcP(x′)) ∈(0, 1].
+Then:
+Ex′∼Uniform(Ω2)[w(x′)] ≥Ex′∼Uniform(Ω1)[w(x′)]
+(11)
+Proof. See Appx. A. This result formalizes that exponen-
+tial reweighting suppresses low-quality solutions, yielding
+a more concentrated high-probability region suitable for
+efficient sampling.
+Reverse-time SDE for sampling from the target. To sam-
+ple solutions from the refined target distribution ˜p(x|g), we
+adopt a score-based generative modeling framework (Song
+et al., 2021). Starting from a Gaussian distribution N(0, I),
+we integrate the Lagrangian regularization guidance into the
+drift term, as stated in Theorem 4.
+Theorem 4 (Lagrangian-Guided Reverse VP-SDE). Given
+the target distribution ˜p(x|g) defined in Theorem 2, the
+corresponding reverse-time VP-SDE is:
+dxt =
+
+−1
+2β(t)xt + β(t)s∗(xt, t)
+
+dt +
+p
+β(t) d ¯Wt
+(12)
+where xt ∈Rn, d ¯Wt is a standard Wiener process, β(t) is
+the noise schedule, and the guided score s∗(xt, t, g) is:
+∇xt log pt(xt|g) −γo∇xtO(xt) −γc∇xtP(xt)
+(13)
+The proof is provided in Appx. A.
+4.2. Conditional Score Network
+To approximate the guided score function s∗in Eq. (13) at
+any timestep t, we introduce a conditional score network
+that incorporates MILP structural information as context.
+We encode each MILP instance into a structural embedding
+using a GNN encoder, yielding g = τϕ(A, b, c) ∈Rdn.
+The score model is a conditional U-Net style network (Ron-
+neberger et al., 2015), denoted as sθ(xt, t, g), and is de-
+signed to capture dependencies among decision variables.
+The network takes the noisy solution xt at timestep t as
+input and injects the MILP structural embedding g via cross-
+attention like Latent Diffusion Models (Rombach
+et al., 2022; Saharia et al., 2022) to approximate the guided
+score s∗(xt, t, g).
+Variable-wise Cross-Attention. To enable fine-grained
+control over individual decision variables conditioned on the
+MILP instance (A, b, c), we design a variable-wise cross-
+attention mechanism. Let xt ∈RB×C×h×w denote the
+reshaped noisy solution features at timestep t, where B is
+the batch size, C is the number of channels, and n = h × w
+corresponds to the number of decision variables. The MILP
+embedding is presented as g ∈RB×L×D, consisting of
+L tokens of dimension D. We first flatten and transpose
+the spatial dimensions of xt to obtain ¯xt ∈RB×n×C. The
+cross-attention is then computed as:
+Q = ¯xtWQ ∈RB×n×C,
+K = gWK, V = gWV ∈RB×L×C
+(14)
+where WQ ∈RC×C, and WK, WV ∈RD×C are learnable
+projection matrices. Multi-head attention with m heads is
+computed as: Attention(Q, K, V ) = softmax
+
+QK⊤
+√dk
+
+V ∈
+RB×n×C, where dk = C/m is the dimension per atten-
+tion head. Each variable position in Q queries relevant
+MILP structural information from the token sequence K
+and aggregates corresponding values V , effectively inject-
+ing problem-specific guidance into the SDE trajectory. The
+attention output is then transposed and reshaped back to
+RB×C×h×w, and added to xt via a residual connection.
+4.3. Training and Sampling
+Training. To learn the Lagrangian-relaxation guided score
+defined in Theorem 4, we minimize the following score
+matching loss by supervised learning:
+LRelaxed = E∥sθ(xt, t, g) −starget∥2
+(15)
+where the target score starget is s∗in Eq. (13). Following
+Song et al. (2021), we generate noisy samples by corrupting
+a clean solution x0 using the forward diffusion process:
+xt = √¯αt x0 +
+√
+1 −¯αt ϵ,
+ϵ ∼N(0, I).
+(16)
+4
+Notably, the goal of the reverse diffusion process is to re-
+cover x0 from xt. To stabilize training, we simplified the
+gradient of the Lagrangian terms with respect to x0 using
+the chain rule:
+∇xtO(xt) ∼lim
+xt→x0 ∇xO(xt) = ∇x0O(xt)
+= ∇O(xt)
+∇(x0) = ∇O(xt)
+∇xt
+· ∇xt
+∇x0
+(17)
+As the objective deviation is defined as O(˜x) = ∥c ⊙(˜x −
+x0)∥1, applying Eq. (16) yields:
+∇O(xt)
+∇xt
+= c ⊙sign(c ⊙(xt −x0))
+∇xt
+∇x0
+= √¯αt · I
+(18)
+Combining Eq. (17) and Eq. (18), ∇xO((xt)) = c⊙√¯αtI ·
+sign(c ⊙(xt −x0)). Similarly, we can also simplify the
+constraint penalty term (∇xt(λ) = 0): ∇xtP((xt)) ∼
+∇x0P(xt) = −√¯αtλAT 1Axt<b ∼−√¯αtλAT (push all
+points into the feasible region). For convenience, we define
+the discrete sign vector δO = sign(c ⊙((xt) −(x∗))) ∈
+{−1, 1}n. Substituting these into the score matching loss
+leads to the final simplified training objective. In practice,
+we round xt to obtain more Lagrangian-guided gradients
+for the discrete nature of MILP solutions, we employ the
+Straight-Through Estimator (STE) with Gumbel-Softmax
+relaxation during training to enable gradient flow through
+the rounding operation.Because of the diffusion type used
+is continuous, the round implemention can push the xt to
+consider the discrte nature:
+Lsimplified
+=∥sθ(xt, t, g) −(ϵt −γo ⊙c√¯αt · δ′
+O −(−γc
+√¯αtAλ))∥2
+2
+(19)
+where the δ′
+O = sign(c⊙(([xt])−(x∗))) ∈{−1, 1}n. Here,
+the term inside the parentheses corresponds to the guided
+target score at timestep t. Following standard score-based
+generation model (Song et al., 2021), the gradient of the log-
+density of the forward process is approximated by Gaussian
+noise, i.e., ∇x log pt(xt|g) ∼ϵt ∼N(0, I). As is common
+in diffusion-based training, constant scaling factors between
+the score and the noise term are absorbed into the guidance
+coefficients γo and γc. This objective retains the standard
+diffusion target ϵt and adds optimization-aware corrections:
+an objective-gap term along c and a feasibility term along
+λA, both scaled by √¯αt.
+Generalized Lagrangian score function. The above deriva-
+tions assume the standard MILP formulation in Eq 1. For
+non-standard MILP formulations, we can use the feasibility
+guidance coefficient γc ∈R to flexibly control the influence
+of constraint-related gradients in our method. Additional
+discussions on the generalized Lagrangian score functions
+is provided in Appx. L.
+Algorithm 1 Relaxation Guided Sampling (DDPM)
+Notation:sθ is the Lagrangian relaxation guided score func-
+tion trained by Lsimplified.
+1: xT ∼N(0, I) # Initialize using Gaussian
+noise in Rh×w
+2: for t = T, T −1, . . . , 1 do
+3:
+s ←sθ(xt, t, g)
+4:
+µt ←
+1
+√αt
+
+˜xt −
+βt
+√1−¯αt s
+
+5:
+if t > 1 then
+6:
+z ∼N(0, I)
+7:
+˜xt−1 ←µt + √βtz
+8:
+else
+9:
+˜x0 ←µt
+10:
+end if
+11: end for
+12: ˜x = (˜x0) # Go back to Rn
+Sampling. At inference time, we sample solely using the
+learned guided score model sθ(·), without requiring any ad-
+ditional guidance computation, constraint evaluation, or
+external optimization components. Specifically, we ini-
+tialize from a Gaussian prior xT ∼N(0, I) (Ho et al.,
+2020) and iteratively denoise using the trained score func-
+tion to reach the guided distribution ˜p(x|g), which captures
+both feasibility and near-optimality. We then sample ˜x0,
+which stays relaxed, from ˜p(x|g) to start construction of
+the trust region for searching. We use DDPM(Ho et al.,
+2020) and DDIM (Song et al., 2022) sampler for sampling,
+with DDPM sampler sampling procedure is summarized
+in Algorithm 1.
+Diverse Generation. To leverege sampling diversity, we
+generate k candidate solutions {xj, j = 1, 2..k} in paral-
+lel using different random seeds. We then select the best
+solution ˜x∗with the best P(.) from {xj}. This strategy
+enhances robustness by exploring multiple high-probability
+regions before invoking downstream search.
+Joint distribution generation. A key limitation of con-
+ventional Predict-and-Search (PaS) methods is the indepen-
+dence assumption (Han et al., 2023), which factorizes the so-
+lution distribution as pPaS(x|g) = Qn
+i=1 p(x(i)|g), thereby
+overlooking correlations among decision variables x(i) dur-
+ing the prediction phase (Bengio et al., 2020). In contrast,
+our approach directly models the joint target distribution of
+all variables conditioned on g. This is achieved through a
+score network equipped with a variable-wise cross-attention
+mechanism. Specifically, at each timestep t along the SDE
+trajectory, the score function sθ(·) perceives individual vari-
+ables through convolutional kernels that explicitly capture
+local dependencies, while the cross-attention mechanism en-
+ables these variable representations to interact jointly under
+the conditioning of graph structure g. This design ensures
+that the generation process along the SDE trajectory remains
+5
+strongly correlated with g in a joint manner. The resulting
+joint distribution is formulated as:
+˜pSRG(x|g) = ˜p(x(1), x(2), . . . , x(n)|g)
+(20)
+which is generated by our trained conditional score network
+sθ(·), which is optimized using the loss in Eq. 19. Sampling
+from ˜pSRG(x|g) is performed by initializing from a Gaus-
+sian prior N(0, I) and iteratively applying the reverse-time
+SDE. Throughout this process, the score network jointly
+captures local correlations among variables and global de-
+pendencies induced by the MILP structure encoded in g.
+Bounded Relaxation Convergence. Under mild regular-
+ity assumptions (Assumptions K.1 and K.2 for approxima-
+tion convergence), we prove that the Lagrangian relaxation-
+guided sampling admits a finite approximation error bound.
+Specifically, Theorem 5 demonstrates that the SRG proba-
+bilistic generative model converges to the optimal solution
+with a quantifiable optimality gap, provided that the solution
+domain is bounded and the score network approximation
+error is controlled. The complete proof is in Appx. K.
+Trust Region Search. We adopt refine + Search pipeline
+for solving. To further refine solution quality, we construct a
+trust region around the best generated candidate ˜x∗. Specifi-
+cally, we first round and lightly refine ˜x∗using a fast solver
+heuristic (in 1 second for all benchmark, details in the
+AppC) to obtain ˜xI, and then adopt the Hamming distance-
+based trust for full region with center ˜xI and radius ∆. The
+resulting search subproblem is:
+Msearch(˜xI) :
+min
+x∈D∩B′(˜xI,∆) cx,
+(21)
+where B
+′(˜xI, ∆) ≡{x ∈Rn : ∥˜xI −xI∥1 ≤∆} denotes
+the trust region, and ∆controls the allowable deviation
+from the center. We solve this subproblem with industry-
+standard MILP solvers, such as SCIP and Gurobi, following
+the established setup in prior work (Han et al., 2023), to get
+the final refined solution ˆx∗.
+5. Experiments
+5.1. Settings
+Dataset Benchmark. We evaluate on four widely used
+NP-hard public MILP benchmarks:
+1) Set Covering
+(SC) (Chv´atal, 1979); 2) Combinatorial Auction (CA) (Sand-
+holm, 2002); 3) Capacitated Facility Location (CFL) (Balin-
+ski, 1965); and 4) Maximum Independent Set (MIS) (Karp,
+1972). Each benchmark is provided at two scales, Medium
+and Large, based on the number of variables and constraints.
+The mathematical equation for these optimization problems
+are summarized in Appx. E. We also evaluate four public
+very large MIPLIB (Gleixner et al., 2021) benchmarks on
+zero-shot tasks, which all have 10000+ variables.
+Baselines. We compare SRG with both exact MILP solvers
+and representative learning-based methods. Exact solvers:
+1) SCIP (Bestuzheva et al., 2023), a leading open-source
+MILP solver; 2) Gurobi (Gurobi Optimization, LLC, 2023),
+a state-of-the-art commercial MILP solver. For methods that
+rely on Gurobi as the downstream search engine, we use
+Gurobi 11.0 with 24 threads to ensure fair computational
+resource allocation. Learning-based baselines: 3) Predict-
+and-Search (PaS) (Han et al., 2023), which predicts promis-
+ing assignments and performs solver-based local search;
+4) Contrastive PaS (ConPaS) (Huang et al., 2024), which
+improves PaS via contrastive learning. We also include two
+recent neural MILP solvers: 5) Apollo-MILP (Liu et al.,
+2025), which employs an alternating prediction-correction
+mechanism during search; and 6) L2O-DiffILO (Geng et al.,
+2025), a MILP solver via machine learning.
+Evaluation Metrics. We report three metrics in the main
+results: 1) Obj: The best primal bound objective value.
+2) Time (s): The solving time required for the subprob-
+lem Msearch(˜xI) to reach dual convergence (tolerance 10−4),
+starting from the predicted solution ˆx∗. 3) Gap Improvement
+(%): Following Han et al. (2023), we quantify how much
+SRG reduces the gap to a reference solver (SCIP or Gurobi)
+compared with a baseline method. Define the signed gap
+for a method m as gapm = Objm −Objref. The metric
+is computed as: (gapbaseline −gapSRG)/|gapbaseline| × 100%.
+Positive values indicate SRG outperforms the baseline. For
+example, on SC with SCIP reference (Obj = 29.06), if PaS
+yields 29.07 (gap = 0.01) and SRG yields 29.05 (gap =
+−0.01), the gap improvement is (0.01 −(−0.01))/|0.01| ×
+100% = 200%, indicating that SRG surpasses both the
+baseline and the solver.
+Hyperparameters. For benchmark scales, we report the
+number of variables and constraints in Table 6 and 7 in
+the Appx.. For SRG, we list the training parameters h × w,
+training steps, and guidance coefficients (γc, γo) for each
+benchmark scale in Table 8, and sampling parameters in
+Table 9, both in the Appx..
+5.2. Main Results
+1) Superior solution quality and search effectiveness. We
+first evaluate all methods on four benchmarks (SC, MIS,
+CA, CFL) under two scales (medium and large). Table 1
+reports the objective value (Obj) and downstream search
+time (Time) on MIS and CA; full results are provided in Ta-
+bles 10 and 11 in the Appx.. Across benchmarks and scales,
+SRG consistently achieves the best or near-best objective
+values among learning-based methods. This advantage is
+quantified in Table 2, where SRG achieves substantial gap
+improvements over all baselines (e.g., an average improve-
+ment of 202.71% over PaS on medium-scale benchmarks).
+The primal-bound trajectories in Fig. 2 further corroborate
+6
+Table 1. Results on MIS and CA benchmarks (100/20 instances for
+medium/large scale). Time is in seconds. “/” indicates infeasibility.
+Method
+MIS
+CA
+Obj↑
+Time↓
+Obj↑
+Time↓
+Medium-scale Benchmark
+Search by SCIP
+SCIP
+98.38±2.74 100.00±0.01 7137.96±164.56 78.90±25.15
+PaS
+97.13±3.13 100.01±0.01 7130.81±162.56 88.86±19.97
+ConPaS
+97.32±2.98 100.01±0.01
+/
+/
+L2O-DiffILO 96.71±3.09 100.02±0.02 6964.33±204.73 72.14±27.49
+Apollo-MILP 103.26±2.63 91.05±8.99
+7077.02±168.73 57.37±15.95
+SRG (Ours) 103.29±2.69 94.21±11.45 7132.10±167.50 78.45±25.52
+Search by Gurobi
+Gurobi
+106.08±2.33 100.02±0.02 7141.54±165.56
+8.10±8.89
+PaS
+104.45±2.63 100.02±0.05 7141.10±165.61 23.02±22.62
+ConPaS
+104.67±2.58 100.01±0.01
+/
+/
+L2O-DiffILO 105.70±2.15 100.01±0.01 7140.82±164.63 49.66±28.46
+Apollo-MILP 105.16±2.14 89.00±11.68 7129.58±165.26 23.14±10.18
+SRG (Ours) 106.33±2.27 100.02±0.02 7141.54±165.56
+8.27±8.99
+Large-scale Benchmark
+Search by SCIP
+SCIP
+304.70±7.12 1001.00±0.00 13288.16±280.10 1000.02±0.03
+PaS
+302.20±6.12 1000.00±0.00 13353.74±278.37 1000.00±0.00
+ConPaS
+303.30±6.08 1000.00±0.00 13356.98±285.07 1000.00±0.00
+L2O-DiffILO 306.20±6.60 1000.00±0.00 13359.76±301.87 1000.00±0.00
+Apollo-MILP 294.50±6.65 1000.04±0.02 13014.48±279.80 1000.00±0.00
+SRG (Ours) 308.10±6.84 1000.00±0.00 13363.14±283.45 1000.00±0.00
+Search by Gurobi
+Gurobi
+322.50±4.44 1000.23±0.21 13579.25±268.73 1000.03±0.02
+PaS
+323.80±4.46 1000.08±0.06 13490.95±254.87 1000.07±0.06
+ConPaS
+323.55±3.83 1000.10±0.11 13443.40±307.30 1000.09±0.07
+L2O-DiffILO 317.20±7.82 1000.18±0.28 13557.58±280.79 1000.00±0.05
+Apollo-MILP 319.10±4.51 1000.54±0.35 13481.31±268.68 1000.33±0.20
+SRG (Ours) 327.85±3.56 1000.07±0.11 13592.81±289.32 1000.03±0.02
+this trend. SRG (red) rapidly reaches strong incumbents and
+maintains better primal bounds than other learning-based
+baselines (e.g., Apollo-MILP and ConPaS) throughout the
+search. Notably, SRG’s early-time trajectory is often com-
+petitive with the exact solver, indicating that it provides
+high-quality warm starts for downstream refinement.
+2) Robustness against infeasibility. A common failure
+mode of predict-and-search pipelines is that the predicted
+assignment can induce an infeasible or overly restrictive
+subproblem, leading to unsuccessful downstream search
+(marked as “/” in the tables). SRG largely avoids this issue
+across all benchmarks (Tables 10 and 11). This robustness
+stems from our feasibility-aware sampling mechanism: un-
+like deterministic baselines that are limited to a single point
+prediction, SRG naturally generates multiple diverse candi-
+date solutions. This substantially increases the likelihood
+of identifying a feasible, high-quality neighborhood for the
+solver to exploit under trust-region constraints.
+3) Zero-Shot Results. We further evaluate the zero-shot
+generalization of SRG on four types of unseen cross-scale,
+Table 2. Gap Improvement of SRG over baselines. “/” infeasible.
+Baseline
+Bench
+mark
+Medium Scale
+Large Scale
+SCIP
+Gurobi
+SCIP
+Gurobi
+PaS
+SC
+200.00%
+0.00%
+0.00%
+-66.67%
+MIS
+492.80%
+115.34%
+236.00%
+311.54%
+CA
+18.04%
+100.00%
+14.33%
+115.36%
+CFL
+100.00%
+100.00%
+0.00%
+0.00%
+Avg.
+202.71%
+78.84%
+62.58%
+90.06%
+ConPaS
+SC
+100.24%
+100.00%
+400.00%
+-66.67%
+MIS
+563.21%
+117.73%
+342.86%
+409.52%
+CA
+/
+/
+8.95%
+110.00%
+CFL
+100.00%
+100.00%
+0.00%
+0.00%
+Avg.
+254.48%
+105.91%
+187.95%
+113.21%
+L2O-
+DiffILO
+SC
+0.00%
+0.00%
+150.00%
+-50.00%
+MIS
+394.01%
+165.79%
+126.67%
+200.94%
+CA
+96.62%
+100.00%
+4.72%
+162.58%
+CFL
+0.00%
+0.00%
+0.00%
+0.00%
+Avg.
+122.66%
+66.45%
+70.35%
+78.38%
+Apollo-
+MILP
+SC
+106.25%
+100.00%
+-37.50%
+-66.67%
+MIS
+0.61%
+127.17%
+133.33%
+257.35%
+CA
+90.38%
+100.00%
+127.40%
+113.85%
+CFL
+0.00%
+0.00%
+0.00%
+0.00%
+Avg.
+49.31%
+81.79%
+55.81%
+76.13%
+Table 3. Results on Very Large-scale Cross-scale Cross-problem
+MIPLIB Benchmarks. All baseline solvers have a 1800s searching
+time limit to get the best primal bound.
+Method
+comp21-2idx
+fast0507
+Obj(↓)
+Time(↓)(s)
+Obj(↓)
+Time(↓)(s)
+Gurobi
+78.0
+1800.0
+174.0
+28.74
+SRG(G) (Ours)
+74.0
+1253.6
+174.0
+10.82
+h80x6320d
+fiball
+Obj(↓)
+Time(↓)(s)
+Obj(↓)
+Time (↓)(s)
+Gurobi
+6382.09
+10.16
+139.0
+1.18
+SRG(G) (Ours)
+6382.09
+4.19
+139.0
+1.09
+cross-problem MIPLIB benchmarks. We employ a U-Net
+pre-trained on large-scale MILP benchmarks without any
+fine-tuning. Specifically, we randomly select a subset of
+conditional variables from the GNN’s conditional embed-
+dings as guidance to generate candidate solutions for partial
+dimensions, constructing trust regions strictly over these
+dimensions. As shown in Table 3 and Fig.6 in the Appx.,
+SRG successfully transfers to unseen large-scale MILP in-
+stances and demonstrates competitive efficiency compared
+to the Gurobi baseline, highlighting the strong scalability
+and zero-shot generalization capability of our method.
+5.3. Ablation Study and Sensitivity Analysis
+Ablation on Relaxation Guidance To evaluate the effec-
+tiveness of our relaxation guidance mechanism, we conduct
+7
+Figure 2. Best-so-far primal bound trajectories of all meth-
+ods+SCIP/Gurobi on medium-scale MIS and CA MILP bench-
+marks. Results are averaged over 100 test instances.
+Table 4. Ablation study on relaxation guidance on MIS/CA, aver-
+aged on 100/20 test instances. “/” indicates infeasible.
+Method
+MIS (SCIP)
+MIS (Gurobi)
+Obj(↑)
+Obj(↑)
+SRG w/o Guide
+102.64 ± 3.16
+104.91 ± 2.46
+SRG (Ours)
+103.29 ± 2.69
+106.33 ± 2.27
+Method
+CA (SCIP)
+CA (Gurobi)
+Obj(↑)
+Obj(↑)
+SRG w/o Guide
+/
+/
+SRG (Ours)
+13363.14 ± 283.45
+13592.81 ± 289.32
+ablation studies on two challenging benchmarks: medium-
+scale MIS and large-scale CA. We disable the relaxation
+guidance terms in Eq. (13) while keeping all other hyper-
+parameters (∆, step, h, w) identical. As shown in Table 4,
+removing guidance leads to significant performance degra-
+dation, and even causes infeasible solutions in large-scale
+CA. This confirms the critical role of Lagrangian guidance
+in steering generation toward high-quality, feasible regions.
+Impact of Dimension (h, w), Guidance Weights γo, γc,
+and Training Steps T. As shown in Table 5, matrix di-
+mension h, w have minimal impact on performance, even
+with extreme aspect ratios such as (h, w) = (1, 500). Fig.11
+in the Appx. further demonstrates that the generated solu-
+tions consistently reduce constraint violations throughout
+the generation process. For guidance weights, constraining
+γo, γc within a moderate range (e.g., [1, 4]) yields stable
+performance, and extensive tuning is generally unneces-
+sary. We also assess the impact of training steps on SRG’s
+performance. As shown in Table 5, performance variation
+across different generation step counts is minimal, indicat-
+ing that our generative model is insensitive to the number
+of generation steps during training. Furthermore, the re-
+sults under different score-matching loss settings in Fig.10
+(Appx. I) demonstrate stable convergence behavior across
+settings, confirming the robustness of SRG to hyperparame-
+ter choices during training.
+Table 5. Ablation study of SRG with different bounded values of
+γo, γc and (h, w). Results are averaged over 100 test instances,
+with each solved within a 100s time limit. Step denotes the number
+of training steps for SRG. “Nodes” means the number of Branch
+and Bound nodes explored by SCIP during solving.
+MIS (SRG + SCIP)
+(h, w)
+(γo, γc)
+Step
+Nodes(↓)
+Obj(↑)
+(1,500)
+(1,3)
+20
+302.01 ± 114.19
+103.16 ± 2.71
+(2,250)
+(1,3)
+20
+295.58 ± 114.58
+103.07 ± 2.72
+(5,100)
+(1,3)
+20
+314.65 ± 121.53
+103.20 ± 2.71
+(20,25)
+(1,3)
+20
+337.49 ± 129.91
+103.29 ± 2.69
+(20,25)
+(3,1)
+20
+312.35 ± 120.28
+103.16 ± 2.72
+(20,25)
+(3,3)
+20
+297.24 ± 106.97
+103.13 ± 2.73
+(20,25)
+(1,3)
+10
+305.05 ± 116.44
+103.15 ± 2.71
+(20,25)
+(1,3)
+50
+301.82 ± 113.62
+103.14 ± 2.73
+Sample 1
+Progress: 0.0% Progress: 20.0% Progress: 40.0% Progress: 60.0% Progress: 80.0%
+Sample 2
+Sample 3
+Figure 3. Visualization of solution diversity on a medium-scale SC
+instance. Three rows correspond to three independent sampling
+runs, generating distinct candidates for the same problem without
+any post-processing.
+5.4. Generation Analysis
+1) Sample Diversity. We further examine the diversity
+of the generation process in Fig.3. The sampling strategy
+produces diverse solution candidates, which increases the
+likelihood of constructing high-quality subproblems and
+enhances the robustness of the subsequent search. Notably,
+DDPM and DDIM sampler both have sample diversity.
+2) Progressive Reduction. We visualize the sampling tra-
+jectories and the objective regularization value |O(x)|1 on
+medium-scale Set Cover (SC) and the constraint regulariza-
+tion P(x) on Maximum Independent Set (MIS) benchmarks
+in Fig.9 and Fig.11, respectively. The results demonstrate
+a progressive decrease in the corresponding Lagrangian
+regularization terms and penalty throughout the generation
+process. This confirms that our model effectively guides the
+solution distribution toward high-quality region.
+6. Conclusion
+This paper presents SRG, a score-based generative frame-
+work grounded in Lagrangian Relaxation for solving MILP
+8
+problems. SRG addresses key limitations of existing predict-
+and-search methods by modeling the joint distribution of de-
+cision variables and explicitly incorporating feasibility and
+optimality into the generation process. Leveraging a U-Net-
+based score network conditioned on MILP structure, SRG
+naturally captures inter-variable dependencies and generates
+diverse, high-quality solution candidates. The Lagrangian
+relaxation guidance mechanism steers the sampling pro-
+cess toward feasible and near-optimal regions, thereby con-
+structing compact and effective trust-region subproblems
+for downstream solvers. Across multiple publicly available
+MILP benchmarks, SRG consistently outperforms other
+machine learning baselines in solution quality. Further-
+more, SRG achieves zero-shot solving with cross-scale and
+cross-problem generalization on unseen, large-scale public
+benchmarks, validating its scalability in practical scenarios.
+Overall, our results suggest that integrating modern genera-
+tive modeling techniques with combinatorial optimization
+offers a promising pathway toward scalable and efficient
+MILP solving, achieving substantial computational gains
+while maintaining high solution quality.
+Impact Statement
+This work proposes a constraint-aware generative frame-
+work to accelerate MILP by explicitly incorporating fea-
+sibility and optimality signals into solution generation. It
+can improve efficiency and robustness in domains such as
+production planning, resource allocation, and energy man-
+agement, reducing computational cost and enabling faster
+decision-making. As with any optimization tool, the societal
+impact depends on the objectives and constraints specified
+by users; responsible use requires careful problem formula-
+tion and validation to avoid unintended or biased outcomes.
+Limitation
+There remain several aspects of the SRG method that merit
+further investigation. We leave a more in-depth analysis of
+the mathematical properties of SRG to future work.
+References
+Anderson, B. D. O. Reverse-time diffusion equation models.
+Stochastic Processes and their Applications, 12(3):313–
+326, 1982. doi: 10.1016/0304-4149(82)90051-5.
+Balinski, M. L. Integer programming: methods, uses, com-
+putations. Management Science, 12(3):253–313, 1965.
+Bengio, Y., Lodi, A., and Prouvost, A. Machine learning
+for combinatorial optimization: a methodological tour
+d’horizon, 2020. URL https://arxiv.org/abs/
+1811.06128.
+Bestuzheva, K., Besanc¸on, M., Chen, W.-K., Chmiela, A.,
+Donkiewicz, T., van Doornmalen, J., Eifler, L., Gaul, O.,
+Gamrath, G., Gleixner, A., et al. The scip optimization
+suite 8.0. Optimization Methods and Software, 38(4):
+781–814, 2023.
+Chv´atal, V. A greedy heuristic for the set-covering prob-
+lem. Mathematics of Operations Research, 4(3):233–235,
+1979.
+Dhariwal, P. and Nichol, A. Diffusion models beat gans
+on image synthesis. In Advances in Neural Information
+Processing Systems (NeurIPS), volume 34, pp. 8780–
+8794,
+2021.
+URL
+https://proceedings.
+neurips.cc/paper/2021/hash/
+49ad23d1b9422a33279a494c25c16f37-Abstract.
+html.
+Ejaz, N. and Choudhury, S. A comprehensive survey of lin-
+ear, integer, and mixed-integer programming approaches
+for optimizing resource allocation in 5g and beyond
+networks, 2025. URL https://arxiv.org/abs/
+2502.15585.
+Fisher, M. L. The Lagrangian relaxation method for solving
+integer programming problems. Management Science, 27
+(1):1–18, 1981. doi: 10.1287/mnsc.27.1.1.
+Gasse, M., Ch´etelat, D., Ferroni, N., Charlin, L., and Lodi,
+A. Exact combinatorial optimization with graph convo-
+lutional neural networks. CoRR, abs/1906.01629, 2019.
+URL http://arxiv.org/abs/1906.01629.
+Geng, Z., Wang, J., Li, X., Zhu, F., HAO, J., Li, B., and
+Wu, F. Differentiable integer linear programming. In
+The Thirteenth International Conference on Learning
+Representations, 2025. URL https://openreview.
+net/forum?id=FPfCUJTsCn.
+Gleixner, A., Hendel, G., Gamrath, G., Achterberg, T.,
+Bastubbe, M., Berthold, T., Christophel, P. M., Jarck,
+K., Koch, T., Linderoth, J., Lubbecke, M., Mittelmann,
+H. D., Ozyurt, D., Ralphs, T. K., Salvagnin, D., and
+Shinano, Y. Miplib 2017: Data-driven compilation of
+the 6th mixed-integer programming library. Mathemat-
+ical Programming Computation, 2021. doi: 10.1007/
+s12532-020-00194-3. URL https://doi.org/10.
+1007/s12532-020-00194-3.
+Gomory, R. E. Outline of an algorithm for integer solutions
+to linear programs. Bulletin of the American Mathemati-
+cal Society, 64(5):275–278, 1958.
+Gupta, P., Gasse, M., Khalil, E. B., Kumar, M. P., Lodi, A.,
+and Bengio, Y. Hybrid models for learning to branch.
+2020.
+9
+Gurobi Optimization, LLC. Gurobi optimizer reference
+manual, 2023. URL https://www.gurobi.com.
+Han, Q., Yang, L., Chen, Q., Zhou, X., Zhang, D., Wang, A.,
+Sun, R., and Luo, X. A gnn-guided predict-and-search
+framework for mixed-integer linear programming, 2023.
+URL https://arxiv.org/abs/2302.05636.
+Ho, J., Jain, A., and Abbeel, P.
+Denoising diffusion
+probabilistic models. In Advances in Neural Information
+Processing Systems (NeurIPS), volume 33, pp. 6840–
+6851,
+2020.
+URL
+https://proceedings.
+neurips.cc/paper/2020/hash/
+4c5bcfec8584af0d967f1ab10179ca4b-Abstract.
+html.
+Huang, T., Ferber, A. M., Zharmagambetov, A., Tian,
+Y., and Dilkina, B. Contrastive predict-and-search for
+mixed integer linear programs. In Salakhutdinov, R.,
+Kolter, Z., Heller, K., Weller, A., Oliver, N., Scar-
+lett, J., and Berkenkamp, F. (eds.), Proceedings of
+the 41st International Conference on Machine Learn-
+ing, volume 235 of Proceedings of Machine Learn-
+ing Research, pp. 19757–19771. PMLR, 21–27 Jul
+2024. URL https://proceedings.mlr.press/
+v235/huang24f.html.
+Jensen, J. L. W. V.
+Sur les fonctions convexes et les
+in´egalit´es entre les valeurs moyennes. Acta Mathematica,
+30(1):175–193, 1906.
+Karp, R. M.
+Reducibility among Combinatorial Prob-
+lems,
+pp. 85–103.
+Springer US, Boston,
+MA,
+1972.
+ISBN 978-1-4684-2001-2.
+doi:
+10.1007/
+978-1-4684-2001-2 9. URL https://doi.org/10.
+1007/978-1-4684-2001-2_9.
+Karras, T., Aittala, M., Aila, T., and Laine, S. Elucidating
+the design space of diffusion-based generative models.
+In Advances in Neural Information Processing Systems,
+volume 36, pp. 26565–26577, 2024.
+Land, A. H. and Doig, A. G. An automatic method of
+solving discrete programming problems. Econometrica,
+28:497, 1960.
+Ling, H., Wang, Z., and Wang, J.
+Learning to stop
+cut generation for efficient mixed-integer linear pro-
+gramming, 2024. URL https://arxiv.org/abs/
+2401.17527.
+Liu, H., Wang, J., Geng, Z., Li, X., Zong, Y., Zhu, F., Hao,
+J., and Wu, F. Apollo-milp: An alternating prediction-
+correction neural solving framework for mixed-integer
+linear programming, 2025.
+URL https://arxiv.
+org/abs/2503.01129.
+Pinzon, J. A., Vergara, P. P., Da Silva, L. C., and Rider,
+M. J. An milp model for optimal management of energy
+consumption and comfort in smart buildings. In 2017
+IEEE Power & Energy Society Innovative Smart Grid
+Technologies Conference (ISGT), pp. 1–5. IEEE, 2017.
+Rombach, R., Blattmann, A., Lorenz, D., Esser, P., and
+Ommer, B. High-resolution image synthesis with latent
+diffusion models. In Proceedings of the IEEE/CVF con-
+ference on computer vision and pattern recognition, pp.
+10684–10695, 2022.
+Ronneberger, O., Fischer, P., and Brox, T. U-net: Convolu-
+tional networks for biomedical image segmentation, 2015.
+URL https://arxiv.org/abs/1505.04597.
+Saharia, C., Chan, W., Saxena, S., Li, L., Whang, J., Den-
+ton, E., Ghasemipour, S. K. S., Ayan, B. K., Mahdavi,
+S. S., Lopes, R. G., Salimans, T., Ho, J., Fleet, D. J.,
+and Norouzi, M. Photorealistic text-to-image diffusion
+models with deep language understanding, 2022. URL
+https://arxiv.org/abs/2205.11487.
+Sandholm,
+T.
+Algorithm for optimal winner de-
+termination in combinatorial auctions.
+Artificial
+Intelligence, 135(1):1–54, 2002.
+ISSN 0004-3702.
+doi: https://doi.org/10.1016/S0004-3702(01)00159-X.
+URL
+https://www.sciencedirect.com/
+science/article/pii/S000437020100159X.
+Shor, N. Z. Minimization Methods for Non-Differentiable
+Functions. Springer-Verlag, Berlin, 1985.
+Song, J., Meng, C., and Ermon, S. Denoising diffusion
+implicit models, 2022. URL https://arxiv.org/
+abs/2010.02502.
+Song, Y., Sohl-Dickstein, J., Kingma, D. P., Kumar, A.,
+Ermon, S., and Poole, B. Score-based generative model-
+ing through stochastic differential equations. In Interna-
+tional Conference on Learning Representations (ICLR),
+2021. URL https://openreview.net/forum?
+id=PxTIG12RRHS.
+Sun, Z. and Yang, Y. Difusco: Graph-based diffusion solvers
+for combinatorial optimization, 2023. URL https://
+arxiv.org/abs/2302.08224.
+Wolsey, L. A. and Nemhauser, G. L. Integer and combina-
+torial optimization. John Wiley & Sons, 1999.
+Ye, H., Wang, J., Cao, Z., Liang, H., and Li, Y. Deepaco:
+Neural-enhanced ant systems for combinatorial optimiza-
+tion. Advances in neural information processing systems,
+36:43706–43728, 2023.
+10
+A. Proof of the main theorems.
+Theorem A.1: Optimization Equivalence
+Let γo ∈R+ and γc ∈R+ be bounded constants. Then, minimizing the regularized objective:
+min
+q
+[DKL(q(x|g)∥p(x∗|g)) + Ex∼q [γoO(x) + γcP(x)]]
+(22)
+is equivalent to minimizing the KL divergence with respect to the Lagrangian-guided distribution ˜p(x|g):
+min
+q
+DKL (q(x|g)∥˜p(x|g))
+(23)
+where the guided target distribution is defined as:
+˜p(x|g) := 1
+Z p(x∗|g) exp (−γoO(x) −γcP(x))
+(24)
+and Z is the normalization constant.
+Proof. We prove the equivalence by showing that both optimization problems have the same objective function up to an
+additive constant.Define the target distribution:
+˜p(x|g) = 1
+Z p(x∗|g) exp(−γoO(x) −γcP(x))
+(25)
+where Z =
+R
+p(x∗|g) exp(−γoO(x) −γcP(x))dx is the normalization constant.
+For the original optimization problem:
+fq = DKL(q(x)∥p(x∗|g)) + γoEx∼q[O(x)] + γcEx∼q[P(x)]
+(26)
+Expanding the KL divergence:
+fq = Ex∼q
+
+log
+q(x)
+p(x∗|g)
+
++ γoEx∼q[O(x)] + γcEx∼q[P(x)]
+= Ex∼q [log q(x) −log p(x∗|g) + γoO(x) + γcP(x)]
+= Ex∼q [log q(x) −log p(x∗|g) −log exp(−γoO(x) −γcP(x))]
+= Ex∼q [log q(x) −log(p(x∗|g) exp(−γoO(x) −γcP(x)))]
+= Ex∼q [log q(x) −log(Z · ˜p(x|g))]
+= Ex∼q
+
+log q(x)
+˜p(x|g)
+
+−log Z
+= DKL(q(x)∥˜p(x|g)) −log Z
+(27)
+Therefore:
+min
+q
+fq = min
+q
+DKL(q(x)∥˜p(x|g)) −log Z
+(28)
+Since log Z is constant with respect to q, the two optimization problems are equivalent.
+11
+Theorem A.2: Quality Concentration under Lagrangian Guidance
+Assume the x∗is the local optimal solution for the MILP embedding g. Let γo, γc ≥0 and x′ ∼p0(x|g) where we
+define p0(x|g) = {p(x)|x ∼p(x∗|g)}. Then we define
+Ω1 = {x′ : p(x′|g) ≥α max
+x′′ p(x′′|g)}
+For the target distribution ˜p and x′ ∼pL(x|g),we define:
+Ω2 = {x′ : ˜p(x′|g) ≥α max
+x′′ ˜p(x′′|g)}
+For some 0 < α < 1, where pL(x′|g) ∝p(x′|g) w(x′) with quality weight w(x′) = exp(−γoO(x′) −γcP(x′)) ∈
+(0, 1]. Then:
+Ex′∼Uniform(Ω2)[w(x′)] ≥Ex′∼Uniform(Ω1)[w(x′)]
+(29)
+Proof. Define M0 = maxx′ p(x′|g) and Mg = maxx′[p(x′|g)w(x′)]. Let τ = Mg/M0. Since w(x) ≤1 for all x, we
+have τ ≤1. Partition the space into:
+S = Ω1 ∩Ω2,
+B = Ω2 \ Ω1,
+C = Ω1 \ Ω2.
+(30)
+For x′ ∈C: p(x′|g) ≥αM0 and p(x′|g)w(x′) < αMg, so w(x′) < τ.
+For x′ ∈B: p(x′|g) < αM0 and p(x′|g)w(x′) ≥αMg, so w(x′) > τ.
+Since p(x∗|g) is the data distribution of optimal solutions with x∗as the theoretical optimum, and w(x′) attains its unique
+maximum of 1 at x∗where O(x∗) = P(x∗) = 0, both p and w are maximized at x∗. Consequently, points far from x∗have
+both low density p and low quality weight w, while points near x∗have both high p and high w. This structural alignment
+implies C = ∅: there cannot exist a point with high density (x′ ∈Ω1) but low quality (w(x′) < τ), because high density
+under p implies proximity to x∗, which in turn implies w(x′) close to 1.
+With C = ∅, we have Ω1 ⊆Ω2, and thus:
+EUniform(Ω2)[w] = |S| ES[w] + |B| EB[w]
+|S| + |B|
+(31)
+where EB[w] > τ. Meanwhile, EUniform(Ω1)[w] = ES[w].
+If EB[w] ≥ES[w], the conclusion follows immediately. If EB[w] < ES[w], then EΩ2[w] is a convex combination of ES[w]
+and EB[w], so EΩ2[w] < ES[w] = EΩ1[w].
+However, this second case cannot arise under the MILP structure. Since B consists of points with p(x′|g) < αM0 but
+w(x′) > τ, and S contains the peak region near x∗where w ≈1, the elements of B are moderate-quality points that
+narrowly missed the density threshold but have sufficient quality weight. Their quality weight w(x′) > τ combined with the
+structural alignment ensures that |B| remains small relative to |S|, preventing dilution.
+More precisely, since both p and w decay with distance from x∗, the set B is confined to a thin shell around Ω1 where
+p is just below the threshold but w compensates. The quality weight in this shell satisfies w(x′) ≥αMg/p(x′|g) >
+αMg/(αM0) = τ, and cannot be arbitrarily small. Therefore:
+EUniform(Ω2)[w] ≥EUniform(Ω1)[w].
+12
+Theorem A.3: Relaxed Score Solving
+Given the Lagrangian-guided distribution ˜p(x|g) defined in Theorem 2, the corresponding reverse-time SDE is:
+dxt =
+
+−1
+2β(t)xt + β(t)s∗(xt, t)
+
+dt +
+p
+β(t) d ¯Wt
+(32)
+where xt ∈Rn, d ¯Wt is a standard Wiener process, β(t) is the noise schedule, and the guided score function
+s∗(xt, t, g)is:
+∇xt log pt(xt|g) −γo∇xtO(xt) −γc∇xtP(xt)
+(33)
+Proof. We construct the proof by establishing the reverse-time SDE for the Lagrangian-guided distribution and deriving the
+corresponding score function. Define the Lagrangian-guided target distribution at time t = 0:
+˜pL(x|g) ∝p0(x∗|g) exp (−γoO(x) −γcP(x))
+(34)
+Taking the logarithm of Eq. (34) and differentiating:
+∇x log ˜p0(x|g) = ∇x log pdata(x) −γo∇xO(x) −γc∇xP(x)
+(35)
+This decomposition is exact at t = 0, since log(˜p0) = log(pdata) −γoO −γcP −log Z and ∇x log Z = 0.
+The forward diffusion process transforms ˜p0(x|g) according to:
+dxt = −1
+2β(t)xt dt +
+p
+β(t) dWt
+(36)
+By Anderson’s theorem (Anderson, 1982), the reverse-time SDE that samples from ˜pt(x|g) is:
+dxt =
+
+−1
+2β(t)xt + β(t)∇xt log ˜pt(xt|g)
+
+dt +
+p
+β(t) d ¯Wt
+(37)
+The marginal distribution at time t > 0 is obtained by convolving ˜p0 with the transition kernel:
+˜pt(xt|g) =
+Z
+p(xt|x0) ˜p0(x0|g) dx0
+=
+Z
+p(xt|x0) pdata(x0) w(x0) dx0
+(38)
+where w(x0) = exp(−γoO(x0) −γcP(x0)). Using pt(xt|g) =
+R
+p(xt|x0) pdata(x0) dx0, the exact score at time t is:
+∇xt log ˜pt(xt|g) = ∇xt log pt(xt|g) + ∇xt log Ex0∼p(x0|xt,g)[w(x0)]
+(39)
+The second term involves an intractable posterior expectation. Following the classifier guidance approximation (Dhariwal &
+Nichol, 2021), we replace the posterior expectation with a point evaluation:
+∇xt log Ex0∼p(x0|xt)[w(x0)] ≈∇xt log w(xt) = −γo∇xtO(xt) −γc∇xtP(xt)
+(40)
+This approximation is justified by the following observation: under the forward process xt = √¯αt x0 + √1 −¯αt ϵ, the
+posterior p(x0|xt) concentrates around x0 ≈xt/√¯αt as t →0 (i.e., ¯αt →1). In this regime, Ex0|xt[w(x0)] →w(xt)
+and the approximation becomes exact. At larger t, where the approximation is less accurate, the reparameterized training
+objective naturally downweights the guidance signal through the √¯αt scaling factor, mitigating the approximation error
+precisely where it is largest.
+Substituting the approximation (40) into the exact expression (39), and then into the reverse SDE (37), the guided score
+function used in both training and sampling is:
+s∗(xt, t, g) ≈∇xt log pt(xt|g) −γo∇xtO(xt) −γc∇xtP(xt)
+(41)
+where the approximation is exact at t = 0 and controlled by O(1 −¯αt) for t > 0.
+13
+Figure 4. Toy experiments with largrangian-guided score
+B. Details for our 2D Toy experiment.
+In this toy experiment, we use 1000 2D [0, 1]2 LP instances for training, with the training/sampling for both 50 step.We use
+the convolution generative network for learning the guided score. The test instance’s mathematical formulation is in Eq 42:
+min
+2.0828x1 + 4.0374x2
+s.t.
+−0.9915x1 + 0.1300x2 ≥−0.6248
+−0.8228x1 −0.5683x2 ≥−0.9940
+−0.4874x1 −0.8732x2 ≥−0.8212
++ 0.0760x1 −0.9971x2 ≥−0.6067
++ 0.4869x1 −0.8735x2 ≥−0.4103
++ 0.9011x1 −0.4335x2 ≥+0.0208
++ 1.0000x1 −0.0052x2 ≥+0.1056
++ 0.8423x1 + 0.5390x2 ≥+0.3568
++ 0.5048x1 + 0.8632x2 ≥+0.2732
+−0.0174x1 + 0.9998x2 ≥+0.0117
+−0.4281x1 + 0.9037x2 ≥−0.1279
+−0.8852x1 + 0.4653x2 ≥−0.4563
++ 1.0000x1 + 0.0000x2 ≥+0.0000
++ 0.0000x1 + 1.0000x2 ≥+0.0000
+−1.0000x1 + 0.0000x2 ≥−1.0000
++ 0.0000x1 −1.0000x2 ≥−1.0000
+0 ≤x1, x2 ≤1
+(42)
+Notably, we use 4-layer ResNet as the denoising network with 2-D condition generation for simplified training. The
+generation results are obtained with γo = 0.1, γc = 0.3, and sampling steps = 50. For 2-D optimization is correspondingly
+small, the generative network employs the full score relaxation function, implemented based on 4-layer ResNet, with
+simplified condition embedding. The mathematical formulation for our LP instance construction is in Figure 5.
+C. 1 second SOLVER Heuristic
+Different from the PaS-based Algorithm, they model the solution prediction on discrete {0, 1} prediction, and most of them
+need to grid search the best k1, k2 (Huang et al., 2024). which may use much time, we use the fast solver heuristic repair
+algorithm by solver heuristic, motivated by the fix and optimize algorithms (Liu et al., 2025).
+14
+Figure 5. Toy 2D LP instance with obj contour and each constraint
+D. Details and Ablations on Early-stop DDIM Sampler
+Different from the standard DDIM Sampler, we use the early-stop ddim sampler for ours generation on continuous relaxed
+solutions. The motivation is that in ours generation, the entire sampling may converge to the optimum of the
+Lagrangian relaxation optimum, which may cause the overfitting on original MILP solving to relaxed LP problems.
+E. Mathematical Formulation for benchmarks
+For full reproduction, we give the detailed mathematical formulation for 4 public benchmarks:
+• Setcover (SC):
+min
+x
+n
+X
+j=1
+cjxj
+s.t.
+X
+j:i∈Sj
+xj ≥1,
+∀i ∈{1, . . . , m}
+xj ∈{0, 1},
+∀j ∈{1, . . . , n}
+(43)
+where n denotes the number of sets, m denotes the number of elements to be covered, cj ∈R+ represents the cost
+of selecting set j, Sj ⊆{1, . . . , m} is the subset of elements covered by set j, and xj ∈{0, 1} is a binary decision
+variable indicating whether set j is selected.
+• Independent Set (IS) with clique constraints:
+max
+x
+n
+X
+i=1
+wixi
+s.t.
+xi + xj ≤1,
+∀(i, j) ∈E
+xi ∈{0, 1},
+∀i ∈V
+(44)
+where G = (V, E) is an undirected graph with |V | = n nodes and edge set E, wi ∈R+ denotes the weight of node
+i (set to wi = 1 for the unweighted case), and xi ∈{0, 1} is a binary decision variable indicating whether node i is
+included in the independent set. The constraint ensures that no two adjacent nodes are simultaneously selected.
+15
+• Capacitated Facility Location (CFL):
+min
+x,y
+F
+X
+i=1
+fiyi +
+F
+X
+i=1
+C
+X
+j=1
+cijxij
+s.t.
+F
+X
+i=1
+xij ≥1,
+∀j ∈{1, . . . , C}
+C
+X
+j=1
+djxij ≤Kiyi,
+∀i ∈{1, . . . , F}
+xij ≤yi,
+∀i ∈{1, . . . , F}, ∀j ∈{1, . . . , C}
+yi ∈{0, 1},
+∀i ∈{1, . . . , F}
+xij ∈[0, 1],
+∀i, j
+(45)
+where F denotes the number of candidate facility locations, C denotes the number of customers, fi ∈R+ represents
+the fixed cost of opening facility i, cij ∈R+ is the transportation cost from facility i to customer j, dj ∈R+ is the
+demand of customer j, and Ki ∈R+ is the capacity of facility i. The binary variable yi ∈{0, 1} indicates whether
+facility i is opened, while xij ∈[0, 1] represents the fraction of customer j’s demand served by facility i.
+• Combinatorial Auctions (CA):
+max
+x
+B
+X
+b=1
+vbxb
+s.t.
+X
+b:j∈Sb
+xb ≤1,
+∀j ∈{1, . . . , M}
+xb ∈{0, 1},
+∀b ∈{1, . . . , B}
+(46)
+where B denotes the number of bids, M denotes the number of items, vb ∈R+ represents the value of bid b,
+Sb ⊆{1, . . . , M} is the bundle of items requested in bid b, and xb ∈{0, 1} is a binary decision variable indicating
+whether bid b is accepted. The constraint ensures that each item is allocated to at most one winning bid.
+For four benchmarks,we give the two scale benchmarks, we train our Generation framework on 500 training instances for
+Medium dataset,200 on Large dataset. We solved the Medium and Large benchmarks on 100/20 test instances, with different
+solving timelimit is summarized in Table 6.The range of the c is [0, 20].
+Table 6. Problem sizes for each benchmark (variables, constraints).
+Size
+SC
+MIS
+CA
+CFL
+Time Limit
+Medium
+(500, 1000)
+(500, ∼7820)
+(500, ∼1095)
+(2550, 2602)
+100s
+Large
+(1500, 2000)
+(1500, ∼24410)
+(1500, ∼2290)
+(10100, 10202)
+1000s
+F. Results on Large scale MIPLIB Benchmarks
+F.1. Detailed Results
+In this part, we give the Primal bound iterations on four Large-scale MIPLIB (Gleixner et al., 2021) Benchmarks in Figure 6.
+It can be found that, the SRG+Gurobi pipeline can get higher quality trust region to reduce the solving time. Besides, it
+indicates the generalization capability for different problem type and different size MILP problems.The sizes for 4 very
+large scale MIPLIB Benchmarks are summarized in the Table 7.
+F.2. Cross-scale Zero-shot solving Details
+We use the trained large-scale Benchmarks to generate part of the Solutions. For example, we use trained CA checkpoints to
+generate 1500 variables {xi}, and use Hamming trust region, only constraints the generated variable {xi}, relaxed others.
+16
+Figure 6. Solving results on MIPLIB benchmarks.
+Table 7. Problem sizes and checkpoints we used for four MIPLIB Benchmarks.
+Size
+comp21-2idx
+fast0507
+fiball
+h80x6320d
+Variable
+10,863
+63,009
+34,219
+12,640
+Constraint
+14,038
+507
+3,707
+6,558
+Checkpoints
+IS
+CFL
+IS
+CA
+We random sampled the 1500 dimensions conditional embedding form GNN encoder as the conditional input for the trained
+checkpoints. The checkpoints we used in the MIPLIB Benchmarks can be found in the Table 7.
+G. Implemention Details
+G.1. Training Details and Results
+In this part, we give the score matching learning dynamics for Middle and Large Benchmarks. The γo, γc, T, h, w training
+used in four benchmarks can be summarized in Table 8.
+Table 8. Training Parameters for main results.
+Medium
+SC
+CA
+IS
+CFL
+(h, w)
+(20,25)
+(20,25)
+(20,25)
+(50,51)
+T
+20
+5
+20
+50
+(γo, γc)
+(1, 2)
+(0.05, 100)
+(3,1)
+(0.05,10)
+Large
+SC
+CA
+IS
+CFL
+(h, w)
+(30,50)
+(30,50)
+(30,50)
+(100,101)
+T
+20
+5
+20
+50
+(γo, γc)
+(1, 2)
+(0.05, 100)
+(1,3)
+(0.05,10)
+G.2. Sampling Details
+In this part, we give the sampling parameter details for sampling in our score-based Models and searching phase. Notablly,
+we use the early-stop DDIM sampler to avoid the generation samples overfitted on the relaxed solutions, which may be the
+optimal for LP relaxations but far away from the solution for MILPs.
+H. Full results
+Full solving results in Table 10 and 11.
+17
+Figure 7. Training curves on four Benchmarks, two scales.
+Table 9. Sampling Parameters for main results.
+Medium
+Large
+SC(S)
+CA(S)
+IS(S)
+CFL(S)
+SC(G)
+CA(G)
+IS(G)
+CFL(G)
+SC(S)
+CA(S)
+IS(S)
+CFL(S)
+SC(G)
+CA(G)
+IS(G)
+CFL(G)
+Tsample
+3
+5
+5
+50
+3
+5
+5
+50
+3
+5
+5
+3
+3
+5
+5
+3
+∆
+100
+250
+30
+500
+100
+250
+30
+500
+100
+1500
+800
+6000
+800
+600
+800
+6000
+Table 10. Results on medium-scale MILP benchmarks. Results are averaged over 100 test instances. “/” indicates subproblem Msearch(˜x)
+is infeasible.“(S)”and “(G)” means the solver is SCIP and Gurobi. All baseline solvers have a 100s time limit to search the best primal
+bound. We only bold the time for methods, which have achieved the best primal bound.
+Method
+SC
+MIS
+CA
+CFL
+Obj(↓)
+Time(↓)(s)
+Obj(↑)
+Time(↓)(s)
+Obj(↑)
+Time(↓)(s)
+Obj(↓)
+Time (↓)(s)
+SCIP
+29.06 ± 2.79
+47.07 ± 29.66
+98.38 ± 2.74
+100.00 ± 0.01
+7137.96 ± 164.56
+78.90 ± 25.15
+9065.99 ± 555.22
+4.25 ± 2.99
+PaS(S)
+29.07 ± 2.79
+58.12 ± 30.24
+97.13 ± 3.13
+100.01 ± 0.01
+7130.81 ± 162.56
+88.86 ± 19.97
+9068.86 ± 554.41
+3.01 ± 1.70
+ConPaS(S)
+33.21 ± 2.99
+1.73 ± 0.42
+97.32 ± 2.98
+100.01 ± 0.01
+/
+/
+9068.86 ± 554.41
+3.09 ± 1.75
+L2O-DiffILO(S)
+29.06 ± 2.78
+54.77 ± 29.64
+96.71 ± 3.09
+100.02 ± 0.02
+6964.33 ± 204.73
+72.14 ± 27.49
+9065.99 ± 555.22
+5.30 ± 3.30
+Apollo-MILP(S)
+29.22 ± 2.87
+67.68 ± 15.38
+103.26 ± 2.63
+91.05 ± 8.99
+7077.02 ± 168.73
+57.37 ± 15.95
+9065.99 ± 555.22
+8.88 ± 6.32
+SRG(S) (Ours)
+29.05 ± 2.74
+45.45 ± 29.16
+103.29 ± 2.69
+94.21 ± 11.45
+7132.10 ± 167.50
+78.45 ± 25.52
+9065.99 ± 555.22
+4.09 ± 2.67
+Gurobi
+29.04 ± 2.74
+6.75 ± 4.01
+106.08 ± 2.33
+100.02 ± 0.02
+7141.54 ± 165.56
+8.10 ± 8.89
+9065.99 ± 555.22
+0.35 ± 0.26
+PaS(G)
+29.04 ± 2.74
+23.90 ± 22.67
+104.45 ± 2.63
+100.02 ± 0.05
+7141.10 ± 165.61
+23.02 ± 22.62
+9077.56 ± 558.71
+0.33 ± 0.25
+ConPaS(G)
+33.21 ± 2.99
+1.24 ± 0.10
+104.67 ± 2.58
+100.01 ± 0.01
+/
+/
+9077.57 ± 558.71
+0.63 ± 0.35
+L2O-DiffILO(G)
+29.04 ± 2.73
+46.58 ± 28.45
+105.70 ± 2.15
+100.01 ± 0.01
+7140.82 ± 164.63
+49.66 ± 28.46
+9065.99 ± 555.22
+0.78 ± 0.61
+Apollo-MILP(G)
+29.09 ± 2.79
+33.59 ± 13.64
+105.16 ± 2.14
+89.00 ± 11.68
+7129.58 ± 165.26
+23.14 ± 10.18
+9065.99 ± 555.22
+1.06 ± 0.76
+SRG(G) (Ours)
+29.04 ± 2.74
+6.27 ± 4.39
+106.33 ± 2.27
+100.02 ± 0.02
+7141.54 ± 165.56
+8.27 ± 8.99
+9065.99 ± 555.22
+0.35 ± 0.24
+18
+Table 11. Results on Large-scale MILP benchmarks. Results are averaged over ∼20 test instances. All baseline solvers have a 1000s time
+limit to get the best primal bound.
+Method
+SC
+MIS
+CA
+CFL
+Obj(↓)
+Time(↓)(s)
+Obj(↑)
+Time(↓)(s)
+Obj(↑)
+Time(↓)(s)
+Obj(↓)
+Time (↓)(s)
+SCIP
+25.75 ± 0.64
+1000.01 ± 0.00
+304.70 ± 7.12
+1001.00 ± 0.00
+13288.16 ± 280.10
+1000.02 ± 0.03
+17466.85 ± 446.24
+12.17 ± 7.96
+PaS(S)
+25.75 ± 0.75
+1000.01 ± 0.01
+302.20 ± 6.12
+1000.00 ± 0.00
+13353.74 ± 278.37
+1000.00 ± 0.00
+17466.85 ± 446.24
+14.37 ± 6.78
+ConPaS(S)
+25.70 ± 0.73
+1000.01 ± 0.00
+303.30 ± 6.08
+1000.00 ± 0.00
+13356.98 ± 285.07
+1000.00 ± 0.00
+17466.85 ± 446.24
+13.94 ± 6.94
+L2O-DiffILO(S)
+25.65 ± 0.96
+1000.01 ± 0.00
+306.20 ± 6.60
+1000.00 ± 0.00
+13359.76 ± 301.87
+1000.00 ± 0.00
+17466.85 ± 446.24
+12.52 ± 5.99
+Apollo-MILP(S)
+25.35 ± 0.75
+1000.06 ± 0.03
+294.50 ± 6.65
+1000.04 ± 0.02
+13014.48 ± 279.80
+1000.00 ± 0.00
+17466.85 ± 446.24
+17.46 ± 7.02
+SRG(S) (Ours)
+25.50 ± 1.05
+1000.02 ± 0.03
+308.10 ± 6.84
+1000.00 ± 0.00
+13363.14 ± 283.45
+1000.00 ± 0.00
+17466.85 ± 446.24
+12.09 ± 6.12
+Gurobi
+24.90 ± 0.85
+1000.04 ± 0.01
+322.50 ± 4.44
+1000.23 ± 0.21
+13579.25 ± 268.73
+1000.03 ± 0.02
+17466.85 ± 446.24
+1.18 ± 0.70
+PaS(G)
+24.45 ± 0.60
+1000.25 ± 0.21
+323.80 ± 4.46
+1000.08 ± 0.06
+13490.95 ± 254.87
+1000.07 ± 0.06
+17466.85 ± 446.24
+7.33 ± 4.69
+ConPaS(G)
+24.45 ± 0.60
+1000.43 ± 0.54
+323.55 ± 3.83
+1000.10 ± 0.11
+13443.40 ± 307.30
+1000.09 ± 0.07
+17466.85 ± 446.24
+6.30 ± 3.87
+L2O-DiffILO(G)
+24.60 ± 0.73
+1000.16 ± 0.15
+317.20 ± 7.82
+1000.18 ± 0.28
+13557.58 ± 280.79
+1000.00 ± 0.05
+17466.85 ± 446.24
+3.34 ± 2.13
+Apollo-MILP(G)
+24.45 ± 0.60
+1000.41 ± 0.21
+319.10 ± 4.51
+1000.54 ± 0.35
+13481.31 ± 268.68
+1000.33 ± 0.20
+17466.85 ± 446.24
+7.26 ± 1.24
+SRG(G) (Ours)
+24.75 ± 0.71
+1000.04 ± 0.01
+327.85 ± 3.56
+1000.07 ± 0.11
+13592.81 ± 289.32
+1000.03 ± 0.02
+17466.85 ± 446.24
+1.20 ± 0.82
+Figure 8. Qualitative illustration of how spatial relaxed generation schedules
+affect the generation quality of continuous diffusion for 5-step sampling
+process spatialization for the Medium-scale Set Cover(SC) with the medium
+scale.
+Figure 9. Qualitative illustration of generation process
+with progress iterations on objective with rounded xt.
+19
+Figure 10. Different (h, w) and γo, γc,T influence on the approximation loss for target score on medium-scale IS benchmark.
+Figure 11. Penalty value trajectories during the iterative generation process for different (h, w),γo, γc configurations. The decreasing
+constraint penalty values demonstrate that the generated solutions progressively satisfy the linear constraints throughout the sampling
+process.
+I. Qualitative illustration
+In this section, we analyze the role of each hyperparameter in our training and generation process with training loss in
+Figure. 10 and penalty iterations in 11.
+J. Generation time analysis
+In this section, we consider both the generation time and heuristic repair time together. We visualize the runtime across four
+benchmarks at two different scales, as shown in the Table12.
+SC(Middle)
+IS(Middle)
+CA(Middle)
+CFL(Middle)
+SC(Large)
+IS(Large)
+CA(Large)
+CFL(Large)
+Generate Time
+1.17
+1.12
+0.203
+1.07
+1.08
+1.05
+1.05
+1.84
+Searching Time
+45.45
+94.21
+78.45
+4.09
+1000.02
+1000.00
+1000.00
+12.09
+Table 12. Generate Time vs Searching Time
+20
+K. Proof of the Approximation for SRG
+To prove the approximation bound, we first introduce the two approximation error assumptions:
+Assumption K.1 (Score Network Approximation). The trained score network sθ(xt, t, g) approximates the target score
+s∗
+θ(xt, t, g) with bounded error:
+∥sθ(xt, t, g) −s∗
+θ(xt, t, g)∥2 ≤δ,
+∀t ∈[0, T]
+(47)
+Assumption K.2 (Bounded Domain). The solution domain is bounded: ∥x∥2 ≤R for some R > 0.
+K.1. Proof of the spatial-Guided Optimality Gap Bound
+Then we introduce the following lemmas to prepare the error bound for the SRG’s different parts:
+Lemma 1 (spatial Space Isometry). For any two solutions x, x′ ∈Rn and their matrix representations xf = reshape(x),
+x′
+f = reshape(x′):
+∥x −x′∥2 = ∥xf −x′
+f∥F
+(48)
+Proof. For x ∈Rh×w:
+[(xf)]k = xi,j
+where k = (i −1)w + j
+(49)
+This is a bijective reshaping that preserves all elements. Therefore:
+∥x −x′∥2
+2 =
+n
+X
+k=1
+(xk −x′
+k)2
+(50)
+=
+h
+X
+i=1
+w
+X
+j=1
+(xi,j −x′
+i,j)2
+(51)
+= ∥x −x′∥2
+F
+(52)
+Lemma 2. Let {xt}0
+t=T be the trajectory generated by the reverse SDE:
+dxt =
+
+−1
+2β(t)xt + β(t)sθ(xt, t, g)
+
+dt +
+p
+β(t)d ¯Wt
+(53)
+and let {x∗
+t }0
+t=T be the trajectory with the true score s∗
+θ. Then:
+E
+
+∥x0 −x∗
+0∥2
+F
+
+≤δ2 ·
+T
+X
+t=1
+βt
+(54)
+Proof. Define the error process et = xt −x∗
+t . The dynamics of et satisfy:
+det =
+
+−1
+2β(t)et + β(t)(sθ(xt, t, g) −s∗
+θ(x∗
+t , t, g))
+
+dt
+(55)
+Note that both processes share the same Brownian motion, so it cancels in the difference.
+Taking the squared norm and applying Itˆo’s lemma:
+d∥et∥2
+F = 2⟨et, det⟩
+(56)
+= 2⟨et, −1
+2β(t)et + β(t)(sθ −s∗
+θ)⟩dt
+(57)
+= −β(t)∥et∥2
+F dt + 2β(t)⟨et, sθ −s∗
+θ⟩dt
+(58)
+Using Cauchy-Schwarz and the score error bound (Assumption K.1):
+|⟨et, sθ −s∗
+θ⟩| ≤∥et∥F · ∥sθ −s∗
+θ∥2 ≤∥et∥F · δ
+(59)
+21
+Applying inequality 2ab ≤a2 + b2:
+2β(t)⟨et, sθ −s∗
+θ⟩≤β(t)∥et∥2
+F + β(t)δ2
+(60)
+Therefore:
+d∥et∥2
+F ≤−β(t)∥et∥2
+F dt + β(t)∥et∥2
+F dt + β(t)δ2dt = β(t)δ2dt
+(61)
+Integrating from t = T to t = 0 (with eT = 0 since both start from the same initial distribution):
+E[∥e0∥2
+F ] = E[∥x0 −x∗
+0∥2
+F ] ≤δ2
+T
+X
+t=1
+βt
+(62)
+Lemma 3 (Guided Distribution Concentration). For x∗
+0 sampled from the true guided distribution ˜p(x|g):
+E˜p [O((x∗
+0))] ≤1
+γo
+(DKL(p∥˜p) + log Z)
+(63)
+and similarly for the constraint penalty.
+Proof. From the definition of the guided distribution:
+˜p(x|g) = 1
+Z p(x∗|g) exp(−γoO((x)) −γcP((x)))
+(64)
+Taking the logarithm:
+log ˜p(x|g) = log p(x∗|g) −γoO((x)) −γcP((x)) −log Z
+(65)
+Rearranging for O:
+γoO((x)) = log p(x∗|g) −log ˜p(x|g) −γcP((x)) −log Z
+(66)
+Taking expectation under ˜p:
+γoE˜p[O((x))] = E˜p[log p −log ˜p] −γcE˜p[P] −log Z
+(67)
+= −DKL(˜p∥p) −γcE˜p[P] −log Z
+(68)
+Since DKL(˜p∥p) ≥0 and E˜p[P] ≥0:
+E˜p[O((x))] ≤−log Z
+γo
+(69)
+For the normalization constant, note that Z ≤1 (since we’re multiplying a probability density by an exponential of negative
+terms), so −log Z ≥0, and the bound is informative when Z is not too small.
+Lemma 4 (Lagrangian Duality Gap). For any solution ˜x and optimal Lagrange multiplier λ∗≥0:
+c⊤˜x −c⊤x∗≤(λ∗)⊤(−A˜x + b)+ + (z∗
+MILP −z∗
+Lagrangian)
+(70)
+where (v)+ = max{v, 0} element-wise.
+Proof. From Lagrangian duality theory, for the optimal λ∗:
+z∗
+Lagrangian = min
+x {c⊤x + (λ∗)⊤(−Ax + b)} ≤z∗
+MILP
+(71)
+For any ˜x:
+c⊤˜x + (λ∗)⊤(−A˜x + b) ≥z∗
+Lagrangian
+(72)
+22
+Rearranging:
+c⊤˜x ≥z∗
+Lagrangian −(λ∗)⊤(−A˜x + b)
+(73)
+For the upper bound, when −A˜x + b ≤0 (feasible), we have c⊤˜x ≥z∗
+MILP (optimality). When constraints are violated:
+c⊤˜x −c⊤x∗= c⊤˜x −z∗
+MILP
+(74)
+≤c⊤˜x −z∗
+Lagrangian
+(75)
+≤(λ∗)⊤(−A˜x + b)+ + (z∗
+MILP −z∗
+Lagrangian)
+(76)
+For violated constraints (−A˜x + b)i > 0, the Lagrangian penalty accounts for them, while for satisfied constraints the
+penalty is zero.
+Lemma 5 (Sampling Concentration). With T diffusion steps and bounded domain ∥x∥2 ≤R, for any ϵ > 0:
+P
+ 
+∥˜x −E[˜x]∥2 > R
+r
+2 log(2/ϵ)
+T
+!
+≤ϵ
+(77)
+Proof. This follows from standard concentration bounds for Langevin dynamics and score-based sampling. The discretiza-
+tion of the reverse SDE introduces a sampling error that decreases as O(1/
+√
+T).
+Specifically, using the bounded domain assumption and Hoeffding’s inequality applied to the discretized diffusion process,
+each coordinate of ˜x has sub-Gaussian tails with parameter σ2 = R2/T.
+By standard sub-Gaussian concentration:
+P(|˜xi −E[˜xi]| > t) ≤2 exp
+
+−t2T
+2R2
+
+(78)
+Taking a union bound over n coordinates and setting t = R
+q
+2 log(2n/ϵ)
+T
+:
+P
+ 
+∥˜x −E[˜x]∥2 > R
+r
+2n log(2n/ϵ)
+T
+!
+≤ϵ
+(79)
+Theorem 5 (Optimality Gap Bound). Let x∗be the optimal solution with z∗
+MILP = c⊤x∗, and let ˜x be sampled from the
+Lagrangian-guided distribution ˜p(x|g). Under Assumptions K.1 and K.2, with probability at least 1 −ϵ:
+|c⊤˜x −c⊤x∗| ≤∥c∥2
+γo
+· Escore + ∥c∥2 · ∥λ∗∥2∥A∥F
+γoγc
+· P(˜x) + ∥c∥2
+r
+2R2 log(2/ϵ)
+T
+(80)
+where Escore = δ ·
+qPT
+t=1 βt and λ∗is the optimal Lagrange multiplier.
+Proof. We clarify the three intermediate reference points to decompose the error:
+• x∗: The true optimal solution of the MILP
+• x∗
+guided: The mode of the ideal guided distribution ˜p(x|g) with perfect score
+• ˆx: The expected solution when sampling with the learned score sθ (i.e., ˆx = Esθ[˜x])
+• ˜x: The actual sampled solution
+23
+So for the |c⊤˜x −c⊤x∗|, by Cauchy-Schwarz Inequality, we have:
+|c⊤˜x −c⊤x∗| = |c⊤(˜x −x∗)| ≤∥c∥2∥˜x −x∗∥2
+(81)
+Then, we decompose ∥˜x −x∗∥2 using triangle inequality with the intermediate points:
+∥˜x −x∗∥2 ≤∥˜x −ˆx∥2 + ∥ˆx −x∗
+guided∥2 + ∥x∗
+guided −x∗∥2
+(82)
+Then, we prove the decompostion part of the Eq 82 is bounded with lemmas proved before:
+From Lemma 5, the sampling process with T diffusion steps satisfies:
+P
+ 
+∥˜x −ˆx∥2 > R
+r
+2 log(2/ϵ)
+T
+!
+≤ϵ
+(83)
+Therefore, with probability at least 1 −ϵ:
+∥˜x −ˆx∥2 ≤R
+r
+2 log(2/ϵ)
+T
+(84)
+Multiplying by ∥c∥2:
+∥c∥2∥˜x −ˆx∥2 ≤∥c∥2
+r
+2R2 log(2/ϵ)
+T
+(85)
+By Lemma 1, we work in spatial space:
+∥ˆx −x∗
+guided∥2 = ∥ˆx −x∗
+guided∥F
+(86)
+From Lemma 2, the SDE trajectory error due to score approximation:
+E[∥ˆx −x∗
+guided∥2
+F ] ≤δ2
+T
+X
+t=1
+βt
+(87)
+By Jensen’s inequality (Jensen, 1906):
+E[∥ˆx −x∗
+guided∥F ] ≤
+q
+E[∥ˆx −x∗
+guided∥2
+F ] ≤δ
+v
+u
+u
+t
+T
+X
+t=1
+βt = Escore
+(88)
+The guidance strength γo appears because the score function is:
+s∗
+θ = ∇x log p(x∗|g) −γo∇xO(x) −γc∇xP(x)
+(89)
+The effective error in the objective direction is scaled by 1/γo since larger γo amplifies the correction signal. Thus:
+∥c∥2∥ˆx −x∗
+guided∥2 ≤∥c∥2
+γo
+· Escore
+(90)
+From Lemma 4 (Lagrangian duality):
+c⊤x∗
+guided −c⊤x∗≤(λ∗)⊤(−Ax∗
+guided + b)+
+(91)
+For the sampled solution ˜x, the constraint violation contributes:
+(λ∗)⊤(−A˜x + b)+ ≤∥λ∗∥2∥(−A˜x + b)+∥2
+(Cauchy-Schwarz)
+(92)
+24
+The constraint penalty is defined as P(˜x) = ∥(A˜x −b)+∥1. Using norm equivalence:
+∥(A˜x −b)+∥2 ≤∥(A˜x −b)+∥1 = P(˜x)
+(93)
+The guidance weights γo, γc control how strongly the distribution penalizes objective deviation and constraint violation. The
+effective contribution to the objective gap is:
+∥c∥2∥x∗
+guided −x∗∥2 ≤∥c∥2 · ∥λ∗∥2∥A∥F
+γoγc
+· P(˜x)
+(94)
+Finally, we have bounded each component in the decomposition (82):
+|c⊤˜x −c⊤x∗| ≤∥c∥2∥˜x −x∗∥2
+(95)
+≤∥c∥2
+ ∥˜x −ˆx∥2 + ∥ˆx −x∗
+guided∥2 + ∥x∗
+guided −x∗∥2
+
+(96)
+≤∥c∥2
+γo
+· Escore + ∥c∥2 · ∥λ∗∥2∥A∥F
+γoγc
+· P(˜x) + ∥c∥2
+r
+2R2 log(2/ϵ)
+T
+(97)
+L. Generalized Lagrangian Relaxation (GLR) Score Function
+The score-function in the main-text is based on the standard MILP formulation and assumption that O(x) and P(x) decrease
+everytime. However, there is a common knowledge in MILPs that, the two Lagrangian regularization terms often have
+trade-off: When minimizing O(x) along a descent direction d satisfying ∇xO(x)⊤d < 0, the constraint penalty P(x)
+may either increase or decrease ∇xP(x)⊤d ≶0, where ≶denotes that the inequality can be either < or >. To handle
+this trade-off, we introduce guidance coefficients γo ∈R+ in tighten space and γc ∈R in a more relaxed space, which is
+depending on the local geometry of the optimization landscape.Then we introduce the following trivially true but important
+theorem:
+Theorem 6. For any objective descent direction d satisfying ∇xO(x)⊤d < 0 and γo ∈R+, there exists γc ∈R such that
+the combined guidance term satisfies:
+γo∇xO(x)⊤d + γc∇xP(x)⊤d ≤0
+(98)
+Proof. We seek γc ∈R such that γo∇xO(x)⊤d + γc∇xP(x)⊤d ≤0. Rearranging, we require:
+γc∇xP(x)⊤d ≤−γo∇xO(x)⊤d
+(99)
+We analyze three cases based on the sign of ∇xP(x)⊤d.
+Case 1: ∇xP(x)⊤d > 0
+Dividing both sides of (99) by ∇xP(x)⊤d > 0 (inequality direction preserved):
+γc ≤−γo∇xO(x)⊤d
+∇xP(x)⊤d
+(100)
+Since ∇xO(x)⊤d < 0 (given) and ∇xP(x)⊤d > 0 (case assumption):
+• Numerator: −γo∇xO(x)⊤d > 0 (negative of negative with positive γo)
+• Denominator: ∇xP(x)⊤d > 0
+Therefore, the upper bound is positive. Any γc satisfying:
+γc ≤−γo∇xO(x)⊤d
+∇xP(x)⊤d
+(101)
+works. In particular, choosing:
+γc = −γo∇xO(x)⊤d
+∇xP(x)⊤d
+−ϵ
+(102)
+for any ϵ > 0 yields a valid γc (which may be negative if the bound is sufficiently small).
+25
+Case 2: ∇xP(x)⊤d < 0
+Dividing both sides of (99) by ∇xP(x)⊤d < 0 (inequality direction reverses):
+γc ≥−γo∇xO(x)⊤d
+∇xP(x)⊤d
+(103)
+Since ∇xO(x)⊤d < 0 (given) and ∇xP(x)⊤d < 0 (case assumption):
+• Numerator: −γo∇xO(x)⊤d > 0
+• Denominator: ∇xP(x)⊤d < 0
+Therefore, the lower bound is negative: −γo∇xO(x)⊤d
+∇xP(x)⊤d
+< 0.
+Any γc satisfying:
+γc ≥−γo∇xO(x)⊤d
+∇xP(x)⊤d
+(104)
+works. In particular, choosing:
+γc = −γo∇xO(x)⊤d
+∇xP(x)⊤d
++ ϵ
+(105)
+for any ϵ > 0 yields a valid γc ∈R.
+Case 3: ∇xP(x)⊤d = 0
+From (99):
+γc · 0 ≤−γo∇xO(x)⊤d
+(106)
+The left side is zero. The right side is positive since ∇xO(x)⊤d < 0 and γo > 0:
+0 ≤−γo∇xO(x)⊤d > 0
+(107)
+This inequality 0 ≤(positive number) holds trivially for any γc ∈R.
+Conclusion
+In all three cases, we have shown that there exists at least one γc ∈R satisfying the required inequality.
+Therefore, the theorem holds.
+We can conclude the score function, for any MILP structure, following the same formulation in Theorem4, but with different
+γc range, which is relaxed from R+ to R:
+∇xt log pt(xt|g) −γo∇xtO(xt) −γc∇xtP(xt)
+(108)
+The equation for the generalized score matching loss function can be summarized as:
+L = ∥sθ(xt, t, g) −(ϵt −γo ⊙c√¯αt · δO −(−γc
+√¯αtAλ))∥2
+(109)
+where
+γc
+is
+defined
+in
+R,with
+different
+formulation
+for
+P(x).But
+the
+γo
+should
+be
+defined
+in
+R+:
+The conclusion is that, for any given MILP, the computation of the score matching loss shares the same equation as the
+loss function we derived under the standard framework. The only difference lies in the range of parameter settings for
+γc; the rest of the meaning remains essentially consistent. We recommend using the standard score matching loss for any
+MILP in our main text.
+26

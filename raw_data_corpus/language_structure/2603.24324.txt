@@ -1,0 +1,752 @@
+LARGE LANGUAGE MODEL GUIDED INCENTIVE AWARE
+REWARD DESIGN FOR COOPERATIVE MULTI-AGENT
+REINFORCEMENT LEARNING ∗
+Dogan Urgun
+Department of Electrical and Electronics Engineering
+Karabuk University
+78050 Karabuk, Türkiye
+durgun@karabuk.edu.tr
+Gokhan Gungor
+Department of Mechatronics Engineering
+Karabuk University
+78050 Karabuk, Türkiye
+gokhangungor@karabuk.edu.tr
+ABSTRACT
+Designing effective auxiliary rewards for cooperative multi-agent systems remains a precarious task;
+misaligned incentives risk inducing suboptimal coordination, especially where sparse task feedback
+fails to provide sufficient grounding. This study introduces an automated reward design framework
+that leverages large language models to synthesize executable reward programs from environment
+instrumentation. The procedure constrains candidate programs within a formal validity envelope
+and evaluates their efficacy by training policies from scratch under a fixed computational budget;
+selection depends exclusively on the sparse task return. The framework is evaluated across four
+distinct Overcooked-AI layouts characterized by varied corridor congestion, handoff dependencies,
+and structural asymmetries. Iterative search generations consistently yield superior task returns and
+delivery counts, with the most pronounced gains occurring in environments dominated by interaction
+bottlenecks. Diagnostic analysis of the synthesized shaping components indicates increased interde-
+pendence in action selection and improved signal alignment in coordination-intensive tasks. These
+results demonstrate that the search for objective-grounded reward programs can mitigate the burden
+of manual engineering while producing shaping signals compatible with cooperative learning under
+finite budgets.
+Keywords Deep learning · large language models · multi-agent learning · reinforcement learning · reward shaping
+1
+Introduction
+Reward specification remains a primary bottleneck in reinforcement learning (RL). In many domains, the intended
+objective is inherently sparse or delayed; consequently, empirical performance often depends more on the design of
+auxiliary feedback than on improvements to the optimization algorithm itself. In cooperative multi-agent reinforcement
+learning (MARL), this challenge is further amplified: as agents interact within a Markov game [1], auxiliary rewards
+influence not only credit assignment and exploration, but also the incentives necessary for coordination. As a result,
+reward shaping that accelerates learning in one setting can induce brittle strategies in another, including behaviors that
+maximize a proxy signal while failing to improve the true task return.
+A formal framework for reward shaping is provided by potential-based reward transformations, which augment the
+reward with a shaped term defined as the discounted difference of a potential function across transitions. Such
+transformations are known to preserve the set of optimal policies under standard assumptions, such as the use of a
+consistent discount factor and a state-dependent potential function [2]. This policy-invariance property clarifies the
+conditions under which an auxiliary learning signal can be introduced without altering the true objective. Although
+subsequent research expanded the framework to incorporate richer features, such as state-action formulations [3], and
+extended it to multi-agent settings [4], such formal advances do not alleviate the practical burden of specifying an
+∗This work is currently under peer review.
+arXiv:2603.24324v1  [cs.LG]  25 Mar 2026
+effective potential function. Furthermore, they fail to cover the broad class of heuristic event bonuses and penalties
+commonly used in applied systems.
+Beyond theoretical limitations, the reliance of deep RL on function approximation and finite training budgets renders
+optimization dynamics highly sensitive to auxiliary rewards; accordingly, theoretically policy-invariant shaping may
+still yield mixed empirical outcomes in complex multi-agent settings [5]. Consequently, reward shaping typically
+requires extensive manual tuning, and the potential for reward misspecification remains a recurring concern. At the
+core of this challenge lies a fundamental mismatch between the implemented reward and the intended objective, which
+is formally addressed by inverse reward design. By treating the specified reward as evidence of intent that requires
+contextual interpretation, this approach reveals that optimizing an underspecified proxy can lead to unintended side
+effects [6], thereby necessitating that automated reward design methods be used against the true objective, rather than
+the auxiliary signals they generate.
+To mitigate the reliance on manual engineering, data-driven paradigms attempt to automate reward design by learning
+functional representations directly from demonstrations or feedback. Inverse Reinforcement Learning (IRL) opera-
+tionalizes this by inferring underlying reward functions from expert trajectories [7-8], while preference-based learning
+recovers reward signals through pairwise comparisons of trajectory segments [9]. Although these approaches are
+powerful when high-quality demonstrations or labels are accessible, they entail substantial data collection and interface
+overhead, which often proves prohibitive in complex, simulation-heavy MARL environments. Furthermore, even when
+a shaping reward is provided, its efficacy often varies across the state space. This inconsistency requires methods that
+determine when and how much to rely on shaping [10].
+Large Language Models (LLMs) emerge as a scalable alternative to data-intensive methods, offering a path toward
+automated reward generation without the overhead of human-in-the-loop labeling. Transformers facilitate robust
+conditional generation [11], and large-scale pretrained models demonstrate broad competence in program synthesis
+from structured context [12]. Recent advances in code generation further support the feasibility of producing nontrivial
+executable artifacts from natural language specifications [13]. Based on these capabilities, recent frameworks utilize
+LLMs to propose reward programs that improve through empirical feedback in RL settings [14]. LLMs also facilitate
+the production of shaped reward programs from language-conditioned task descriptions [15]. Nevertheless, autonomous
+reward generation presents two primary technical challenges: generated functions require basic correctness and
+boundedness, while candidate rewards require objective-aligned evaluation to mitigate the risk of optimizing spurious
+proxies.
+To address these requirements, this work introduces an LLM-guided reward shaping search framework for cooperative
+MARL. The proposed approach represents reward function candidates as executable programs, evaluates them through
+end-to-end training against a fixed baseline, and selects the optimal candidates based solely on the sparse task objective.
+By doing so, the framework ensures that the shaping signals remain grounded in the true mission goal while leveraging
+the generative prior of LLMs. We evaluate this method on a standard cooperative coordination benchmark across
+multiple tasks and analyze the resulting reward candidates to characterize their impact on multi-agent coordination.
+The contributions of this work are threefold. First, we introduce an automated reward search framework for cooperative
+MARL that leverages objective-grounded selection to ensure alignment with global goals. Second, we provide empirical
+validation across four coordination tasks, incorporating incentive diagnostics to characterize the signals induced by
+candidate rewards. Finally, we present a systematic diagnostic analysis that illustrates how synthesized reward functions
+shape specific coordination behaviors and influence the underlying multi-agent learning dynamics.
+2
+Related Work
+Reduction of reward engineering has been studied from several perspectives, including reward shaping and credit
+assignment in cooperative MARL, reward construction or optimization from data and interaction, and programmatic
+reward generation using LLMs. Reward shaping remains a common practical tool for accelerating learning with sparse
+objectives, but it introduces design choices that can change learning dynamics and, in multi-agent settings, can change
+incentives. Policy-invariant shaping provides a principled baseline for adding auxiliary signal without altering the
+underlying objective [2], and later work broadens the class of potential-based constructions [3]. In cooperative MARL,
+the reward signal also serves as a mechanism for credit assignment, motivating designs that better reflect each agent’s
+contribution to team performance; potential-based difference rewards are an example of this direction [4]. These lines
+of work clarify that auxiliary rewards can be useful, but they do not remove the need to specify effective shaping terms
+for a given domain, nor do they ensure that heuristically chosen event-based shaping will avoid proxy optimization.
+A second set of methods aims to reduce manual tuning by modifying or learning how rewards are used during training.
+Some approaches explicitly optimize the reward function so that, under a fixed learning procedure, the induced behavior
+2
+Figure 1: The proposed objective-grounded reward search framework.
+better matches a target notion of alignment [16]. Other work studies how an agent can learn to rely on shaping rewards
+selectively when shaping quality varies across the state space [10]. These approaches motivate two design choices
+adopted in the present work: reward candidates are evaluated through end-to-end training under a fixed baseline, and
+selection is performed using the true task objective rather than the shaped signal. Reward specification can also be
+addressed by inferring objectives from demonstrations or feedback. Inverse RL infers a reward function from expert
+behavior [7-8], and preference-based learning infers rewards from human comparisons [9]. Such methods reduce the
+need to handcraft shaping terms, but require demonstrations, preferences, or interactive supervision. The present work
+targets a complementary regime in which repeated simulation and environment instrumentation are available and in
+which reward candidates can be tested by training and evaluation without collecting additional human labels.
+Recent work has leveraged LLMs to generate executable artifacts, enabled by Transformer-based conditional generation
+[11-12], and demonstrated in general-purpose code synthesis [13]. Building on these capabilities, LLMs have been
+used to propose reward programs that are improved through empirical feedback in RL [14], and to generate shaped
+reward programs from task descriptions [15]. Our approach diverges from these frameworks in two aspects critical
+to cooperative MARL: candidate rewards are executable programs over instrumentation signals, and candidates are
+accepted only when they improve the sparse task objective under a fixed multi-agent learning baseline, which is intended
+to limit proxy optimization effects [6].
+3
+Method
+The general framework of the proposed method is illustrated in fig. 1. The system implements an iterative, closed-loop
+reward engineering process that leverages the generative capabilities of LLMs and the evaluative precision of MARL.
+An objective-grounded reward search procedure is described for cooperative MARL. At a high level, an LLM proposes
+executable reward candidates conditioned on a structured task description and an archive of prior outcomes. Each
+candidate is constrained by a validity envelope that enforces implementability and discourages exploitable proxies.Valid
+candidates are used to train policies from scratch with a fixed MARL learner under a fixed budget, and their performance
+is evaluated solely with the sparse task objective. In addition, descriptive incentive diagnostics are computed from
+rollouts and used as structured feedback for subsequent candidate generation.
+3
+3.1
+Problem Setting and Reward Interfaces
+We consider a cooperative Markov game [1] defined by the tuple G = ⟨S,{Ai}n
+i=1,P,rsparse,γ⟩, with n agents interacting
+in the state space S. At each time step t, the environment is in state st ∈S. Each agent i ∈{1,...,n} selects an action
+at,i from its individual action space Ai, forming a joint action at = (at,1,...,at,n) ∈A, where A is the joint action space.
+The system dynamics follow the transition probability kernel P : S × A × S →[0,1], which defines the probability
+P(st+1 | st,at) of transitioning to state st+1 given the current state st and joint action at. Furthermore, rsparse : S ×A →R
+defines the reward function for shared sparse tasks, and γ ∈[0,1] is the discount factor.
+In this cooperative setting, the task reward is sparse and shared; specifically, a scalar reward rsparse,t = rsparse(st,at) is
+produced by the environment and assigned equally to all agents. The performance objective is to maximize the expected
+discounted sparse return:
+J(π) = Eτ∼π
+"
+T−1
+∑
+t=0
+γ trsparse,t
+#
+,
+(1)
+where π denotes the joint policy, τ represents a trajectory induced by π, and T is the episode horizon.
+In addition to the sparse reward, the simulator exposes structured instrumentation through an information record infot.
+A deterministic feature map φ is used to convert the transition and instrumentation into a feature vector,
+xt = φ(st,at,st+1,infot).
+(2)
+A reward candidate is represented as an executable program p that produces agent-specific shaping signals from the
+instrumentation. Given the state features xt and the global sparse task reward rsparse,t, the program generates a vector of
+auxiliary shaping
+r(p)
+t
+= p(xt,rsparse,t) ∈Rn,
+(3)
+where the i-th component r(p)
+t,i denotes the shaping signal assigned to agent i at step t. During training, each agent
+receives an augmented reward
+˜rt,i = rsparse,t +λ r(p)
+t,i ,
+(4)
+where λ ≥0 is the fixed scaling factor. The sparse reward term preserves the intended task objective, while the shaping
+term is used only to improve learning under finite budgets. In all results reported, the candidates are compared using the
+sparse objective in eq. (1), not the shaped return.
+3.2
+Objective-Grounded Search and Selection
+Let Train(·;θ ,ξ) denote training with a fixed MARL learner (MAPPO) using fixed hyperparameters θ and randomness
+ξ. The candidate evaluation process adheres to the Centralized Training, Decentralized Execution (CTDE) paradigm, as
+illustrated in fig. 2. During the centralized training phase (fig. 2a), a centralized critic V leverages a shared buffer of
+global states and joint observations to evaluate the collective policy and derive training feedback. This centralized value
+estimate is utilized to provide advantage signals that guide the policy updates for all agents. Conversely, during the
+decentralized execution phase (fig. 2b), the decentralized actors πi select actions based strictly on local observations.
+Upon completion of training with the augmented rewards defined in eq. (4), the candidate is evaluated exclusively via
+the sparse task objective G to obtain the empirical estimate bJ(p).
+The search process evolves over a total of G generations. At each generation index g ∈{1,...,G}, a structured
+context cg is constructed from the task description, the instrumentation schema, the reward interface, and summaries of
+previously evaluated candidates. The LLM proposes K reward candidates by sampling from a conditional distribution
+qψ(p | cg). Each candidate p is filtered by a validity envelope before training. The envelope enforces correct input
+and output signatures, determinism, bounded outputs via clipping, and robustness to missing instrumentation keys.
+Candidates failing validation are rejected, and when failures are syntactic or runtime in nature, a bounded number of
+repair attempts are performed by conditioning on the error trace.
+Within each generation, candidates are trained and evaluated, and the best candidate is selected based on the sparse
+return:
+p⋆
+g ∈argmax
+k∈Vg
+bJ(pg,k),
+(5)
+where pg,k is the k-th candidate in generation g for k ∈Vg ⊆{1,...,K}, and Vg denotes the set of indices for candidates
+that pass validation. Selection is objective-grounded because only the sparse return is used for promotion. The
+complete procedure, which encompasses LLM-based iterative reward generation and the inner MARL evaluation loop,
+is summarized in Algorithm 1.
+4
+Multi-Agent Environment
+Centralized Training Phase
+V
+Agent 1
+Agent 2
+Agent n
+V
+Policy
+Critic
+Training Feedback
+Observation
+Action
+(a) Centralized Training Phase
+Multi-Agent Environment
+Observation
+Action
+Policy
+Decentralized Execution Phase
+ 
+(b) Decentralized Execution Phase
+Figure 2: Overview of the CTDE paradigm for multi-agent reinforcement learning. (a) Centralized Training: A shared
+critic (V) utilizes global state information and joint observation buffers to guide policy updates via training feedback.
+(b) Decentralized Execution: Individual actors (πi) rely exclusively on local observations for action selection, ensuring
+scalability in partially observable environments.
+Algorithm 1: Objective-grounded incentive-aware reward search.
+Require :Task specification and instrumentation schema; validity envelope; learner settings θ ; generations G;
+candidates per generation K
+1 Initialize archive A ←/0, and best score bJbest ←−∞
+2 for g = 1 to G do
+3
+Construct context cg from task description and archive summaries
+4
+Sample candidates {pg,k}K
+k=1 ∼qψ(p | cg)
+5
+for k = 1 to K do
+6
+Validate and, if needed, repair pg,k
+7
+if pg,k is valid then
+8
+Train policy π g,k ←Train(·;θ ,ξ) using augmented rewards ˜rt,i
+9
+Evaluate estimate bJ(pg,k) using sparse reward only
+10
+Compute diagnostics d(pg,k) from rollouts
+11
+A ←A∪{(pg,k,bJ(pg,k),d(pg,k))}
+12
+end if
+13
+end for
+14
+Update context summaries in A
+15 end for
+Return :Best candidate p⋆= arg max
+(p,·,·)∈A
+bJ(p)
+3.3
+Incentive Diagnostics Used for Feedback
+The candidate program can assign different shaping signals to different agents, even when the task objective is shared.
+For interpretability, the shaping component is analyzed separately from the sparse reward. Using the agent-specific
+shaping signal r(p)
+t,i , the discounted shaping return for agent i on a rollout is defined as:
+Si(p) =
+T−1
+∑
+t=0
+γ tr(p)
+t,i .
+(6)
+5
+These returns are computed on the shaping component only and therefore can be asymmetric even when the environment
+reward is a shared team reward.
+3.3.1
+Payoff imbalance.
+Payoff imbalance measures the disparity in shaping returns across n agents. To ensure the metric remains bounded and
+interpretable, we define it as the normalized sum of all-pairs differences:
+∆(p) = ∑n
+i=1 ∑n
+j=i+1 |Si(p)−Sj(p)|
+(n−1)∑n
+k=1 |Sk(p)|+ε
+,
+(7)
+where ε > 0 is a small constant for numerical stability. This formulation is bounded within [0,1], where ∆(p) →0
+indicates a symmetric distribution of rewards and larger values signal a disproportionate concentration on a subset of
+agents.
+3.3.2
+Incentive alignment
+Incentive alignment measures the degree to which per-step shaping signals concurrently reinforce the agents. For an
+ensemble of n agents, we define this as the average pairwise Pearson correlation across all time steps in an episode:
+ρ(p) =
+2
+n(n−1)
+n
+∑
+i=1
+n
+∑
+j=i+1
+corr
+
+r(p)
+t,i ,r(p)
+t,j
+
+.
+(8)
+Strongly positive values (ρ →1) indicate that the shaping signals are synchronized, suggesting that the reward program
+p induces mutually reinforcing behaviors. Conversely, values near zero or negative suggest decoupled or conflicting
+incentives, potentially signaling a breakdown in cooperative dynamics or the optimization of competitive proxy goals.
+3.3.3
+Action Coupling
+Action coupling quantifies the statistical dependence between the agents’ decision-making processes under the policy
+optimized via program p. For an ensemble of n agents, we report the average pairwise Normalized Mutual Information
+(NMI) across all time steps:
+NMI(p) =
+2
+n(n−1)
+n
+∑
+i=1
+n
+∑
+j=i+1
+I(Ai;A j)
+p
+H(Ai)H(Aj),
+(9)
+where I(Ai;A j) denotes the mutual information between the action distributions of agents i and j, and H(Ai) represents
+the marginal entropy of the discrete action random variable Ai estimated from rollout data. Unlike raw mutual
+information, this geometric mean normalization ensures the metric is bounded within [0,1], where higher NMI indicates
+more interdependent action selection. This serves as a proxy for identifying whether the synthesized reward signals
+induce emergent coordination or lead to independent, decoupled strategies.
+3.3.4
+Diagnostic Feedback and Logging
+Upon the completion of each evaluation rollout, the framework logs a comprehensive diagnostic tuple for every
+candidate:
+d(p) =
+
+bJ(p),∆(p),ρ(p),NMI(p)
+
+,
+(10)
+which characterizes the candidate’s performance, payoff distribution, signal alignment, and behavioral coupling,
+respectively. While these diagnostics serve as high-dimensional descriptive feedback to guide the LLM proposer in
+subsequent generations, the final selection and promotion mechanism remains strictly exclusive to the sparse task
+return bJ(p). This decoupling ensures that while the search process is informed by complex coordination metrics, the
+optimization objective remains grounded in the true environment goal, preventing the emergence of reward-hacking or
+the optimization of unintended proxy behaviors.
+4
+Results
+In this section, we evaluate the effectiveness of our diagnostic-grounded reward search in discovering rewards that
+strengthen multi-agent coordination. We begin by introducing the benchmark layouts and the specific coordination
+challenges inherent in each. We then analyze the objective performance gains across successive generations, highlighting
+learning dynamics in environments characterized by significant interaction bottlenecks. Finally, we provide a detailed
+diagnostic analysis to clarify how the discovered shaping signals influence agent interdependence, incentive alignment,
+and payoff distribution.
+6
+Figure 3: Layouts used in the reported experiments: Cramped Room, Forced Coordination, Coordination Ring, and
+Asymmetric Advantages.
+4.1
+Layout Characteristics and Coordination Challenges
+Evaluation is performed on the Overcooked-AI cooperative cooking environment [17], where two agents (n = 2) must
+coordinate navigation, resource handling, and timed handoffs to deliver completed soups. The task reward is sparse and
+is provided only for valid deliveries.
+We select four layouts representing a diverse spectrum of dyadic coordination challenges (see Fig. 3): Cramped Room,
+Forced Coordination, Coordination Ring, and Asymmetric Advantages. Cramped Room is a compact shared workspace
+in which both agents repeatedly traverse narrow corridors and compete for space. Forced Coordination separates key
+resources, so progress depends on repeated handoffs and turn-taking at constrained interaction points. Coordination
+Ring requires synchronized navigation around a ring-like topology with limited passing, which makes deadlocks and
+mistimed detours costly under sparse feedback. Asymmetric Advantages introduces asymmetric access paths and
+staging locations, which induces complementary roles while still requiring compatible joint execution.
+4.2
+Objective Performance and Learning Dynamics
+The empirical success of the diagnostic-grounded search is demonstrated by the progression of the sparse task return J
+across two successive generations. As reported in Table 1, each search generation is conducted on top of a MAPPO
+baseline, where candidates are trained from scratch under a fixed computational budget and selected exclusively based
+on the sparse task objective.
+Across all evaluated layouts, we observe a consistent monotonic increase in both sparse returns and successful delivery
+counts in later generations. The most substantial gains are realized in Coordination Ring and Forced Coordination,
+where baseline performance is severely constrained by the difficulty of credit assignment under tight interaction
+bottlenecks. In these scenarios, the baseline agent frequently suffers from coordination failures such as deadlocks,
+mistimed passing, and handoff synchronization issues.
+The synthesized reward programs from later generations effectively bridge this exploration gap by providing dense
+auxiliary signals for intermediate progress. This acceleration in coordination discovery is clearly reflected in the results:
+for instance, in the Coordination Ring layout, the Gen 2 candidate achieves a nearly twelve-fold increase in successful
+deliveries compared to the baseline (7.65 vs. 0.15), while simultaneously reducing invalid deliveries from 11.30 to 0.85.
+In more straightforward layouts like Cramped Room and Asymmetric Advantages, where the baseline performance is
+naturally stronger, the framework still yields incremental yet statistically significant improvements within the same
+compute budget.
+Table 1: Final evaluation on four Overcooked layouts. J denotes sparse return (mean ± std across evaluation episodes).
+Deliveries and invalid deliveries are episode means.
+Layout
+J
+Deliveries
+Invalid Deliveries
+Baseline
+Gen 1
+Gen 2
+Baseline
+Gen 1
+Gen 2
+Baseline
+Gen 1
+Gen 2
+Cramped Room
+148±39
+180±25
+188±10
+7.40
+9.00
+9.40
+1.15
+0.25
+0.75
+Forced Coordination
+32±14
+55±26
+103±29
+1.60
+2.75
+5.15
+0.80
+1.25
+0.30
+Coordination Ring
+13±5
+102±28
+153±24
+0.15
+5.10
+7.65
+11.30
+3.50
+0.85
+Asymmetric Advantages
+231±38
+322±36
+381±25
+11.55
+16.10
+19.05
+6.15
+3.45
+1.55
+7
+(a) Cramped Room
+(b) Forced Coordination
+(c) Coordination Ring
+(d) Asymmetric Advantages
+Figure 4: Learning curves of evaluation sparse return J for the MAPPO baseline and the selected candidates from the
+first and second generations. Shaded regions indicate variability across evaluation episodes.
+Baseline
+Sparse return
+148
+±39
+C0
+Sparse return
+148
+±39
+C1
+Sparse return
+171
+±25
+C2
+Sparse return
+180
+±25
+C3
+Sparse return
+152
+±25
+C0
+Sparse return
+184
+±10
+C1
+Sparse return
+188
+±10
+C2
+Sparse return
+170
+±10
+C3
+Sparse return
+178
+±10
+Cramped Room
+Generation 1
+ (Top 4)
+Generation 0
+ (MAPPO Baseline)
+Generation 2
+ (Top 4)
+Baseline
+Sparse return
+32
+±14
+C0
+Sparse return
+39
+±26
+C1
+Sparse return
+55
+±26
+C2
+Sparse return
+28
+±26
+C3
+Sparse return
+47
+±26
+C0
+Sparse return
+103
+±29
+C1
+Sparse return
+92
+±29
+C2
+Sparse return
+64
+±29
+C3
+Sparse return
+78
+±29
+Forced Coordination
+Generation 1
+ (Top 4)
+Generation 0
+ (MAPPO Baseline)
+Generation 2
+ (Top 4)
+Baseline
+Sparse return
+231
+±38
+C0
+Sparse return
+304
+±36
+C1
+Sparse return
+287
+±36
+C2
+Sparse return
+322
+±36 
+C3
+Sparse return
+255
+±36
+C0
+Sparse return
+332
+±25
+C1
+Sparse return
+365
+±25
+C2
+Sparse return
+381
+±25
+C3
+Sparse return
+348
+±25
+Asymmetric Advantages
+Generation 1
+ (Top 4)
+Generation 0
+ (MAPPO Baseline)
+Generation 2
+ (Top 4)
+Baseline
+Sparse return
+13
+±5
+C0
+Sparse return
+88
+±28
+C1
+Sparse return
+71
+±28
+C2
+Sparse return
+43
+±28
+C3
+Sparse return
+102
+±28
+C0
+Sparse return
+110
+±24
+C1
+Sparse return
+142
+±24
+C2
+Sparse return
+153
+±24
+C3
+Sparse return
+126
+±24
+Coordination Ring
+Generation 1
+ (Top 4)
+Generation 0
+ (MAPPO Baseline)
+Generation 2
+ (Top 4)
+Figure 5: Candidate promotion diagram. Nodes summarize evaluated candidates and objective scores, and edges
+indicate the promotion path used to condition subsequent generations.
+The temporal evolution of agent performance, illustrated through the learning curves in fig. 4, reveals the critical role
+of synthesized rewards in accelerating coordination. In nearly all layouts, the MAPPO baseline (red) exhibits either
+8
+(a) Cramped Room: Increasing trends in Action Coupling (NMI)
+and Incentive Alignment (ρ) signify reduced collision rates in
+high-density areas.
+(b) Forced Coordination: A sharp decline in Payoff Imbalance
+(∆) alongside rising NMI indicates a shift from single-agent
+dominance to equitable workload distribution.
+(c) Coordination Ring: Steady growth in ρ and NMI demon-
+strates the emergence of synchronized circular motion and tem-
+poral waiting behaviors.
+(d) Asymmetric Advantages: The upward trajectory in NMI
+confirms the LLM’s ability to synthesize specialized reward
+structures for agents with distinct roles.
+Figure 6: Empirical Coordination Diagnostics across Overcooked-AI Layouts. The plots illustrate the iterative
+improvement from Baseline to Generation 2. Blue solid lines represent Action Coupling (NMI), while green dashed
+lines show Incentive Alignment (ρ) and the orange dotted line indicates Payoff Imbalance (∆).
+high variance or premature convergence to suboptimal policies. In contrast, candidates from Generation 1 (blue) and
+Generation 2 (green) consistently demonstrate higher sample efficiency and asymptotic performance. This trend is most
+prominent in the Coordination Ring (fig. 4c), where the baseline fails to achieve meaningful progress, while successive
+search generations progressively unlock higher-order cooperative behaviors, leading to a substantial vertical shift in the
+reward curves.
+To further elucidate the search process, fig. 5 provides a structural lineage of candidate promotion across generations.
+Each node represents an independent training run of a synthesized reward program, with edges indicating the genealogi-
+cal path used to condition subsequent LLM prompts. This hierarchical selection mechanism ensures that the search
+space is effectively pruned toward objective-aligned regions.
+The lineage diagrams highlight a robust compounding effect: for instance, in Forced Coordination, the jump from
+Baseline (32±14) to Gen 2 (103±29) is not merely a result of luck, but the outcome of a structured refinement process
+where successful shaping strategies from the first generation serve as a foundation for more complex incentives in the
+second. This iterative improvement confirms that the LLM-proposer can successfully interpret the diagnostic feedback
+d(p) from previous iterations to mitigate coordination bottlenecks, such as deadlocks and synchronization failures,
+which otherwise impede the baseline learner.
+9
+4.3
+Coordination Diagnostics and Shaping Signals
+The incentive diagnostics in Sect. 3.3 clarify the evolution of interaction patterns and shaping signals across generations.
+These quantities represent descriptive summaries from rollouts rather than claims of equilibrium properties. Notably,
+payoff imbalance and incentive alignment calculations focus on the candidate shaping component r(p)
+t,i instead of the
+shared sparse task reward. Consequently, these metrics capture the distribution of the auxiliary learning signal among
+agents. Figure 6 reports the mean diagnostic values for candidate pools that satisfy a minimum sparse-return criterion.
+Two primary trends emerge from these results.
+First, the action coupling, measured through NMI, increases across successive search generations in all layouts (Fig. 6a-
+d). This trend indicates that high-performance reward candidates facilitate more interdependent action selection. In
+the Overcooked environment, effective performance relies on precise coordinated timing and mutual adaptation. This
+requirement includes corridor yield maneuvers, the sequencing of interactions at shared stations, and the synchronization
+of travel paths. The observed increase in NMI remains consistent with the emergence of these strategic dependencies.
+Second, incentive alignment (ρ) increases in Cramped Room, Coordination Ring, and Asymmetric Advantages (Fig. 6a,
+c, d). This result indicates that the proposed shaping signals for both agents exhibit a higher positive correlation in later
+generations. In practice, this pattern aligns with shaping programs that reinforce intermediate progress toward shared
+subgoals. This alignment prevents the introduction of competing gradients that might destabilize coordination.
+A layout-specific pattern is evident in Forced Coordination (Fig. 6b). Because this layout depends on repeated handoffs,
+shaping that concentrates auxiliary return on a single agent can create asymmetric learning dynamics. In such cases,
+one agent receives strong gradients, while the other receives weak or noisy guidance. The payoff imbalance diagnostic
+(∆) decreases between generations in Forced Coordination, which indicates a more uniform distribution of shaping
+signals for the selected later-generation candidates. This behavior remains consistent with reward programs that provide
+guidance for both roles necessary for successful handoffs.
+5
+Conclusion
+An objective-grounded approach to autonomous reward program synthesis for cooperative MARL has been presented.
+In this framework, a large language model generates candidate shaping programs from environment instrumentation.
+These candidates remain constrained by a formal validity envelope and undergo evaluation under a fixed MAPPO
+learner. Selection across successive generations depends solely on the sparse task return; consequently, performance
+improvements are directly related to the intended objective, rather than to the auxiliary shaping signal itself.
+Across four Overcooked-AI layouts, later search generations exhibit higher sparse returns and increased delivery
+counts. The most pronounced gains appear in layouts dominated by interaction bottlenecks under sparse feedback.
+Diagnostic trends for the shaping component indicate increased action coupling and higher alignment of shaping signals
+in coordination-heavy tasks. Furthermore, a reduction in the shaping concentration on a single agent is evident in
+handoff-driven layouts. These results suggest that objective-grounded reward program search can mitigate the burden
+of manual reward engineering while it yields shaping signals compatible with stable cooperative learning under finite
+training budgets.
+References
+[1] Michael L. Littman. Markov games as a framework for multi-agent reinforcement learning. In Proceedings of the
+Eleventh International Conference on Machine Learning (ICML), pages 157–163. Morgan Kaufmann, 1994.
+[2] Andrew Y. Ng, Daishi Harada, and Stuart J. Russell. Policy invariance under reward transformations: Theory and
+application to reward shaping. In Proceedings of the Sixteenth International Conference on Machine Learning
+(ICML), pages 278–287. Morgan Kaufmann, 1999.
+[3] Anna Harutyunyan, Sam Devlin, Peter Vrancx, and Ann Nowé. Expressing arbitrary reward functions as potential-
+based advice. In Proceedings of the Twenty-Ninth AAAI Conference on Artificial Intelligence (AAAI), pages
+2652–2658, 2015.
+[4] Sam Devlin, Logan Yliniemi, Daniel Kudenko, and Kagan Tumer. Potential-based difference rewards for
+multiagent reinforcement learning. In Proceedings of the 13th International Conference on Autonomous Agents
+and Multiagent Systems (AAMAS), pages 165–172, 2014.
+[5] Sam Devlin, Marek Grze´s, and Daniel Kudenko. An empirical study of potential-based reward shaping and advice
+in complex, multi-agent systems. Advances in Complex Systems, 14(2):251–278, 2011.
+10
+[6] Dylan Hadfield-Menell, Smitha Milli, Pieter Abbeel, Stuart Russell, and Anca Dragan. Inverse reward design. In
+Advances in Neural Information Processing Systems (NeurIPS), 2017.
+[7] Andrew Y. Ng and Stuart J. Russell. Algorithms for inverse reinforcement learning. In Proceedings of the
+Seventeenth International Conference on Machine Learning (ICML), pages 663–670. Morgan Kaufmann, 2000.
+[8] Brian D. Ziebart, Andrew Maas, J. Andrew Bagnell, and Anind K. Dey. Maximum entropy inverse reinforcement
+learning. In Proceedings of the Twenty-Third AAAI Conference on Artificial Intelligence (AAAI), pages 1433–1438,
+2008.
+[9] Paul F. Christiano, Jan Leike, Tom B. Brown, Miljan Martic, Shane Legg, and Dario Amodei. Deep reinforcement
+learning from human preferences. In Advances in Neural Information Processing Systems (NeurIPS), 2017.
+[10] Yujing Hu, Wenxuan Wang, Jiahang Tian, Yixiang Wu, Yingfeng Chen, Jianye Hao, Feng Wu, and Changjie Fan.
+Learning to utilize shaping rewards: A new approach of reward shaping. In Advances in Neural Information
+Processing Systems (NeurIPS), 2020.
+[11] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Łukasz Kaiser, and
+Illia Polosukhin. Attention is all you need. In Advances in Neural Information Processing Systems (NeurIPS),
+2017.
+[12] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind
+Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan,
+Rewon Child, Aditya Ramesh, Daniel Ziegler, Jeffrey Wu, Clemens Winter, Christopher Hesse, Mark Chen, Eric
+Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec
+Radford, Ilya Sutskever, and Dario Amodei. Language models are few-shot learners. In Advances in Neural
+Information Processing Systems (NeurIPS), 2020.
+[13] Yujia Li, David Choi, Junyoung Chung, et al. Competition-level code generation with AlphaCode. Science,
+378(6624):1092–1097, 2022.
+[14] Yecheng Jason Ma, William Liang, Guanzhi Wang, De-An Huang, Osbert Bastani, Dinesh Jayaraman, Yuke Zhu,
+Linxi Fan, and Anima Anandkumar. EUREKA: Human-level reward design via coding large language models. In
+International Conference on Learning Representations (ICLR), 2024.
+[15] Tianbao Xie, Siheng Zhao, Chen Henry Wu, Yitao Liu, Qian Luo, Victor Zhong, Yanchao Yang, and Tao Yu.
+Text2reward: Reward shaping with language models for reinforcement learning. In International Conference on
+Learning Representations (ICLR), 2024.
+[16] Dhawal Gupta, Yash Chandak, Scott M. Jordan, Philip S. Thomas, and Bruno Castro da Silva. Behavior alignment
+via reward function optimization. In Advances in Neural Information Processing Systems (NeurIPS), 2023.
+[17] Micah Carroll, Rohin Shah, Mark K. Ho, Tom Griffiths, Sanjit A. Seshia, Pieter Abbeel, and Anca D. Dragan. On
+the utility of learning about humans for human-ai coordination. In Advances in Neural Information Processing
+Systems (NeurIPS), pages 5175–5186, 2019.
+11

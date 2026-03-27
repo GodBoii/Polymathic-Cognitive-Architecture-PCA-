@@ -1,0 +1,1433 @@
+AscendOptimizer: Episodic Agent for Ascend NPU
+Operator Optimization
+Jiehao Wu1,∗, Zixiao Huang1,∗, Wenhao Li2, Chuyun Shen3, Junjie Sheng1,†, and Xiangfeng
+Wang4,5,6,†
+1School of Computer Science and Technology, East China Normal University
+2School of Computer Science and Technology, Tongji University
+3Shanghai University of International Business and Economics
+4Key Lab of Mathematics and Engineering Applications (MoE), East China Normal University
+5School of Mathematical Sciences, East China Normal University
+6Shenzhen Loop Area Institute (SLAI)
+Project Website: https://github.com/KernelHive
+Abstract
+AscendC (Ascend C) operator optimization on Huawei Ascend neural processing units (NPUs) faces a
+two-fold knowledge bottleneck: unlike the CUDA ecosystem, there are few public reference implementations to
+learn from, and performance hinges on a coupled two-part artifact—a host-side tiling program that orchestrates
+data movement and a kernel program that schedules and pipelines instructions. We present AscendOptimizer,
+an episodic agent that bootstraps this missing expertise by turning execution into experience. On the host side,
+AscendOptimizer performs profiling-in-the-loop evolutionary search to discover valid and high-performing tiling
+and data-movement configurations directly from hardware feedback. On the kernel side, it mines transferable
+optimization motifs by rewinding optimized kernels—systematically de-optimizing them to synthesize instructive
+“bad-to-good” trajectories—and distills these motifs into a retrievable experience bank for guided rewriting. By
+alternating host tuning and kernel rewriting in a closed loop, AscendOptimizer steadily expands feasibility
+and pushes latency down. On a benchmark of 127 real AscendC operators, AscendOptimizer achieves a 1.19×
+geometric-mean speedup over the open-source baseline, with 49.61 % of operators outperforming their references,
+outperforming strong agent and search baselines.
+1
+Introduction
+As the parameter scale of large language models (LLMs) advances towards the trillion level, the supply of
+computational resources has become a core factor constraining the development of artificial intelligence. In
+this context, operators, as the atomic execution units of computation graphs, directly determine the training
+throughput and online inference response latency of models [8]. Although hardware vendors continuously push the
+theoretical peak performance of chips, unoptimized operators often fail to exploit the full potential of the hardware
+due to memory bandwidth walls and complex instruction pipeline constraints. The practical bottleneck is that
+high performance typically requires scarce, hardware-specific expertise, while naive automatic approaches often
+suffer from low compilation success rates and noisy profiling feedback. Therefore, enabling efficient development
+and aggressive optimization of operators has become a critical bridge connecting algorithmic innovation with
+underlying hardware performance.
+To lower the barrier of writing high-performance operators, the NVIDIA GPU ecosystem has established
+a relatively mature automated optimization toolchain. The technical roadmap has evolved rapidly, from early
+∗Equal contribution.
+†Corresponding author.
+1
+arXiv:2603.23566v1  [cs.LG]  24 Mar 2026
+search-based auto-tuning tools—such as TVM [7] and Ansor [37]—to the recent rise of LLM-driven generative
+optimization. Agent frameworks such as Astra [29] and PRAGMA [11] leverage LLM code reasoning together with
+compiler feedback or profiling signals, and have demonstrated expert-level performance for CUDA or Triton [13]
+kernel generation. A key driver behind these successes is the abundance of open-source GPU code, which provides
+rich implicit optimization patterns for model pretraining.
+However, transferring this automation to domain-specific accelerators (DSAs) remains challenging.
+We
+specifically target the Huawei Ascend NPU, which serves as a critical alternative computational substrate in
+scenarios where GPU access is constrained. Beyond industrial relevance, Ascend represents a distinct class of
+architectures that use the Da Vinci architecture (Ascend’s AI Core microarchitecture) with an explicitly managed
+memory hierarchy. Unlike GPUs with implicit caches, AscendC mandates that developers explicitly orchestrate
+data movement and synchronization within the on-chip Unified Buffer (UB) [39]. This architectural paradigm
+shift, combined with a lack of open-source references, makes it difficult for general-purpose LLMs to transfer
+CUDA-based generation/optimization priors to Ascend.
+Concretely, an AscendC operator is not a monolithic kernel: it is a two-part artifact composed of a host-side
+tiling program (deciding how data are partitioned and moved) and a device-side kernel program (deciding how
+computation is scheduled and pipelined). This split is precisely why porting a kernel is insufficient: performance is
+co-determined by where data move and how instructions flow.
+Recent benchmarking results from MultiKernelBench [30] quantitatively reveal a severe generalization
+gap mentioned above. Table 1 shows even for SOTA models, the one-shot generation pass rate (Pass@1) for
+CUDA operators reaches 44.2 % to 52.6 %, while the pass rate for AscendC operators drops to below 2.1 %. This
+two-orders-of-magnitude gap is not merely a matter of syntax, but is rooted in knowledge scarcity: due to
+the lack of high-quality training corpora that encode explicit tiling constraints and pipeline orchestration, LLMs
+frequently generate code that overflows buffers or calls non-existent APIs. Without expert guidance, existing agent
+frameworks struggle to achieve effective code generation and optimization on Ascend.
+Table 1: One-shot operator generation pass rate (Pass@1) across hardware platforms, reported by MultiKernel-
+Bench [30]. The results confirm severe knowledge scarcity on Ascend.
+Model
+CUDA (Pass@1)
+AscendC (Pass@1)
+DeepSeek-R1
+52.6 %
+1.4 %
+Claude-Sonnet-4
+47.0 %
+2.1 %
+Qwen3-235B (think)
+44.2 %
+0.7 %
+To tackle the above knowledge scarcity, we build on a key insight: when external data are insufficient,
+we can bootstrap experience internally by exploiting the structured nature of code. Crucially, in
+AscendC the performance object is already factorized into two coupled components—the host tiling program and
+the device kernel program—and each component exposes a different “handle” for self-supervision. On the one
+hand, the tiling space is notoriously discontinuous: small changes in tile sizes or data-movement schedules can
+flip a configuration from “fast” to “fails-to-compile.” Yet this brittleness is also a blessing: hardware execution
+feedback provides an objective ground truth, allowing us to evolve valid high-performance configurations directly
+from on-device measurements. On the other hand, kernel-level optimizations (e.g., pipelining, vectorization, and
+latency hiding) are highly structured and compositional. Even though we lack paired “bad-to-good” training data,
+we can reliably create them by deliberately rewinding optimizations—turning “good” code into “bad” code on
+purpose. This optimization rewind process is conceptually related to prior “rewind”-style self-supervision (e.g.,
+ReWiND [34]), but we apply it to kernel optimization motifs and distill the resulting trajectories into a retrievable
+pattern library for RAG-based rewriting under hardware feedback.
+Based on this insight, we propose AscendOptimizer, a two-stage operator optimization framework designed
+for knowledge-scarce settings and targeting expert-free performance bootstrapping. While it is convenient to
+name the stages separately, AscendOptimizer is better viewed as a block coordinate descent procedure over a
+single joint objective: it alternates between optimizing tiling T with the kernel fixed, and optimizing the kernel K
+with the tiling fixed, so improvements in one block reshape the feasible and high-performing region of the other.
+Stage I performs evolution-guided program search over tiling decisions: using hardware-in-the-loop feedback
+as a boundary detector, it rapidly converges to high-quality tiling strategies within the implicit feasible region.
+Stage II performs optimization-rewind based experience bootstrapping for kernel code: by deliberately
+rewinding (i.e., removing) optimizations in a small set of seed implementations, we construct an optimization
+pattern library. This library is not merely an offline artifact: during online optimization, AscendOptimizer (i)
+2
+Table 2: Comparison of key capability dimensions. AscendOptimizer achieves coverage across all three dimensions,
+highlighting its unique advantages in addressing the scarcity of knowledge and data for Ascend NPUs. Here,
+Optimizes Existing Impl. indicates that the method takes an existing (e.g., vendor-provided or open-source)
+operator implementation as input and improves it, rather than generating a kernel entirely from scratch; Automatic
+Optimization indicates no need for manually written hardware-specific optimization rules; Training-free indicates
+no need for additional training or fine-tuning of large models.
+Method/Work
+Optimizes Existing Impl.
+Automatic Optimization
+Training-free
+ASPLOS’25 [39]
+✓
+✗
+✓
+Hermes [40]
+✓
+✗
+✓
+AscendKernelGen [6]
+✗
+✓
+✗
+AscendOptimizer (Ours)
+✓
+✓
+✓
+diagnoses bottlenecks from compilation/profiling signals, (ii) retrieves the most relevant patterns, and (iii) applies
+them as structured rewrites to produce a new kernel candidate, which is then re-evaluated under the current tiling
+configuration—closing the loop between “what we learned” and “what actually runs fast.”
+The main contributions are threefolds: 1) We introduce AscendOptimizer, an episodic agent framework
+that treats an AscendC operator as a coupled host-tiling and device-kernel optimization problem, and alternates
+between the two to reliably navigate feasibility constraints while continuously improving end-to-end latency. 2)
+We propose optimization rewind as a practical mechanism to bootstrap kernel-optimization experience under
+data scarcity: by systematically de-optimizing strong seed kernels, we synthesize “bad-to-good” trajectories and
+distill them into a retrievable pattern library that can be applied as structured rewrites during online optimization.
+3) We curate a standardized benchmark of 127 real AscendC operators and demonstrate that AscendOptimizer
+delivers consistent gains over the open-source baseline.
+2
+Related Work
+Traditional Operator Compilation and Domain-Specific Architecture Optimization. High-performance
+operator development has long relied on complex compiler infrastructure and expert-level manual tuning. Systems
+such as TVM [7], Halide [21], Triton [26], and TileLang [28] have lowered the barrier to operator development
+by constructing Domain-Specific Languages (DSLs) and Intermediate Representations (IRs) [14]. Polyhedral
+compilation techniques, including Pluto [5], Tiramisu [3], and the early AKG [36], utilize mathematical models
+to automate loop transformations, while works like Ansor [37], Tenset [38], and Mirage [32] introduce search
+algorithms and cost models to explore a broader optimization space [33, 41]. However, the SOTA operators such
+as FlashAttention [8, 23] demonstrates that general compilation abstractions often fall short of deeply customized
+manual logic when pursuing extreme performance. This contradiction is particularly acute on DSAs (e.g., Ascend
+NPU): complex memory hierarchies and non-standard instruction sets make it difficult for traditional compilers to
+balance development efficiency and performance without specific hardware expert knowledge [39, 1].
+LLM Agent-based Operator Generation and Iterative Optimization. The code generation capabilities of
+Large Language Models (LLMs) have catalyzed a new paradigm of ”Generation as Optimization.” KernelBench [20]
+and TritonBench [13] have verified the foundational capabilities of LLMs in generating CUDA/Triton operators. To
+address correctness issues and performance bottlenecks in generated code, Multi-Agent collaboration and feedback
+loops have become mainstream research directions: Astra [29] pioneered a multi-agent system based on Dual-Flow
+feedback, utilizing compilation feedback for iterative code refinement; Stark [9] and PRAGMA [11] improved
+optimization limits through multi-role collaboration mechanisms and profiling-driven inference, respectively;
+CudaForge [35], KernelEvolve [18], and Geak [27] introduced Hardware-in-the-loop feedback, using runtime
+metrics to guide agents in correcting logic; EvoEngineer [10] combined evolutionary algorithms to explore
+gradient-free optimization paths, while TritonForge [12] and GPU Kernel Scientist [2] further strengthened
+optimization capabilities for specific IRs. StitchCUDA [16] presents a rubric-based multi-agent end-to-end GPU
+programming framework, highlighting automated coordination across kernels, host code, and profiling feedback,
+which complements these prior GPU-oriented approaches. Although they perform excellently in the NVIDIA GPU
+ecosystem, their migration to DSAs faces severe obstacles: due to the closed nature of underlying architectural
+knowledge (Knowledge Gap) and the extreme scarcity of aligned training corpora, direct migration often results in
+significantly limited code compilation rates and performance [30, 6].
+Internalized Optimization based on Model Training and RL. Distinct from the inference-time closed loops
+3
+of Agents, another category of methods focuses on internalizing optimization experience into model parameters
+via Reinforcement Learning (RL) or Supervised Fine-Tuning (SFT). Kevin [4], TritonRL [31], and AutoTriton [15]
+employ multi-round RL to train models for generating efficient kernels; the CUDA-L1/L2 [17, 25] series and Seed-
+Coder [22] utilize large-scale sampling and contrastive learning to enable models to generate matrix multiplication
+operators that surpass closed-source libraries. While these methods are effective, they rely heavily on high model
+training costs and massive domain-specific ”code-performance” data pairs. This data dependency constitutes
+an insurmountable barrier in immature hardware ecosystems [30], which is the core motivation for this paper’s
+exploration of a Training-free paradigm.
+Comparison with Contemporary Ascend Operator Optimization Work. We also survey two types
+of contemporary work directly targeting the Ascend architecture. The first category is optimization based on
+system-level performance engineering: ASPLOS’25 [39] and NeutronAscend [1] analyze performance bottlenecks
+at the micro-architecture level, relying on expert experience to guide tuning; Hermes [40] from USENIX ATC’25
+constructs an industrial-grade ”Profiling-Analysis-Suggestion” system, yet its essence remains expert-led diagnostic
+optimization [19]. The second category is LLM-driven NPU code generation: AscendKernelGen [6] established a
+generation-evaluation closed loop for Ascend to improve code compilability; MultiKernelBench [30] provided a
+cross-platform generation benchmark, revealing the data scarcity and generalization challenges on NPU targets.
+Unlike the aforementioned trajectories, AscendOptimizer aims to solve the problem of ”knowledge scarcity in
+AscendC development”: premised on optimizing existing operator, it adopts an Expert-free and Training-free
+end-to-end optimization, simultaneously achieving full-stack optimization covering host-side tiling configurations
+and kernel-side code logic. By circumventing high model training and data construction costs, AscendOptimizer
+attributes performance gains to the automated completion and reuse of scarce domain knowledge (comparison in
+Table 2).
+3
+The AscendOptimizer Agent
+Stage I: Evolutionary-Guided Program Search ()
+Stage Ⅱ: Optimization-Rewind based Experience Bootstrapping ()
+Original
+Operator
+Base Tiling 
+Function 
+ɳbase
+ 
+Evolvable Template Synthesis
+Attributes ϕ
+Evolutionary 
+Cycle
+Population
+Offspring 
+{ɳϯ+1} 
+Evaluation
+Optimized 
+Tiling  ɳ∗
+μ
+퐏퐫퐨͹ͼ΀풎풖μΫμί
+LLM
+LLM
+Offline Experience Construction
+Trajectory 
+ͨ =  ɭ 0  … ɭ ϖ  
+Multi-Step 
+Degradation
+LLM
+Experience Extraction
+(ɭ μ , ɭ μ+Έ )
+ℳ= ⟨ϖ푖ϯϧϡ,  퐷ϡϮϟ, 푩풐μμ풍ίζίέγ, 퐷푖ϢϢ⟩
+LLM
+Expert 
+Code
+Experience 
+Base
+Online Iterative Refinement
+Initial 
+Kernel 
+ɭ0
+Current 
+Kernel 
+ɭr
+Bottleneck 
+Diagnosis
+Experience 
+Retrieval
+Next Kernel 
+ɭr+1
+Refiner 
+(ɭr, ℳ)
+{ℳ}
+Top-k
+Entries
+Bottleneck 
+Description
+LLM
+Optimized 
+Kernel ɭ∗
+Alternating
+optimization
+arg min
+ϖ,ύ  ℒ 퐸푥ϡϟ(ϖ, ύ, ϕ) ϊ 
+Fix K,
+Optimize T
+(Stage I)
+Fix T,
+Optimize K
+(Stage II)
+Optimal  Τ∗,   Λ∗
+AscendOptimizer
+Figure 1: Overview of AscendOptimizer. Stage I performs evolutionary-guided program search with hardware-
+in-the-loop profiling feedback to discover valid high-performance configurations; Stage II bootstraps optimization
+experience via optimization rewind and applies retrieval-augmented kernel optimization to address structural
+bottlenecks. The two stages are executed in an alternating loop, where improvements from one stage feed into the
+other for progressive end-to-end optimization.
+We first formalize the optimization of Ascend C operators as a dual search problem under heterogeneous
+computational constraints. Subsequently, we introduce the AscendOptimizer agent framework . Addressing the
+challenge of scarce expert experience in operator optimization, we design two complementary solving mechanisms
+tailored to the search space characteristics of the optimization targets: (1) for Tiling parameters, which exhibit
+strong implicit constraints and a highly discontinuous, fragmented solution landscape, we employ Evolutionary-
+Guided Program Search; (2) for Kernel code, which possesses high logical degrees of freedom and transferable
+4
+optimization patterns, we utilize Optimization-Rewind based Experience Bootstrapping.
+3.1
+Problem Setup
+In the Ascend NPU heterogeneous computing architecture, we formalize the operator task to be optimized as a
+tuple O = ⟨T , K, S⟩, where:
+• T ∈Ctiling: The tiling function running on the host side.
+It calculates data block sizes and movement
+instructions, directly determining the utilization of the on-chip UB and the saturation of the data movement
+pipeline.
+• K ∈Ckernel: The Kernel Code running on the AI Core. It governs instruction-level parallelism (ILP), vector
+unit utilization, and synchronization overhead.
+• S: The set of static operator attributes (e.g., Input Shape, Data Type, Layout).
+Given a set of hardware constraints H (e.g., buffer capacity, pipeline stages), our objective is to identify the
+optimal Tiling function T ∗and Kernel implementation K∗that minimize the end-to-end execution latency on real
+hardware:
+(T ∗, K∗) = arg min
+T ,K
+L (Exec(T , K, S) | H) .
+(1)
+Here, Exec(·) denotes hardware compilation and execution, and L denotes the measured latency. For brevity,
+when H and S are fixed, we write L(K | Tcurr) as shorthand for L(Exec(Tcurr, K, S) | H) and omit Exec(·) and
+H. In Stage II, Tcurr is fixed only within one inner refinement loop; across outer alternating rounds, Stage I can
+update Tcurr. Since H contains numerous non-differentiable black-box constraints (e.g., bank conflicts, cache
+thrashing), and the code space Ctiling × Ckernel is highly discrete and non-convex, this problem is intractable via
+direct gradient descent.
+3.2
+Overview
+AscendOptimizer optimizes the host-side tiling function T and the device-side kernel code K in two stages. While
+both problems lack reliable expert guidance, their search spaces have very different structures; accordingly, we
+adopt two complementary strategies:
+Stage I: Evolutionary-Guided Program Search.
+Tiling decisions are highly sensitive to Shape and Layout,
+exhibiting a discontinuous and fragmented landscape that is difficult to abstract into a general rule library.
+Consequently, we model Tiling optimization as a program search problem, leveraging LLMs to perform evolutionary
+search within the function space, implicitly learning hardware constraints via Hardware-in-the-Loop (HIL) feedback.
+Stage II: Optimization-Rewind based Experience Bootstrapping.
+Unlike Tiling, Kernel computation
+pipelines (e.g., Double Buffering, Vectorization) possess strong structural characteristics and transferability, yet
+the forward search space is vast. We construct a structured optimization pattern library via ”Optimization
+Rewind” (deliberate de-optimization), transforming infinite code search into finite expert experience retrieval and
+application; in online optimization, each candidate kernel is still compiled and executed on real NPUs to obtain
+measured feedback for selection.
+3.3
+Stage I: Evolutionary-Guided Program Search
+We elevate Tiling optimization to a constrained Program Search process. Distinct from the explicit experience
+retrieval in Stage II, this stage adopts an implicit exploration strategy. Since general Tiling rules cannot be
+predefined, we utilize hardware execution feedback as a “boundary detector”. A zero-tolerance mechanism eliminates
+infeasible solutions, forcing the evolutionary algorithm to converge automatically to optimal configurations within
+the implicit feasible region of the hardware.
+Traditional compiler autotuning usually assumes a relatively smooth parameter landscape. In contrast, our
+LLM-driven mutation leverages semantic priors to guide code-level exploration and bias candidates toward
+hardware-feasible regions. Unlike template-bound numerical tuning, it also supports lightweight structural rewrites
+(e.g., dynamic boundary handling), helping the search escape discontinuous regions where conventional methods
+often stagnate.
+5
+• Evolvable Template Synthesis. First, the LLM analyzes the original operator code and attributes S to
+identify key logic blocks controlling data partitioning and movement. The system automatically synthesizes
+a base tiling function Tbase containing “evolution markers” (see Appendix B.2, Fig. 6). This process goes
+beyond parameter extraction by functionalizing loop structures and conditional branches, thereby defining
+the initial search space for evolution.
+• LLM-based Function Mutation. We treat each Tiling function as an individual I = T and employ the
+LLM as an intelligent mutation operator MLLM. In generation t, the LLM generates offspring based on the
+code structure of the parent individual and historical performance feedback:
+Tt+1 ∼MLLM(Tt, Promptmutate).
+(2)
+Mutation operations cover two dimensions: (1) Parameter Fine-tuning, such as adjusting “BlockDim”; and
+(2) Logic Rewriting, such as altering the computation logic of “TilingKey” or memory alignment strategies.
+This mechanism allows to break through fixed template limitations and explore structural optimization
+opportunities.
+• Rigorous Hardware-in-the-Loop Evaluation. To address the difficulty of explicitly formalizing Tiling
+experience, we directly use NPU execution feedback as the fitness function. We adopt a zero-tolerance
+strategy to filter invalid individuals:
+f(T ) =
+
+
+
+
+
+
+
+1
+L(Exec(T , Kbase, S) | H),
+Success,
+Discard,
+CompileFail or PrecisionError.
+(3)
+Any T resulting in compilation failure or precision anomalies is immediately removed from the population.
+This strong constraint mechanism ensures the evolutionary process rapidly filters out invalid search paths,
+focusing on high-performance regions that satisfy implicit hardware constraints (e.g., address alignment,
+buffer limits).
+3.4
+Stage II: Optimization-Rewind based Experience Bootstrapping
+While Stage I identifies the optimal parameters for a fixed code structure, it cannot overcome fundamental
+architectural bottlenecks (e.g., pipeline stalls or missing double-buffering). To address the chronic scarcity of
+expert-level data in the Ascend ecosystem, we propose Optimization-Rewind, a self-supervised mechanism that
+transforms a small set of high-performance seed kernels into a retrievable experience bank.
+3.4.1
+Inverse Experience Distillation via Rewind
+Instead of searching for optimizations in a vacuum, we perform a systematic reverse-engineering on a seed set of
+expert-level kernels Kexpert.
+1. Stepwise De-optimization (Rewind): Starting from Kexpert, an LLM acts as an “inverse agent” that
+identifies and systematically removes specific optimization motifs—such as unrolling loops, breaking pipeline
+masking, or reverting vectorized intrinsics to scalar implementations. This generates a trajectory of decreasing
+performance: T = (K(0), K(1), . . . , K(T )), where K(0) = Kexpert.
+2. Hardware-Grounded Validation: Each variant is executed on the NPU. We only retain pairs (K(t+1), K(t))
+where the observed latency L(K(t+1)) significantly exceeds L(K(t)). This ensures that each rewound feature is
+a verified performance driver under real hardware constraints.
+3. Semantic Distillation: For each validated pair, the LLM analyzes the code diff alongside hardware profiling
+signals to distill a structured Optimization Tuple M:
+M = ⟨Title, Description, Bottleneck, Code Diff⟩.
+(4)
+Here, Bottleneck is used as the primary retrieval key (via embedding), while Description and Code Diff provide
+the actionable context for rewriting. This converts raw code deltas into semantic expertise (e.g., identifying that
+a specific synchronization removal caused an MTE2 pipeline stall), forming a retrievable Experience Bank.
+6
+Algorithm 1 AscendOptimizer
+Require: Initial tiling program T (0), initial kernel K(0);
+Require: Evaluation function L(·), outer rounds R, Stage I steps U, Stage II steps S;
+Output: Best pair (T †, K†);
+1: (T †, K†) ←(T (0), K(0));
+2: ℓ† ←L(T †, K†);
+3: for r = 1 to R do
+4:
+Inherit current best: (T (r,0), K(r,0)) ←(T †, K†)
+5:
+(Stage I) Optimize T with K† fixed:
+6:
+T (r)
+best ←T (r,0), ℓ(r)
+T,best ←L(T (r)
+best, K†)
+7:
+for u = 1 to U do
+8:
+˜T ←TilingSearchStep(T (r)
+best, K†);
+9:
+if ˜T compiles and passes correctness then
+10:
+˜ℓT ←L( ˜T , K†);
+11:
+if ˜ℓT < ℓ(r)
+T,best then
+12:
+T (r)
+best ←˜T , ℓ(r)
+T,best ←˜ℓT ;
+13:
+end if
+14:
+end if
+15:
+end for
+16:
+(Stage II) Optimize K with inherited T (r)
+best fixed:
+17:
+K(r)
+best ←K†, ℓ(r)
+K,best ←L(T (r)
+best, K(r)
+best);
+18:
+for s = 1 to S do
+19:
+˜K ←KernelRefine(T (r)
+best, K(r)
+best);
+20:
+if ˜K compiles and passes correctness then
+21:
+˜ℓK ←L(T (r)
+best, ˜K);
+22:
+if ˜ℓK < ℓ(r)
+K,best then
+23:
+K(r)
+best ←˜K, ℓ(r)
+K,best ←˜ℓK;
+24:
+end if
+25:
+end if
+26:
+end for
+27:
+Round inheritance: (T †, K†) ←(T (r)
+best, K(r)
+best);
+28:
+ℓ† ←ℓ(r)
+K,best;
+29: end for
+30: return (T †, K†).
+3.4.2
+Retrieval-Augmented Kernel Refinement
+During the online optimization of a target operator, the agent treats refinement as an episodic retrieval-and-apply
+task:
+• Bottleneck Diagnosis: The agent analyzes the target kernel Kcurr and its profiling traces to formulate a
+diagnostic query q.
+• Experience Retrieval: A dense retriever fetches the Top-k tuples {Mi}k
+i=1 from the Experience Bank whose
+symptoms best match the current bottleneck.
+• Knowledge-Guided Rewriting: A Refiner LLM applies the retrieved expert patterns to rewrite Kcurr. Each
+rewritten candidate is then compiled and evaluated on real hardware; only variants that pass compilation and
+improve measured latency are retained for the next iteration.
+3.5
+Alternating Optimization of Tiling and Kernel
+Tiling and kernel optimizations often target different hardware constraints (e.g., data layout and on-chip resource
+limits), so applying them simultaneously can create conflicting behaviors. To prevent local gains from introducing
+new bottlenecks, we adopt an alternating strategy with explicit time scales: in each Stage II inner loop, T is
+fixed while K is refined; after that inner loop, Stage I resumes and may update T for the next outer round. This
+iterative handoff keeps updates feasible and makes the two optimizers synergistic within the execution environment
+(see Algorithm 1).
+7
+4
+Experiments
+We construct our benchmark using the Huawei official AscendC repository, cann-ops1, adopting its implementations
+as performance baselines. The preparation process involves verifying compilability and numerical correctness
+against a CPU reference, followed by removing operators that fail to execute or meet accuracy standards. This
+filtering process results in a final evaluation set of 127 operators.
+4.1
+Hardware and Metrics
+Hardware and Software Stack.
+Experiments are performed on Huawei Ascend 910B4 NPUs using the CANN
+8.3 software stack. To ensure reproducibility, we maintain a unified configuration across all operators, including
+identical toolchains, stream settings, and synchronization mechanisms.
+Correctness.
+Numerical accuracy is verified by comparing NPU outputs with CPU references through an
+elementwise tolerance check. We apply both absolute and relative tolerances, which are adjusted based on the
+specific operator and data type. An operator is marked as correct if the proportion of elements exceeding these
+thresholds remains below a predefined limit. This protocol follows the standard tolerance policies provided in
+official CANN examples.
+Performance.
+We report latency and relative speedup over the cann-ops baseline:
+speedup(op) = Tbaseline(op)
+Tgen(op)
+.
+(5)
+Each operator is warmed up before measurement and timed for multiple repetitions. We additionally report fastp,
+the fraction of operators with speedup greater than p:
+fastp = |{op | speedup(op) > p}|
+|O|
+.
+(6)
+Benchmark construction and filtering.
+We start from the cann-ops AscendC operator repository and
+use the provided implementations as our baseline. During preparation, we (i) verify compilability, (ii) check
+numerical correctness against a CPU reference, and (iii) remove operators that fail compilation/execution or
+violate correctness.
+Input-shape adjustment (noise reduction).
+Because hardware-level timing can be noisy for small workloads,
+we moderately increase the input shapes for a subset of operators to improve runtime stability and make performance
+differences more observable. To minimize threats to validity, we follow three safeguards: (i) we only apply shape
+changes that preserve operator semantics (e.g., scaling batch/sequence/spatial dimensions without changing the
+computation type); (ii) for each affected operator, we evaluate both the baseline and all optimized variants under
+the same adjusted shape (so reported speedups remain comparable); and (iii) we keep the scaling factor small and
+report the original and adjusted shapes in this appendix.
+Clarification on Evaluation Paradigm and Data Overlap.
+It is important to note that the seed kernels
+used to construct the offline experience bank in Stage II are derived from the same set of 127 benchmark operators.
+Unlike standard predictive machine learning tasks where overlapping train and test sets cause data leakage and
+undermine zero-shot generalization, AscendOptimizer follows the classical system auto-tuning paradigm. Our
+framework operates as a training-free episodic agent that uses Retrieval-Augmented Generation (RAG); no model
+weights are updated. The objective is transductive: to discover the absolute lowest latency for a given target
+workload on specific hardware. Therefore, ”overfitting” the optimization strategies to the target operators and the
+Ascend architecture is the explicit goal of the system, rather than a methodological flaw.
+1https://gitee.com/ascend/cann-ops
+8
+4.2
+Main Results
+We adopt a heterogeneous model deployment strategy to balance high-level code reasoning with iterative inference
+efficiency. For structural initialization and offline tasks—specifically, Evolvable Template Synthesis in Stage I and
+Self-Supervised Experience Construction in Stage II—we utilize GPT-5.2. Conversely, for the dynamic online
+optimization loops, we employ DeepSeek-V3.2 to drive both the LLM-based Function Mutation in Stage I and the
+Iterative Retrieval and Refinement in Stage II. Consequently, the Stage II evaluation relies on an experience bank
+built during the offline rewind phase by GPT-5.2, which contains 412 distinct optimization tuples.
+Table 3 reports level-wise results with explicit sample counts (level1/level2/level3 contain 43/77/7 oper-
+ators, respectively).
+For each level, we report the geometric-mean speedup (GM) and the fastx ratios for
+x ∈{1.0, 1.2, 1.4, 2.0}, where higher is better. Across all three levels, increasing pure sampling from BoN@5 to
+BoN@40 yields only modest gains. OpenEvolve [24] generally outperforms BoN, supporting the benefit of iterative
+refinement over one-shot sampling. AscendOptimizer achieves the best overall results, with GM values of
+1.08/1.21/1.81 on level1/level2/level3 and fast1.0 ratios of 46.51 %/49.35 %/71.43 %. On level3, fast1.2, fast1.4, and
+fast2.0 reach 28.57 %; compared with OpenEvolve, this corresponds to ties on fast1.2 and fast1.4 and a clear lead
+on fast2.0.
+Table 3: Main performance. GM denotes the geometric-mean speedup relative to the reference implementation
+(higher is better). fastp denotes the fraction of test cases that achieve at least an x× speedup. BoN@N samples N
+complete kernels and selects the fastest candidate according to measured runtime. For the BoN and OpenEvolve
+baselines, we expose the complete operator implementation (host and kernel code) to the optimizer. All methods
+are given the same compilation/profiling interface and the same optimization budget (40 iterations and DeepSeek-
+V3.2).
+Level Tasks Method
+GM ↑
+fast1.0 ↑
+fast1.2 ↑
+fast1.4 ↑
+fast2.0 ↑
+level1
+43
+BoN@5
+1.01
+9.09%
+2.27%
+0.00%
+0.00%
+BoN@40
+1.02
+11.63%
+2.33%
+2.33%
+0.00%
+OpenEvolve
+1.02
+16.28%
+4.65%
+2.33%
+0.00%
+AscendOptimizer
+1.08
+46.51%
+6.98%
+6.98%
+2.33%
+level2
+77
+BoN@5
+1.02
+12.99%
+2.60%
+2.60%
+2.60%
+BoN@40
+1.04
+19.48%
+6.49%
+3.90%
+1.30%
+OpenEvolve
+1.08
+28.57%
+5.19%
+3.90%
+3.90%
+AscendOptimizer
+1.21
+49.35%
+18.18%
+11.69%
+7.79%
+level3
+7
+BoN@5
+0.00
+0.00%
+0.00%
+0.00%
+0.00%
+BoN@40
+1.03
+14.29%
+14.29%
+0.00%
+0.00%
+OpenEvolve
+1.63
+57.14%
+28.57%
+28.57%
+14.29%
+AscendOptimizer
+1.81
+71.43%
+28.57%
+28.57%
+28.57%
+Speedup distribution. Figure 2 complements the aggregate metrics in Table 3 by showing the full distribution
+of improvements. The curve rises rapidly near 1.0×–1.2×, indicating that many operators obtain reliable moderate
+gains, while the long right tail shows that a non-trivial subset benefits from large improvements (up to above
+20×). In particular, 30.2 % and 14.3 % of operators surpass the stricter 1.2× and 2.0× thresholds, respectively,
+confirming that the method improves both broad coverage and high-end acceleration.
+4.3
+Ablation Study
+We evaluate the contribution of each component within AscendOptimizer, as shown in Table 4. To ensure a fair
+comparison, all configurations are evaluated under the same optimization budget. Stage I alone yields a GM of
+1.09, with fast1.0 at 38.58 % and fast2.0 at 3.15 %, indicating that tiling/execution tuning improves robustness
+but has limited headroom at stricter speedup thresholds. Stage II alone improves GM to 1.12 and achieves the
+best mid-threshold metrics (fast1.2=15.75 %, fast1.4=11.81 %), showing the benefit of semantic kernel rewriting.
+The full AscendOptimizer obtains the best overall trade-off, with the highest GM (1.19), the highest fast1.0
+(49.61 %), and the highest fast2.0 (7.09 %). These results suggest that Stage I and Stage II are complementary,
+and alternating them is important for jointly improving average gains and high-threshold acceleration.
+9
+Figure 2: CDF of per-operator speedups achieved by AscendOptimizer on 63 optimized operators. The x-axis is
+the speedup over the baseline and the y-axis is the cumulative fraction of operators. Dashed markers highlight the
+corresponding tail ratios: 39.7 % of operators achieve at least 1.1×, 30.2 % achieve at least 1.2×, 19.0 % achieve at
+least 1.5×, and 14.3 % achieve at least 2.0×.
+Table 4: Ablation results of AscendOptimizer. All rows are EvoAscend variants. Higher is better (↑). Fast is
+reported in % (shown once in the header).
+Variant
+GM ↑
+fastp (%, ↑)
+p=1.0 p=1.2 p=1.4 p=2.0
+stage I
+1.09
+38.58
+7.09
+4.72
+3.15
+stage II
+1.12
+37.80
+15.75
+11.81
+4.72
+AscendOptimizer (Ours)
+1.19
+49.61
+14.96
+11.02
+7.09
+4.4
+Case Study
+4.4.1
+Semantic Analysis of the Experience Bank
+To further analyze how optimization experience is organized in the experience bank, Figure 3 visualizes the
+semantic distribution of optimization instances extracted from the bank. Concretely, we encode each optimization
+record (Title and Description) into a vector representation, and apply dimensionality reduction and clustering to
+reveal how different strategy families group in the semantic space.
+As shown in Figure 3, the strategies produced by AscendOptimizer form compact and separable clusters in the
+embedding space. Some clusters align with best-practice categories described in the official documentation (e.g.,
+tiling adjustments and double buffering; shaded in grey). Meanwhile, we also observe several clusters that do
+not map cleanly to the documentation’s explicit taxonomy (highlighted in red). These clusters include patterns
+such as finer-grained event synchronization, vectorized non-finite checks, and elimination of high-latency scalar
+instructions. The figure suggests that the experience bank captures not only common, standard optimization
+strategies, but also recurring patterns that emerge in practice yet are not explicitly categorized in the official
+documentation.
+4.4.2
+Operator Optimization Trajectory
+In Stage II, the system diagnoses bottlenecks, retrieves relevant patterns, and applies semantic rewrites (e.g.,
+pipelining/synchronization and mapping changes). Figure 5 illustrates a representative rewrite: we replace the
+remainder-based per-core quota assignment with block-level load balancing and a nested scan across tensors, which
+reduces tail imbalance and improves core utilization. Correspondingly, a major jump at iteration 33 (within a
+10
+Figure 3: Semantic landscape of optimization strategies via embedding clustering. Each optimization record (Title
+& Description) is embedded using an embedding model, projected to 2D for visualization with PCA, and clustered
+with K-Means. Grey/light regions denote clusters aligned with categories described in the official documentation,
+while red regions denote clusters that do not directly correspond to the documentation’s explicit taxonomy.
+Stage II period) introduces a more effective heterogeneous core mapping and reaches 2.31×.
+Figure 4: Optimization trajectory of the ”foreach pow scalar and tensor” operator.
+Figure 4 shows the optimization trajectory of ”foreach pow scalar and tensor”, illustrating how AscendOp-
+timizer mitigates domain experience scarcity via an alternating two-stage loop. The system switches every 10
+iterations between Stage I (evolutionary tiling/execution tuning) and Stage II (experience-bank-driven semantic
+kernel rewriting).
+On this operator, Stage I quickly delivers up to a 1.09× speedup but then plateaus, indicating that further
+gains are bounded by the original kernel structure.In Stage II, the system diagnoses bottlenecks, retrieves relevant
+patterns, and applies semantic rewrites (e.g., pipelining/synchronization and mapping changes). Figure 5 illustrates
+a representative rewrite: we replace the remainder-based per-core quota assignment with block-level load balancing
+and a nested scan across tensors, which reduces tail imbalance and improves core utilization. Correspondingly, a
+major jump at iteration 33 (within a Stage II period) introduces a more effective heterogeneous core mapping and
+reaches 2.31×. Overall, Stage I exploits the remaining tuning headroom, while Stage II injects reusable experience
+to break structural bottlenecks.
+11
+(a) Original: remainder-based per-core
+quota
+blockCount = ceil(totalData / elemsPerBlock)
+baseElems
+= (blockCount / nCores) * elemsPerBlock
+remBlocks
+=
+blockCount % nCores
+for core in [0 .. nCores-1]:
+quota[core] = baseElems
+if core < remBlocks:
+quota[core] += elemsPerBlock
+// +1 block
+// assign contiguous ranges to each core
+scan tensors and cut when used == quota[core]
+(b) Optimized: block-level load balanc-
+ing (big/small cores)
+blockCount = ceil(totalData / elemsPerBlock)
+blocksPerCore = blockCount / nCores
+tailBlocks = blockCount for core in [0 ..
+nCores-1]:(*@coreBlocks = blocksPerCore + (core <
+tailBlocks)quota[core] = (*coreBlocks*) *
+elemsPerBlock@@(*// nested scan: fill each
+core’s quota across tensors*)
+@@for core in [0 .. nCores-1]:while quota[core] >
+0:take = min(quota[core],
+remaining(tensor))assign(core, tensor,
+take)quota[core] -= take
+Figure 5: Illustration of a key scheduling rewrite in foreach pow scalar and tensor: (a) the original
+remainder-based per-core quota assignment; (b) the optimized block-level load balancing with a nested scan across
+tensors (changes highlighted in red).
+5
+Conclusion
+This work targets the challenge of automatic generation and optimization of AscendC operators on Ascend
+NPUs under severe scarcity of expert knowledge and training data. We propose AscendOptimizer, a two-stage
+self-bootstrapped framework that enables end-to-end optimization without hand-crafted rules or additional model
+training. We cast optimization as a joint search over host-side tiling configurations and AI Core kernel logic, and
+exploit their distinct search-space characteristics via a divide-and-conquer design: Stage I leverages hardware-in-the-
+loop compilation and on-device performance feedback to synthesize high-performance feasible tiling configurations
+through evolutionary search; Stage II constructs a retrievable, structured optimization memory via rewind and
+applies retrieval-augmented semantic kernel rewriting to overcome structural bottlenecks beyond parameter tuning.
+Experimental results demonstrate that the proposed framework yields consistent performance improvements and
+outperforms strong baselines. Future work will improve robustness to dynamic shapes and cross-stack variability,
+reduce hardware-in-the-loop overhead, and strengthen noise tolerance and correctness assurance.
+References
+[1] Xin Ai, bing zhang, Qiange Wang, Yanfeng Zhang, Hao Yuan, Shufeng Gong, and Ge Yu. NeutronAscend: Op-
+timizing GNN training with Ascend AI processors. ACM Transactions on Architecture and Code Optimization,
+22(4):1–26, 2025.
+[2] Martin Andrews and Sam Witteveen. GPU Kernel Scientist: An LLM-driven framework for iterative kernel
+optimization. arXiv preprint arXiv:2506.20807, 2025.
+[3] Riyadh Baghdadi, Jessica Ray, Malek Ben Romdhane, Emanuele Del Sozzo, Abdurrahman Akkas, Yunming
+Zhang, Patricia Suriana, Shoaib Kamil, and Saman Amarasinghe. Tiramisu: A polyhedral compiler for
+expressing fast and portable code. In 2019 IEEE/ACM International Symposium on Code Generation and
+Optimization (CGO), 2019.
+[4] Carlo Baronio, Pietro Marsella, Ben Pan, Simon Guo, and Silas Alberti. Kevin: Multi-turn RL for generating
+CUDA kernels. arXiv preprint arXiv:2507.11948, 2025.
+[5] Uday Bondhugula, Albert Hartono, J Ramanujam, and P Sadayappan. A practical automatic polyhedral
+parallelizer and locality optimizer. In The ACM SIGPLAN Conference on Programming Language Design
+and Implementation (PLDI), 2008.
+[6] Xinzi Cao, Jianyang Zhai, Pengfei Li, Zhiheng Hu, Cen Yan, Bingxu Mu, Guanghuan Fang, Bin She, Jiayu Li,
+Yihan Su, et al. AscendKernelGen: A systematic study of LLM-based kernel generation for neural processing
+units. arXiv preprint arXiv:2601.07160, 2026.
+12
+[7] Tianqi Chen, Thierry Moreau, Ziheng Jiang, Lianmin Zheng, Eddie Yan, Haichen Shen, Meghan Cowan,
+Leyuan Wang, Yuwei Hu, Luis Ceze, et al. TVM: An automated end-to-end optimizing compiler for deep
+learning. In The 13th USENIX Symposium on Operating Systems Design and Implementation (OSDI), pages
+578–594, 2018.
+[8] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher R´e. Flashattention: Fast and memory-efficient
+exact attention with IO-awareness. the 36th International Conference on Neural Information Processing
+Systems (NeurIPS), 2022.
+[9] Juncheng Dong, Yang Yang, Tao Liu, Yang Wang, Feng Qi, Vahid Tarokh, Kaushik Rangadurai, and Shuang
+Yang. STARK: Strategic team of agents for refining kernels. arXiv preprint arXiv:2510.16996, 2025.
+[10] Ping Guo, Chenyu Zhu, Siyuan Chen, Fei Liu, Xi Lin, Zhichao Lu, and Qingfu Zhang. EvoEngineer: Mastering
+automated CUDA kernel code evolution with large language models. arXiv preprint arXiv:2510.03760, 2025.
+[11] Kelun Lei, Hailong Yang, Huaitao Zhang, Xin You, Kaige Zhang, Zhongzhi Luan, Yi Liu, and Depei Qian.
+PRAGMA: A profiling-reasoned multi-agent framework for automatic kernel optimization. arXiv preprint
+arXiv:2511.06345, 2025.
+[12] Haonan Li, Keyu Man, Partha Kanuparthy, Hanning Chen, Wei Sun, Sreen Tallam, Chenguang Zhu, Kevin
+Zhu, and Zhiyun Qian. TritonForge: Profiling-guided framework for automated Triton kernel optimization.
+arXiv preprint arXiv:2512.09196, 2025.
+[13] Jianling Li, Shangzhan Li, Zhenye Gao, Qi Shi, Yuxuan Li, Zefan Wang, Jiacheng Huang, WangHaojie
+WangHaojie, Jianrong Wang, Xu Han, et al. TritonBench: Benchmarking large language model capabilities
+for generating Triton operators. In Findings of the Association for Computational Linguistics: ACL 2025,
+2025.
+[14] Mingzhen Li, Yi Liu, Xiaoyan Liu, Qingxiao Sun, Xin You, Hailong Yang, Zhongzhi Luan, Lin Gan, Guangwen
+Yang, and Depei Qian. The deep learning compiler: A comprehensive survey. IEEE Transactions on Parallel
+and Distributed Systems, 32(3):708–727, 2020.
+[15] Shangzhan Li, Zefan Wang, Ye He, Yuxuan Li, Qi Shi, Jianling Li, Yonggang Hu, Wanxiang Che, Xu Han,
+Zhiyuan Liu, et al. AutoTriton: Automatic triton programming with reinforcement learning in LLMs. arXiv
+preprint arXiv:2507.05687, 2025.
+[16] Shiyang Li, Zijian Zhang, Winson Chen, Yuebo Luo, Mingyi Hong, and Caiwen Ding. Stitchcuda: An
+automated multi-agents end-to-end gpu programing framework with rubric-based agentic reinforcement
+learning. arXiv preprint arXiv:2603.02637, 2026.
+[17] Xiaoya Li, Xiaofei Sun, Albert Wang, Jiwei Li, and Chris Shum. CUDA-L1: Improving CUDA optimization
+via contrastive reinforcement learning. arXiv preprint arXiv:2507.14111, 2025.
+[18] Gang Liao, Hongsen Qin, Ying Wang, Alicia Golden, Michael Kuchnik, Yavuz Yetim, Jia Jiunn Ang, Chunli Fu,
+Yihan He, Samuel Hsia, et al. KernelEvolve: Scaling agentic kernel coding for heterogeneous AI accelerators
+at meta. arXiv preprint arXiv:2512.23236, 2025.
+[19] Salli Moustafa. Accelerating sparse matrix-matrix multiplication with the Ascend AI core. In The 5th
+Workshop on Accelerated Machine Learning (AccML), 2023.
+[20] Anne Ouyang, Simon Guo, Simran Arora, Alex L Zhang, William Hu, Christopher R´e, and Azalia Mirhoseini.
+KernelBench: Can LLMs write efficient GPU kernels? arXiv preprint arXiv:2502.10517, 2025.
+[21] Jonathan Ragan-Kelley, Connelly Barnes, Andrew Adams, Sylvain Paris, Fr´edo Durand, and Saman Ama-
+rasinghe. Halide: A language and compiler for optimizing parallelism, locality, and recomputation in image
+processing pipelines.
+In The 34th ACM SIGPLAN Conference on Programming Language Design and
+Implementation (PLDI), 2013.
+[22] ByteDance Seed, Yuyu Zhang, Jing Su, Yifan Sun, Chenguang Xi, Xia Xiao, Shen Zheng, Anxiang Zhang,
+Kaibo Liu, Daoguang Zan, et al. Seed-coder: Let the code model curate data for itself. arXiv preprint
+arXiv:2506.03524, 2025.
+13
+[23] Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao. FlashAttention-3:
+Fast and accurate attention with asynchrony and low-precision. The 38th Conference on Neural Information
+Processing Systems (NeurIPS), 2024.
+[24] Asankhaya Sharma. OpenEvolve: An open-source evolutionary coding agent, 2025.
+[25] Songqiao Su, Xiaofei Sun, Xiaoya Li, Albert Wang, Jiwei Li, and Chris Shum. CUDA-L2: Surpassing cuBLAS
+performance for matrix multiplication through reinforcement learning. arXiv preprint arXiv:2512.02551, 2025.
+[26] Philippe Tillet, Hsiang-Tsung Kung, and David Cox. Triton: An intermediate language and compiler for tiled
+neural network computations. In The 3rd ACM SIGPLAN International Workshop on Machine Learning and
+Programming Languages (MAPL), 2019.
+[27] Jianghui Wang, Vinay Joshi, Saptarshi Majumder, Xu Chao, Bin Ding, Ziqiong Liu, Pratik Prabhanjan
+Brahma, Dong Li, Zicheng Liu, and Emad Barsoum. Geak: Introducing triton kernel AI agent & evaluation
+benchmarks. arXiv preprint arXiv:2507.23194, 2025.
+[28] Lei Wang, Yu Cheng, Yining Shi, Zhengju Tang, Zhiwen Mo, Wenhao Xie, Lingxiao Ma, Yuqing Xia, Jilong
+Xue, Fan Yang, et al. TileLang: A composable tiled programming model for AI systems. arXiv preprint
+arXiv:2504.17577, 2025.
+[29] Anjiang Wei, Tianran Sun, Yogesh Seenichamy, Hang Song, Anne Ouyang, Azalia Mirhoseini, Ke Wang,
+and Alex Aiken. Astra: A multi-agent system for GPU kernel performance optimization. arXiv preprint
+arXiv:2509.07506, 2025.
+[30] Zhongzhen Wen, Yinghui Zhang, Zhong Li, Zhongxin Liu, Linna Xie, and Tian Zhang. MultiKernelBench: A
+multi-platform benchmark for kernel generation. arXiv preprint arXiv:2507.17773, 2025.
+[31] Jiin Woo, Shaowei Zhu, Allen Nie, Zhen Jia, Yida Wang, and Youngsuk Park. TritonRL: Training LLMs to
+think and code triton without cheating. arXiv preprint arXiv:2510.17891, 2025.
+[32] Mengdi Wu, Xinhao Cheng, Shengyu Liu, Chunan Shi, Jianan Ji, Man Kit Ao, Praveen Velliengiri, Xupeng
+Miao, Oded Padon, and Zhihao Jia. Mirage: A multi-level superoptimizer for tensor programs. In The 19th
+USENIX Symposium on Operating Systems Design and Implementation (OSDI), 2025.
+[33] Yi Zhai, Yu Zhang, Shuo Liu, Xiaomeng Chu, Jie Peng, Jianmin Ji, and Yanyong Zhang. TLP: A deep learning-
+based cost model for tensor program tuning. In The 28th ACM International Conference on Architectural
+Support for Programming Languages and Operating Systems (ASPLOS), 2023.
+[34] Jiahui Zhang, Yusen Luo, Abrar Anwar, Sumedh Anand Sontakke, Joseph J Lim, Jesse Thomason, Erdem
+Biyik, and Jesse Zhang. ReWiND: Language-guided rewards teach robot policies without new demonstrations.
+arXiv preprint arXiv:2505.10911, 2025.
+[35] Zijian Zhang, Rong Wang, Shiyang Li, Yuebo Luo, Mingyi Hong, and Caiwen Ding. CudaForge: An agent
+framework with hardware feedback for cuda kernel optimization. arXiv preprint arXiv:2511.01884, 2025.
+[36] Jie Zhao, Bojie Li, Wang Nie, Zhen Geng, Renwei Zhang, Xiong Gao, Bin Cheng, Chen Wu, Yun Cheng, Zheng
+Li, et al. AKG: Automatic kernel generation for neural processing units using polyhedral transformations. In
+The 42nd ACM SIGPLAN International Conference on Programming Language Design and Implementation
+(PLDI), 2021.
+[37] Lianmin Zheng, Chengfan Jia, Minmin Sun, Zhao Wu, Cody Hao Yu, Ameer Haj-Ali, Yida Wang, Jun Yang,
+Danyang Zhuo, Koushik Sen, et al. Ansor: Generating high-performance tensor programs for deep learning.
+In The 14th USENIX symposium on operating systems design and implementation (OSDI), 2020.
+[38] Lianmin Zheng, Ruochen Liu, Junru Shao, Tianqi Chen, Joseph E Gonzalez, Ion Stoica, and Ameer Haj Ali.
+TenSet: A large-scale program performance dataset for learned tensor compilers. In The 35th Conference on
+Neural Information Processing Systems (NeurIPS) Datasets and Benchmarks Track, 2021.
+[39] Yuhang Zhou, Zhibin Wang, Guyue Liu, Shipeng Li, Xi Lin, Zibo Wang, Yongzhong Wang, Fuchun Wei,
+Jingyi Zhang, Zhiheng Hu, et al. Squeezing operator performance potential for the ascend architecture. In
+The 30th ACM International Conference on Architectural Support for Programming Languages and Operating
+Systems (ASPLOS), 2025.
+14
+[40] Yuhang Zhou, Zibo Wang, Zhibin Wang, Ruyi Zhang, Chen Tian, Xiaoliang Wang, Wanchun Dou, Guihai
+Chen, Bingqiang Wang, Yonghong Tian, et al. Accelerating model training on Ascend chips: An industrial
+system for profiling, analysis and optimization. In 2025 USENIX Annual Technical Conference (USENIX
+ATC), 2025.
+[41] Hongyu Zhu, Amar Phanishayee, and Gennady Pekhimenko. Daydream: Accurately estimating the efficacy
+of optimizations for DNN training. In 2020 USENIX Annual Technical Conference (USENIX ATC), 2020.
+15
+A
+Additional Experimental Details
+Final benchmark size.
+After these checks and adjustments, we retain 127 operators for all reported experiments.
+Category
+Operator
+level1 (43)
+add custom, addcdiv, addcmul, angle v2, arange, cast, ccopy, clip by value v2, com-
+plex mat dot, cos, equal, eye, eye fp64, fill, gcd, greater equal, heaviside, icamax, icamin,
+is inf, isamax, isamin, lerp, less, less equal, lin space, logical not, logical or, muls, neg,
+non finite check, reciprocal, reshape, rsqrt, sasum, scasum, scnrm2, scopy, snrm2, sqrt,
+sscal, strideslice neg concat v2, trunc
+level2 (77)
+ge glu grad v2, ge glu v2, ge glu v3, gelu quant, swi glu, swi glu grad, circular pad,
+pad v3 grad replication, reflection pad3d grad, strided slice assign v2, foreach acos,
+foreach add list,
+foreach add scalar,
+foreach add scalar list,
+foreach addcdiv scalar,
+foreach addcmul scalar,
+foreach addcmul scalar list,
+foreach asin,
+foreach copy,
+foreach cos,
+foreach div list,
+foreach div scalar,
+foreach erf,
+foreach erfc,
+fore-
+ach exp, foreach expm1, foreach lerp scalar, foreach log2, foreach maximum scalar,
+foreach minimum scalar,
+foreach mul list,
+foreach mul scalar,
+foreach neg,
+fore-
+ach non finite check and unscale, foreach pow scalar, foreach pow scalar and tensor,
+foreach reciprocal,
+foreach round off number,
+foreach sigmoid,
+foreach sign,
+foreach sinh,
+foreach sqrt,
+foreach sub scalar,
+foreach tan,
+foreach tanh,
+fore-
+ach zero inplace,
+motion compensation,
+upsample bicubic2d aa grad,
+upsam-
+ple bilinear2d aa, upsample bilinear2d aa backward, upsample bilinear2d grad, upsam-
+ple nearest exact3d, upsample trilinear3d backward, feeds repeat, cross entropy loss,
+add sigmoid mul reduce sum d,
+cross,
+expand v2,
+fast gelu grad,
+gelu,
+gelu grad,
+inplace fused matmul softmax grad,
+kl div target backward,
+mul sigmoid,
+swish,
+tril,
+triu,
+add layer norm,
+add layer norm grad,
+add rms norm dynamic quant,
+add rms norm quant,
+deep norm,
+group norm swish,
+rms norm,
+rms norm grad,
+adaptive avg pool3d grad, avg pool3 d
+level3 (7)
+bev pool,
+flash attention score with large head dim,
+matmul all reduce,
+mat-
+mul api constant, matmul leakyrelu, matmul reduce scatter, complex mat mul
+B
+Method Details and Experience Bank Analysis
+This section provides additional analyses of the optimization experience bank and detailed method snippets.
+B.1
+Experience Bank Analysis
+Methodological Comparison of Optimization Experience Sources.
+Table 5 compares the official Ascend
+C best practices with the optimization experience bank constructed in this work from a experience representation
+perspective.
+The comparison shows that while official documentation provides stable and interpretable optimization rules
+for human developers, the proposed experience bank captures optimization experience in a machine-consumable
+form, enabling direct integration with automated code generation and optimization pipelines.
+Validation and extension beyond documented best practices.
+Based on the observed semantic structure,
+Table 6 summarizes how the automatically constructed experience bank relates to the official Ascend C best
+practices at the optimization semantics level. This case study demonstrates that the proposed optimization
+experience bank not only reproduces and refines optimization principles explicitly documented in official Ascend C
+best practices, but also systematically uncovers implicit optimization behaviors that are not formally documented.
+By organizing such experience in a retrieval-augmented and machine-consumable form, the experience bank
+provides effective support for automated operator-level code optimization.
+16
+Table 5: Comparison between official Ascend C best practices and the automatically constructed optimization
+experience bank
+Dimension
+Official Ascend C Best Prac-
+tices
+Automatically Constructed Ex-
+perience Bank
+Experience
+acquisi-
+tion
+Manual summarization of long-
+term expert engineering experience
+Automatic mining via self-supervised
+rewind on benchmarks
+Experience form
+Explicit rules and guidelines (rule-
+based)
+Implicit optimization patterns dis-
+tilled from code differences
+Granularity
+Coarse-grained,
+principle-level
+(e.g., “increase tiling”, “reduce
+GM access”)
+Fine-grained, statement-, instruction-
+, and pipeline-level rewrite patterns
+Coverage scope
+Common and generalizable opti-
+mization scenarios
+Long-tail
+operator
+shapes,
+non-
+typical control flow, and special data
+paths
+Extensibility
+Static, requires continuous manual
+maintenance
+Automatically extensible with new
+benchmarks and operators
+Support for automa-
+tion
+No (primarily serves human devel-
+opers)
+Yes (directly usable as RAG context
+for LLM-driven code rewriting)
+Table 6: Validation and extension of official Ascend C best practices by the optimization experience bank (selected
+examples)
+Optimization
+Cate-
+gory
+Covered
+in
+Docs
+Doc Granular-
+ity
+Observed Optimization Be-
+havior (Representative Tags)
+Relation
+Tiling size under UB ca-
+pacity (arithmetic inten-
+sity)
+Yes
+Principle / case-
+level
+Increase tile size or restore block-
+tiling to raise compute intensity
+under UB constraints
+Validation + re-
+finement
+DMA
+efficiency
+and
+transfer consolidation
+Yes
+Mechanism-level
+Consolidate fragmented transfers
+and increase chunk size for better
+DMA startup amortization
+Validation
++
+structuring
+Double buffering and
+pipeline overlapping
+Yes
+Mechanism-level
+Enable/disable double buffering
+conditionally based on micro-tile
+size and sync cost
+Validation
++
+conditionaliza-
+tion
+Reduction intrinsics /
+vectorized
+reduction
+path
+Yes
+Guideline-level
+Choose
+vectorized
+reduction
+paths and hierarchical reduction
+for throughput scaling
+Validation + ex-
+tension
+Fine-grained
+syn-
+chronization
+and
+queue-depth tuning
+Partial
+Scattered / im-
+plicit
+Replace coarse barriers with finer
+events and tune internal queue
+depth to reduce management
+overhead
+Supplementing
+implicit experi-
+ence
+Scalar arithmetic and
+index computation sim-
+plification
+No
+–
+Remove high-latency div/mod
+and simplify multi-dimensional
+index computation in scalar loops
+Undocumented
+Scalar-loop algorithmic
+shortcuts (early-exit /
+search pruning)
+No
+–
+Add early termination conditions
+to scalar search loops to cut
+worst-case latency
+Undocumented
+Specialized
+SIMD
+al-
+gorithm paths beyond
+generic best practices
+No
+–
+Domain-specific SIMD implemen-
+tations not described as a general
+best practice
+Undocumented
+17
+B.2
+Method Details
+Method details: base tiling function Tbase
+1
+2 // # evolve_tiling_block_start
+3 std::map<std::string, int64_t> AdaptiveTilingStrategy(const std::vector<int64_t>& xShape,
+4
+const std::vector<int64_t>& srcShape,
+5
+int64_t dim,
+6
+const std::string& reduceType,
+7
+bool includeSelf,
+8
+int64_t inputBytes)
+9 {
+10
+constexpr int64_t CORENUM = 1;
+11
+constexpr int64_t BLOCK_BYTES_SIZE = 32;
+12
+13
+std::map<std::string, int64_t> params;
+14
+if (xShape.empty() || srcShape.empty()) {
+15
+return params;
+16
+}
+17
+18
+if (dim < 0 || dim >= static_cast<int64_t>(xShape.size()) ||
+19
+dim >= static_cast<int64_t>(srcShape.size())) {
+20
+return params;
+21
+}
+22
+23
+int64_t batchSize = 1;
+24
+for (int64_t i = 0; i < dim; ++i) {
+25
+batchSize *= xShape[i];
+26
+}
+27
+28
+const int64_t dimSizeX = xShape[dim];
+29
+const int64_t dimSizeSrc = srcShape[dim];
+30
+31
+int64_t strideSize = 1;
+32
+for (int64_t i = dim + 1; i < static_cast<int64_t>(xShape.size()); ++i) {
+33
+strideSize *= xShape[i];
+34
+}
+35
+36
+int64_t reduction = 0;
+37
+if (reduceType == "sum") {
+38
+reduction = 0;
+39
+} else if (reduceType == "prod") {
+40
+reduction = 1;
+41
+} else if (reduceType == "mean") {
+42
+reduction = 2;
+43
+} else if (reduceType == "amax") {
+44
+reduction = 3;
+45
+} else if (reduceType == "amin") {
+46
+reduction = 4;
+47
+}
+48
+49
+int64_t blockSize = (inputBytes > 0) ? (BLOCK_BYTES_SIZE / inputBytes) : BLOCK_BYTES_SIZE;
+50
+if (blockSize <= 0) {
+51
+blockSize = 1;
+52
+}
+53
+54
+const int64_t blockNum = (strideSize + blockSize - 1) / blockSize;
+55
+const int64_t coreNum = std::min<int64_t>(CORENUM, blockNum == 0 ? CORENUM : blockNum);
+56
+57
+const bool specialCase = (batchSize == 1 && dimSizeX == dimSizeSrc && !includeSelf &&
+58
+reduction == 4 && inputBytes == 4);
+59
+const int64_t blockDim = specialCase ? coreNum : 0;
+60
+61
+params["batchSize"] = batchSize;
+62
+params["dimSizeX"] = dimSizeX;
+63
+params["dimSizeSrc"] = dimSizeSrc;
+64
+params["strideSize"] = strideSize;
+65
+params["reduction"] = reduction;
+18
+66
+params["includeSelf"] = includeSelf ? 1 : 0;
+67
+params["blockSize"] = blockSize;
+68
+params["blockNum"] = blockNum;
+69
+params["blockDim"] = blockDim;
+70
+params["specialCaseFlag"] = specialCase ? 1 : 0;
+71
+72
+return params;
+73 }
+74 // # evolve_tiling_block_end
+Figure 6: Base tiling function Tbase with evolution markers, synthesized from the operator code and attributes S.
+Method details: optimization thought from rewind
+1 "optimization_point": {
+2
+"title": "Elimination of Pipeline Serialization and Enhancement of DMA Transfer Efficiency",
+3
+"description": "The Fast Version achieves significantly higher performance by addressing three
+critical architectural inefficiencies present in the Slow Version:
+4
+5 1) Pipeline pipelining:
+6
+- The Slow Version invokes ‘PipeBarrier<PIPE_ALL>()‘ inside the inner loop for every complex element.
+7
+- On the Ascend AI Core, this forces a full stall across MTE1/MTE2/MTE3 and the Vector units, preventing
+overlap between data movement and computation.
+8
+- Removing these barriers restores the intended decoupled pipeline and enables instruction-level
+parallelism.
+9
+10 2) DMA burst efficiency:
+11
+- The Slow Version sets ‘maxDataCount = 2‘ (1 complex float = 8 bytes), far below the typical
+32B/64B-efficient burst sizes on MTE.
+12
+- Increasing it to ‘maxDataCount = 8‘ (32 bytes) improves the payload-to-overhead ratio for DMA commands.
+13
+14 3) Optimized data paths:
+15
+- Switching from ‘CopyInPad‘ (via ‘DataCopyPad‘) to ‘CopyIn‘ (via ‘DataCopy‘), and enabling aligned mode
+in ‘CopyOut‘, allows the operator to take the high-performance aligned DMA path.
+16
+- ‘DataCopyPad‘ is generally slower due to extra handling for non-contiguous or unaligned accesses, while
+‘DataCopy‘ maps more directly to efficient hardware move instructions when alignment is satisfied.",
+17
+"bottleneck": "The primary bottleneck is the intentional serialization of the execution pipeline
+caused by excessive synchronization barriers and extremely small tiling sizes, which prevents the
+overlapping of memory transfers and vector computations.",
+18
+"code_diff": "
+19
+--- Changes in op_kernel ---
+20 --- Slow/op_kernel
+21 +++ Fast/op_kernel
+22 @@ -62,8 +62,8 @@
+23
+calNum = kernelParam.calNumPerCore;
+24
+25
+startOffset = kernelParam.offset;
+26 -
+// Shrink tile size even further so each iteration processes just one complex value.
+27 -
+maxDataCount = 2;
+// elements (1 complex number)
+28 +
+// Shrink tile size aggressively so each iteration only handles a few elements, killing burst
+efficiency.
+29 +
+maxDataCount = 8;
+// elements (4 complex numbers)
+30
+31
+// ub 192kb
+32
+pipe.InitBuffer(xMatQueue, 2, maxDataCount * sizeof(T));
+// 54kb
+33 @@ -123,10 +123,9 @@
+34
+__aicore__ inline void ComplexMatDotAIV<T>::SingleIteration(uint64_t offset, uint64_t dataCount,
+35
+LocalTensor<uint32_t> offsetLocal)
+36
+{
+37 -
+// Use padded copies even for aligned lengths to avoid the fast aligned DMA path.
+38 -
+CopyInPad(offset, dataCount);
+39 +
+CopyIn(offset, dataCount);
+40
+Compute(dataCount, offsetLocal);
+41 -
+CopyOut(offset, dataCount, 0);
+42 +
+CopyOut(offset, dataCount, 1);
+19
+43
+}
+44
+45
+template <typename T>
+46 @@ -181,15 +180,8 @@
+47
+T yr = yMatLocal.GetValue(base);
+48
+T yi = yMatLocal.GetValue(base + 1);
+49
+50 -
+T outReal = xr * yr - xi * yi;
+51 -
+T outImag = xr * yi + xi * yr;
+52 -
+53 -
+// Force a pipe-wide barrier on every complex element so the loop cannot be pipelined,
+54 -
+// intentionally serializing read/compute/write for each value.
+55 -
+PipeBarrier<PIPE_ALL>();
+56 -
+outMatLocal.SetValue(base, outReal);
+57 -
+outMatLocal.SetValue(base + 1, outImag);
+58 -
+PipeBarrier<PIPE_ALL>();
+59 +
+outMatLocal.SetValue(base, xr * yr - xi * yi);
+60 +
+outMatLocal.SetValue(base + 1, xr * yi + xi * yr);
+61
+}
+62
+63
+outMatQueue.EnQue<T>(outMatLocal);
+64
+"
+65
+}
+Figure 7: optimization thought example: key changes from a slow to a fast implementation. The figure shows a
+diff for ComplexMatDotAIV, illustrating how (i) adjusting the tiling granularity, (ii) using the aligned DataCopy
+path, and (iii) removing per-element PipeBarrier synchronizations improve burst efficiency and restore pipelined
+execution.
+C
+Use of LLMs
+We use LLMs for polish writing. Specifically, LLMs assist in refining the grammar, clarity, and overall presentation
+of the paper, ensuring that the text is clear and professionally written. No experimental results or core content
+were generated by LLMs.
+20

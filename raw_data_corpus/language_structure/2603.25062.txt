@@ -1,0 +1,1283 @@
+SIGMA: Structure-Invariant Generative Molecular Alignment for Chemical
+Language Models via Autoregressive Contrastive Learning
+Xinyu Wang 1 Fei Dou 2 Jinbo Bi 1 Minghu Song 3
+Abstract
+Linearized string representations serve as the
+foundation of scalable autoregressive molecular
+generation; however, they introduce a fundamen-
+tal modality mismatch where a single molecular
+graph maps to multiple distinct sequences. This
+ambiguity leads to trajectory divergence, where
+the latent representations of structurally equiva-
+lent partial graphs drift apart due to differences in
+linearization history. To resolve this without aban-
+doning the efficient string formulation, we pro-
+pose Structure-Invariant Generative Molecular
+Alignment (SIGMA). Rather than altering the
+linear representation, SIGMA enables the model
+to strictly recognize geometric symmetries via a
+token-level contrastive objective, which explic-
+itly aligns the latent states of prefixes that share
+identical suffixes.
+Furthermore, we introduce
+Isomorphic Beam Search (IsoBeam) to elimi-
+nate isomorphic redundancy during inference by
+dynamically pruning equivalent paths. Empirical
+evaluations on standard benchmarks demonstrate
+that SIGMA bridges the gap between sequence
+scalability and graph fidelity, yielding superior
+sample efficiency and structural diversity in multi-
+parameter optimization compared to strong base-
+lines.
+1. Introduction
+Drug discovery has been fundamentally reshaped by Chem-
+ical Language Models (ChemLMs), which cast molecu-
+lar design as a sequence modeling problem (Chithrananda
+et al., 2020; Bran et al., 2023; Bagal et al., 2021; Li et al.,
+2023). This paradigm parallels the success of Large Lan-
+guage Models (LLMs), where scaling Transformer architec-
+1School of Computing, University of Connecticut, Storrs, CT,
+USA 2Institute for Artificial Intelligence, University of Georgia,
+Athens, GA, USA 3Institute of Hydrobiology, Chinese Academy
+of Sciences, Wuhan, China.
+tures (Vaswani et al., 2017) enables modeling of complex
+linguistic dependencies (Devlin et al., 2019; Radford et al.,
+2019; Liu et al., 2019; Jiang et al., 2023). Inspired by this
+progress, cheminformatics has adopted self-attention mecha-
+nisms under the assumption that chemical connectivity rules
+can be learned analogously to linguistic grammar.
+To enable this linguistic processing, molecular graphs are
+typically serialized into 1D string representations, with the
+Simplified Molecular Input Line Entry System (SMILES)
+being the de facto standard (Weininger, 1988).
+This
+linearization allows models to leverage vast, unlabelled
+chemical repositories for pre-training, drawing from mas-
+sive databases such as PubChem (Wang et al., 2009),
+ChEMBL (Gaulton et al., 2012), and ZINC (Irwin &
+Shoichet, 2005; Sterling & Irwin, 2015). By estimating prob-
+ability distributions over these molecular strings, ChemLMs
+have achieved significant breakthroughs across a spectrum
+of downstream applications. These range from the de novo
+generation of novel drug candidates (Xu et al., 2024; Lee
+et al., 2024) to the precise prediction of molecular proper-
+ties (Wang et al., 2019; Honda et al., 2019) and complex
+bioactivity modeling (Seal et al., 2022; 2023).
+However, treating chemistry as language introduces a fun-
+damental modality mismatch between 1D sequences and
+the underlying 2D/3D molecular graph. Unlike natural
+language, where word order is semantic, molecular seri-
+alization order is arbitrary. A single graph can correspond
+to factorially many valid SMILES strings depending on
+traversal choices. Standard autoregressive models, lack-
+ing geometric inductive biases of Message Passing Neural
+Networks (MPNNs) (Gilmer et al., 2017; Hu et al., 2019),
+treat these permutations as distinct sequences. Alterna-
+tive encodings such as SELFIES (Krenn et al., 2020) and
+DeepSMILES (O’Boyle & Dalke, 2018) improve robustness
+but do not eliminate the one-to-many mapping issue (Scalia
+et al., 2020; Gao et al., 2022). As illustrated in Figure 1
+(and Appendix A), this causes trajectory divergence: two
+equivalent partial molecular graphs can follow different lin-
+earization paths and drift apart in latent space.
+This divergence leads to manifold fragmentation, where
+chemical space splits into clusters defined by syntax rather
+than structure. For optimization, this is harmful: reinforce-
+1
+arXiv:2603.25062v1  [cs.LG]  26 Mar 2026
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+Figure 1. Conceptual comparison between Global Contrastive Learning and our proposed Structure-Invariant Autoregressive Contrastive
+Learning (SIGMA). Top: Traditional methods treat different SMILES permutations (Views A, B, C) of the same molecule as distinct
+sequences, and only contrast the complete SMILES strings, causing Manifold Fragmentation where functionally equivalent states
+(substrings) map to disparate points in the latent space. Bottom: SIGMA enforces Trajectory Alignment. By identifying that Views A, B,
+and C share a topologically identical suffix, SIGMA explicitly aligns their generation paths into a unified trajectory, while pushing away
+structurally distinct negative samples (View D).
+ment learning agents may remain confined to one syntactic
+region, limiting exploration and inducing mode collapse.
+Existing remedies rely on Randomized SMILES augmenta-
+tion (Bjerrum, 2017) or auxiliary graph encoders (Zhu et al.,
+2023), assuming invariance emerges from exposure. In prac-
+tice, models often memorize frequent permutations instead
+of learning structural equivalence, yielding poor sample ef-
+ficiency (Tetko et al., 2020). Graph-based generators (Wang
+et al., 2025) encode geometry explicitly but sacrifice the
+scalability and stability of sequence Transformers. A frame-
+work is needed that preserves sequence efficiency while
+enforcing strict geometric invariance.
+Therefore, we propose Structural-Invariant Generative
+Molecular Alignment (SIGMA) via autoregressive con-
+trastive learning, a framework designed to resolve trajectory
+divergence by embedding geometric consistency directly
+into the autoregressive backbone. Instead of relying on
+passive data augmentation, SIGMA employs a rigorous
+token-level contrastive objective (shown in Figure 2). We
+construct pairs of randomized prefix trajectories that de-
+scribe the same partial graph and share identical valid fu-
+ture completions. By aligning their latent representations,
+SIGMA reconnects fragmented regions of the latent mani-
+fold, enabling geometry-invariant understanding regardless
+of molecular syntax.
+Furthermore, trajectory invariance can be incorporated into
+model training but should also be recognized during in-
+ference. Commonly used sampling methods, such as ran-
+dom sampling and beam search, frequently suffer from
+isomorphic redundancy, wasting computational resources
+by generating multiple SMILES strings that decode to the
+same molecule. To address this, we introduce Isomorphic
+Beam Search (IsoBeam), a structure-aware decoding strat-
+egy shown in Figure 3. IsoBeam dynamically detects when
+different search paths converge to identical subgraphs and
+prunes the redundant trajectories, reallocating the search
+budget to explore structurally distinct scaffolds.
+Our main contributions are summarized as follows:
+• We identify Manifold Fragmentation caused by tra-
+jectory divergence as the root cause of inefficiency
+in ChemLMs. We propose SIGMA to enforce latent
+isotropy via dense trajectory alignment, effectively
+making the sequence model behave like a graph model
+in latent space.
+• We introduce a novel Structure-Invariant Contrastive
+Loss that operates at the token level during the gen-
+eration of the SMILES. By maximizing the mutual
+information between equivalent generation paths, we
+decouple chemical semantics from syntactic variation.
+• We propose IsoBeam, an inference algorithm that elimi-
+nates isomorphic redundancy. Empirical results demon-
+strate that IsoBeam significantly increases the struc-
+tural diversity of generated molecules.
+2. Related Work
+Generative Models for Molecular Design. Deep genera-
+tive models for molecules broadly fall into two categories:
+graph-based and sequence-based approaches. Graph genera-
+tive models, such as GCPN (You et al., 2018), GraphAF (Shi
+et al., 2020), and LO-ARM (Wang et al., 2025), construct
+molecules node-by-node or via motif assembly. These mod-
+els possess intrinsic permutation invariance but typically
+rely on complex graph matching operations or expensive
+validity masking, limiting their scalability.
+In contrast, ChemLMs leverage the efficiency of Trans-
+former architectures to process molecules as linearized
+SMILES strings (Bagal et al., 2021; Chithrananda et al.,
+2
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+Figure 2. Token-level contrastive supervision across equivalent SMILES sequences. Two structurally equivalent SMILES (top: constrained
+random, bottom: original) are decoded independently using an autoregressive model. Positive alignment losses (suffix-align) are applied
+over matched suffix tokens (shown in blue and green), while negative repulsion (prefix-repel) is enforced between mismatched prefix
+tokens (in red). (Left) Token distribution alignment is computed using output logits; (Right) attention alignment compares cross-attention
+weights across matched positions.
+2020). While ChemLMs scale effectively, they suffer from
+a modality mismatch: the linearization process destroys
+topological locality. Recent benchmarks indicate that this
+lack of geometric inductive bias leads to brittle representa-
+tions, where semantically equivalent but syntactically dis-
+tinct SMILES elicit inconsistent behaviors (Ganeeva et al.,
+2024). Our work aims to fill this gap, inducing the geomet-
+ric rigor of graph models into the scalable architecture of
+ChemLMs via structural alignment.
+Canonicalization Bias and Data Augmentation.
+The
+many-to-one mapping from molecular graphs to SMILES
+strings creates isomorphic ambiguity (Weininger, 1988).
+This canonicalization bias arises when models memorize
+the rigid syntax of canonical SMILES rather than the under-
+lying molecular geometry. The prevalent mitigation strategy
+is data augmentation via Randomized SMILES (Bjerrum,
+2017; Ar-Pous et al., 2019). While augmentation improves
+robustness, naive enumeration fails to cover the full syntac-
+tic manifold due to combinatorial explosion (Tetko et al.,
+2020). As a result, models often memorize specific frag-
+ments rather than learning a generalized invariant mapping.
+Unlike these implicit approaches, SIGMA explicitly en-
+forces invariance through a structured contrastive objective,
+decoupling geometric learning from the combinatorial ex-
+plosion of string enumeration.
+Contrastive Learning in Molecular Representation.
+Global Alignment. Early methods aligned global representa-
+tions. Graph-based approaches (e.g., MolCLR (Wang et al.,
+2022)) maximize agreement between perturbed graphs. In
+the sequence domain, SimSon (Pinheiro et al., 2022) and
+CONSMI (Qian et al., 2024) adapt SimCLR to align global
+SMILES embeddings (e.g., [CLS] token). While CON-
+SMI conditions generation on invariant latents, its coarse-
+grained alignment is insufficient for guiding the fine-grained,
+step-by-step decisions required in autoregressive decod-
+ing (Fabian et al., 2020).
+Token-level Alignment.
+To enable fine-grained control,
+token-wise approaches have emerged. In NLP, SimCTG (Su
+et al., 2021) uses self-contrastive loss to reduce anisotropy,
+forcing intra-sequence token distinctiveness to prevent de-
+generation. However, it lacks inter-sequence structural align-
+ment. Molecular adaptations like FineMolTex (Zhou et al.,
+2024) align tokens with motifs but often necessitate complex
+multi-modal architectures.
+SIGMA bridges these paradigms via Dense Trajectory
+Alignment. Unlike SimCTG (intra-sequence) or SimSon
+(global), SIGMA aligns token-level trajectories across struc-
+turally equivalent views. By contrasting shared suffixes
+against structurally distinct negatives, it ensures generative
+dynamics strictly adhere to the underlying chemical topol-
+ogy.
+3. Methodology
+The proposed SIGMA is a framework designed to resolve
+the modality mismatch in autoregressive ChemLMs. Unlike
+standard approaches that treat SMILES permutations as in-
+dependent sequences, SIGMA enforces geometric isotropy
+in the latent space by explicitly aligning the generative tra-
+jectories of structurally equivalent molecular views.
+3.1. Problem Formulation: Generative Modeling on
+Chemical Manifolds
+Let G ∈G be a molecular graph defined by a set of atoms
+and bonds. In the context of autoregressive modeling, G is
+serialized into a sequence of tokens S = (x1, . . . , xL) from
+a vocabulary V. A fundamental challenge in this domain
+is the one-to-many mapping: a single graph G corresponds
+3
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+Figure 3. Resolving Isomorphic Redundancy with Isomorphic Beam (IsoBeam) Search. (Top) Standard Beam Search: Beam capacity
+is wasted on multiple linearizations of the same molecule (e.g., variants of acetophenone), causing isomorphic redundancy where
+topologically identical duplicates crowd the search space. (Bottom) IsoBeam Search: A Partial Graph Check verifies if prefixes share
+identical substructures and consistent attachment points. Lower-probability isomorphic paths are dynamically pruned (red cross),
+reallocating the budget to explore distinct trajectories (e.g., a pyridine-based scaffold), thereby maximizing structural diversity.
+to a factorial set of valid SMILES permutations Π(G) =
+{S(1), . . . , S(K)}, determined by the traversal order.
+Standard ChemLMs maximize the likelihood of a sequence
+S via the autoregressive factorization:
+log pθ(S) =
+XL
+t=1 log pθ(xt|x<t)
+(1)
+While effective for unique sequences (e.g., natural lan-
+guage), this objective treats S(i) and S(j) from the same
+equivalence class Π(G) as distinct, unrelated training exam-
+ples. This leads to Trajectory Divergence: the hidden states
+ht(S(i)) and ht(S(j)) corresponding to the same chemical
+substructure are mapped to orthogonal regions in the latent
+manifold. Our goal is to learn a parameterized encoder fθ(·)
+such that the latent representations remain invariant under
+the permutation group of the graph:
+fθ(x(i)
+<t) ≈fθ(x(j)
+<t)
+if
+Mol(x(i)
+<t) ∼= Mol(x(j)
+<t)
+(2)
+where ∼= denotes subgraph isomorphism.
+3.2. Constructing Functionally Equivalent Views
+A critical prerequisite for contrastive learning is the rigor-
+ous identification of positive pairs. Naive augmentation
+often leads to syntactic false positives—prefixes that map
+to isomorphic subgraphs but are syntactically incompatible
+(e.g., one expecting a ring-closure digit, the other a branch
+opening). To address this, we propose a view construction
+pipeline rooted in Functional Equivalence.
+We construct a positive pair (Su, Sv) by sampling two ran-
+domized traversals that diverge in their history but converge
+to a common future trajectory. Formally, we decompose the
+generation process into a prefix p and a suffix s. We aim
+to find two distinct prefixes pu and pv that are compatible
+with the exact same suffix string s. The validity of the pair
+(pu, pv) is conditioned on the Dual Consistency Condition:
+1. Syntactic Divergence (pu ̸= pv): The prefixes must
+represent distinct graph traversal histories (e.g., starting
+from different atoms or traversing branches in reverse
+orders), ensuring the contrastive task is non-trivial.
+2. Structural Equivalence via Oracle Verification: The
+concatenation of both prefixes with the shared suffix s
+must reconstruct the identical molecular graph G. We
+verify this using the InChIKey hashing oracle H:
+H(Mol(pu ⊕s)) ≡H(Mol(pv ⊕s)) ≡H(G)
+(3)
+The “Probe Suffix” Protocol.
+A practical engineering
+challenge is that incomplete SMILES prefixes are often
+chemically invalid and cannot be processed by standard
+informatics tools. To resolve this, we employ a Probe
+Suffix Protocol. During training view construction, if a
+random split point leaves open rings or unclosed branches,
+we temporarily append a chemically stable completion frag-
+ment sprobe (e.g., a methyl cap or ring closure) solely for
+the purpose of structure verification. This ensures that the
+equivalence is based on the rigid topological structure rather
+than unstable transient states.
+Structural Negatives.
+Standard contrastive methods of-
+ten rely on random in-batch negatives. However, this is
+insufficient for fine-grained chemical discrimination. We
+introduce Structural Negatives: for a given anchor prefix
+pu, we explicitly sample a negative prefix pneg from the
+batch such that H(Mol(pneg ⊕s)) ̸= H(G). This forces
+4
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+the model to distinguish between truly isomorphic trajecto-
+ries and those representing distinct chemical entities (e.g.,
+stereoisomers or scaffold hops), sharpening the decision
+boundary in the latent space.
+3.3. Architecture and Parameterization
+We instantiate our framework using a autoregressive archi-
+tecture. Let fθ denote the backbone network parameterized
+by θ. Given a SMILES sequence S, the model computes
+a sequence of contextual hidden states H = [h1, . . . , hL],
+where ht ∈Rdmodel.
+Projection-Decoupled Mechanism.
+Directly applying
+contrastive loss on the backbone representations H restricts
+the expressivity required for the primary generative task.
+The MLE objective relies on precise syntactic features
+(e.g., specific ring indices ‘1‘ vs ‘2‘) to predict the next
+token, whereas contrastive learning seeks to abstract away
+from these superficial variations. To resolve this Syntax-
+Semantics Conflict, we introduce a dedicated non-linear
+Projection Head gϕ mapping H to a lower-dimensional
+metric space Z:
+zt = gϕ(ht) = W (2)σ(W (1)ht + b(1)) + b(2)
+(4)
+where σ is a ReLU activation, W (1) ∈Rdmodel×dmodel,
+and W (2) ∈Rdproj×dmodel. In our implementation, we
+set dmodel = 768 and dproj = 128. This bottleneck ar-
+chitecture acts as an information filter, preserving only the
+essential structural semantics required for the invariance
+objective, while the backbone ht retains the full syntactic
+context for autoregressive prediction.
+Siamese Forward Pass.
+During training, the model oper-
+ates in a Siamese manner with shared weights. For a given
+mini-batch of N molecules, we generate 2N augmented
+views (functionally equivalent pairs). These are processed
+in parallel to obtain the representations Zu and Zv. The
+autoregressive loss LMLE is computed on the logits derived
+from H (ensuring syntactic validity), while the structural
+regularization LSIGMA is computed on the normalized pro-
+jections ˆz = z/∥z∥2 (ensuring geometric consistency).
+3.4. Dense Trajectory Alignment Objective
+Previous works in molecular contrastive learning typically
+employ Global Alignment (e.g., aligning [CLS] tokens).
+However, autoregressive generation is a sequential deci-
+sion process where errors can accumulate. To enforce fine-
+grained consistency, we propose a Dense Trajectory Align-
+ment objective.
+Formulation.
+Consider the projected embeddings of the
+suffix tokens for a positive pair, denoted as Zu
+suf and Zv
+suf,
+Algorithm 1 Isomorphic Beam Search (IsoBeam)
+Require: Beam size K, Model M, Oracle H (e.g., RDKit to
+InChIKey)
+1: Initialize Beam B ←{[BOS]}
+2: for t = 1 . . . Tmax do
+3:
+Expand B to candidates via top-k sampling
+4:
+Bnew ←∅, Sseen ←∅
+5:
+Sort candidates by cumulative log-probability
+6:
+for each candidate c in candidates do
+7:
+M ←MolFromSmiles(c)
+8:
+if M is None then
+9:
+// Keep invalid intermediates for completion
+10:
+Bnew ←Bnew ∪{c}
+11:
+else
+12:
+// Check structural uniqueness for valid graphs
+13:
+id ←H(M)
+14:
+if id /∈Sseen then
+15:
+Bnew ←Bnew ∪{c}
+16:
+Sseen ←Sseen ∪{id}
+17:
+end if
+18:
+end if
+19:
+if |Bnew| = K then
+20:
+break
+21:
+end if
+22:
+end for
+23:
+B ←Bnew
+24: end for
+25: Output: B
+and a set of structural negatives. We compute the token-wise
+similarity matrix between the trajectories. The goal is to
+maximize the likelihood that the t-th token in the suffix of
+view u aligns with the corresponding t-th token in view v.
+The loss for a specific time step t in the suffix is formulated
+as:
+L(t)
+SIGMA = −log
+exp(sim(zu,t, zv,t)/τ)
+exp(sim(zu,t, zv,t)/τ) + P
+k∈Nneg exp(sim(zu,t, zk,t)/τ)
+(5)
+where sim(·, ·) denotes cosine similarity and τ is a tempera-
+ture parameter. Crucially, rather than aligning a single pivot
+point, we average this objective over the entire suffix length
+Lsuf:
+LSIGMA =
+1
+Lsuf
+XLsuf
+t=1 L(t)
+SIGMA
+(6)
+Theoretical Insight: Implicit Gradient Alignment.
+A
+key theoretical question is: why does aligning the suffix rep-
+resentations enforce invariance in the prefix representations?
+We analyze this through the lens of gradient flow. In a causal
+Transformer, the hidden state of a suffix token st is a func-
+tion of the prefix context p and the preceding suffix tokens
+s<t: hst = Transformer(st|p, s<t). In our construction,
+for a positive pair, the suffix inputs s<t are identical. The
+only variable is the prefix p. Minimizing the contrastive loss
+LSIGMA between hu
+st and hv
+st necessitates minimizing the
+distance between the conditional distributions induced by
+5
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+pu and pv. Since the suffix parameters are shared, the gradi-
+ent ∇LSIGMA backpropagates through the suffix attention
+layers to update the prefix encoder, effectively enforcing:
+Encoder(pu) ≈Encoder(pv)
+(7)
+Thus, dense trajectory alignment acts as a robust proxy for
+aligning the prefix representations, leveraging the causal
+structure of the model to propagate invariance backwards
+from the future (suffix) to the past (prefix).
+The final training objective combines the generative and
+contrastive tasks: Ltotal = LNLL+λLSIGMA, where λ is a
+hyperparameter balancing generation quality and structural
+regularization.
+3.5. Isomorphic Beam Search (IsoBeam)
+While SIGMA aligns the latent space during training, stan-
+dard Beam Search allows the generation of redundant syn-
+tactic variations during inference. To address this, we in-
+troduce IsoBeam, which enforces structural uniqueness dy-
+namically.
+The core mechanism of IsoBeam is to prune candidates that
+correspond to already-visited molecular graphs. At each
+decoding step t, for every candidate sequence c in the beam:
+1. Validity Check: We first check if the current partial
+sequence c forms a syntactically valid molecule (e.g.,
+using RDKit).
+2. Conditional Pruning: If c is invalid (e.g., open rings
+or branches), it is retained in the beam to allow for
+future completion. If c is valid, we compute its struc-
+tural identifier (InChIKey). If this identifier has already
+been encountered in the current beam (meaning it is an
+isomorphic variant of a higher-probability candidate),
+c is pruned. Otherwise, it is retained and its identifier
+is added to the visited set.
+This strategy ensures that the beam does not waste capacity
+on multiple permutations of the same valid substructure or
+molecule, effectively maximizing the exploration of unique
+chemical space.
+Complexity vs. Diversity Trade-off.
+Although IsoBeam
+introduces an overhead for RDKit validation at each step, it
+dramatically increases the effective beam size. In standard
+beam search, a beam of size K = 10 might contain only 2
+unique molecular structures (with 5 permutations each). In
+IsoBeam, a beam of size K = 10 is guaranteed to contain
+10 topologically distinct structures. This trade-off is highly
+favorable for molecular optimization tasks where sample
+efficiency and scaffold diversity are paramount.
+4. Experiments
+Experimental Setup We evaluate SIGMA on unsuper-
+vised molecular generation and goal-directed optimization.
+The backbone is a GPT-2 (Small) causal language model
+trained on ZINC-250k (Irwin & Shoichet, 2005). Base-
+lines include: (1) Sequence Models, trained on canonical
+SMILES or randomized SMILES augmentation (RandAug-
+ment); (2) Graph-based SOTA, namely LO-ARM (Wang
+et al., 2025); and (3) Ablations without the dense contrastive
+objective. Full implementation and hyperparameters are in
+Appendix B.
+4.1. Analysis of Geometric Invariance
+A central hypothesis of this work is that standard autore-
+gressive objectives lead to manifold fragmentation, whereas
+SIGMA enforces a smooth, geometry-invariant latent space.
+We verify this through macroscopic visualization, micro-
+scopic alignment analysis, and quantitative consistency met-
+rics.
+Macroscopic: Resolving Manifold Fragmentation.
+We
+sample 10 molecules and generate 50 randomized SMILES
+views each. Terminal hidden states are projected via t-SNE.
+As shown in Fig. 4, the baseline latent space is entangled,
+with isomorphic views scattered. Data augmentation im-
+proves separation but still produces fragmented clusters.
+SIGMA collapses all permutations of a molecule into com-
+pact, well-separated clusters, indicating successful abstrac-
+tion from syntactic variation.
+Microscopic: Isomorphic Semantic Alignment.
+We an-
+alyze token-level representations using cosine similarity
+between hidden states of two equivalent but differently se-
+rialized trajectories of Acetophenone (Fig. 5). Baselines
+show alignment only along identical suffix tokens. SIGMA
+exhibits a clear off-diagonal semantic block, demonstrat-
+ing alignment of equivalent chemical substructures despite
+different character sequences. This shows SIGMA learns
+structural semantics rather than memorizing syntax.
+4.2. Unconditional Generation: Bridging Sequence and
+Graph Models
+We next investigate whether the learned geometric invari-
+ance translates to superior generative quality on the ZINC-
+250k benchmark. Historically, a trade-off exists in genera-
+tive chemistry: sequence models achieve high validity but
+suffer from distribution shift (high Fr´echet ChemNet Dis-
+tance, FCD), while graph models capture the distribution
+well but often struggle with validity constraints.
+As presented in Table 2, SIGMA effectively bridges this
+gap.
+6
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+Figure 4. Latent Space Visualization of Geometric Invariance. We utilize t-SNE to project the terminal hidden states of 50
+randomized SMILES views for 10 distinct molecules (color-coded by molecular identity). SIGMA (Ours) achieves superior geometric
+invariance, where isomorphic views collapse into tight, well-separated clusters. In contrast, the Baseline (MLE) exhibits severe manifold
+fragmentation, with isomorphic trajectories scattered and entangled. Random SMILES Augmentation improves separation but suffers
+from disconnected islands, where a single molecule maps to multiple disjoint clusters. Last Token Contrastive Learning fails to cleanly
+disentangle structural identities, demonstrating that dense token-level alignment is essential for learning isotropic representations.
+Figure 5. Token-wise Latent Alignment Heatmaps. We visualize the cosine similarity matrices of hidden states between two
+syntactically distinct SMILES linearizations of Acetophenone (y-axis: CC(=O)..., x-axis: O=C(C)...). SIGMA (Left) exhibits a
+distinct semantic alignment block in the top-left region. Despite the disjoint syntax of the prefix (acetyl group), the model aligns the latent
+representations of CC(=O) and O=C(C), confirming it captures the underlying structural equivalence. In contrast, the Baseline and GCL
+models show near-zero similarity (dark blue) in this off-diagonal region, indicating they rely primarily on surface-level token matching
+and fail to recognize the structural identity of the permuted prefixes. All models successfully align the identical suffix (c1ccccc1,
+bottom-right diagonal).
+• Validity & Uniqueness: SIGMA maintains the near-
+perfect validity (> 99.8%) characteristic of autore-
+gressive sequence models, significantly outperforming
+graph-based baselines like GraphAF and MoFlow.
+• Distributional Fidelity (FCD): Crucially, SIGMA
+achieves a Fr´echet ChemNet Distance (FCD) of 0.752.
+This is not only a substantial improvement over the
+standard sequence baselines (e.g., CharRNN: 0.965,
+RandSMILES: 0.892) but also establishes a new state-
+of-the-art among sequence-based methods.
+This result confirms that by resolving manifold fragmen-
+tation, SIGMA learns a chemical probability distribution
+that is both syntactically robust (high validity) and chemi-
+cally realistic (low FCD), effectively competing with com-
+putationally expensive graph autoregressive models (e.g.,
+LO-ARM).
+4.3. Optimization Efficiency in Reinforcement Learning
+To rigorously assess if SIGMA’s geometric invariance im-
+proves optimizability, we adopt a plug-and-play protocol
+using the standard REINVENT algorithm (Olivecrona et al.,
+2017) as a fixed backbone. This design isolates the quality
+of the generative prior as the sole variable affecting perfor-
+mance. We evaluate on the PMO Benchmark (MPO and
+exploration tasks), with results summarized in Table 1.
+Regarding raw optimization, SIGMA performs compara-
+bly to the baseline, an expected outcome due to RL-driven
+score saturation. However, a critical divergence appears in
+structural diversity. SIGMA generates significantly more
+unique scaffolds (#Scaf) across all tasks. For instance, in
+the Osimertinib task, SIGMA identifies over 7,700 unique
+scaffolds a ∼40% increase over the baseline (5,600) despite
+achieving similar peak scores.
+This highlights distinct exploration dynamics. While the
+baseline suffers from mode collapse (generating trivial vari-
+7
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+Table 1. PMO Benchmark Performance. (mean ± s.d. over 3 runs). Blue and pink shading indicate superior performance by SIGMA
+and the baseline, respectively. While peak scores (Top-1, Avg-100) are comparable due to saturation, SIGMA significantly excels in
+exploration (#Scaf). In tasks like Osimertinib, SIGMA discovers 20–40% more unique scaffolds, confirming that geometric invariance
+facilitates effective scaffold hopping rather than local exploitation.
+Use
+Optimization Quality
+Efficiency
+Exploration
+Task
+SIGMA
+Top-Avg 1 (↑)
+Tio-Avg 10 (↑)
+Top-Avg 100 (↑)
+Top-AUC 1 (↑)
+Top-AUC 10 (↑)
+Top-AUC 100 (↑)
+SA (↑)
+Div (↑)
+# Scaf (↑)
+MPO (Multiproperty Objective)
+Sitagliptin
+-
+0.552 ± 0.029
+0.540 ± 0.035
+0.498 ± 0.032
+0.502 ± 0.050
+0.473 ± 0.034
+0.404 ± 0.040
+2.823 ± 0.356
+0.603 ± 0.091
+2670 ± 489
+✓
+0.607 ± 0.013
+0.596 ± 0.020
+0.541 ± 0.014
+0.544 ± 0.011
+0.508 ± 0.020
+0.423 ± 0.016
+3.628 ± 0.487
+0.656 ± 0.073
+3143 ± 89
+Zaleplon
+-
+0.616 ± 0.040
+0.611 ± 0.037
+0.593 ± 0.031
+0.557 ± 0.011
+0.535 ± 0.006
+0.493 ± 0.007
+2.400 ± 0.247
+0.479 ± 0.083
+3518 ± 441
+✓
+0.635 ± 0.015
+0.627 ± 0.016
+0.610 ± 0.013
+0.578 ± 0.007
+0.558 ± 0.005
+0.517 ± 0.002
+2.833 ± 0.046
+0.531 ± 0.035
+3902 ± 298
+Fexofenadine
+-
+0.893 ± 0.012
+0.889 ± 0.014
+0.877 ± 0.020
+0.794 ± 0.017
+0.776 ± 0.016
+0.745 ± 0.015
+4.525 ± 0.211
+0.444 ± 0.011
+6211 ± 412
+✓
+0.957 ± 0.023
+0.945 ± 0.023
+0.932 ± 0.020
+0.807 ± 0.006
+0.790 ± 0.005
+0.758 ± 0.004
+4.360 ± 0.423
+0.376 ± 0.059
+6272 ± 467
+Osimertinib
+-
+0.910 ± 0.021
+0.906 ± 0.022
+0.896 ± 0.019
+0.847 ± 0.008
+0.835 ± 0.008
+0.807 ± 0.007
+3.476 ± 0.257
+0.463 ± 0.063
+5667 ± 941
+✓
+0.902 ± 0.003
+0.899 ± 0.004
+0.892 ± 0.002
+0.846 ± 0.004
+0.836 ± 0.003
+0.808 ± 0.003
+3.460 ± 0.154
+0.532 ± 0.039
+7731 ± 190
+Perindopril
+-
+0.642 ± 0.047
+0.642 ± 0.047
+0.639 ± 0.057
+0.550 ± 0.026
+0.536 ± 0.023
+0.512 ± 0.017
+4.245 ± 0.249
+0.340 ± 0.084
+5295 ± 317
+✓
+0.648 ± 0.005
+0.647 ± 0.006
+0.643 ± 0.006
+0.552 ± 0.003
+0.539 ± 0.002
+0.514 ± 0.001
+4.383 ± 0.163
+0.405 ± 0.093
+6188 ± 263
+Median Molecule
+Median 1
+-
+0.417 ± 0.024
+0.417 ± 0.024
+0.407 ± 0.029
+0.372 ± 0.016
+0.365 ± 0.016
+0.341 ± 0.018
+4.748 ± 0.428
+0.298 ± 0.115
+1618 ± 334
+✓
+0.431 ± 0.018
+0.431 ± 0.018
+0.415 ± 0.011
+0.393 ± 0.014
+0.385 ± 0.014
+0.359 ± 0.012
+4.922 ± 0.144
+0.458 ± 0.047
+1692 ± 161
+Median 2
+-
+0.349 ± 0.012
+0.342 ± 0.011
+0.329 ± 0.007
+0.299 ± 0.009
+0.285 ± 0.004
+0.265 ± 0.003
+2.953 ± 0.314
+0.412 ± 0.014
+5654 ± 201
+✓
+0.346 ± 0.002
+0.335 ± 0.004
+0.323 ± 0.003
+0.304 ± 0.003
+0.287 ± 0.002
+0.265 ± 0.001
+2.785 ± 0.138
+0.397 ± 0.047
+5911 ± 138
+Table 2. Unconditional Generation on ZINC250k. Baselines
+marked with † and ‡ are retrieved from (Wang et al., 2025) and (Wu
+et al., 2024), respectively. TIS (Trajectory Invariance Score) mea-
+sures latent divergence between isomorphic prefixes (lower is
+better). SIGMA achieves state-of-the-art FCD among sequence
+models, effectively bridging the gap with graph-based approaches.
+Model
+TIS(↓)
+Validity (↑)
+Uniqueness (↑)
+Novelty (↑)
+IntDiv (↑)
+FCD (↓)
+Graph-based
+GraphAF†
+-
+0.685
+0.986
+-
+-
+16.02
+MoFlow†
+-
+0.631
+0.999
+-
+-
+20.93
+LO-ARM†
+-
+0.961
+1.000
+-
+-
+3.229
+Sequence-based
+CharRNN‡
+-
+0.899
+0.690
+0.182
+0.992
+0.965
+mGPT2‡
+-
+0.853
+0.674
+0.672
+0.960
+0.830
+MolGPT‡
+-
+0.980
+0.770
+0.766
+0.989
+0.923
+RandSMILES
+2.677
+0.986
+0.756
+0.689
+0.889
+0.892
+LTCL
+1.698
+0.988
+0.798
+0.711
+0.910
+0.834
+SIGMA (Ours)
+0.041
+0.998
+0.814
+0.798
+0.910
+0.752
+ations of local optima), SIGMA leverages its isotropic latent
+space to facilitate effective scaffold hopping. By travers-
+ing the connected manifold of isomorphic views, SIGMA
+avoids syntactic minima, covering a significantly broader
+chemical space without sacrificing optimization success.
+4.4. Breaking the Redundancy Ceiling: Isomorphic
+Beam Search
+We address a decoding bottleneck: standard beam search
+wastes capacity on redundant isomorphic SMILES. Scaling
+beam width K from 100 to 50,000 (Fig. 6) shows both meth-
+ods generate similar numbers of valid SMILES, confirming
+robust modeling. However, scaffold discovery diverges
+sharply. Standard beam search saturates near K = 5,000,
+producing mainly redundant variants. IsoBeam maintains
+near-linear growth by pruning isomorphic paths and reallo-
+cating computation to distinct regions of chemical space. At
+K = 50,000, IsoBeam finds over 11,000 scaffolds, roughly
+2× the baseline.
+Figure 6. Inference Scalability Analysis (K = 100 →50, 000).
+Left: Both strategies yield comparable valid SMILES, confirming
+SIGMA’s robustness. Right: A critical divergence in scaffold
+diversity. Standard Beam Search (Grey) saturates at K ≈5, 000
+due to isomorphic redundancy. In contrast, IsoBeam (Red) mines
+the chemical long-tail, breaking the saturation ceiling to discover
+> 2× unique scaffolds at K = 50, 000.
+5. Conclusion
+This paper introduces SIGMA, a framework designed to re-
+solve the topological misalignment in autoregressive chem-
+ical language models. By enforcing latent isotropy across
+isomorphic SMILES views, SIGMA effectively eliminates
+canonicalization bias without relying on computationally ex-
+pensive graph encoders. Experiments on ZINC-250k show
+that this geometric regularization effectively bridges the gap
+with graph-based models, achieving state-of-the-art distribu-
+tional alignment (FCD) while maintaining superior validity.
+Furthermore, we show that this invariance is critical for
+goal-directed optimization, enabling RL agents to explore
+the chemical space efficiently with significantly reduced
+mode collapse. These findings suggest that incorporating
+explicit geometric constraints offers a scalable and robust
+direction for next-generation molecular generative models.
+8
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+Impact Statement
+Our work aims to advance the field of machine learning
+for molecular design. The potential societal impact of this
+research is largely positive, offering tools to accelerate drug
+discovery and material science. As with any generative
+technology in chemistry, there is a remote risk of misuse
+for designing harmful substances. We believe that standard
+safety protocols in the pharmaceutical industry and respon-
+sible release of research code are sufficient to mitigate these
+risks. We do not foresee any immediate negative societal
+consequences that require specific highlighting beyond stan-
+dard dual-use considerations.
+References
+Ar-Pous, J., Johansson, S. V., Prykhodko, O., Bjerrum, E. J.,
+Tyrchan, C., Reymond, J.-L., Chen, H., and Engkvist,
+O. Randomized smiles strings improve the quality of
+molecular generative models. Journal of cheminformatics,
+11(1):71, 2019.
+Bagal, V., Aggarwal, R., Vinod, P., and Priyakumar,
+U. D. Molgpt: molecular generation using a transformer-
+decoder model. Journal of chemical information and
+modeling, 62(9):2064–2076, 2021.
+Bjerrum, E. J. Smiles enumeration as data augmentation for
+neural network modeling of molecules. arXiv preprint
+arXiv:1703.07076, 2017.
+Bran, A. M., Cox, S., Schilter, O., Baldassari, C., White,
+A. D., and Schwaller, P. Chemcrow: Augmenting large-
+language models with chemistry tools. arXiv preprint
+arXiv:2304.05376, 2023.
+Chithrananda, S., Grand, G., and Ramsundar, B. Chemberta:
+large-scale self-supervised pretraining for molecular prop-
+erty prediction. arXiv preprint arXiv:2010.09885, 2020.
+Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. Bert:
+Pre-training of deep bidirectional transformers for lan-
+guage understanding. In Proceedings of the 2019 confer-
+ence of the North American chapter of the association for
+computational linguistics: human language technologies,
+volume 1 (long and short papers), pp. 4171–4186, 2019.
+Fabian, B., Edlich, T., Gaspar, H., Segler, M., Meyers, J.,
+Fiscato, M., and Ahmed, M. Molecular representation
+learning with language models and domain-relevant aux-
+iliary tasks. arXiv preprint arXiv:2011.13230, 2020.
+Ganeeva, V., Sakhovskiy, A., Khrabrov, K., Savchenko,
+A., Kadurin, A., and Tutubalina, E. Lost in translation:
+Chemical language models and the misunderstanding of
+molecule structures. In Findings of the Association for
+Computational Linguistics: EMNLP 2024, pp. 12994–
+13013, 2024.
+Gao, W., Fu, T., Sun, J., and Coley, C. Sample efficiency
+matters: a benchmark for practical molecular optimiza-
+tion. Advances in neural information processing systems,
+35:21342–21357, 2022.
+Gaulton, A., Bellis, L. J., Bento, A. P., Chambers, J., Davies,
+M., Hersey, A., Light, Y., McGlinchey, S., Michalovich,
+D., Al-Lazikani, B., et al. Chembl: a large-scale bioactiv-
+ity database for drug discovery. Nucleic acids research,
+40(D1):D1100–D1107, 2012.
+Gilmer, J., Schoenholz, S. S., Riley, P. F., Vinyals, O., and
+Dahl, G. E. Neural message passing for quantum chem-
+istry. In International conference on machine learning,
+pp. 1263–1272. Pmlr, 2017.
+Honda, S., Shi, S., and Ueda, H. R. Smiles transformer: Pre-
+trained molecular fingerprint for low data drug discovery.
+arXiv preprint arXiv:1911.04738, 2019.
+Hu, W., Liu, B., Gomes, J., Zitnik, M., Liang, P., Pande, V.,
+and Leskovec, J. Strategies for pre-training graph neural
+networks. arXiv preprint arXiv:1905.12265, 2019.
+Irwin, J. J. and Shoichet, B. K. Zinc- a free database of
+commercially available compounds for virtual screening.
+Journal of chemical information and modeling, 45(1):
+177–182, 2005.
+Jiang, A., Sablayrolles, A., Roux, A., et al. Mistral 7b. arXiv
+preprint arXiv:2310.06825, 2023.
+Krenn, M., H¨ase, F., Nigam, A., Friederich, P., and Aspuru-
+Guzik, A. Self-referencing embedded strings (selfies): A
+100% robust molecular string representation. Machine
+Learning: Science and Technology, 1(4):045024, 2020.
+Lee, S., Kreis, K., Veccham, S., Liu, M., Reidenbach, D.,
+Paliwal, S., Vahdat, A., and Nie, W. Molecule generation
+with fragment retrieval augmentation. Advances in Neu-
+ral Information Processing Systems, 37:132463–132490,
+2024.
+Li, Y., Gao, C., Song, X., Wang, X., Xu, Y., and Han, S.
+Druggpt: a gpt-based strategy for designing potential
+ligands targeting specific proteins. bioRxiv, pp. 2023–06,
+2023.
+Liu, Y., Ott, M., Goyal, N., Du, J., Joshi, M., Chen, D.,
+Levy, O., Lewis, M., Zettlemoyer, L., and Stoyanov, V.
+Roberta: A robustly optimized bert pretraining approach.
+arXiv preprint arXiv:1907.11692, 2019.
+O’Boyle, N. and Dalke, A. Deepsmiles: an adaptation of
+smiles for use in machine-learning of chemical structures.
+2018.
+9
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+Olivecrona, M., Blaschke, T., Engkvist, O., and Chen, H.
+Molecular de-novo design through deep reinforcement
+learning. Journal of cheminformatics, 9(1):48, 2017.
+Pinheiro, G. A., Da Silva, J. L., and Quiles, M. G. Smiclr:
+Contrastive learning on multiple molecular representa-
+tions for semisupervised and unsupervised representation
+learning. Journal of Chemical Information and Modeling,
+62(17):3948–3960, 2022.
+Qian, Y., Shi, M., and Zhang, Q. Consmi: contrastive learn-
+ing in the simplified molecular input line entry system
+helps generate better molecules. Molecules, 29(2):495,
+2024.
+Radford, A., Wu, J., Child, R., Luan, D., Amodei, D.,
+Sutskever, I., et al. Language models are unsupervised
+multitask learners. OpenAI blog, 1(8):9, 2019.
+Scalia, G., Grambow, C. A., Pernici, B., Li, Y.-P., and Green,
+W. H. Evaluating scalable uncertainty estimation methods
+for deep learning-based molecular property prediction.
+Journal of chemical information and modeling, 60(6):
+2697–2717, 2020.
+Seal, S., Carreras-Puigvert, J., Trapotsi, M.-A., Yang, H.,
+Spjuth, O., and Bender, A. Integrating cell morphology
+with gene expression and chemical structure to aid mito-
+chondrial toxicity detection. Communications Biology, 5
+(1):858, 2022.
+Seal, S., Yang, H., Trapotsi, M.-A., Singh, S., Carreras-
+Puigvert, J., Spjuth, O., and Bender, A. Merging bioac-
+tivity predictions from cell morphology and chemical
+fingerprint models using similarity to training data. Jour-
+nal of Cheminformatics, 15(1):56, 2023.
+Shi, C., Xu, M., Zhu, Z., Zhang, W., Zhang, M., and Tang,
+J. Graphaf: a flow-based autoregressive model for molec-
+ular graph generation. arXiv preprint arXiv:2001.09382,
+2020.
+Sterling, T. and Irwin, J. J. Zinc 15–ligand discovery for
+everyone. Journal of chemical information and modeling,
+55(11):2324–2337, 2015.
+Su, Y., Liu, F., Meng, Z., Lan, T., Shu, L., Shareghi,
+E., and Collier, N. Tacl: Improving bert pre-training
+with token-aware contrastive learning. arXiv preprint
+arXiv:2111.04198, 2021.
+Tetko, I. V., Karpov, P., Van Deursen, R., and Godin, G.
+State-of-the-art augmented nlp transformer models for
+direct and single-step retrosynthesis. Nature communica-
+tions, 11(1):5575, 2020.
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. At-
+tention is all you need. Advances in neural information
+processing systems, 30, 2017.
+Wang, S., Guo, Y., Wang, Y., Sun, H., and Huang, J. Smiles-
+bert: large scale unsupervised pre-training for molecular
+property prediction. In Proceedings of the 10th ACM in-
+ternational conference on bioinformatics, computational
+biology and health informatics, pp. 429–436, 2019.
+Wang, Y., Xiao, J., Suzek, T. O., Zhang, J., Wang, J., and
+Bryant, S. H. Pubchem: a public information system for
+analyzing bioactivities of small molecules. Nucleic acids
+research, 37(suppl 2):W623–W633, 2009.
+Wang, Y., Wang, J., Cao, Z., and Barati Farimani, A. Molec-
+ular contrastive learning of representations via graph neu-
+ral networks. Nature Machine Intelligence, 4(3):279–287,
+2022.
+Wang, Z., Shi, J., Heess, N., Gretton, A., and Titsias,
+M. K. Learning-order autoregressive models with ap-
+plication to molecular graph generation. arXiv preprint
+arXiv:2503.05979, 2025.
+Weininger, D. Smiles, a chemical language and information
+system. 1. introduction to methodology and encoding
+rules. Journal of chemical information and computer
+sciences, 28(1):31–36, 1988.
+Wu, J.-N., Wang, T., Chen, Y., Tang, L.-J., Wu, H.-L., and
+Yu, R.-Q. t-smiles: a fragment-based molecular repre-
+sentation framework for de novo ligand design. Nature
+Communications, 15(1):4993, 2024.
+Xu, L., Xia, L., Pan, S., and Li, Z. Triple generative self-
+supervised learning method for molecular property pre-
+diction. International Journal of Molecular Sciences, 25
+(7):3794, 2024.
+You, J., Liu, B., Ying, Z., Pande, V., and Leskovec, J. Graph
+convolutional policy network for goal-directed molecu-
+lar graph generation. Advances in neural information
+processing systems, 31, 2018.
+Zhou, Q., Xu, H., Li, H., Zhang, H., Zhang, X., Wang,
+Y., and Gao, K. Token-level contrastive learning with
+modality-aware prompting for multimodal intent recogni-
+tion. In Proceedings of the AAAI conference on artificial
+intelligence, volume 38, pp. 17114–17122, 2024.
+Zhu, J., Xia, Y., Wu, L., Xie, S., Zhou, W., Qin, T., Li,
+H., and Liu, T.-Y. Dual-view molecular pre-training. In
+Proceedings of the 29th ACM SIGKDD Conference on
+Knowledge Discovery and Data Mining, pp. 3615–3627,
+2023.
+10
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+A. Visualization of Trajectory Dynamics
+To provide an intuitive understanding of the ”manifold fragmentation” problem discussed in Section 4.1 and the redundancy
+issue addressed in Section 4.4, we visualize the generation trajectories in Figure 7.
+Figure 7(b) illustrates the unconstrained scenario (characteristic of standard sampling or naive beam search), where the
+stochastic nature of sequential decoding leads to divergent paths for the same molecular graph. This divergence is the root
+cause of the ”saturation” phenomenon observed in our beam width experiments.
+In contrast, Figure 7(c) demonstrates the constrained alignment principle. Although visually depicted using randomized
+training views, this same mechanism underpins our IsoBeam decoding strategy: by dynamically recognizing and merging
+structurally equivalent partial paths (indicated by the converging arrows), the model is forced to explore topologically
+distinct regions rather than syntactic permutations.
+Figure 7. Conceptual Visualization of Trajectory Dynamics. (a) The canonical reference path. (b) Unconstrained trajectories diverge
+into isomorphic variations (Redundancy). (c) Constrained trajectories align structurally equivalent paths. This alignment mechanism is
+central to SIGMA’s training objective and is explicitly enforced during inference via IsoBeam to prune redundant search branches. *Note:
+START/END markers denote sequence boundaries; arrows indicate traversal direction.
+B. Implementation Details
+In this section, we provide detailed specifications regarding the model architecture, training hyperparameters, computing
+infrastructure, and baseline configurations to ensure the reproducibility of our results. Our code and pre-trained models will
+be made publicly available upon acceptance.
+B.1. Model Architecture
+We utilize the GPT-2 Small architecture as the backbone for the SIGMA model. The model consists of a 12-layer
+Transformer decoder with 12 attention heads and a hidden dimension of dmodel = 768.
+• Embedding Layer: We use a learned positional embedding with a maximum sequence length of 128 (covering > 99%
+of SMILES strings in ZINC-250k).
+• Projection Head: For the contrastive learning objective (SIGMA alignment), we attach a 2-layer MLP projection head
+(Hidden dim: 768 →256) to the terminal hidden state of the Transformer. This head is used only during training to
+compute the contrastive loss and is discarded during inference.
+• Parameter Count: The total number of trainable parameters is approximately 124M.
+B.2. Training Configuration
+All models, including SIGMA and sequence-based baselines, were trained for 50 epochs on the ZINC-250k dataset. We
+use the AdamW optimizer with a linear learning rate warmup for the first 5% of training steps, followed by a cosine decay
+schedule. To stabilize training, we apply gradient clipping.
+11
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+We specifically note that for SIGMA, the batch size refers to the number of unique molecules; since we generate 2 views per
+molecule for contrastive learning, the effective number of sequences processed per step is 2 × Batch Size.
+Detailed hyperparameters are listed in Table 3.
+Table 3. Hyperparameter Settings for SIGMA Training.
+Hyperparameter
+Value
+Optimization
+Optimizer
+AdamW
+Peak Learning Rate
+5 × 10−4
+Weight Decay
+0.01
+Beta parameters
+(0.9, 0.999)
+Gradient Clipping (Norm)
+1.0
+Batch Size
+64
+Training Epochs
+50
+Warmup Steps
+2000
+Contrastive Learning
+Temperature (τ)
+0.1
+Augmentation Views (N)
+2
+Projection Head Dim
+256
+Architecture (GPT-2 Small)
+Layers
+12
+Attention Heads
+12
+Hidden Dimension
+768
+Dropout
+0.1
+Max Sequence Length
+128
+B.3. Data Preprocessing and Tokenization
+• Dataset: We use the ZINC-250k dataset (Irwin & Shoichet, 2005), comprising 250,000 commercially available
+drug-like molecules. We follow the standard random split: 220k for training, 20k for validation, and 10k for testing.
+• Tokenization: We employ a character-level tokenizer derived from the training set. The vocabulary consists of 69
+unique tokens, including standard atomic symbols (e.g., C, O, N), bond types, branching/ring indicators, and special
+control tokens (e.g., [BOS], [EOS], [PAD]).
+• Augmentation: For the contrastive objective, randomized SMILES are generated on-the-fly using RDKit by traversing
+the molecular graph with random starting atoms and traversal orders.
+B.4. Computing Infrastructure
+All experiments were conducted on a single NVIDIA A100 Tensor Core GPU (40GB VRAM). The software environment
+includes:
+• Framework: PyTorch 2.1.0
+• Chemistry Library: RDKit 2023.09.5 (for SMILES handling, augmentation, and validity checks).
+• Transformers Library: HuggingFace Transformers 4.35.0.
+Inference with IsoBeam at K = 50, 000 was optimized using batch processing on the GPU to maximize throughput.
+12
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+B.5. Inference Details (IsoBeam)
+For the asymptotic analysis in Section 4.4, we scaled the beam width K across the set {100, 500, 1000, 5000, 10000, 50000}.
+• Standard Beam Search: Implemented using the default HuggingFace generate function with num beams=K and
+num return sequences=K.
+• IsoBeam: Implemented as a custom decoding loop. At each step, valid partial SMILES are cached. We utilize a hash
+map to store InChIKeys of visited structures to perform O(1) redundancy checks.
+C. Data Construction and View Generation
+To ensure the reproducibility of our topology-aware view construction, we detail the graph partitioning and string generation
+process utilized in Section 3.2.
+C.1. Graph Partitioning Algorithm
+For a given molecule G = (V, E), we identify the set of cuttable bonds Ecut ⊂E. A bond e = (u, v) is included in Ecut if
+and only if:
+1. Acyclicity: e does not belong to any ring system.
+2. Non-Terminal (Optional): To avoid creating trivial fragments (e.g., single methyl groups), we typically require that
+both resulting components have at least 2 heavy atoms. ]
+During training, for each molecule in a batch, we uniformly sample one bond e ∈Ecut to dissolve. This partitions the graph
+into two connected components: the prefix subgraph Gpre and the suffix subgraph Gsuf.
+C.2. Handling Attachment Points
+Crucially, simply severing the bond would lose topological information regarding the connection point. To resolve this, we
+introduce **dummy atoms** (anchors) at the cut site.
+• The atom u in Gpre that was connected to v is marked with a wildcard token (e.g., *) or a specific isotope tag to
+indicate the growth direction.
+• This ensures that the SMILES string for Gpre explicitly encodes an ”open” valency, distinguishing, for example, an
+ethyl group (CC*) from an ethane molecule (CC).
+C.3. Contrastive View Generation
+The core of SIGMA is strictly aligning syntactically distinct strings that represent the same geometric subgraph. Once Gpre
+is fixed:
+• View 1: We generate a canonical SMILES string s(1)
+pre of Gpre (rooted at the cut point or canonically ordered).
+• View 2: We generate a randomized SMILES string s(2)
+pre of the same subgraph Gpre by performing a random DFS
+traversal (using RDKit’s doRandom=True).
+This pair (s(1)
+pre, s(2)
+pre) serves as a positive sample for the contrastive objective, as they are guaranteed to map to the identical
+topological structure despite their sequence differences.
+D. Dense Trajectory Alignment Objective
+Given equivalent prefix pairs (pi, pj), SIGMA applies a token-level contrastive objective over their valid suffix trajectories.
+Let ht denote the hidden state at position t. We minimize an InfoNCE-style loss:
+13
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+LSIGMA = −
+X
+t
+log
+exp(sim(h(i)
+t , h(j)
+t )/τ)
+P
+k exp(sim(h(i)
+t , h(k)
+t
+)/τ)
+.
+(8)
+This aligns representations across equivalent syntactic trajectories, restoring manifold connectivity.
+E. Additional Evidence of Geometric Invariance
+To verify that the geometric invariance observed in Section 4.1 generalizes to complex pharmaceutical compounds, we
+conduct an additional microscopic alignment analysis on **Acetylsalicylic acid (Aspirin)**.
+We inspect the attention patterns between two synonymous SMILES representations of Aspirin that differ significantly in
+their starting syntax:
+• View A: CC(=O)Oc1ccccc1C(=O)O (Standard canonical start)
+• View B: O=C(C)Oc1ccccc1C(=O)O (Alternative start with inverted acetyl group)
+As visualized in Figure 8, SIGMA exhibits strong **off-diagonal semantic alignment**. specifically, the representations
+of the acetyl group tokens—CC(=O) in View A and O=C(C) in View B—show high cosine similarity (indicated by the
+bright block in the top-left corner), despite being composed of different character sequences. This confirms that SIGMA has
+successfully learned to abstract the underlying functional group (the acetyl ester) independent of its specific linearization
+order. The continued high similarity along the diagonal for the shared benzene ring substructure (Oc1ccccc1...) further
+validates that the model maintains trajectory consistency once the syntax converges.
+Figure 8. Geometric Alignment on Acetylsalicylic Acid (Aspirin). We visualize the token-level cosine similarity between two
+isomorphic views of Aspirin: CC(=O)... vs. O=C(C).... The high-similarity region (red block) aligning the distinct prefixes
+confirms that SIGMA correctly identifies the topological equivalence of the acetyl group despite the variation in linearization direction.
+F. Metric Definitions
+To ensure reproducibility, we provide formal definitions for all evaluation metrics used in our experiments.
+F.1. Generative Quality Metrics
+Let G be the set of generated molecules and Dtrain be the training dataset.
+• Validity: The fraction of generated SMILES strings that can be parsed into valid molecular graphs by RDKit.
+• Uniqueness: The fraction of valid molecules that are unique within the generated set G.
+Uniqueness = |unique(Gvalid)|
+|Gvalid|
+• Novelty: The fraction of valid, unique generated molecules that do not appear in the training set.
+Novelty = |{m ∈Gvalid | m /∈Dtrain}|
+|Gvalid|
+14
+SIGMA: Structure-Invariant Generative Molecular Alignment via Autoregressive Contrastive Learning
+• Internal Diversity (IntDiv): Measures the chemical diversity within the generated set using the average pairwise
+Tanimoto distance (Td) of Morgan fingerprints (M).
+IntDiv(G) = 1 −
+1
+|G|2
+X
+mi,mj∈G
+Tanimoto(M(mi), M(mj))
+F.2. Distribution Learning Metrics
+• Fr´echet ChemNet Distance (FCD): Measures the distance between the distribution of generated molecules and the
+test set in the activation space of ChemNet (a pre-trained GRU). Lower FCD indicates that the generated molecules
+capture the chemical and biological properties of the real data distribution more accurately.
+• Scaffold Diversity (#Scaf): The number of unique Bemis-Murcko scaffolds extracted from the generated set. A
+scaffold is obtained by removing all side chain atoms and keeping only the ring systems and linkers. Higher #Scaf
+indicates better exploration of the structural topology.
+F.3. Geometric Invariance Metrics
+• Trajectory Invariance Score (TIS): A custom metric to quantify the stability of the latent representation against
+isomorphic permutations. For a given molecule M, let s1 and s2 be two distinct SMILES prefixes representing the
+same partial graph Gsub. Let h(s) denote the normalized terminal hidden state of the model given prefix s. TIS is
+defined as the expected cosine distance over the test set:
+TIS = EM∼Dtest [1 −sim(h(s1), h(s2))]
+Lower TIS values (closer to 0) indicate stronger geometric invariance, where the model maps syntactically different but
+topologically equivalent sequences to nearby points in the latent space.
+F.4. Optimization Metrics (PMO)
+For the Reinforcement Learning tasks, we report:
+• Top-1 / Top-10 / Top-100: The average reward score of the top K molecules found during the optimization process.
+• Success Rate: The percentage of generated molecules that satisfy all hard constraints (if applicable) and exceed a
+predefined reward threshold.
+15

@@ -1,0 +1,1080 @@
+HDPO: Hybrid Distillation Policy Optimization via Privileged
+Self-Distillation
+Ken Ding
+NVIDIA
+kennethd@nvidia.com
+Abstract
+Large language models trained with reinforcement learning (RL) for mathe-
+matical reasoning face a fundamental challenge: on problems the model
+cannot solve at all—“cliff” prompts—the RL gradient vanishes entirely,
+preventing any learning signal from reaching these failure modes. We
+introduce Hybrid Distillation Policy Optimization (HDPO), which aug-
+ments standard RL with privileged self-distillation targeting cliff prompts.
+On each training step, HDPO identifies prompts where all rollouts fail,
+generates privileged rollouts by providing the model with ground-truth
+information, filters for correct solutions, and distills the teacher’s token-
+level distribution into the student. Because teacher and student share
+the same weights—differing only in their input—the realizability gap is
+provably bounded, unlike cross-model distillation. We prove that R=1
+filtered privileged generation recovers the optimal KL-regularized RL pol-
+icy in the hard-threshold limit. Experiments on OpenMathInstruct-2 with
+Qwen2.5-Math-1.5B-Instruct show that HDPO consistently improves cover-
+age metrics (pass@4 by +0.8–1.1%, pass@8 by +0.4–1.7%) while maintaining
+greedy accuracy, with the distillation weight λ providing direct control over
+the exploration–exploitation tradeoff.
+1
+Introduction
+Recent advances in reinforcement learning from verifiable rewards (RLVR) have enabled
+large language models to develop sophisticated mathematical reasoning capabilities (Shao
+et al., 2024; DeepSeek-AI et al., 2025). Among RL algorithms for language models, Group
+Relative Policy Optimization (GRPO) (Shao et al., 2024) has emerged as a practical and
+effective approach, eliminating the need for a critic network by normalizing rewards within
+each group of rollouts to compute advantages.
+However, GRPO and related policy gradient methods share a fundamental limitation: they
+can only learn from problems where at least some rollouts succeed. When all rollouts for a
+prompt receive zero reward — a condition commonly called a "cliff" (Zhang et al., 2025b) —
+the advantage estimates are identical for all trajectories and the policy gradient vanishes.
+These zero-gradient prompts are precisely the ones where learning is most needed, yet they
+receive no training signal. Le et al. (Le et al., 2025) characterize this as the zero-variance
+prompt problem and show that, on their benchmark, a significant fraction of prompts falls in
+this regime—the exact proportion depends on the dataset and model, but the phenomenon
+creates a persistent learning dead zone at the frontier of the model’s capability.
+We take a different approach inspired by the principle of learning using privileged informa-
+tion(Vapnik and Vashist, 2009). In our framework, Hybrid Distillation Policy Optimization
+(HDPO), the model acts as both teacher and student. As the teacher, it receives the problem
+along with ground-truth information and generates rollouts from this privileged context.
+As the student, it receives only the original problem. Because both roles use the same model
+weights, the gap between their distributions is provably bounded (Proposition 1), unlike
+cross-model distillation where the gap depends on architectural differences between teacher
+and student.
+1
+arXiv:2603.23871v1  [cs.LG]  25 Mar 2026
+HDPO operates as follows: on each training step, after standard GRPO updates, we identify
+cliff prompts where all rollouts scored zero. For these prompts, the model generates
+privileged rollouts conditioned on ground truth, filters for correct ones (R = 1), and distills
+the teacher’s token-level distribution into the student via JSD. The R = 1 filter is not a
+heuristic — we prove it implements rejection sampling from the KL-regularized RL optimal
+policy (Proposition 2).
+Our contributions are as follows:
+(1) We introduce HDPO, a hybrid training objective that combines RL with privileged
+self-distillation targeting cliff prompts where the RL gradient vanishes.
+(2) We prove that same-model privileged distillation achieves a strictly tighter realizability
+gap than cross-model distillation — the gap depends only on the information content of the
+ground truth, eliminating the model-mismatch term that cross-model distillation cannot
+avoid (Proposition 1).
+(3) We prove that R = 1 filtered privileged generation recovers the optimal KL-regularized
+RL policy (Proposition 2), providing theoretical justification for the teacher construction.
+(4) We demonstrate on OpenMathInstruct-2 (Toshniwal et al., 2024) that HDPO improves
+coverage (pass@4, pass@8) while maintaining greedy accuracy (pass@1), with the distillation
+weight λ providing explicit control over the exploration–exploitation tradeoff.
+2
+Background
+2.1
+Reinforcement Learning for Language Models
+Reinforcement learning-based training of language models formulates text generation as
+a sequential decision problem where the policy πθ generates tokens autoregressively and
+receives a scalar reward upon completion. This framework, popularized by RLHF (Ouyang
+et al., 2022) for instruction following, has been adapted to mathematical reasoning as
+reinforcement learning from verifiable rewards (RLVR), where the reward is typically binary:
+r(x, y) = 1 if the solution y is correct and 0 otherwise (DeepSeek-AI et al., 2025). This binary,
+outcome-level reward makes credit assignment particularly challenging, as the model must
+determine which tokens contributed to a correct or incorrect answer.
+2.2
+Group Relative Policy Optimization
+GRPO (Shao et al., 2024) generates G rollouts {y1, . . . , yG} for each prompt x and computes
+advantages by normalizing rewards within each group: c
+Ai
+=
+ri −µ
+σ
+. This eliminates
+the need for a separate critic network, reducing memory requirements and avoiding the
+instability of value function estimation.
+GRPO applies PPO-style ratio clipping (Schulman et al., 2017) to stabilize updates: LGRPO =
+−E [min (ρtA, clip (ρt, 1 −ε, 1 + ε) A)], where ρt
+=
+πθ(at|st)
+πold(at|st) is the importance ratio.
+Training alternates between generating rollouts from the current policy and performing
+gradient updates on the clipped objective.
+2.3
+The Cliff Problem
+Under binary reward with G rollouts, the advantage for a prompt x takes one of three
+forms: (i) all rollouts succeed, giving zero advantages — the model has already learned this
+prompt; (ii) mixed results, giving positive advantages for successes and negative for failures
+— the standard learning regime; or (iii) all rollouts fail, giving zero advantages — the model
+receives no gradient despite urgently needing signal.
+Case (iii) — commonly called a “cliff” (Zhang et al., 2025b) — is the critical failure mode: the
+hardest problems, which represent the frontier of the model’s capability, receive essentially
+no gradient (Le et al., 2025). The model can only learn from prompts at intermediate difficulty
+2
+— hard enough that some rollouts fail (providing contrast for advantage estimation) but easy
+enough that some succeed. The cliff boundary can only advance indirectly, as learning on
+nearby prompts must transfer to cliff prompts through weight sharing alone — there is no
+direct gradient signal on the cliffs themselves.
+2.4
+Approaches to the Cliff Problem
+A growing body of work has identified the cliff problem as a critical bottleneck in RL for rea-
+soning and proposed diverse strategies to address it. These approaches introduce substantial
+additional complexity — new hyperparameters, auxiliary models, replay infrastructure, or
+modifications to the training loop — to work around the zero-gradient problem. By contrast,
+HDPO requires only a single additional forward pass with ground truth appended to the
+prompt and a standard JSD loss: no curriculum scheduler, no replay buffer, no process
+reward model, no scaffolding heuristics. We organize the existing approaches into several
+categories to illustrate this complexity.
+Curriculum and filtering. VCRL (Jiang et al., 2025) observes that group reward variance
+is a natural proxy for prompt difficulty and dynamically schedules sampling to focus on
+the high-variance frontier. DAPO (Yu et al., 2025) filters out zero-variance prompts entirely,
+oversampling until informative prompts are found. While effective, these methods avoid
+cliff prompts rather than learning from them — the hardest problems are simply skipped,
+leaving the cliff boundary to advance only through indirect transfer from nearby solved
+prompts.
+Scaffolded and augmented generation. Scaf-GRPO (Zhang et al., 2025b) diagnoses learning
+stagnation on cliff prompts and injects tiered in-prompt hints — from abstract concepts
+to concrete steps — that fade as the model improves. HINT (Wang et al., 2025) provides
+targeted guidance to help ineffective rollouts navigate toward correct solutions. EvoCoT
+(Liu et al., 2025) constrains the exploration space by self-generating and verifying chain-
+of-thought trajectories, then gradually expands by shortening CoT steps. These methods
+require designing or learning a hint generation strategy, deciding when to inject and fade
+hints, and managing the distributional gap between scaffolded and unscaffolded generations
+— a non-trivial engineering and research effort per domain.
+Experience replay. Retrospective Replay (Dou et al., 2025) stores early exploratory trajectories
+and revisits them later when the model has grown capable. RLEP (Zhang et al., 2025a)
+collects verified correct trajectories and blends them into mini-batches. Replay methods
+introduce a buffer management system with its own hyperparameters (buffer size, sampling
+strategy, staleness thresholds) and face a fundamental tension: replayed trajectories are
+off-policy and may become increasingly stale as training progresses, potentially teaching the
+model to imitate outdated reasoning patterns.
+Advantage shaping and process rewards. Le et al. (Le et al., 2025) tackle zero-variance
+prompts by scaling each token’s gradient in proportion to its entropy, reclaiming learning
+signal from otherwise wasted prompts. PRIME (Cui et al., 2025) enables online process
+reward model updates using only policy rollouts and outcome labels. Lightman et al.
+(Lightman et al., 2024) demonstrate that step-level verification rewards substantially improve
+reasoning. However, process reward approaches require training and maintaining a separate
+reward model — itself a significant undertaking — and shaped rewards may not perfectly
+align with the outcome objective.
+Interleaved RL and distillation. ReLIFT (Ma et al., 2025) finds that RL excels on easier
+questions while SFT is crucial for the hardest ones, and interleaves RL with targeted online
+SFT on questions the current policy cannot solve. ReLIFT is conceptually closest to HDPO
+but is considerably more complex: it requires a two-phase training loop with switching
+logic, an external source of high-quality solutions for the SFT phase, and careful tuning of
+the interleaving schedule. HDPO achieves the same goal — learning signal on cliff prompts
+— with a single unified objective, using the model’s own privileged rollouts rather than
+external solutions, and with theoretical guarantees (bounded realizability gap, optimal
+target characterization) that ReLIFT lacks.
+3
+In summary, existing approaches to the cliff problem introduce substantial machinery —
+curriculum schedulers, hint generators, replay buffers, process reward models, or multi-
+phase training loops — to work around the zero-gradient problem. HDPO’s mechanism
+is remarkably simple by comparison: append ground truth to the prompt, generate, filter
+for correctness, and distill via JSD. This simplicity is not a limitation but a feature: it
+arises from the observation that the model can solve cliff prompts when given privileged
+information — the same weights that fail unprompted succeed with ground-truth context,
+providing a naturally bounded distillation target. HDPO is also complementary to these
+approaches — curriculum methods could prioritize near-cliff prompts, and process rewards
+could densify signal on non-cliff prompts — but it achieves its core effect with minimal
+additional complexity.
+2.5
+Knowledge Distillation for Reasoning
+Knowledge distillation (Hinton et al., 2015) transfers knowledge from a teacher to a student by
+minimizing the divergence between their output distributions. For autoregressive language
+models, a key challenge is distribution mismatch: the student is trained on teacher-generated
+or fixed sequences, but at inference must generate from its own distribution. Agarwal et al.
+(Agarwal et al., 2024) address this with Generalized Knowledge Distillation (GKD), which
+trains the student on its own generated outputs while receiving teacher feedback. GKD
+offers flexibility in divergence choice (forward KL, reverse KL, JSD).
+Self-distillation for reasoning. Zhao et al. (Zhao et al., 2026) propose on-policy self-
+distillation (OPSD), where a single LLM serves as both teacher and student under different
+informational contexts — the teacher conditions on privileged information such as verified
+reasoning traces or ground-truth solutions, while the student sees only the problem. Training
+minimizes per-token divergence over the student’s own on-policy rollouts. Hübotter et
+al. (Hübotter et al., 2026) introduce Self-Distillation Policy Optimization (SDPO), which
+converts rich textual feedback (runtime errors, judge evaluations) into a dense learning
+signal by distilling the model’s feedback-conditioned predictions back into the unconditional
+policy, addressing the credit-assignment bottleneck of scalar-only reward.
+Unified KD and RL frameworks. Several works jointly optimize distillation and RL objectives.
+KDRL (Xu et al., 2025) simultaneously minimizes reverse KL divergence between student
+and teacher while maximizing expected reward, finding that the combination outperforms
+either objective alone. RLAD (Zhang et al., 2026) replaces the standard importance ratio with
+a geometric mixture of the old policy and a teacher model, embedding the teacher directly
+into the RL policy update. G-OPD (Yang et al., 2026) shows theoretically that standard
+on-policy distillation is a special case of dense KL-constrained RL and introduces reward
+extrapolation to enable students to surpass teacher performance.
+Diversity preservation. Li et al. (Li et al., 2025) identify the diversity collapse problem:
+RLVR fine-tuning improves pass@1 but degrades pass@k as the policy concentrates around a
+single mode. DPH-RL replaces mode-seeking divergences (reverse KL) with mass-covering
+alternatives (forward KL, JSD) that continuously reference the initial policy to maintain broad
+solution coverage. This insight directly motivates HDPO’s use of JSD for the distillation loss:
+JSD provides mode-covering signal that expands the student’s support without collapsing
+to a single mode.
+Privileged information. The concept of learning using privileged information (LUPI)
+(Vapnik and Vashist, 2009) provides a theoretical framework for training with auxiliary
+information available only at training time. Penaloza et al. (Penaloza et al., 2026) introduce
+pi-Distill, a joint teacher-student objective for privileged information distillation. HDPO
+instantiates the LUPI framework specifically for RL: ground truth serves as privileged
+information, the model itself serves as teacher, JSD (Lin, 1991) provides the distillation
+mechanism, and distillation targets only cliff prompts where the RL gradient vanishes.
+4
+3
+Method: Hybrid Distillation Policy Optimization
+3.1
+Motivation
+The central insight of HDPO is that for cliff prompts, we can construct a teacher signal
+without any external model or human annotation — by giving the model itself access to
+the answer. When conditioned on ground-truth information (e.g., the solution to a math
+problem), even a small model can generate correct reasoning traces with high probability.
+The key properties of this construction are: (i) the teacher and student share the same
+weights, differing only in their input context; (ii) the R = 1 filter selects only correct teacher
+trajectories; and (iii) distillation targets only cliff prompts where the RL gradient is zero.
+Property (i) is critical: because teacher and student are the same model, the realizability gap
+— the KL divergence between their output distributions — is bounded by a function of the
+privileged information alone (Proposition 1). This is strictly tighter than the bound for any
+cross-model teacher, which incurs an additional model-mismatch term that same-model
+distillation eliminates entirely. Property (ii) ensures we distill from the optimal target, not
+just any correct trajectory. Property (iii) restricts distillation to cliff prompts, where the RL
+gradient is zero and thus cannot provide signal on its own.
+3.2
+Formal Definition
+Formal Definition.
+The HDPO training objective combines LGRPO with a LJSD distillation
+term on cliff prompts:
+LHDPO(θ) = LGRPO(θ) + λ · LJSD(θ)
+where LJSD is the token-averaged JSD over filtered teacher trajectories on cliff prompts:
+LJSD(θ) =
+1
+Ntok
+∑
+(x, y)∈T
+|y|
+∑
+t = 1
+JSDk (πT ( · | y< t) ∥πθ ( · | y< t))
+The distillation set T is constructed via two levels of filtering. First, identify cliff prompts —
+prompts where all K standard rollouts failed:
+C = {x ∈B : ∑k R(x, y(k)) = 0}
+Second, for each x ∈C, generate privileged rollouts ¯yj ∼πθ(· | x ⊕y∗)x by injecting
+ground truth y∗into the prompt, and retain only correct trajectories:
+T = {(x, ¯y) : x ∈C, ¯y ∼πθ(· | x ⊕y∗), R(x, ¯y) = 1}
+That is, T contains (prompt, trajectory) pairs where (a) the prompt is a cliff — all standard
+rollouts scored zero — and (b) the privileged model, conditioned on ground truth, generated
+a correct solution. Ntok
+= ∑(x, y)∈T |y| is the total distillation token count (computed
+globally across all data-parallel ranks). πT and πθ share the same weights; they differ only
+in their input (privileged vs. unprivileged). In practice, JSDk is approximated using the
+teacher's top-k (k = 64) logits, renormalized. The tail correction for student mass outside
+the top-k support is exact: Prest · ln 2.
+3.3
+Algorithm
+3.4
+Theoretical Analysis
+We argue that HDPO’s effectiveness rests on two properties: on the correct teacher trajectories,
+the distance between the student and teacher distributions is bounded (unlike cross-model
+5
+Algorithm 1 HDPO Training
+Require: Policy πθ, prompt set X , ground truth {y∗}, reward R, learning rate α, distillation
+weight λ, rollouts per prompt K
+1: for step = 1, . . . , N do
+2:
+// Standard GRPO
+3:
+Sample prompt batch B ⊂X
+4:
+for all x ∈B do
+5:
+Generate K rollouts y(k) ∼πθ(· | x)
+6:
+end for
+7:
+Score: ˆAi = (ri −µ)/σ
+8:
+Compute LGRPO via clipped policy gradient with leave-one-out advantages
+9:
+// Privileged self-distillation on cliff prompts
+10:
+Identify cliffs: C = {x ∈B : ∑k r(k) = 0}
+11:
+for all x ∈C do
+12:
+Generate ¯y(j) ∼πθ(· | x ⊕y∗)
+13:
+end for
+14:
+Filter: T = {(x, ¯y) : R(x, ¯y) = 1}
+15:
+Compute LJSD =
+1
+Ntok ∑(x, ¯y)∈T ∑| ¯y|
+t=1 JSDk(πT(·| ¯y<t) ∥πθ(·| ¯y<t))
+16:
+// Update
+17:
+θ ←θ −α∇θ
+ LGRPO(θ) + λ · LJSD(θ)
+
+18: end for
+distillation), and the R
+=
+1 filter ensures the teacher distribution the student moves
+toward corresponds to the KL-regularized RL optimal policy (Proposition 2). Moreover, this
+bound is strictly tighter than what any cross-model teacher can achieve: because teacher and
+student share the same function, the only source of distributional divergence is the privileged
+information itself. A cross-model teacher introduces an additional model-mismatch term
+that same-model distillation eliminates entirely (Proposition 1).
+Proposition 1 (Realizability Gap Comparison). Let PT and PS denote the per-position output
+distributions of a language model θ when prompted with and without ground truth g, respectively.
+DKL(PT ∥PS) ≤L2
+θ · ∆(g)2
+2
+(i) Same-model bound. where Lθ is the local Lipschitz constant of the model’s logit function on
+bounded inputs and ∆(g) is the input-space distance attributable to g.
+(ii) Cross-model comparison. For cross-model distillation with a separate teacher model ϕ receiving
+the same privileged input cT, the realizability gap satisfies:
+DKL(Pϕ(·|cT) ∥Pθ(·|cS)) ≤
+ Lθ · ∆(g) +
+ fϕ (cT) −fθ (cT)
+
+∞
+2
+2
+The cross-model bound contains an additive model-mismatch term
+ fϕ (cT) −fθ (cT)
+
+∞that is
+absent from the same-model bound. This term vanishes if and only if the models produce identical
+logits on the privileged input.
+Proof sketch.
+Both bounds follow from Lemma 1 (Appendix A), which shows DKL ≤∥δ∥∞
+2
+2
+for any logit perturbation δ. For (i): since teacher and student evaluate the same function fθ
+on different inputs, the logit difference is bounded by Lθ · ∆(g) via Lipschitz continuity. For
+(ii): the logit difference decomposes via the triangle inequality into a model-mismatch term
+plus the same input-perturbation term from (i) (Appendix A).
+Interpretation.
+The proposition provides a direct comparison between same-model and
+cross-model distillation. Both bounds share the same ∆(g) term — the cost of incorporating
+6
+privileged information — but the cross-model bound pays an additional price for model
+mismatch. With a drifting teacher (where the teacher shares the student’s current weights),
+the model-mismatch term is identically zero throughout training. With a frozen teacher
+(initialized at the start of training), a non-zero model-mismatch term appears, yielding
+looser guarantees that approach the cross-model regime.
+Relation to prior work.
+The bound follows from standard Lipschitz continuity and logit
+perturbation arguments. Lemma 1 (Appendix A) is a known bound on KL divergence under
+softmax logit perturbation. The contribution of Proposition 1 is not the bound itself but
+the comparison: it makes explicit that same-model privileged distillation eliminates the
+model-mismatch term that cross-model distillation cannot avoid.
+Proposition 2 (R=1 Filtering Yields the RL-Optimal Policy). Consider the KL-regularized RL
+objective:
+max
+π
+Eτ∼π[R(τ)] −β · KL(π ∥πre f )
+For binary reward R ∈{0, 1}, the unique optimizer is π∗(x) ∝πre f (x) exp(R(x)/β). In the limit
+β →0+, π∗converges to πre f (·|R = 1) — the reference policy conditioned on correctness — and
+R = 1 rejection sampling from πre f recovers it exactly.
+Proof sketch.
+The unique solution takes the form (Rafailov et al., 2023):
+π∗(τ) = πre f (τ) ·
+exp
+ R(τ)
+β
+
+Z(β)
+where Z(β) is the partition function. For binary reward R(τ) ∈{0, 1}, this reweights correct
+trajectories by exp(1/β) relative to incorrect ones. In the hard-threshold limit β →0+,
+incorrect trajectories receive zero weight and the optimal policy concentrates entirely on
+correct trajectories (Appendix B):
+π∗(τ) →πre f (τ | R(τ) = 1) =
+πre f (τ) · 1[R(τ) = 1]
+Pπre f (R = 1)
+Connection to HDPO.
+The KL-regularized objective above is the standard RL formulation:
+maximize reward while staying close to a reference πre f . Proposition 2 shows that in
+the β
+→
+0 limit with binary reward, the optimal policy is πre f (· | R
+=
+1) — the
+reference distribution conditioned on correctness — and that R = 1 rejection sampling
+recovers it exactly. On non-cliff prompts, GRPO's policy gradient optimizes this objective
+directly and provides learning signal. On cliff prompts, however, all K rollouts score zero:
+Pπ_θ(·|prompt)(R = 1) ≈0. The reference has negligible support on correct trajectories, so
+πre f (· | R = 1) is inaccessible — rejection sampling produces no accepted samples, and the
+RL gradient vanishes.
+HDPO resolves this by replacing πre f with a proxy whose optimal solution has non-
+degenerate support on correct trajectories. Injecting ground truth g into the prompt yields
+πθ(· | prompt, g), which shares the student's weights but has substantially higher P(R = 1).
+The KL-regularized objective with this proxy reference,
+max π E[R(τ)] −β · KL(π ∥πθ(· | prompt, g))
+has a well-defined optimal solution πθ(· | prompt, g, R = 1) with non-empty support on
+correct trajectories, precisely where the original objective's solution πθ(· | prompt, R = 1)
+had none. Ground truth injection expands the set of trajectories τ where R(τ)
+=
+1,
+7
+Table 1: Best pass@k on OpenMathInstruct-2 validation (2048 samples, Qwen2.5-Math-1.5B-
+Instruct) across 2000 training steps on 8×H200 GPUs. All HDPO variants use JSD with
+global token-count normalization. Bold indicates best in column. Results on 8×H100 GPUs
+are provided in Appendix D and show consistent trends with minor quantitative variation.
+Method
+pass@1
+pass@4
+pass@8
+GRPO Baseline
+0.6519
+0.7749
+0.8228
+HDPO (frozen, λ=0.01)
+0.6519
+0.7812
+0.8218
+HDPO (frozen, λ=0.1)
+0.6304
+0.7812
+0.8398
+HDPO (drifting, λ=0.01)
+0.6514
+0.7861
+0.8271
+HDPO (drifting, λ=0.1)
+0.6294
+0.7856
+0.8364
+transforming an objective with a degenerate solution into one with a substantive target.
+R = 1 filtering on this proxy has a well-defined optimal solution (Proposition 2). HDPO
+approximates it by generating from πθ(· | x, y∗) and retaining only R=1 completions, yielding
+a finite-sample estimate of πθ(· | x, y∗, R=1). This departs from the theoretical target in two
+ways: the proxy reference πpriv replaces πref (the gap bounded by Proposition 1), and the
+privileged pass rate can be substantially below 1 on hard problems, introducing sampling
+noise. Proposition 1 then bounds the gap between this proxy target and the ideal target
+πθ(· | prompt, R = 1): because teacher and student share weights, the only source of
+divergence is the privileged information itself, with the model-mismatch term identically
+zero for a drifting teacher.
+π-Distill (Penaloza et al., 2026) independently arrives at the same objective structure: its
+teacher objective JTeacher = E[R] −β · DKL(πT(·|x, I) ∥sg[πS(·|x)]) takes exactly this
+form with πre f = sg[πS]. Where π-Distill optimizes this objective via gradient ascent at
+finite β across all prompts, HDPO implements the β →0 limit mechanically via hard R=1
+filtering, activating only on cliff prompts where gradient-based optimization of the objective
+fails.
+4
+Experiments
+4.1
+Experimental Setup
+We evaluate HDPO using OpenMathInstruct-2 (Toshniwal et al., 2024), a large-scale dataset
+of mathematical problems sourced from the MATH competition benchmark (Hendrycks
+et al., 2021) and GSM8K. We use Qwen2.5-Math-1.5B-Instruct (Yang et al., 2024) as the base
+model. The dataset is split into 95% training and 5% validation (seed 42), yielding 2048
+validation problems evaluated with binary rewards from hf_math_verify. The base RL
+algorithm is GRPO with G=16 rollouts per prompt, leave-one-out advantages, and PPO-style
+ratio clipping (ε=0.2). We train for 2000 steps with AdamW (Loshchilov and Hutter, 2019)
+at learning rate 1e−6 with linear warmup. Generation uses vLLM (Kwon et al., 2023) at
+temperature 1.0. Full experimental details are provided in Appendix C.
+We compare four HDPO configurations against the GRPO baseline, varying the teacher type
+(frozen at initialization vs. drifting with current policy) and the distillation weight (λ ∈
+{0.01, 0.1}). All HDPO variants use top-k=64 JSD with global token-count normalization. We
+report best pass@1, pass@4, and pass@8 across training, evaluated every 10 steps with 2048
+samples per evaluation.
+4.2
+Results
+The drifting teacher at λ = 0.01 achieves the highest pass@4 (0.7861, +1.1% over baseline)
+and strong pass@8 (0.8271, +0.4%) while essentially maintaining pass@1 (0.6514 vs 0.6519).
+This is our primary result — HDPO broadens the model’s coverage without sacrificing
+greedy accuracy. We note that the magnitude of improvement at λ=0.01 varies across
+8
+hardware (see Appendix D); the effect is consistent in direction but modest in size relative to
+run-to-run variance.
+Increasing λ from 0.01 to 0.1 trades pass@1 for pass@8. Both teacher types at λ = 0.1 achieve
+~0.84 pass@8 (+1.4–1.7% over baseline) but pass@1 drops by ~2.3–2.8%. λ directly controls the
+exploration–exploitation trade-off in the output distribution. The λ=0.1 improvements on
+pass@8 are the most robust finding, reproducing consistently across hardware configurations.
+The drifting teacher advantage is most pronounced at low λ; at λ = 0.1, the advantage
+narrows as the strong distillation signal dominates.
+5
+Discussion
+The results demonstrate that HDPO provides a consistent mechanism for broadening
+the model’s solution distribution on mathematical reasoning tasks. At λ=0.01, HDPO
+improves pass@4 and pass@8 while essentially maintaining pass@1, though the magnitude
+of improvement is modest and varies across hardware (Appendix D). At λ=0.1, the coverage
+gains are larger and more robust, at the cost of pass@1. This is the core value proposition: by
+providing learning signal on cliff prompts where GRPO cannot, HDPO expands the model’s
+coverage, with λ controlling how aggressively it trades greedy accuracy for coverage.
+The λ parameter provides explicit control over the exploration–exploitation tradeoff. At
+λ=0.01, the distillation signal is a gentle nudge that broadens coverage; at λ=0.1, it becomes
+the dominant training signal on cliff prompts, significantly improving pass@8 but at the cost
+of pass@1. At our model scale (1.5B), we observe a consistent tradeoff between pass@1 and
+pass@k as λ increases, though it remains an open question whether this tradeoff persists at
+larger scales.
+We hypothesize that this tradeoff reflects model capacity interacting with mode-covering
+distillation. When the privileged model solves a problem via multiple distinct strategies,
+the JSD loss trains the student to place mass on all of them. For a small model, limited
+capacity means these modes compete for the same parameters: the model cannot maintain
+multiple fully coherent reasoning strategies simultaneously. The result is a flatter distribution
+where no single strategy dominates cleanly, degrading greedy accuracy (pass@1), while
+the broader support means additional samples discover genuinely different approaches
+(improving pass@k). We hypothesize that the ideal output distribution is not uniform but
+concentrated: a single dominant mode that greedy decoding reliably recovers, with smaller
+secondary modes accessible through repeated sampling. Pure RL naturally produces this
+shape through mode-seeking dynamics but cannot discover strategies where all rollouts
+fail. This analysis motivates the expand-then-sharpen curriculum described in Section 6:
+distillation first broadens strategy support on cliff prompts, then RL restores a dominant
+mode while preserving secondary strategies as a long tail.
+The drifting teacher — which shares the current policy’s weights at each step — outperforms
+the frozen teacher (initialized at the start of training) at low λ. At λ = 0.1, the advantage
+narrows as the strong distillation signal dominates.
+The frozen teacher at λ=0.1 achieves the single highest pass@8 (0.8398), suggesting that the
+initial model’s distribution may be more diverse — not yet shaped by RL’s mode-seeking
+dynamics — at the cost of a larger realizability gap. These results suggest a tradeoff between
+signal diversity and realizability in teacher choice, though confirming this as a general
+principle requires broader evaluation across scales and datasets.
+6
+Limitations
+Our results are demonstrated on a single model scale (1.5B parameters) and a single dataset
+(OpenMathInstruct-2, sourced from MATH (Hendrycks et al., 2021)). While the theoretical
+analysis (Proposition 1, Proposition 2) is scale-agnostic, the empirical magnitude of HDPO’s
+improvements may vary with model capacity, dataset difficulty, and reward function design.
+9
+Larger models may have fewer cliff prompts (higher baseline success rates), potentially
+reducing HDPO’s marginal benefit, or may benefit more from the expanded coverage.
+HDPO introduces computational overhead: generating and filtering privileged rollouts,
+computing top-k teacher logits, and the additional forward pass for the JSD loss. In our
+implementation, privileged generation is performed by the same vLLM instance used for
+standard rollouts, amortizing some of this cost. The overhead is proportional to the number
+of cliff prompts per step.
+A natural extension is to re-inject previously cliff prompts — now solvable after distillation —
+back into the RL training distribution for mode-sharpening. Crucially, re-injection should be
+delayed: by allowing continued training on other prompts before revisiting former cliffs, we
+test whether the distilled strategies are durably encoded rather than transiently accessible.
+This expand-then-sharpen cycle could systematically convert cliffs into solved prompts while
+maintaining the benefits of RL’s mode-seeking dynamics, achieving both high pass@k (broad
+coverage) and high pass@1 (sharp modes). We leave this curriculum-learning extension to
+future work.
+7
+Conclusion
+We have introduced HDPO, a hybrid training objective that augments reinforcement learning
+with privileged self-distillation to address the cliff problem in mathematical reasoning. By
+leveraging ground truth as privileged information and the model’s own weights as the
+teacher, HDPO provides bounded, non-zero gradients on prompts where the standard RL
+gradient vanishes. Our theoretical analysis shows that same-model privileged distillation
+achieves a strictly tighter realizability gap than cross-model distillation, with the gap
+depending only on the model’s Lipschitz constant and the information content of the ground
+truth (Proposition 1), and that R=1 filtering recovers the optimal KL-regularized RL policy
+(Proposition 2).
+Experiments on OpenMathInstruct-2 with Qwen2.5-Math-1.5B-Instruct show that HDPO
+consistently improves pass@4 and pass@8, with the distillation weight λ providing direct
+control over the exploration–exploitation tradeoff.
+At λ=0.1, coverage improvements
+(pass@8 +1.4–1.7%) reproduce robustly across hardware; at λ=0.01, improvements are
+consistent in direction but smaller in magnitude and more sensitive to run-to-run variance.
+Looking forward, the expand-then-sharpen paradigm — using HDPO to broaden coverage,
+then RL to sharpen modes on previously unsolvable prompts — suggests a curriculum
+that could progressively reduce the fraction of cliff prompts. Combined with evaluation
+on larger model scales and diverse reasoning benchmarks, this direction could establish
+privileged self-distillation as a standard component of RL training for language models.
+A
+Realizability Gap Bound — Full Proof
+A.1
+Setup
+Let fθ denote a language model with parameters θ and vocabulary V. For context c (a
+sequence of token embeddings), the model produces logits z = fθ(c) ∈R|V| and output
+distribution Pθ(·|c) = so f tmax( fθ(c)).
+For prompt x, ground truth g, and prefix y<t, define:
+• Teacher: PT = Pθ(· | cT) where cT = [x; g; y<t]
+• Student: PS = Pθ(· | cS) where cS = [x; y<t]
+The realizability gap at position t is DKL(PT ∥PS): the KL divergence between the teacher
+and student distributions. A small realizability gap means the student can feasibly match
+the teacher’s distribution without large parameter updates — the optimization target is
+within reach.
+10
+A.2
+Lemma 1 (KL Divergence under Logit Perturbation)
+This is a standard bound in information theory; we include the proof for completeness.
+Statement. For any z ∈R|V| and δ ∈R|V|:
+DKL(so f tmax(z) ∥so f tmax(z + δ)) ≤∥δ ∥2
+∞
+2
+Proof. Let P = so f tmax(z) and Q = so f tmax(z + δ). Write out the KL divergence explicitly:
+DKL(P ∥Q) = ∑
+v∈V
+P(v)log P(v)
+Q(v)
+Substituting P(v) =
+exp(zv)
+Z
+and Q(v) =
+exp(zv+δv)
+Z′
+where Z = ∑j exp(zj) and Z′ =
+∑j exp(zj + δj):
+DKL(P ∥Q) = ∑
+v∈V
+P(v) (log P(v) −log Q(v))
+DKL(P ∥Q) = ∑
+v
+P(v)
+
+zv −logZ −zv −δv + logZ′ = −EP[δ] + logZ′ −logZ
+Z′
+Z =
+∑j ezjeδj
+∑j ezj
+= ∑
+j
+ezj
+∑j ezj eδj = ∑
+j
+Pjexp(δj)
+Since Z′
+Z = ∑j P(j)exp(δj) = EP[exp(δ)], we obtain:
+DKL(P ∥Q) = logEP[exp(δ)] −EP[δ]
+This is the centered cumulant generating function of δ under P.
+Define ψ(s) = logEP[exp(sδ)] −s · EP[δ] for s ∈[0, 1]. Then ψ(0) = 0 and ψ(1) = DKL(P ∥
+Q).
+Computing derivatives:
+• ψ′(s) = EQs[δ] −EP[δ], where Qs(v) ∝P(v)exp(s · δv) is the exponentially tilted
+distribution.
+• ψ′′(s) = VarQs(δ)
+By Taylor’s theorem with integral remainder:
+ψ(1) =
+Z 1
+0 (1 −s) ψ′′(s) ds =
+Z 1
+0 (1 −s) VarQs(δ) ds
+For any distribution over a bounded domain, Var(X) ≤E[X2] ≤∥X ∥2
+∞.
+Since each
+component δv satisfies |δv| ≤∥δ ∥∞:
+DKL(P ∥Q) ≤∥δ ∥2
+∞
+Z 1
+0 (1 −s) ds = ∥δ ∥2
+∞
+2
+■
+11
+A.3
+Assumption 1 (Local Lipschitz Continuity)
+On the domain of bounded inputs (finite embeddings, finite sequence length), the logit
+function fθ is locally Lipschitz continuous: there exists Lθ < ∞such that
+∥fθ(c1) −fθ(c2) ∥∞≤Lθ · d(c1, c2)
+for all valid contexts c1, c2 in the bounded domain, where d(·, ·) is a distance metric on the
+input space.
+Justification. This is a standard property for neural networks on compact domains. For
+transformers specifically, Kim et al. (2021) establish local Lipschitz bounds for self-attention
+on bounded input domains. Recent work shows the per-layer local Lipschitz constant scales
+as O(C√n) where n is sequence length and C depends on weight norms and attention
+distribution concentration.
+A.4
+Proposition 1 (Realizability Gap Comparison)
+A.4.1
+Part I – Same-Model Bound
+Statement. Under Assumption 1, the per-position realizability gap for same-model privileged
+distillation satisfies:
+DKL(PT ∥PS) ≤L2
+θ · ∆(g)2
+2
+where ∆(g) = d(cT, cS) is the input-space distance attributable to the ground truth tokens g.
+Proof. Teacher and student evaluate the same function fθ on different inputs cT and cS. By
+Assumption 1:
+∥zT −zS ∥∞=∥fθ(cT) −fθ(cS) ∥∞≤Lθ · d(cT, cS) = Lθ · ∆(g)
+Applying Lemma 1 with δ = zT −zS:
+DKL(PT ∥PS) ≤∥zT −zS ∥2
+∞
+2
+≤L2
+θ · ∆(g)2
+2
+■
+Key properties of this bound:
+1. It depends only on the model θ (via Lθ) and the information content of the ground
+truth g (via ∆(g)).
+2. It does not depend on any capacity gap between two different models.
+3. The difficulty of distillation scales with how much the ground truth changes the
+prediction, not with architectural differences.
+A.4.2
+Part II – Cross-Model Comparison
+Statement. Under Assumption 1, for cross-model distillation with teacher ϕ and student θ, where
+the teacher receives privileged input cT and the student receives cS, the realizability gap satisfies:
+DKL(Pϕ(·|cT) ∥Pθ(·|cS)) ≤
+ Lθ · ∆(g) +
+ fϕ (cT) −fθ (cT)
+
+∞
+2
+2
+Proof. The logit difference between the cross-model teacher and the student decomposes as:
+fϕ (cT) −fθ (cS) =
+
+fϕ (cT) −fθ (cT)
+ + [ fθ (cT) −fθ (cS)]
+12
+The first bracket captures the model mismatch: the difference in logit functions between
+models ϕ and θ evaluated on the same input.
+The second bracket is the same input
+perturbation that appears in Part I. By the triangle inequality:
+ fϕ (cT) −fθ (cS)
+
+∞≤
+ fϕ (cT) −fθ (cT)
+
+∞+ Lθ · ∆(g)
+where the second inequality applies Assumption 1 to the student model θ. Applying Lemma
+1 with δ = fϕ (cT) −fθ (cS) yields the bound. ■
+A.5
+Remark
+The bound in Part I may be quantitatively loose: the Lipschitz constant Lθ for a deep
+transformer can be large due to multiplicative composition across layers. However, the
+comparison in Part II does not depend on the tightness of the Lipschitz bound. The same
+Lθ · ∆(g) term appears in both bounds, and the cross-model bound is strictly larger by the
+model-mismatch term regardless of the absolute magnitudes. A loose Lipschitz constant
+affects both bounds equally — it does not favor one distillation setting over the other.
+Moreover, Lθ is the same for both teacher and student in the same-model case (since they
+share parameters), so it does not introduce a capacity mismatch — it merely scales the bound
+uniformly.
+B
+Proposition 2 Full Proof
+Proposition 2 (R = 1 Filtering Yields the RL-Optimal Policy). We provide the full derivation
+here. For binary reward:
+For binary reward R(τ) ∈{0, 1}, the exponential factor takes only two values:
+exp
+ R(τ)
+β
+
+= exp
+ 1
+β
+
+i f R(τ) = 1,
+and
+exp
+ R(τ)
+β
+
+= 1 i f R(τ) = 0
+Substituting into the Gibbs distribution:
+π∗(τ) =
+πre f (τ) · exp
+ 1[R(τ)= 1]
+β
+
+Z(β)
+where the partition function evaluates to:
+Z(β) = Pπre f (R = 0) · 1 + Pπre f (R = 1) · exp
+ 1
+β
+
+= (1 −p) + p · exp
+ 1
+β
+
+where p = Pπ_re f (R = 1) is the probability that πre f generates a correct trajectory. This gives the
+relative weighting of correct vs incorrect trajectories:
+π∗(τ | R = 1)
+π∗(τ | R = 0) = exp
+ 1
+β
+
+(for trajectories with equal πref weight)
+The hard-threshold limit. As β →0+, the exponential ratio exp(1/β) →∞. This means
+correct trajectories receive infinitely more weight than incorrect ones. Concretely, for any incorrect
+trajectory with R(τ) = 0:
+π∗(τ) =
+πre f (τ) · exp
+ 1[0= 1]
+β
+
+Z(β)
+=
+πre f (τ) · 1
+Z(β)
+→0
+as β →0+
+13
+Table 2: Hyperparameters used in all experiments.
+Category
+Parameter
+Value
+Model
+Architecture
+Qwen2.5-Math-1.5B-Instruct
+Precision
+bfloat16
+Max sequence length
+4096
+Dataset
+Training
+OpenMathInstruct-2
+Validation samples
+2048
+Reward function
+hf_math_verify (binary)
+Optimization
+Optimizer
+AdamW (β1=0.9, β2=0.999, ϵ=10−8)
+Learning rate
+10−6
+LR schedule
+Linear warmup (50 steps, 0.1→1.0×), then constant
+Weight decay
+0.01
+Max gradient norm
+1.0
+GRPO
+Prompts per step
+32
+Generations per prompt
+16
+Training batch size
+512
+Advantage normalization
+Leave-one-out baseline
+Ratio clip ϵ
+0.2
+Loss granularity
+Token-level
+Reference KL penalty β
+0.0
+Generation temperature
+1.0
+Generation backend
+vLLM (colocated)
+Sequence packing
+Enabled
+Privileged Distillation
+Distillation weight λ
+{0.01, 0.1}
+Distillation loss
+JSD
+Teacher type
+{Drifting (shared current policy weights), Frozen (initial weights)}
+Normalization
+Global token count (rank-invariant)
+Teacher top-k
+64
+Cliff threshold
+reward_sum = 0.0
+Teacher success threshold
+reward ≥1.0
+Max cliff prompts per step
+32
+Evaluation
+Validation period
+Every 10 steps
+Reported metrics
+pass@1, pass@4, pass@8
+Infrastructure
+GPUs
+8×H200 (1 node); replicated on 8×H100
+Seed
+42
+because Z(β) ∼p · exp(1/β) grows without bound while the numerator is fixed. Conversely, for
+a correct trajectory with R(τ) = 1:
+π∗(τ) =
+πre f (τ) · exp
+ 1[1 = 1]
+β
+
+Z(β)
+=
+πre f (τ) · exp
+
+1
+β
+
+p · exp
+
+1
+β
+
++ (1 −p)
+→
+πre f (τ)
+p
+=
+πre f (τ)
+Pπ_re f (R = 1)
+where the limit follows from dividing numerator and denominator by exp(1/β) and noting that
+(1 −p) / exp(1/β) →0. Therefore, in the limit:
+π∗(τ) →πre f (τ | R(τ) = 1) =
+πre f (τ) · 1[R(τ) = 1]
+Pπ_re f (R = 1)
+C
+Experimental Details
+D
+Hardware Variation
+All main results (Table 1) were obtained on 8×H200 GPUs. We replicated all five config-
+urations on 8×H100 GPUs with identical hyperparameters. The training computation is
+mathematically equivalent; differences arise from floating-point non-determinism across
+14
+GPU microarchitectures (different matmul tiling, reduction order, and FlashAttention kernel
+implementations), which compound over 2000 training steps to produce subtly different
+final weights.
+Table 3: Best pass@k on 8×H100 GPUs. Same setup as Table 1. Bold indicates best in column.
+Method
+pass@1
+pass@4
+pass@8
+GRPO Baseline
+0.6509
+0.7739
+0.8223
+HDPO (frozen, λ=0.01)
+0.6484
+0.7773
+0.8252
+HDPO (frozen, λ=0.1)
+0.6343
+0.7856
+0.8369
+HDPO (drifting, λ=0.01)
+0.6499
+0.7783
+0.8213
+HDPO (drifting, λ=0.1)
+0.6343
+0.7832
+0.8359
+The qualitative findings are consistent: λ=0.1 improves pass@8 by +1.4–1.5% over baseline
+on both hardware configurations, and pass@1 remains highest for the baseline and λ=0.01
+configurations.
+The primary quantitative difference is at λ=0.01: on H200, drifting-
+0.01 achieves the highest pass@4 (+1.1%), while on H100 the improvement is smaller
+(+0.4%) and the best pass@4 shifts to frozen-0.1. This suggests the λ=0.01 improvements,
+while directionally consistent, are close to the noise floor introduced by hardware-level
+floating-point non-determinism and temperature-1 evaluation variance. The λ=0.1 coverage
+improvements are robust across both configurations.
+LLM Usage Statement
+The research idea underlying HDPO—using privileged self-distillation to provide learning
+signal on cliff prompts—originated with the author. However, an AI language model
+(Claude, Anthropic) was used extensively throughout this project in ways that go beyond
+minor writing assistance. Specifically: (1) the mathematical formalization of Proposition 1
+and Proposition 2, including the proof structure and verification of correctness, was
+developed collaboratively with LLM assistance; (2) the paper text, including the related
+work survey, theoretical exposition, and discussion sections, was substantially drafted
+and edited with LLM assistance; and (3) the LLM was used as a research collaborator to
+brainstorm explanations for experimental phenomena (e.g., the pass@1 vs. pass@k tradeoff)
+and to compare HDPO against related work. All experimental results (training runs, metric
+measurements) were produced by the author without LLM involvement. The LLM also
+provided substantial code implementation assistance for the training infrastructure.
+References
+Rishabh Agarwal, Nino Vieillard, Yongchao Zhou, Piotr Stanczyk, Sabela Ramos, Matthieu
+Geist, and Olivier Bachem. On-policy distillation of language models: Learning from
+self-generated mistakes. In International Conference on Learning Representations, 2024. URL
+https://arxiv.org/abs/2306.13649.
+Ganqu Cui, Lifan Yuan, Zefan Wang, Hanbin Wang, Yuchen Zhang, et al. Process re-
+inforcement through implicit rewards.
+arXiv preprint arXiv:2502.01456, 2025.
+URL
+https://arxiv.org/abs/2502.01456.
+DeepSeek-AI, Daya Guo, Dejian Yang, et al. DeepSeek-R1: Incentivizing reasoning capability
+in LLMs via reinforcement learning. arXiv preprint arXiv:2501.12948, 2025. URL https:
+//arxiv.org/abs/2501.12948.
+Shihan Dou, Muling Wu, Jingwen Xu, Rui Zheng, Tao Gui, Qi Zhang, and Xuanjing Huang.
+Improving RL exploration for LLM reasoning through retrospective replay. arXiv preprint
+arXiv:2504.14363, 2025. URL https://arxiv.org/abs/2504.14363.
+Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn
+Song, and Jacob Steinhardt. Measuring mathematical problem solving with the MATH
+15
+dataset. In Neural Information Processing Systems, 2021. URL https://arxiv.org/abs/2103.
+03874.
+Geoffrey Hinton, Oriol Vinyals, and Jeff Dean. Distilling the knowledge in a neural network.
+arXiv preprint arXiv:1503.02531, 2015. URL https://arxiv.org/abs/1503.02531.
+Jonas Hübotter, Frederike Lübeck, Lejs Behric, Anton Baumann, Marco Bagatella, Daniel
+Marta, Ido Hakimi, Idan Shenfeld, Thomas Kleine Buening, Carlos Guestrin, and Andreas
+Krause. Reinforcement learning via self-distillation. arXiv preprint arXiv:2601.20802, 2026.
+URL https://arxiv.org/abs/2601.20802.
+Guochao Jiang, Wenfeng Feng, Guofeng Quan, Chuzhan Hao, Yuewei Zhang, Guohua
+Liu, and Hao Wang. VCRL: Variance-based curriculum reinforcement learning for large
+language models. arXiv preprint arXiv:2509.19803, 2025. URL https://arxiv.org/abs/
+2509.19803.
+Hyunjik Kim, George Papamakarios, and Andriy Mnih. The Lipschitz constant of self-
+attention. In International Conference on Machine Learning, 2021. URL https://arxiv.org/
+abs/2006.04710.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu,
+Joseph E. Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for
+large language model serving with PagedAttention. In Symposium on Operating Systems
+Principles, 2023. URL https://arxiv.org/abs/2309.06180.
+Thanh-Long V. Le, Myeongho Jeon, Kim Vu, Viet Lai, and Eunho Yang. No prompt left
+behind: Exploiting zero-variance prompts in LLM reinforcement learning via entropy-
+guided advantage shaping. arXiv preprint arXiv:2509.21880, 2025. URL https://arxiv.
+org/abs/2509.21880.
+Long Li, Zhĳian Zhou, Jiaran Hao, Jason Klein Liu, Yanting Miao, Wei Pang, Xiaoyu Tan,
+Wei Chu, Zhe Wang, Shirui Pan, Chao Qu, and Yuan Qi. The choice of divergence: A
+neglected key to mitigating diversity collapse in reinforcement learning with verifiable
+reward. arXiv preprint arXiv:2509.07430, 2025. URL https://arxiv.org/abs/2509.07430.
+Hunter Lightman, Vineet Kosaraju, Yura Burda, Harri Edwards, Bowen Baker, Teddy Lee,
+Jan Leike, John Schulman, Ilya Sutskever, and Karl Cobbe. Let’s verify step by step. In
+International Conference on Learning Representations, 2024. URL https://arxiv.org/abs/
+2305.20050.
+Jianhua Lin. Divergence measures based on the Shannon entropy. IEEE Transactions on
+Information Theory, 37(1):145–151, 1991. URL https://ieeexplore.ieee.org/document/
+61115/.
+Huanyu Liu, Jia Li, Chang Yu, Taozhi Chen, Yihong Dong, Lecheng Wang, Xiaolong Hu,
+and Ge Li. EvoCoT: Overcoming the exploration bottleneck in reinforcement learning.
+arXiv preprint arXiv:2508.07809, 2025. URL https://arxiv.org/abs/2508.07809.
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In International
+Conference on Learning Representations, 2019. URL https://arxiv.org/abs/1711.05101.
+Lu Ma, Hao Liang, Meiyi Qiang, Lexiang Tang, Xiaochen Ma, Zhen Hao Wong, Junbo Niu,
+Chengyu Shen, Runming He, Yanhao Li, Bin Cui, and Wentao Zhang. Learning what
+reinforcement learning can’t: Interleaved online fine-tuning for hardest questions. arXiv
+preprint arXiv:2506.07527, 2025. URL https://arxiv.org/abs/2506.07527.
+Long Ouyang, Jeff Wu, Xu Jiang, Diogo Almeida, Carroll L. Wainwright, Pamela Mishkin,
+Chong Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, et al. Training language
+models to follow instructions with human feedback. In Neural Information Processing
+Systems, 2022. URL https://arxiv.org/abs/2203.02155.
+Emiliano Penaloza, Dheeraj Vattikonda, Nicolas Gontier, Alexandre Lacoste, Laurent Charlin,
+and Massimo Caccia. Privileged information distillation for language models. arXiv
+preprint arXiv:2602.04942, 2026. URL https://arxiv.org/abs/2602.04942.
+16
+Rafael Rafailov, Archit Sharma, Eric Mitchell, Stefano Ermon, Christopher D. Manning, and
+Chelsea Finn. Direct preference optimization: Your language model is secretly a reward
+model. In Neural Information Processing Systems, 2023. URL https://arxiv.org/abs/2305.
+18290.
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal
+policy optimization algorithms.
+arXiv preprint arXiv:1707.06347, 2017.
+URL https:
+//arxiv.org/abs/1707.06347.
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang,
+Mingchuan Zhang, Y.K. Li, Y. Wu, and Daya Guo. DeepSeekMath: Pushing the limits of
+mathematical reasoning in open language models. arXiv preprint arXiv:2402.03300, 2024.
+URL https://arxiv.org/abs/2402.03300.
+Shubham Toshniwal, Wei Du, Ivan Moshkov, Branislav Kisacanin, Alexan Ayrapetyan, and
+Igor Gitman. OpenMathInstruct-2: Accelerating AI for math with massive open-source
+instruction data. arXiv preprint arXiv:2410.01560, 2024. URL https://arxiv.org/abs/
+2410.01560.
+Vladimir Vapnik and Akshay Vashist. A new learning paradigm: Learning using privileged
+information. Neural Networks, 22(5–6):544–557, 2009. doi: 10.1016/j.neunet.2009.06.042.
+Xinyi Wang, Jinyi Han, Zishang Jiang, Tingyun Li, Jiaqing Liang, Sihang Jiang, Zhaoqian
+Dai, Shuguang Ma, Fei Yu, and Yanghua Xiao. HINT: Helping ineffective rollouts navigate
+towards effectiveness. arXiv preprint arXiv:2510.09388, 2025. URL https://arxiv.org/
+abs/2510.09388.
+Hongling Xu, Qi Zhu, Heyuan Deng, Jinpeng Li, Lu Hou, Yasheng Wang, Lifeng Shang,
+Ruifeng Xu, and Fei Mi. KDRL: Post-training reasoning LLMs via unified knowledge
+distillation and reinforcement learning. arXiv preprint arXiv:2506.02208, 2025. URL
+https://arxiv.org/abs/2506.02208.
+An Yang, Beichen Zhang, Binyuan Hui, Bofei Gao, Bowen Yu, Chengpeng Li, Dayiheng
+Liu, Jianhong Tu, Jingren Zhou, Junyang Lin, Keming Lu, Mingfeng Xue, Runji Lin,
+Tianyu Liu, Xingzhang Ren, and Zhenru Zhang. Qwen2.5-Math technical report: Toward
+mathematical expert model via self-improvement. arXiv preprint arXiv:2409.12122, 2024.
+URL https://arxiv.org/abs/2409.12122.
+Wenkai Yang, Weĳie Liu, Ruobing Xie, Kai Yang, Saiyong Yang, and Yankai Lin. Learning
+beyond teacher: Generalized on-policy distillation with reward extrapolation. arXiv
+preprint arXiv:2602.12125, 2026. URL https://arxiv.org/abs/2602.12125.
+Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, et al. DAPO: An open-source LLM
+reinforcement learning system at scale. arXiv preprint arXiv:2503.14476, 2025. URL
+https://arxiv.org/abs/2503.14476.
+Hongzhi Zhang, Jia Fu, Jingyuan Zhang, Kai Fu, Qi Wang, Fuzheng Zhang, and Guorui
+Zhou. RLEP: Reinforcement learning with experience replay for LLM reasoning. arXiv
+preprint arXiv:2507.07451, 2025a. URL https://arxiv.org/abs/2507.07451.
+Xichen Zhang, Sitong Wu, Yinghao Zhu, Haoru Tan, Shaozuo Yu, Ziyi He, and Jiaya Jia.
+Scaf-GRPO: Scaffolded group relative policy optimization for enhancing LLM reasoning.
+arXiv preprint arXiv:2510.19807, 2025b. URL https://arxiv.org/abs/2510.19807.
+Zhaoyang Zhang, Shuli Jiang, Yantao Shen, Yuting Zhang, Dhananjay Ram, Shuo Yang,
+Zhuowen Tu, Wei Xia, and Stefano Soatto. Reinforcement-aware knowledge distillation
+for LLM reasoning. arXiv preprint arXiv:2602.22495, 2026. URL https://arxiv.org/abs/
+2602.22495.
+Siyan Zhao, Zhihui Xie, Mengchen Liu, Jing Huang, Guan Pang, Feiyu Chen, and Aditya
+Grover. Self-distilled reasoner: On-policy self-distillation for large language models. arXiv
+preprint arXiv:2601.18734, 2026. URL https://arxiv.org/abs/2601.18734.
+17

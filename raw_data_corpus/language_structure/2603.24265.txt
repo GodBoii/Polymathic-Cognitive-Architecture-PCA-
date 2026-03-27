@@ -1,0 +1,929 @@
+DeepDTF: Dual-Branch Transformer Fusion for
+Multi-Omics Anticancer Drug Response Prediction
+Yuhan Zhao
+Department of Computer Science
+North Carolina State University
+Raleigh, NC, USA
+yzhao66@ncsu.edu
+Jacob Tennant
+Department of Computer Science
+North Carolina State University
+Raleigh, NC, USA
+jmtennan@ncsu.edu
+James Yang
+Department of Computer Science
+North Carolina State University
+Raleigh, NC, USA
+jbyang2@ncsu.edu
+Zhishan Guo
+Department of Computer Science
+North Carolina State University
+Raleigh, NC, USA
+zguo32@ncsu.edu
+Young Whang
+UNC School of Medicine
+University of North Carolina
+at Chapel Hill
+Chapel Hill, NC, USA
+ywhang@med.unc.edu
+Ning Sui∗
+Department of Molecular and
+Structural Biochemistry
+North Carolina State University
+Raleigh, NC, USA
+nsui@ncsu.edu
+Abstract—Cancer drug response varies widely across tumors
+due to multi-layer molecular heterogeneity, motivating compu-
+tational decision support for precision oncology. Despite recent
+progress in deep CDR models, robust alignment between high-
+dimensional multi-omics and chemically structured drugs re-
+mains challenging due to cross-modal misalignment and limited
+inductive bias. We present DeepDTF, an end-to-end dual-branch
+Transformer fusion framework for joint log(IC50) regression
+and drug sensitivity classification. The cell-line branch uses
+modality-specific encoders for multi-omics profiles with Trans-
+former blocks to capture long-range dependencies, while the drug
+branch represents compounds as molecular graphs and encodes
+them with a GNN-Transformer to integrate local topology with
+global context. Omics and drug representations are fused by a
+Transformer-based module that models cross-modal interactions
+and mitigates feature misalignment. On public pharmacogenomic
+benchmarks under 5-fold cold-start cell-line evaluation, DeepDTF
+consistently outperforms strong baselines across omics settings,
+achieving up to RMSE = 1.248, R2 = 0.875, and AUC = 0.987
+with full multi-omics inputs, while reducing classification error
+(1-ACC) by 9.5%. Beyond accuracy, DeepDTF provides biolog-
+ically grounded explanations via SHAP-based gene attributions
+and pathway enrichment with pre-ranked GSEA.
+Index
+Terms—Drug
+response
+prediction,
+Deep
+Learning,
+Graph neural networks, Transformer, Precision oncology, Bioin-
+formatics
+I. INTRODUCTION
+Cancer remains a leading cause of mortality, and treatment
+outcomes are strongly shaped by genetic factors and the
+molecular heterogeneity of tumors [1]. Precision oncology
+aims to tailor therapy to an individual’s molecular profile,
+making drug response prediction a central computational
+task [2]. Because response is influenced by multi-layer molec-
+ular mechanisms, effective predictors must model nonlinear in-
+teractions between high-dimensional multi-omics features and
+diverse drug chemical structures [3]. Compared with empirical
+∗Corresponding author.
+screening and in vitro assays, computational modeling offers
+scalable decision support [4].
+Large pharmacogenomic resources pair molecular profiles
+with drug sensitivity readouts such as IC50 [5], including
+CCLP [6] and GDSC [7], enabled by advances in high-
+throughput profiling [8]. Earlier methods relied on statistical
+heuristics and classical machine learning, e.g., Elastic Net
+with SVM [9], random forests [10], and autoencoders [11].
+Deep learning reduced reliance on manual feature engineering
+and improved representation learning, including CNN-based
+approaches such as CDRscan [12] and tCNN [13], and mul-
+timodal designs such as DeepCDR [14] and DeepDSC [15].
+However, CNNs can struggle with long-range and context-
+dependent interactions, motivating Transformer-based model-
+ing [16]. DeepTTA [17] integrates SMILES-based drug repre-
+sentations with genomic profiles using Transformer modules,
+and approaches such as DeepFusionCDR [18] and DeePath-
+Net [19] improve predictive accuracy by modeling cross-
+modal dependencies and incorporating biological structure.
+More recent studies further emphasize robust fusion and
+generalization [20], and transfer-oriented designs such as
+TransCDR [21] that explicitly study generalization to novel
+compound scaffolds and cell line subgroups.
+Effectively modeling interactions between multi-omics fea-
+tures and drug structure remains challenging under high di-
+mensionality and limited sample size. Many pipelines still
+rely on simplistic fusion strategies such as direct concatena-
+tion, static weighting, or shallow attention, which can under-
+model cross-modal dependence and semantic misalignment.
+Moreover, the same drug can exhibit different efficacy under
+distinct regulatory states, which may not be captured by a
+single omics layer. This motivates integrating beyond gene-
+centric signals, such as proteomics and DNA methylation [3].
+Finally, predictive accuracy alone is insufficient for practical
+arXiv:2603.24265v1  [cs.LG]  25 Mar 2026
+Fig. 1.
+Overall workflow of the DeepDTF, including (i) multi-omics and drug-structure inputs, (ii) transformer model (detailed in Fig. 2), (iii) dual task
+prediction (IC50 regression and sensitivity classification), and (iv) an interpretability module based on SHAP→GSEA. SHAP produces a signed gene ranking,
+which is used for pre-ranked GSEA: The top panel illustrates a GSEA enrichment plot (running ES with pathway “hit” positions along the ranked list), and
+the bottom panel shows the corresponding null/random ES distribution for assessing enrichment direction and significance.
+decision support: models benefit from interpretable evidence
+that can connect predictions to genes and pathways and
+support hypothesis generation.
+Specifically, we propose DeepDTF, a novel hybrid dual-
+branch Transformer model for anticancer drug response pre-
+diction that supports IC501 regression, sensitivity classifica-
+tion, and interpretability. The cell-line branch integrates het-
+erogeneous omics with a CNN–Transformer to capture local
+and long-range dependencies, while the drug branch uses a
+GNN–Transformer to combine molecular-graph topology with
+global context. A Transformer fusion module then performs
+dynamic cross-modal attention to align and integrate drug–
+omics representations, mitigating semantic misalignment. Be-
+yond prediction, we provide an interpretability pipeline based
+on gene-level SHAP (SHapley Additive exPlanations)
+[22]
+attribution and gene set-level pathway enrichment GSEA
+(Gene Set Enrichment Analysis) [23], to produce biologically
+grounded explanations.
+II. METHODS
+A. Overview of DeepDTF Framework
+DeepDTF targets core challenges in cancer drug response
+(CDR) modeling: learning reliable drug–cell-line interactions
+under high-dimensional, heterogeneous omics and chemically
+structured drugs, where naive fusion can suffer from cross-
+modal misalignment. To address this, we adopt a dual-branch
+design (Fig. 1) that first extracts modality-preserving token
+representations for (i) cell-line multi-omics and (ii) drug
+1The IC50 value, or half-maximal inhibitory concentration, represents the
+concentration of an inhibitory substance needed to reduce a biological process
+or response by 50%. It is a common measure of drug potency, indicating how
+much of a substance is needed to achieve a specific level of inhibition. A
+lower IC50 value generally suggests a more potent drug, meaning it requires
+less substance to achieve the same effect.
+structure, and then performs token-level fusion to model their
+interactions for log(IC50) regression and sensitivity classifica-
+tion. Beyond predictive accuracy, DeepDTF provides biologi-
+cally grounded explanations by connecting model attributions
+to genes and pathways through a post-hoc interpretability
+pipeline based on gene-level SHAP and pathway-level GSEA.
+Details of the interpretability workflow, experimental protocol,
+and biological findings are presented in Sec. IV.
+Figure 2 details the architecture. In order to capture long-
+range dependencies among heterogeneous omics signals, the
+cell-line branch uses modality-specific encoders followed by
+Transformer blocks. In order to preserve chemical topology
+and functional substructures, the drug branch encodes molec-
+ular graphs with a GNN-Transformer. Finally, to mitigate
+semantic misalignment between omics and drug features, a
+Fusion-Transformer performs cross-modal attention over the
+joint token set, followed by lightweight task heads for regres-
+sion and classification.
+B. Input Representation and Preprocessing
+Multi-omics inputs. Multi-omics signals are heterogeneous.
+To preserve modality semantics while enabling joint modeling,
+we maintain separate modality-aligned vectors and denote the
+feature set for each cell line c as
+Xc =
+
+xGE
+c
+, xMUT
+c
+, xCNV
+c
+, xPROT
+c
+, x∆PROT
+c
+, xMETH
+c
+	
+, (1)
+where GE/MUT/CNV denote gene expression / mutation /
+copy-number variation, PROT denotes proteomics abundance,
+∆PROT denotes proteomics difference with respect to healthy
+references, and METH denotes DNA methylation features.
+Drug graph inputs. Preserving local chemical context and
+topology is critical for accurate and explainable drug response
+modeling, since many drug effects are driven by specific func-
+tional groups and local substructures. We convert each drug d
+Fig. 2. Detailed architecture of DeepDTF. The left block is a dual-branch feature extractor for multi-omics and drug structure. The right block is a feature
+fusion joint prediction module with a Fusion-Transformer and two task-specific heads for IC50 regression and sensitivity classification.
+from its SMILES string into a molecular graph Gd = (Vd, Ed)
+using RDKit [24] and represent it as a PyTorch Geometric
+(PyG) object. Each atom v ∈Vd is assigned a feature vector
+hv, and each bond (u, v) ∈Ed is assigned an edge feature
+vector euv.
+C. Dual-Branch Feature Extractor
+Multi-omics profiles are high-dimensional feature vectors
+without a universally agreed interaction graph, making graph-
+based inductive biases unreliable. In order to obtain compact
+tokens while retaining local feature patterns, we therefore
+tokenize multi-omics features via CNN-based projection. In
+contrast, drug molecules have a chemically grounded graph
+structure, where message passing captures local chemical
+context and functional groups; thus we preserve this inductive
+bias via GNN-based encoding for drug structures (Fig. 2 left).
+1) Cell-line Branch: CNN with Attention + Transformer:
+CNN tokenization with attention. We first apply a CNN-
+based encoder with attention to capture local patterns and pro-
+duce a compact token sequence. Let xc denote the modality-
+stacked omics feature vector, then the CNN encoder outputs
+a sequence of latent tokens:
+H(0)
+c
+= fCNN-Attn(xc),
+H(0)
+c
+∈Rnc×d.
+(2)
+The channel attention module uses multi-scale convolutions
+and global pooling to reweight feature channels, improving
+robustness under high dimensionality and limited samples.
+Transformer encoding. We then apply a Transformer encoder
+to H(0)
+c
+to capture long-range dependencies among omics-
+derived tokens:
+Hc = Transomics(H(0)
+c ).
+(3)
+Each Transformer layer uses multi-head self-attention. The
+output is followed by residual connections, layer normaliza-
+tion, and a position-wise feed-forward network (FFN), as in
+standard Transformer designs.
+2) Drug Branch: GNN + Transformer: Graph neural
+encoding for local chemical context. Given a molecular graph
+Gd = (Vd, Ed), we apply a graph neural network (GNN) to
+obtain node embeddings. A generic message-passing layer can
+be written as:
+m(ℓ)
+u
+=
+X
+v∈N (u)
+ϕ(ℓ)
+h(ℓ)
+u , h(ℓ)
+v , euv
+
+,
+(4)
+h(ℓ+1)
+u
+= ψ(ℓ)
+h(ℓ)
+u , m(ℓ)
+u
+
+,
+(5)
+where N(u) denotes the neighbors of node u, and ϕ, ψ are
+learnable functions, like MLPs with normalization. After L
+layers, we obtain node token embeddings:
+H(0)
+d
+= [h(L)
+u ]u∈Vd ∈Rnd×d.
+(6)
+Transformer encoding. While GNNs capture local topology
+effectively, long-range dependencies and global substructure
+interactions can be challenging for shallow message passing.
+We therefore apply a Transformer encoder over the node
+tokens:
+Hd = Transdrug(H(0)
+d ),
+(7)
+so that the drug representation benefits from both GNN and
+global token interactions.
+D. Feature Fusion Joint Prediction Module
+After obtaining omics tokens Hc and drug node tokens Hd,
+DeepDTF performs explicit cross-modal interaction modeling
+using a Fusion-Transformer (Fig. 2 right). We concatenate the
+two token sequences and feed them into a Fusion-Transformer:
+Hjoint = Transfusion([Hc; Hd]).
+(8)
+Because self-attention is computed over the joint token set,
+Transfusion can dynamically align drug substructures with
+context-dependent cellular states, mitigating semantic mis-
+alignment between modalities.
+A learnable pooling operator produces a pair-level embed-
+ding z:
+z = Pool(Hjoint) ∈Rd.
+(9)
+Then pooled representation z is passed to two prediction
+heads: (i) a regression head to predict log(IC50), and (ii) a
+classification head to predict sensitivity:
+ˆy = greg(z),
+ˆp = gcls(z).
+(10)
+We optimize a multi-task objective with MSE for regression
+and focal loss for classification:
+Lreg = 1
+N
+N
+X
+i=1
+(ˆyi −yi)2,
+(11)
+LFL = −1
+N
+N
+X
+i=1
+h
+(1−ˆpi)γti log(ˆpi)+ ˆpγ
+i (1−ti) log(1−ˆpi)
+i
+,
+(12)
+where ti ∈{0, 1} is the ground-truth sensitivity label and
+γ > 0 controls the focusing strength.
+The overall objective is a weighted multi-task loss with ℓ2
+regularization:
+L = α Lreg + β LFL + λ∥Θ∥2
+2,
+(13)
+where Θ denotes trainable parameters and α, β, λ are hyper-
+parameters.
+III. EXPERIMENTS AND RESULTS
+A. Dataset and Pre-Processing
+a) Data sources: We use GDSC2 (Release 8.5, Oct
+2023) [7] for IC50 and genomics, CCLP [6] for multi-omics,
+and PubChem [25] for standardized drug structures (SMILES)
+and identifiers. To ensure reliable training and sufficient rep-
+resentation per category, we retain cancer types with at least
+10 cell lines. We further keep cell lines whose mutation/CNV
+profiles overlap with Cancer Gene Census (CGC) genes from
+CCLP to improve feature reliability. For drugs, we exclude
+compounds without valid PubChem compound IDs and re-
+move molecules with molecular weight > 1000 g/mol to retain
+drug-like candidates. This resulted in 782 cell lines in 28
+cancer types and 256 anticancer drugs.
+b) Data preprocessing:
+Genomic: We normalize gene expression (GE) profiles
+from GDSC2 using the Robust Multi-array Average (RMA)
+algorithm to [0,1] yielding 17,777 gene features per cell line.
+Mutation (MUT) data are encoded as binary vectors of length
+28,669 (1 for mutation, 0 otherwise), and CNV data as ternary
+vectors of length 735 (−1 for deletion, 0 for normal, +1 for
+amplification).
+Proteomics: We incorporate proteomics abundance with
+8,453 proteins per cell line. A consistent subset of 822
+proteins is observed across all cell lines, while the remaining
+proteins exhibit varying missingness. We additionally derive
+a proteomics-difference view (∆PROT) by contrasting each
+cell line against a healthy baseline from ProteomicsDB [26],
+i.e., x∆PROT
+c
+= xPROT
+c
+−xPROT
+healthy. We use Additive Shift
+Weighting (ASW) as the default integration:
+˜xPROT
+c
+= xPROT
+c
++ x∆PROT
+c
+.
+(14)
+DNA methylation: We include DNA methylation features
+represented by 56,146 methylation clusters per cell line, where
+each cluster contains 846 attributes including genomic coor-
+dinates and coverage-related quality indicators. Methylation
+values are in [0, 1], coverage is defined as (total read depth
+of a gene fragment) / (number of CpGs in the cluster), and is
+used for quality control. We used coverage ≥10 to remove
+low-confidence clusters while retaining most loci, following
+common practice in bisulfite-seq analysis [27].
+Drug structure graphs: We represent each drug as a 2D
+molecular graph constructed from its SMILES string using
+RDKit [24] and processed with PyTorch Geometric. Following
+the widely used OGB featurization, each atom is associated
+with a 9-dimensional categorical node feature and each bond
+is associated with a 3-dimensional categorical edge feature.
+After filtering, the final dataset contains 164,165 drug–cell
+line pairs, spanning 782 cell lines and 256 drugs across 28
+cancer types. For classification, we binarize responses using
+the standard threshold [28]:
+Labeld,c =
+(
+1,
+log(IC50)d,c < −2.0
+(Sensitive)
+0,
+otherwise
+(Resistant)
+(15)
+B. Evaluation Metrics
+We report standard metrics for both tasks, chosen to quantify
+different aspects of prediction quality in CDR modeling.
+a) Regression (IC50):
+• RMSE: the typical magnitude of prediction error (in
+log-IC50 units). Lower RMSE means predictions are, on
+average, closer to ground truth.
+• R2: the fraction of variance in the true IC50 values
+explained by the model. Higher R2 indicates better fit
+to the response distribution.
+• PCC: the strength of linear association between predicted
+and true IC50 values. Higher PCC indicates better ranking
+consistency and trend alignment.
+b) Classification (Sensitivity):
+• AUC: measure how well the model ranks sensitive vs.
+resistant pairs; robust under class imbalance.
+• ACC: overall fraction of correctly predicted labels.
+• SEN (Recall for Sensitive): the ability to correctly
+identify truly sensitive cases (avoid missing effective
+drugs).
+• SPEC (Recall for Resistant): the ability to correctly
+identify truly resistant cases (avoid recommending inef-
+fective drugs).
+C. Baselines
+We compare DeepDTF with representative deep CDR pre-
+dictors under identical splits and preprocessing.
+CDRscan [12] encodes mutation features and drug finger-
+prints via CNN modules and integrates them with a docking-
+inspired interaction mechanism for IC50 prediction.
+tCNN [13] uses dual CNN encoders for drug and cell
+line features (mutation/CNV) followed by feature fusion for
+response prediction.
+TABLE I
+EVALUATION OF THE PROPOSED METHOD AND BASELINES
+Setting
+Method
+RMSE
+R2
+PCC
+ACC
+SEN
+SPEC
+AUC
+MUT+CNV
+tCNN [13]
+1.459
+0.725
+0.851
+0.952
+0.706
+0.977
+0.963
+DeepCDR [14]
+1.401
+0.770
+0.878
+0.953
+0.732
+0.975
+0.969
+DeepTTA [17]
+1.420
+0.775
+0.880
+0.953
+0.732
+0.978
+0.970
+DeepDTF
+1.403
+0.780
+0.883
+0.954
+0.738
+0.978
+0.975
+MUT+CNV+GE
+CDRscan [12]
+1.483
+0.715
+0.846
+0.950
+0.667
+0.979
+0.960
+tCNN [13]
+1.459
+0.725
+0.851
+0.952
+0.706
+0.977
+0.963
+DeepCDR [14]
+1.320
+0.822
+0.907
+0.958
+0.754
+0.975
+0.975
+DeepTTA [17]
+1.302
+0.821
+0.906
+0.958
+0.760
+0.980
+0.976
+DeepDTF
+1.253
+0.870
+0.933
+0.962
+0.768
+0.981
+0.982
+All Multi-Omics
+CDRscan [12]
+1.480
+0.717
+0.846
+0.951
+0.668
+0.981
+0.961
+tCNN [13]
+1.458
+0.725
+0.852
+0.954
+0.708
+0.980
+0.965
+DeepCDR [14]
+1.312
+0.824
+0.910
+0.959
+0.754
+0.976
+0.975
+DeepTTA [17]
+1.292
+0.825
+0.912
+0.959
+0.756
+0.980
+0.977
+GraTransDRP [29]
+1.272
+0.850
+0.922
+0.964
+0.732
+0.981
+0.980
+DeepDTF
+1.248
+0.875
+0.938
+0.965
+0.771
+0.983
+0.987
+DeepCDR [14] is a strong multimodal framework com-
+bining
+drug
+molecular
+graphs
+with
+multi-omics
+(e.g.,
+GE/MUT/CNV) using graph convolution and omics-specific
+subnetworks.
+DeepTTA [17] adopts Transformer-based drug represen-
+tation learning (from SMILES tokens) with an MLP for
+transcriptomic features, supporting both IC50 regression and
+sensitivity classification.
+GraTransDRP
+[29] introduces a graph-transformer-style
+architecture for drug response prediction, and public imple-
+mentations support multi-omics inputs (methylation + gene
+expression + mutation) together with drug graphs.
+D. Experimental Results and Comparison Study
+We implement DeepDTF in PyTorch2 and train with Adam
+for 60 epochs (batch size 256, learning rate 1 × 10−3, weight
+decay 3 × 10−4; focal loss γ = 2). We select checkpoints by
+validation RMSE within each fold and run experiments on an
+NVIDIA RTX 3090 GPU.
+Cold start cell line evaluation: We use 5-fold cross-
+validation with cell-line-level splits stratified by cancer type.
+All drug-cell line pairs inherit the fold assignment of their cell
+line, so the test folds contain unseen cell lines. This prevents
+cell-line leakage through repeated pairing of the same cell line
+with multiple drugs. Feature scaling is fit on the training split
+of each fold and applied to the corresponding test split. We
+keep the drug set fixed and evaluate generalization to new cell
+lines, matching drug repositioning and screening settings.
+Table
+I
+summarizes
+the
+comparison
+under
+three
+in-
+put settings and the results are averaged over 5 folds.
+For MUT+CNV, DeepDTF achieves R2
+=
+0.780 and
+AUC= 0.975, yielding the best overall. When adding GE
+(MUT+CNV+GE), DeepDTF outperforms all competitors on
+both regression and classification: it reduces RMSE by ∼3.8%
+compared with the best baseline and increases AUC from
+2Code will be released upon acceptance.
+0.976 to 0.982; meanwhile, the classification error rate (1-
+ACC) decreases by 9.5%. With All Multi-Omics enabled,
+DeepDTF further improves AUC to = 0.987, surpassing
+GraTransDRP across all metrics, indicating that richer omics
+signals and explicit cross-modal token fusion jointly contribute
+to more accurate and reliable CDR prediction.
+Fig. 3. Ablation studies on omics integration and model components, where
+(a) and (c) show the regression performance under different combinations of
+omics inputs and model variants; while (b) and (d) report the classification
+metrics obtained from various omics integration strategies and model variants.
+E. Ablation Studies
+We conduct two ablation studies to examine (i) the effect of
+omics inputs and (ii) the contribution of key model modules,
+under identical training and evaluation protocols.
+Omics ablation. As shown in Fig. 3(a), regression perfor-
+mance under different omics inputs is visualized using RMSE
+(left Y-axis), R2, and PCC (right Y-axis). Classification results
+are shown in Fig. 3(b) via ACC, SEN, SPEC, and AUC.
+GE is the strongest single modality, and adding modalities
+consistently improves performance. Proteomics further im-
+proves performance, and All Omics yields the best overall
+results (RMSE=1.248, R2=0.875, PCC=0.938, AUC=0.987),
+indicating complementary gains from additional omics layers.
+Model
+ablation.
+Fig.
+3(c,d)
+evaluate
+six
+variants:
+CNN+Attn, w/o Tr-CL, w/o Tr-Drug, FP-Drug, w/o Tr-Fusion,
+and DeepDTF. Removing either the cell-line Transformer (w/o
+Tr-CL) or the drug Transformer (w/o Tr-Drug) degrades both
+regression and classification, confirming the importance of
+token-level global modeling on both modalities. Replacing
+drug graphs with fingerprints (FP-Drug) is consistently worse
+than DeepDTF, supporting the benefit of graph-based drug
+structure modeling. Finally, removing the Fusion-Transformer
+slightly reduces performance, indicating additional gains from
+explicit cross-modal interaction modeling.
+IV. INTERPRETABILITY ANALYSIS
+High predictive accuracy is necessary but insufficient for
+precision oncology, where mechanistic evidence is often re-
+quired to trust a model and to generate hypotheses. We there-
+fore perform an interpretability analysis that links DeepDTF
+predictions to gene and pathway-level signals (Fig. 1).
+We first use SHAP [22] on the drug sensitivity classification
+output to obtain signed gene attributions, indicating which
+genes drive higher or lower IC50. SHAP gives direction-
+aware gene contributions, but single gene lists are unstable
+and hard to interpret mechanistically. We therefore project
+the signed SHAP ranking onto curated gene sets using pre-
+ranked GSEA [23] with MSigDB Hallmark [30] to summa-
+rize genes into pathway programs. Together, SHAP identifies
+direction-aware gene drivers, while GSEA maps these drivers
+to interpretable biological mechanisms, yielding biologically
+grounded explanations at both gene and pathway levels.
+A. Protocol
+SHAP assigns each gene-aligned input features j a signed
+contribution score ϕj for a given prediction, so that
+ˆy ≈ϕ0 +
+M
+X
+j=1
+ϕj,
+(16)
+where ϕ0 is the expected output under a background distribu-
+tion. We adopt the signed convention:
+• ϕj > 0: gene j increases the predicted sensitivity score
+(sensitivity-associated contribution).
+• ϕj < 0: gene j decreases the predicted sensitivity score
+(resistance-associated contribution).
+Thus, SHAP provides both importance and direction for mech-
+anistic interpretation.
+We then perform pre-ranked GSEA on MSigDB Hallmark
+gene sets to obtain pathway-level enrichments [23], [30]. We
+rank genes by aggregated signed SHAP scores and compute
+an enrichment score (ES) with direction:
+• ES > 0: the pathway is enriched among sensitivity-
+driving genes (positive SHAP).
+Fig. 4. Cartesian-regime biological explanations via SHAP–GSEA. (a) Top
+genes with positive SHAP (sensitivity-associated). (b) Bottom genes with
+negative SHAP (resistance-associated). (c) Top enriched Hallmark pathways
+from signed-SHAP rankings (positive ES; sensitivity-associated programs).
+(d) Top enriched Hallmark pathways from negative signed-SHAP rankings
+(negative ES; resistance-associated programs)
+• ES < 0: the pathway is enriched among resistance-driving
+genes (negative SHAP).
+In this way, the SHAP →GSEA procedure converts local
+feature attributions into statistically supported pathway pro-
+grams, making the explanations more robust and biologically
+interpretable.
+B. Results and interpretation
+We report results under a cancer×drug Cartesian evaluation
+regime: for each cancer type, we aggregate SHAP values
+within each cancer type across a broad set of drug contexts,
+aiming to capture cancer-contextual signals.
+Figs. 4(a) and (b) report the top genes with the largest
+positive and negative SHAP values, respectively, highlighting
+the most influential sensitivity- and resistance-associated
+gene drivers. Figs. 4(c) and (d) report Hallmark pathways
+enriched
+from
+the
+signed-SHAP
+rankings.
+We
+observe
+that
+several
+well-established
+cancer-related
+pathways
+are
+significantly
+enriched
+among
+the
+highest-attribution
+genes.
+On
+the
+sensitivity-associated
+side
+(Fig.
+4c),
+enriched pathways such as TNFA SIGNALING VIA NFKB,
+WNT BETA CATENIN SIGNALING,
+and
+P53 PATHWAY
+indicate
+that
+the
+model
+relies
+on
+coordinated
+inflammatory,
+stress-response
+and
+oncogenic-state
+programs when classifying a drug as sensitive. On the
+resistance-associated
+side
+(Fig.
+4d),
+enriched
+pathways
+such
+as
+DNA REPAIR,
+MTORC1 SIGNALING,
+and
+INTERFERON GAMMA RESPONSE suggest that DeepDTF
+leverages
+coordinated
+programs
+related
+to
+genome
+maintenance, growth/metabolism regulation, and immune-
+related signaling when classifying a drug as resistant.
+Overall, the SHAP→GSEA analysis provides more than
+post-hoc visualization: it offers a mechanism-aware sanity
+check and a hypothesis-generation tool. DeepDTF consistently
+re-identifies multiple well-characterized cancer programs as
+the dominant decision drivers, offering strong face validity
+that the model’s decisions are anchored in coherent biology
+rather than unstructured feature noise. Importantly, beyond
+recovering established pathways, the attribution rankings also
+surface less-emphasized genes and pathway programs that may
+have been overlooked in standard biomarker-centric analyses,
+thereby generating testable hypotheses for follow-up experi-
+ments. Such signals can prioritize follow-up studies (e.g., tar-
+geted validation, biomarker stratification, and resistance mech-
+anism probing) and may ultimately support precision oncology
+workflows, including mechanism-guided patient stratification
+or personalized drug design by highlighting which molecular
+programs should be perturbed to shift a predicted response.
+V. CONCLUSION
+We presented DeepDTF, an end-to-end dual-branch frame-
+work for cancer drug response prediction that jointly mod-
+els cancer cell line multi-omics and drug chemical struc-
+ture. DeepDTF uses a CNN–Transformer encoder to tok-
+enize and contextualize heterogeneous omics signals and a
+GNN-Transformer encoder to capture both local chemical
+topology and global substructure dependencies from molec-
+ular graphs. A Fusion-Transformer then performs fine-grained
+cross-modal attention over omics and drug tokens, enabling
+context-dependent interaction modeling and mitigating seman-
+tic misalignment. Across multiple omics settings, DeepDTF
+consistently improves both log(IC50) regression and sensitiv-
+ity classification over strong baselines, and ablation studies
+verify the contributions of omics augmentation, graph-based
+drug encoding, and each Transformer component. To enhance
+practical transparency, we further provide a post-hoc inter-
+pretability pipeline that links gene-level SHAP attributions
+to pathway-level programs via pre-ranked GSEA, yielding
+direction-aware, biologically coherent explanations. Together,
+these results suggest DeepDTF as a strong and interpretable
+foundation for precision oncology decision support.
+REFERENCES
+[1] L. A. Garraway, J. Verweij, and K. V. Ballman, “Precision oncology: An
+overview,” Journal of Clinical Oncology, vol. 31, no. 15, pp. 1803–1805,
+2013.
+[2] J. Barretina, G. Caponigro, N. Stransky, K. Venkatesan, A. A. Margolin,
+S. Kim, and L. A. Garraway, “The cancer cell line encyclopedia enables
+predictive modelling of anticancer drug sensitivity,” Nature, vol. 483, no.
+7391, pp. 603–607, 2012.
+[3] N. McGranahan and C. Swanton, “Clonal heterogeneity and tumor
+evolution: past, present, and the future,” Cell, vol. 168, no. 4, pp. 613–
+628, 2017.
+[4] J. A. DiMasi, H. G. Grabowski, and R. W. Hansen, “Innovation in the
+pharmaceutical industry: New estimates of r&d costs,” Journal of Health
+Economics, vol. 47, pp. 20–33, 2016.
+[5] J. L. Sebaugh, “Guidelines for accurate ec50/ic50 estimation,” Pharma-
+ceutical Statistics, vol. 10, no. 2, pp. 128–134, 2011.
+[6] S. A. Forbes, D. Beare, H. Boutselakis, S. Bamford, N. Bindal, J. Tate,
+C. G. Cole, S. Ward, E. Dawson, L. Ponting et al., “Cosmic: somatic
+cancer genetics at high-resolution,” Nucleic acids research, vol. 45,
+no. D1, pp. D777–D783, 2017.
+[7] Y. Wanjuan, S. Jorge, G. Patricia, E. J. Edelman, L. Howard, and
+et al., “Genomics of drug sensitivity in cancer (gdsc): A resource
+for therapeutic biomarker discovery in cancer cells,” Nucleic Acids
+Research, no. D1, p. D955, 2013.
+[8] L. Wang, X. Li, L. Zhang, and et al., “Improved anticancer drug
+response prediction in cell lines using matrix factorization with similarity
+regularization,” BMC Cancer, vol. 17, no. 1, pp. 1–12, 2017.
+[9] Y. Wang, J. Fang, and S. Chen, “Inferences of drug responses in
+cancer cells from cancer genomic features and compound chemical and
+therapeutic properties,” Scientific Reports, vol. 6, pp. 1–11, 2016.
+[10] S. Haider and et al., “A copula-based approach for design of multivariate
+random forests for drug sensitivity prediction,” PLoS ONE, vol. 10,
+no. 12, p. e0144490, 2015.
+[11] L. Xu and et al., “Autoencoder-based feature selection method for
+classification of anticancer drug response,” Frontiers in Genetics, vol. 10,
+p. 1284, 2019.
+[12] H. Chang and et al., “Cdrscan: A cnn-based drug response prediction
+model,” Briefings in Bioinformatics, vol. 21, no. 3, pp. 1077–1086, 2020.
+[13] Q. Liu and et al., “tcnn: Drug response prediction with cnns,” Bioinfor-
+matics, vol. 37, no. 5, pp. 659–666, 2021.
+[14] B. M. Kuenzi and et al., “Deepcdr: A deep learning framework for drug
+response prediction,” Nature Communications, vol. 11, no. 1, p. 4870,
+2020.
+[15] B. Hossein and et al., “Deepdsc: Deep learning for drug sensitivity
+prediction,” BMC Bioinformatics, vol. 20, no. 1, p. 376, 2019.
+[16] A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez,
+L. Kaiser, and I. Polosukhin, “Attention is all you need,” in Advances
+in Neural Information Processing Systems (NeurIPS), vol. 30, 2017.
+[17] L. Jiang and et al., “Deeptta: A transformer-based model for predicting
+cancer drug response,” Briefings in Bioinformatics, vol. 23, no. 3, p.
+bbac100, 2022.
+[18] X. Hu and et al., “Deepfusioncdr: Employing multi-omics integration
+and molecule-specific transformers for enhanced prediction of cancer
+drug responses,” IEEE Journal of Biomedical and Health Informatics,
+2024.
+[19] Z. Cai, R. C. Poulos, A. Aref, P. J. Robinson, R. R. Reddel, and
+Q. Zhong, “Deepathnet: A transformer-based deep learning model
+integrating multiomic data with cancer pathways,” Cancer Research
+Communications, vol. 4, no. 12, pp. 3151–3164, 2024.
+[20] Y. Wu, M. Chen, and Y. Qin, “Anticancer drug response prediction
+integrating multi-omics pathway-based difference features and multiple
+deep learning techniques,” PLOS Computational Biology, vol. 21, no. 3,
+p. e1012905, 2025.
+[21] X. Xia, C. Zhu, F. Zhong, and L. Liu, “Transcdr: a deep learning model
+for enhancing the generalizability of drug activity prediction through
+transfer learning and multimodal data fusion,” BMC biology, vol. 22,
+no. 1, p. 227, 2024.
+[22] S. M. Lundberg and S.-I. Lee, “A unified approach to interpreting model
+predictions,” in Advances in Neural Information Processing Systems
+(NeurIPS), vol. 30, 2017.
+[23] A. Subramanian, P. Tamayo, V. K. Mootha, S. Mukherjee, B. L. Ebert,
+M. A. Gillette, A. Paulovich, S. L. Pomeroy, T. R. Golub, E. S. Lander,
+and J. P. Mesirov, “Gene set enrichment analysis: A knowledge-based
+approach for interpreting genome-wide expression profiles,” Proceedings
+of the National Academy of Sciences, vol. 102, no. 43, pp. 15 545–
+15 550, 2005.
+[24] G. Landrum et al., “Rdkit: A software suite for cheminformatics,
+computational chemistry, and predictive modeling,” Greg Landrum,
+vol. 8, no. 31.10, p. 5281, 2013.
+[25] S. Kim, P. A. Thiessen, E. E. Bolton, J. Chen, G. Fu, A. Gindulyte,
+L. Han, J. He, S. He, B. A. Shoemaker et al., “Pubchem substance
+and compound databases,” Nucleic acids research, vol. 44, no. D1, pp.
+D1202–D1213, 2016.
+[26] P. Samaras, T. Schmidt, M. Frejno, S. Gessulat, M. Reinecke, A. Jarzab,
+J. Zecha, J. Mergner, P. Giansanti, H.-C. Ehrlich, S. Aiche, J. Rank,
+H. Kienegger, H. Krcmar, B. Kuster, and M. Wilhelm, “Proteomicsdb:
+a multi-omics and multi-organism resource for life science research,”
+Nucleic Acids Research, vol. 48, no. D1, pp. D1153–D1163, 10 2019.
+[Online]. Available: https://doi.org/10.1093/nar/gkz974
+[27] A. Akalin, M. Kormaksson, S. Li, F. E. Garrett-Bakelman, M. E.
+Figueroa, A. Melnick, and C. E. Mason, “methylkit: a comprehensive
+r package for the analysis of genome-wide dna methylation profiles,”
+Genome biology, vol. 13, no. 10, p. R87, 2012.
+[28] F. Iorio, T. A. Knijnenburg, D. J. Vis, G. R. Bignell, M. P. Menden,
+M. Schubert, N. Aben, E. Gonc¸alves, S. Barthorpe, H. Lightfoot et al.,
+“A landscape of pharmacogenomic interactions in cancer,” Cell, vol.
+166, no. 3, pp. 740–754, 2016.
+[29] T. Chu, T. T. Nguyen, B. D. Hai, Q. H. Nguyen, and T. Nguyen, “Graph
+transformer for drug response prediction,” IEEE/ACM Transactions on
+Computational Biology and Bioinformatics, vol. 20, no. 2, pp. 1065–
+1072, 2022.
+[30] A. Liberzon, C. Birger, H. Thorvaldsd´ottir, M. Ghandi, J. P. Mesirov,
+and P. Tamayo, “The molecular signatures database (msigdb) hallmark
+gene set collection,” Cell Systems, vol. 1, no. 6, pp. 417–425, 2015.

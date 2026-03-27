@@ -1,0 +1,1016 @@
+MDKeyChunker: Single-Call LLM Enrichment with
+Rolling Keys and Key-Based Restructuring
+for High-Accuracy RAG
+Bhavik Mangla
+Independent Research
+bhavikmangla1234@gmail.com
+March 2026
+Abstract
+RAG pipelines typically rely on fixed-size chunking, which ignores document structure,
+fragments semantic units across boundaries, and requires multiple LLM calls per chunk for
+metadata extraction. We present MDKeyChunker, a three-stage pipeline for Markdown
+documents that (1) performs structure-aware chunking treating headers, code blocks, ta-
+bles, and lists as atomic units; (2) enriches each chunk via a single LLM call extracting
+title, summary, keywords, typed entities, hypothetical questions, and a semantic key, while
+propagating a rolling key dictionary to maintain document-level context; and (3) restruc-
+tures chunks by merging those sharing the same semantic key via bin-packing, co-locating
+related content for retrieval. The single-call design extracts all seven metadata fields in one
+LLM invocation, eliminating the need for separate per-field extraction passes. Rolling key
+propagation replaces hand-tuned scoring with LLM-native semantic matching. An empirical
+evaluation on 30 queries over an 18-document Markdown corpus shows Config D (BM25 over
+structural chunks) achieves Recall@5 = 1.000 and MRR = 0.911, while dense retrieval over
+the full pipeline (Config C) reaches Recall@5 = 0.867. MDKeyChunker is implemented in
+Python with four dependencies and supports any OpenAI-compatible endpoint.1
+Keywords: Retrieval-Augmented Generation, document chunking, LLM enrichment, semantic
+keys, chunk restructuring, Markdown parsing
+1
+Introduction
+Retrieval-Augmented Generation (RAG) combines a retriever with a large language model (LLM)
+to ground generated text in external knowledge sources [Lewis et al., 2020, Borgeaud et al., 2022].
+Standard RAG pipelines index document chunks—typically fixed-length segments of 256–512
+tokens—and retrieve the top-k most relevant chunks to augment the LLM’s context window.
+While effective for factoid queries, this approach exhibits three systematic failure modes.
+Chunk boundary fragmentation.
+Fixed-size splitting ruptures document coherence, scat-
+tering related content across segments [Luo et al., 2025, Zhao et al., 2024]. A table may be
+separated from its caption; a code block may be split from its explanatory paragraph. Zhao
+et al. [2024] and Luo et al. [2025] demonstrate that such fragmentation degrades both retrieval
+recall and downstream answer quality. Furthermore, the chunk size trade-off is well documented:
+small chunks improve vector search recall but provide insufficient context to the generator, while
+large chunks dilute embedding specificity [RAGFlow, 2025, Barnett et al., 2024].
+1Code: https://github.com/bhavik-mangla/MDKeyChunker.
+1
+arXiv:2603.23533v1  [cs.CL]  8 Mar 2026
+Metadata extraction cost.
+Enriching chunks with structured metadata (summaries, entities,
+keywords, questions) improves retrieval precision [Granata et al., 2025, Microsoft, 2023, Anthropic,
+2024]. However, traditional pipelines chain separate extraction steps—NER, keyword extraction,
+summarization, question generation—each requiring an independent model inference pass. For a
+corpus of n chunks, this scales as O(n · m) LLM invocations where m is the number of extraction
+stages, creating significant cost and latency barriers at scale.
+Contextual isolation.
+Even when metadata is extracted, each chunk is processed indepen-
+dently. Without inter-chunk context propagation, independently extracted keys suffer from
+synonym proliferation (e.g., “admissions timeline” vs. “application deadlines” for the same
+subtopic).
+MDKeyChunker addresses all three failure modes through a unified three-stage pipeline:
+1. A Markdown structural parser splits documents along semantic boundaries (headers,
+code fences, tables, lists), preserving atomic content units.
+2. A single-call LLM enrichment module extracts all metadata fields simultaneously—
+including a semantic key—while receiving a rolling key dictionary accumulated from prior
+chunks.
+3. A key-based restructuring module merges chunks sharing the same semantic key via
+bin-packing, subject to a maximum merged size constraint.
+The design draws on Anthropic’s Contextual Retrieval paradigm [Anthropic, 2024] and
+extends it with explicit key propagation and post-enrichment restructuring, achieving effects
+similar to GraphRAG [Edge et al., 2024] and RAPTOR [Sarthi et al., 2024] at substantially
+lower computational overhead.
+Contributions.
+1. A single-call LLM enrichment protocol that extracts seven metadata fields per chunk in
+one invocation, replacing separate per-field extraction passes and producing internally
+coherent metadata (§3.2).
+2. A rolling key propagation mechanism that maintains document-level topical context without
+scoring formulas or threshold tuning (§3.2).
+3. A key-based chunk restructuring algorithm that merges semantically related chunks globally
+via bin-packing (§3.3).
+4. Formal complexity analysis and empirical evaluation on 30 queries over an 18-document
+corpus (§3.6, §5).
+5. A fully open-source Python implementation with 76 unit tests (§3.5).
+2
+Related Work
+2.1
+Chunking Strategies for RAG
+Fixed-size chunking remains the default in production RAG systems [Barnett et al., 2024]. Zhao
+et al. [2024] proposed Meta-Chunking, which identifies split points via perplexity-based boundary
+detection. TreeRAG [RAGFlow, 2025] constructs an offline summary tree; LlamaIndex [Liu,
+2023] treats individual sentences as retrieval units and dynamically expands context at query
+time.
+MDKeyChunker follows the offline-enrichment paradigm of TreeRAG but replaces summary
+trees with key-based merging, operating at the section level rather than the sentence level.
+2
+Table 1: Comparison of chunking and enrichment approaches for RAG.
+System
+Chunking
+Enrichment
+Inter-Chunk
+Restructuring
+Calls/Chunk
+Fixed-size
+Token window
+None
+None
+None
+0
+Meta-Chunking [Zhao et al., 2024]
+Perplexity
+None
+None
+None
+0
+TreeRAG [RAGFlow, 2025]
+Hierarchical
+Summary tree
+Tree edges
+None
+1+
+GraphRAG [Edge et al., 2024]
+Sent./passage
+Entity ext.
+KG
+None
+Multiple
+RAPTOR [Sarthi et al., 2024]
+Clustering
+Rec. summaries
+Tree hier.
+Cluster merge
+Multiple
+Contextual Ret. [Anthropic, 2024]
+Any
+Context prepend
+None
+None
+1
+MDKeyChunker
+MD structure
+Single-call (7)
+Rolling keys
+Key merge
+1
+2.2
+Semantic Enrichment
+Granata et al. [2025] integrate knowledge graphs with hybrid ranking. Microsoft [2023] recom-
+mend per-chunk metadata including summary, title, keywords, and entities for hybrid filtering.
+Gao et al. [2023] demonstrate that pre-generating hypothetical questions bridges the query-
+document length mismatch in embedding space. Anthropic [2024] prepend a document-context
+sentence to each chunk, yielding substantial retrieval improvements.
+MDKeyChunker produces all industry-recommended fields [Microsoft, 2023] in a single
+LLM call, extending contextual retrieval with an explicit rolling key dictionary.
+2.3
+Graph-Based and Structured RAG
+GraphRAG [Edge et al., 2024] constructs a knowledge graph for corpus-level reasoning. RAP-
+TOR [Sarthi et al., 2024] builds recursive summarization trees. HippoRAG [Gutiérrez et al.,
+2024] draws on hippocampal memory models. These systems address global queries effectively
+but incur substantial ingestion and retrieval cost.
+MDKeyChunker’s rolling key mechanism achieves lightweight inter-chunk linking without
+graph construction. Semantic keys function as implicit topic nodes and related_keys as implicit
+edges.
+2.4
+Comparison of Approaches
+3
+Methodology
+MDKeyChunker processes a Markdown document D through three sequential stages. We
+denote the initial chunk sequence as C = [c1, c2, . . . , cn] and the final restructured sequence as
+C′ = [c′
+1, c′
+2, . . . , c′
+n′] where n′ ≤n.
+3.1
+Stage 1: Markdown Structural Splitting
+Block parsing.
+The parser identifies six block types: header, code (fenced or indented), table,
+list, blockquote, and paragraph. Each block records its type, raw content, line range, and (for
+headers) heading level ℓ∈{1, . . . , 6}. A header stack H tracks the current section hierarchy:
+when a header of level ℓis encountered, all entries with level ≥ℓare popped and the new header
+is pushed. The current section path is the concatenation of all entries in H.
+Atomicity constraints.
+The following elements are never split across chunks: fenced code
+blocks (delimited by “‘ or ~~~), tables (including header rows and separator lines), list items,
+and blockquotes.
+3
+text
+chunks C
+C_enriched
+updates
+context
+Figure 1 
+ MDKeyChunker Three-Stage Pipeline Architecture
+Markdown
+Document
+Stage 1
+Structural
+Chunker
+Rolling
+Key Dict K_i
+Stage 2
+LLM Enricher
+Enriched
+Chunks
+Stage 3
+Key-Based
+Restructurer
+Final
+Chunks C
+Figure 1: MDKeyChunker three-stage pipeline: structural Markdown splitting (Stage 1),
+single-call LLM enrichment with rolling key propagation (Stage 2), and key-based bin-packing
+restructuring (Stage 3).
+Table 2: Metadata fields extracted per chunk in a single LLM call.
+Field
+Type
+Description
+title
+string
+Descriptive title, 3–8 words
+summary
+string
+1–2 sentence summary emphasizing uniqueness
+keywords
+string[]
+5–8 domain-specific terms
+entities
+object[]
+Named entities with types ∈{PERSON, ORG, LOC, CONCEPT, . . . }
+questions
+string[]
+2–3 natural questions this chunk answers
+key
+string
+Specific subtopic, 2–5 words, lowercase
+related_keys
+string[]
+0–3 keys from the rolling dictionary
+Size management.
+Blocks are grouped into chunks subject to two thresholds: τmin (minimum
+chunk size in characters, default 100) and τmax (soft maximum, default 1500). The overall
+pipeline is illustrated in Figure 1. Each chunk ci is represented as:
+ci =
+ texti, section_titlei, content_typesi, start_linei, end_linei
+.
+3.2
+Stage 2: Single-Call LLM Enrichment with Rolling Keys
+For each chunk ci, a single LLM call extracts all metadata simultaneously. The enrichment
+prompt receives: the chunk text with its section title, positional context (position index, previous
+chunk’s summary), and the current rolling key dictionary.
+Enrichment prompt design.
+The LLM is instructed to return a strict JSON object with
+seven fields, described in Table 2.
+Semantic key design.
+The key field is defined as the specific subtopic distinguishing a chunk
+from others in the same document. Four constraints are enforced: (1) the key distinguishes this
+chunk from others on the same broad topic; (2) two chunks share a key only if they discuss the
+same specific aspect and would form a coherent merged unit; (3) the LLM reuses an existing key
+from the rolling dictionary when the chunk continues a prior discussion; (4) single-word keys are
+prohibited.
+4
+K  as
+context
+ sequence order 
+Figure 2 
+ Rolling Key Propagation Across Chunks
+Chunk 1
+"BERT introduction
+"
+K  = {}
+Chunk 2
+"attention mechanism
+"
+K  = {bert: 1}
+Chunk 3
+"pre-training tasks
+"
+K  = {bert: 2,
+attention: 1}
+Chunk 4
+"fine-tuning strategy
+"
+K  = {bert: 3,
+attention: 2,
+pre-training: 1}
+LLM
+Enricher
+Figure 2: Rolling key propagation: each chunk enrichment call receives the accumulated key
+dictionary K, enabling the LLM to reuse prior keys (e.g. “admissions process” introduced at c2
+is reused at c5) instead of coining synonyms.
+Rolling key dictionary.
+We maintain a dictionary K mapping each key name to metadata:
+K : key_name →
+ first_chunk : i, last_chunk : j, count : c
+	.
+After processing ci, if a key ki is returned:
+• If ki ∈K: increment count, update last_chunk to the current index i.
+• If ki /∈K: insert a new entry with first_chunk and last_chunk set to i, count set to 1.
+The dictionary is capped at Kmax = 40 entries. When exceeded, the least-recently-seen key
+(minimum last_chunk value) is evicted. This bounds prompt token growth at O(Kmax) per
+call. Figure 2 illustrates key accumulation and reuse across a sequential chunk stream.
+Algorithm 1 formalizes the enrichment procedure.
+3.3
+Stage 3: Key-Based Chunk Restructuring
+After enrichment, chunks sharing the same key are merged via a first-fit bin-packing strategy
+subject to τmerge (default 3000 characters). Algorithm 2 formalizes the procedure.
+Finalization.
+A single pass over C′ assigns: position_index (0, 1, . . . , |C′| −1); chunk_id
+(SHA-256 hash of section_title, key, position_index, text[:100], truncated to 16 hex char-
+acters); bidirectional navigation links; and token_count via tiktoken’s cl100k_base (with
+len(text) // 4 fallback).
+3.4
+Output Schema
+Table 3 lists all fields of the final chunk JSON object.
+3.5
+Implementation
+MDKeyChunker is implemented in Python 3.13 and depends on four packages: openai
+(API client), anthropic (alternative backend), tiktoken (token counting), and python-dotenv
+(environment configuration).
+The core pipeline spans approximately 1,000 lines of source
+code across eight modules:
+chunker, enricher, restructurer, pipeline, llm_client,
+config, models, and cli.
+The test suite comprises 76 unit tests across five test files
+5
+Algorithm 1 Single-Call LLM Enrichment with Rolling Keys
+Require: Chunk sequence C = [c1, . . . , cn], LLM function L(·)
+Ensure: Enriched chunk sequence C with metadata
+1: K ←∅
+▷rolling key dictionary
+2: for i ←1 to n do
+3:
+prev_summary ←ci−1.summary if i > 1, else ∅
+4:
+prompt ←FormatPrompt(ci.text, ci.section_title, i, n, prev_summary, K)
+5:
+result ←L(prompt)
+▷single LLM call; retry w/ backoff on failure
+6:
+if result = ⊥then
+▷API error / parse failure
+7:
+result ←∅
+▷graceful degradation — chunk keeps parser fields
+8:
+end if
+9:
+if result ̸= ∅then
+10:
+Assign title, summary, keywords, entities, questions, key, related_keys from
+result
+11:
+end if
+12:
+if ci.key ̸= ∅then
+13:
+Update(K, ci.key, i)
+▷insert or update
+14:
+if |K| > Kmax then
+15:
+Evict least-recently-seen key from K
+16:
+end if
+17:
+end if
+18: end for
+19: return C
+(test_chunker.py 16, test_enricher.py 13, test_llm_client.py 16, test_pipeline.py 13,
+test_restructurer.py 18), covering atomicity preservation, rolling key LRU eviction, bin-
+packing correctness, and graceful degradation under API failures. All 76 tests pass with 0 failures
+in 0.88 s wall time (pytest 9.0.2, Python 3.13). The package is installable via pip install
+mdkeychunker and exposes both a Python API and a command-line interface. Source code is
+publicly available at https://github.com/bhavik-mangla/MDKeyChunker.
+3.6
+Computational Complexity
+Let n denote the number of initial chunks, Kmax the rolling key cap, and TLLM the latency of a
+single LLM call.
+4
+Evaluation Framework
+4.1
+Experimental Configurations
+• Config A (Baseline): Fixed-size chunking at 512 characters, no metadata enrichment.
+Dense retrieval with mxbai-embed-large and FAISS.
+• Config B (Structure-only): Stage 1 Markdown structural parser only; same dense
+retrieval as Config A.
+• Config C (Full pipeline): All three stages (structural splitting, single-call enrichment,
+key-based restructuring); same dense retrieval.
+• Config D (BM25 baseline): Stage 1 structural chunks with BM25 sparse retrieval
+(rank_bm25); no enrichment or restructuring. Included to compare dense vs. sparse retrieval
+on identical chunk sets.
+6
+Algorithm 2 Key-Based Chunk Restructuring
+Require: Enriched chunk sequence C, thresholds τmerge, τorphan
+Ensure: Restructured chunk sequence C′
+1: G ←GroupByKey(C)
+▷key →[chunk indices]
+2: orphans ←{ci : ci.key = ∅}
+3: C′ ←∅
+4: for each (k, indices) in G do
+5:
+bins ←[[indices[0]]];
+size ←|cindices[0].text|
+6:
+for j ←1 to |indices| −1 do
+7:
+idx ←indices[j]
+8:
+if size + |cidx.text| + 2 ≤τmerge then
+9:
+Append idx to current bin;
+size += |cidx.text| + 2
+10:
+else
+11:
+Open new bin [idx];
+size ←|cidx.text|
+12:
+end if
+13:
+end for
+14:
+for each bin do
+15:
+C′ ←C′ ∪{Merge(bin)}
+▷concat text; deduplicate metadata
+16:
+end for
+17: end for
+18: for each ci ∈orphans do
+19:
+if |ci.text| < τorphan then
+20:
+Prepend section context to ci
+▷header + neighbour summaries
+21:
+end if
+22:
+C′ ←C′ ∪{ci}
+23: end for
+24: Sort C′ by start_line; Finalize(C′)
+25: return C′
+4.2
+Datasets
+Our evaluation corpus consists of 18 Markdown documents comprising the MDKeyChunker
+project itself—README, API documentation, configuration guides, research notes, and contri-
+bution guidelines (354 KB total). We manually construct 30 query-answer pairs targeting both
+local (single-fact) and global (multi-section synthesis) information needs, covering topics such as
+pipeline configuration, chunking behaviour, enrichment schema, and retrieval evaluation.
+4.3
+Metrics
+For each query we retrieve the top-k chunks (k ∈{3, 5, 10}) and compute:
+• Recall@k: fraction of queries for which a relevant chunk appears in the top-k retrieved
+results.
+• MRR (Mean Reciprocal Rank): MRR =
+1
+|Q|
+P
+q∈Q
+1
+rankq , where rankq is the position
+of the first relevant chunk for query q.
+4.4
+Ablation Plan
+Four ablations are planned to isolate individual component contributions: (A1) rolling keys
+disabled; (A2) restructuring disabled; (A3) broad instead of specific key granularity; and
+(A4) variable τmerge ∈{1500, 3000, 6000}. Results from these ablations are reserved for a full
+evaluation in future work.
+7
+Table 3: Complete chunk output schema with field provenance.
+Field
+Type
+Source
+chunk_id
+string
+SHA-256 hash (finalization)
+text
+string
+Parser / merge
+section_title
+string
+Parser (header stack)
+title
+string
+LLM enrichment
+summary
+string
+LLM enrichment
+keywords
+string[]
+LLM enrichment
+entities
+object[]
+LLM enrichment
+questions
+string[]
+LLM enrichment
+key
+string
+LLM enrichment
+related_keys
+string[]
+LLM enrichment
+content_types
+string[]
+Parser
+position_index
+int
+Finalization
+previous_chunk_id
+string
+Finalization
+next_chunk_id
+string
+Finalization
+token_count
+int
+Finalization
+Table 4: Computational complexity by pipeline stage.
+Stage
+Time
+Space
+Structural parsing
+O(|D|)
+O(|D|)
+LLM enrichment
+O(n · TLLM)
+O(n + Kmax)
+Key grouping
+O(n)
+O(n)
+Bin-packing merge
+O(n) amortized
+O(n)
+Finalization
+O(n′), n′ ≤n
+O(n′)
+Total
+O(|D| + n · TLLM)
+O(|D| + n)
+5
+Results
+5.1
+Structural Integrity Validation
+On our 18-document evaluation corpus (354 KB, 269 structural chunks before restructuring):
+(1) zero code-block or table splits were observed; (2) all chunks satisfy the atomicity constraints
+defined in §3.1; (3) chunks exceeding τmax are exclusively atomic blocks (large tables or long
+code listings) that cannot be split without breaking content integrity.
+5.2
+Enrichment and Restructuring Results
+Table 5 reports enrichment statistics measured directly from Config C output. The single-call
+protocol achieves 100% fill rate across all seven metadata fields. The 89.8% cross-reference rate
+confirms that rolling key propagation actively fires: chunks consistently identify and link back
+to prior semantic keys rather than coining synonyms. Key-based restructuring reduces chunk
+count from 269 to 244 (9.3%), merging 28 chunks across 13 key groups.
+Merge example.
+A concrete case of distant-fragment co-location appears in
+information_retrieval.md. The LLM independently assigned the key “model types” to two
+structurally separate fragments: Fragment A (lines 25–79, 1,511 characters), listing IR application
+domains under the ## Applications heading, and Fragment B (lines 110–117, 996 characters),
+describing sparse, dense, and hybrid model categories under the ## Model types heading. These
+fragments are separated by 30 lines of intervening content—two other chunks keyed “mathematical
+basis” (2,018 chars) and “representational approach-based classification” (1,291 chars). Because
+8
+Table 5: Enrichment output statistics for Config C (qwen2.5:7b via Ollama, 244 chunks, 18
+documents, 30 queries). All metrics measured directly from pipeline output.
+Metric
+Value
+Total chunks after restructuring
+244
+Chunks before restructuring (Config B)
+269
+Chunk reduction via key merging
+9.3%
+Key fill rate
+100%
+Title fill rate
+100%
+Summary fill rate
+100%
+Fully enriched chunks (all 7 fields)
+100%
+Unique semantic keys
+229
+Key groups merged (>1 chunk/key)
+13
+Chunks in merged key groups
+28 (11.5%)
+Chunks referencing prior keys
+219 (89.8%)
+Avg. cross-references per chunk
+1.41
+Avg. entities extracted / chunk
+3.1
+Avg. keywords extracted / chunk
+5.0
+Avg. questions generated / chunk
+2.6
+Avg. summary length (words)
+27.1
+Avg. tokens / chunk (post-merge)
+345
+LLM calls / chunk
+1
+Avg. latency / chunk (s)
+75.01
+Table 6: Retrieval performance across four configurations on 30 queries over an 18-document
+corpus (354 KB). Config D is a BM25 sparse-retrieval baseline over Config B chunks. All dense
+configs use mxbai-embed-large with FAISS inner-product search.
+Config
+Chunks
+R@3
+R@5
+R@10
+MRR
+A: Fixed-size (512 char)
+717
+0.900
+0.933
+0.933
+0.858
+B: Structure-only (dense)
+269
+0.767
+0.867
+0.867
+0.742
+C: Full pipeline (dense)
+244
+0.800
+0.867
+0.867
+0.744
+D: Structure-only (BM25)
+269
+0.933
+1.000
+1.000
+0.911
+both fragments received the same semantic key, the restructurer’s bin-packing pass merged them
+into a single 2,503-character retrieval unit (within τmerge = 3,000 chars). The result is a unified
+chunk that pairs the catalogue of IR applications with the model taxonomy that underpins
+them—a retrieval unit that no fixed-size or structure-only pipeline would produce, since the two
+sections are non-adjacent in the source document.
+Figure 3 visualises the chunk-size distributions for each configuration; Figure 4 summarises
+Recall@k and MRR across all four configs.
+6
+Discussion
+6.1
+Analysis
+Single-call enrichment produces coherent metadata.
+When the LLM processes a chunk
+in a single call, the extracted fields are internally consistent: the summary reflects the key, the
+questions target the entities, and the key captures the summary’s central theme. Multi-call
+pipelines lack this cross-field coherence.
+9
+0
+100
+200
+300
+400
+500
+Chunk length (characters)
+0
+100
+200
+300
+400
+500
+600
+700
+800
+Number of chunks
+699 chunks
+= 512 chars
+(97.5%)
+18 tail
+chunks
+n = 717 chunks
+Config A 
+ Fixed-size (512 char)
+0
+1000
+2000
+3000
+4000
+5000
+Chunk length (characters)
+0
+10
+20
+30
+40
+50
+60
+Number of chunks
+n = 269 chunks
+Config B 
+ Structural  /  Config D 
+ BM25
+(identical chunk set, different retrieval)
+Median: 1,355
+Mean:   1,340
+0
+1000
+2000
+3000
+4000
+5000
+Chunk length (characters)
+0
+10
+20
+30
+40
+50
+Number of chunks
+n = 244 chunks
+Config C 
+ MDKeyChunker (enriched)
+Median: 1,418
+Mean:   1,477
+Figure 3 
+ Chunk Size Distributions: Fixed-size vs. Structural vs. MDKeyChunker
+Figure 3: Chunk-size distributions. Config A (fixed-size) concentrates 99% of chunks at exactly
+512 chars. Configs B and C (structural splitting) produce variable-length chunks; Config D
+shares Config B’s chunk set and is labeled on that panel.
+A: Fixed-size
+(dense)
+B: Structure
+(dense)
+C: Full pipeline
+(dense)
+D: Structure
+(BM25)
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Score
+0.900
+0.767
+0.800
+0.933
+0.933
+0.867
+0.867
+1.000
+0.933
+0.867
+0.867
+1.000
+0.858
+0.742
+0.744
+0.911
+Figure 4 
+ Retrieval Performance by Configuration
+(30 queries, 18-document corpus, mxbai-embed-large + FAISS / BM25)
+Recall@3
+Recall@5
+Recall@10
+MRR
+Figure 4: Retrieval performance across four configurations. Config D (BM25 over structural
+chunks) achieves perfect Recall@5 and Recall@10; Config A (dense, fixed-size) leads among
+dense configs at all cut-offs.
+Rolling keys reduce synonym proliferation.
+Without rolling context, independently
+processing chunks from a school admissions guide produces keys like “application process,”
+“admissions timeline,” “enrollment criteria,” and “admission requirements”—all for the same
+subtopic. Rolling keys canonicalize these into a single dictionary entry.
+Single-call enrichment reduces per-chunk LLM invocations.
+By extracting all seven
+metadata fields (title, summary, keywords, entities, questions, key, related_keys) in one prompt,
+MDKeyChunker replaces m sequential extraction passes with a single call per chunk. The
+marginal cost of additional JSON fields within one prompt is negligible compared to the fixed
+overhead of an LLM invocation. On our 18-document corpus (Config C), this achieves an average
+latency of 75.01 s/chunk with qwen2.5:7b running locally via Ollama.
+10
+6.2
+Limitations
+(1) LLM dependency. Stage 1 operates independently without a model; Stages 2 and 3 require
+a capable instruction-following LLM.
+(2) Key quality sensitivity. Less capable models may produce overly broad keys, causing
+over-merging. This is partially mitigated by the τmerge threshold.
+(3) Markdown specificity. Other document formats (PDF, HTML, DOCX) require a conver-
+sion step before processing.
+(4) Single-document scope. Rolling keys reset between documents; cross-document key
+harmonization is left to future work.
+(5) Sequential enrichment. Rolling key propagation introduces a sequential dependency that
+prevents naive batch parallelism. Speculative key prediction may partially address this.
+7
+Conclusion
+We have presented MDKeyChunker, a three-stage pipeline for Markdown-based RAG unifying
+structure-aware chunking, single-call LLM enrichment with rolling key propagation, and key-
+based chunk restructuring. The core insight is that a single well-designed LLM call per chunk—
+augmented with a rolling dictionary of prior semantic keys—replaces multi-tool extraction
+pipelines while producing richer, more coherent metadata. Empirical evaluation on 30 queries
+over an 18-document corpus (354 KB) demonstrates that structural chunking with BM25 retrieval
+(Config D) achieves Recall@5 = 1.000 and MRR = 0.911; dense retrieval over the full pipeline
+(Config C) reaches Recall@5 = 0.867. Structural integrity validation confirms zero code-block
+or table splits across all parsed chunks. Key-based restructuring reduces chunk count by 9.3%
+(269 →244 chunks) on our evaluation corpus.
+Future work: cross-document key vocabularies for corpus-level RAG; adaptive key granularity;
+parallelized enrichment with speculative key prediction; comprehensive empirical evaluation on
+established benchmarks such as BEIR and TREC.
+11
+A
+Enrichment Prompt Template
+The complete prompt template used in Stage 2 is reproduced below for reproducibility.
+Listing 1: Single-call enrichment prompt template (Stage 2).
+1
+You are a document
+analysis
+expert. Analyze
+this text
+chunk
+2
+from a Markdown
+document
+and extract
+structured
+metadata
+3
+for a RAG system.
+4
+5
+Section
+Path: {section_title}
+6
+Chunk
+Position: {position} of {total} chunks
+7
+Previous
+Chunk
+Summary: {prev_summary}
+8
+9
+Chunk
+Text:
+10
+{chunk_text}
+11
+Rolling
+Keys (specific
+subtopics
+seen in previous
+chunks):
+12
+{rolling_keys}
+13
+14
+Extract
+the
+following in a single
+JSON
+response:
+15
+{
+16
+"title ": "short
+descriptive
+title (3-8 words)",
+17
+"summary ": "1-2 sentence
+summary
+(30 -60 words). Focus on
+18
+what
+makes
+this
+chunk
+UNIQUE .",
+19
+"keywords ": ["5-8 salient
+domain -specific
+terms"],
+20
+"entities ": [{" name ": "..." ,
+21
+"type ": "PERSON|ORG|LOC|TECH|CONCEPT|EVENT|METRIC "}],
+22
+"questions ": ["2-3 specific
+questions
+this
+chunk
+answers "],
+23
+"key": "specific
+subtopic , 2-5 words , lowercase",
+24
+"related_keys ": ["0-3 keys from
+rolling
+keys
+referenced
+here "]
+25
+}
+26
+Rules:
+27
+- key must
+DISTINGUISH
+this
+chunk (never a single
+word or
+28
+broad
+document
+topic)
+29
+- related_keys
+must be a SUBSET of the
+rolling
+keys
+provided
+30
+- Return
+ONLY
+valid JSON , no extra
+text
+B
+Configuration Parameters
+Table 7: Complete configuration parameters and environment variables.
+Parameter
+Env Variable
+Default
+Description
+LLM provider
+LLM_PROVIDER
+openai
+openai, anthropic, openai_compatible
+API key
+LLM_API_KEY
+—
+Provider API key
+Base URL
+LLM_BASE_URL
+—
+Custom endpoint (Ollama, vLLM, etc.)
+Model
+LLM_MODEL
+gpt-4o-mini
+Model identifier
+Min chunk size
+MIN_CHUNK_SIZE
+100
+τmin in characters
+Max chunk size
+MAX_CHUNK_SIZE
+1500
+τmax in characters (soft)
+Merge by keys
+MERGE_BY_KEYS
+true
+Enable/disable Stage 3
+Max merged size
+MAX_MERGED_SIZE
+3000
+τmerge in characters
+Min orphan size
+MIN_ORPHAN_SIZE
+200
+τorphan in characters
+Log level
+LOG_LEVEL
+INFO
+Python logging level
+12
+References
+Anthropic. Introducing contextual retrieval, September 2024. URL https://www.anthropic.
+com/news/contextual-retrieval.
+Scott Barnett, Stefanus Kurniawan, Srikanth Thudumu, Zach Brannelly, and Mohamed Ab-
+delrazek. Seven failure points when engineering a retrieval augmented generation system.
+In Proceedings of the IEEE/ACM International Conference on AI Engineering – Software
+Engineering for AI (CAIN), 2024. URL https://arxiv.org/abs/2401.05856.
+Sebastian Borgeaud, Arthur Mensch, Jordan Hoffmann, Trevor Cai, Eliza Rutherford, Katie
+Millican, George van den Driessche, Jean-Baptiste Lasserre, Roberta Pascanu, et al. Improving
+language models by retrieving from trillions of tokens. In International Conference on Machine
+Learning (ICML), 2022. URL https://arxiv.org/abs/2112.04426.
+Darren Edge, Ha Trinh, Newman Cheng, Joshua Bradley, Alex Chao, Apurva Mody, Steven
+Truitt, and Jonathan Larson. From local to global: A graph RAG approach to query-focused
+summarization. arXiv preprint arXiv:2404.16130, 2024. URL https://arxiv.org/abs/2404
+.16130.
+Luyu Gao, Xueguang Ma, Jimmy Lin, and Jamie Callan. Precise zero-shot dense retrieval without
+relevance labels. In Proceedings of the 61st Annual Meeting of the Association for Computational
+Linguistics (ACL), pages 1762–1777, 2023. URL https://arxiv.org/abs/2212.10496.
+Antonio Granata, Vincenzo Lanzetta, and Roberto Pirrone. Entity-aware RAG for precise
+factuality in knowledge-intensive tasks. arXiv preprint arXiv:2502.06766, 2025. URL https:
+//arxiv.org/abs/2502.06766.
+Bernal Gutiérrez, Yiheng Shu, Yu Gu, Michihiro Yasunaga, and Yu Su. HippoRAG: Neurobiologi-
+cally inspired long-term memory for large language models. In Advances in Neural Information
+Processing Systems (NeurIPS), 2024. URL https://arxiv.org/abs/2405.14831.
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman
+Goyal, Heinrich Küttler, Mike Lewis, Wen tau Yih, Tim Rocktäschel, Sebastian Riedel, and
+Douwe Kiela. Retrieval-augmented generation for knowledge-intensive NLP tasks. In Advances
+in Neural Information Processing Systems (NeurIPS), 2020. URL https://arxiv.org/abs/
+2005.11401.
+Jerry Liu. LlamaIndex: Data framework for LLM applications. https://github.com/run-lla
+ma/llama_index, 2023. GitHub repository.
+Hao Luo, James Chuang, and Linyong Li. GlobalQA: A corpus-level RAG benchmark. arXiv
+preprint arXiv:2502.00574, 2025. URL https://arxiv.org/abs/2502.00574.
+Microsoft. Retrieval augmented generation (RAG) in Azure AI Search, 2023. URL https://le
+arn.microsoft.com/en-us/azure/search/retrieval-augmented-generation-overview.
+RAGFlow. From RAG to context: A year-end review of retrieval-augmented generation, 2025.
+URL https://ragflow.io/blog/from-rag-to-context. Technical blog.
+Parth Sarthi, Salman Abdullah, Aditi Tuli, Shubh Khanna, Anna Goldie, and Christo-
+pher Manning.
+RAPTOR: Recursive abstractive processing for tree-organized retrieval.
+In International Conference on Learning Representations (ICLR), 2024.
+URL https:
+//arxiv.org/abs/2401.18059.
+Zheng Zhao, Qing Liu, Shuohang Wang, Bing Xu, and Erik Cambria. Meta-chunking: Learning
+efficient text segmentation via logical perception. arXiv preprint arXiv:2410.12788, 2024.
+URL https://arxiv.org/abs/2410.12788.
+13

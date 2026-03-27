@@ -1,0 +1,1467 @@
+EndoVGGT: GNN-Enhanced Depth Estimation
+for Surgical 3D Reconstruction
+Falong Fan, Yi Xie, Arnis Lektauers, Bo Liu, and Jerzy Rozenblit
+University of Arizona, Tucson, AZ, USA
+{falongfan, yix, lektauers, boliu, jerzyr}@arizona.edu
+Abstract. Accurate 3D reconstruction of deformable soft tissues is essen-
+tial for surgical robotic perception. However, low-texture surfaces, specular
+highlights, and instrument occlusions often fragment geometric continuity,
+posing a challenge for existing fixed-topology approaches. To address
+this, we propose EndoVGGT, a geometry-centric framework equipped
+with a Deformation-aware Graph Attention (DeGAT) module. Rather
+than using static spatial neighborhoods, DeGAT dynamically constructs
+feature-space semantic graphs to capture long-range correlations among
+coherent tissue regions. This enables robust propagation of structural cues
+across occlusions, enforcing global consistency and improving non-rigid
+deformation recovery. Extensive experiments on SCARED show that our
+method significantly improves fidelity, increasing PSNR by 24.6% and
+SSIM by 9.1% over prior state-of-the-art. Crucially, EndoVGGT exhibits
+strong zero-shot cross-dataset generalization to the unseen SCARED and
+EndoNeRF domains, confirming that DeGAT learns domain-agnostic geo-
+metric priors. These results highlight the efficacy of dynamic feature-space
+modeling for consistent surgical 3D reconstruction.
+Keywords: Surgical 3D Reconstruction · Depth Estimation
+1
+Introduction
+Three-dimensional reconstruction of endoscopic surgical scenes is a fundamental
+component of modern surgical practice, including robot-assisted surgery [28,27]
+and computer-assisted surgical training [23]. By providing accurate depth in-
+formation, the systems enhance navigation [13] and laparoscopic training [5],
+thereby increasing perception precision for downstream surgical tasks.
+Large Reconstruction Models (LRMs) are transformer-based feed-forward
+networks trained on diverse multi-scene datasets to learn scene-agnostic geometric
+priors, with VGGT [24] as a representative example of geometry-grounded models.
+Although successful in natural scenes, LRMs’ extension to surgical settings is
+fundamentally limited by domain shift. Existing LRMs are predominantly trained
+on rigid, object-centric datasets assuming static geometry and stable illumination.
+In contrast, surgical scenes feature intrinsic non-rigidity, soft-tissue deformation,
+and dynamic instrument occlusion [5,10]. Consequently, direct deployment of
+general-domain models yields artifacts, including disrupted tissue topology and
+arXiv:2603.24577v1  [cs.CV]  25 Mar 2026
+2
+F. Fan et al.
+Fig. 1: Visualization of DeGAT neighbor aggregation. (a–b) Visualization
+of neighborhood construction and feature responses in the proposed DeGAT
+module. ⋆indicates the centroid and ◦indicates its neighbors. The highlighted
+⋆aggregates informative context even across instrument boundaries, enabling
+robust feature refinement. (c–d) Depth estimation comparison without (c) and
+with (d) DeGAT. Incorporating DeGAT yields sharper boundaries and improved
+structural continuity for both instruments and organs, as shown in the red box.
+depth errors. In parallel, recent surgical approaches based on NeRF or Gaussian
+Splatting rely on per-scene optimization, which requires repeated fitting for each
+new case, limiting their large-scale generalization across diverse procedures.
+To address these limitations, we propose Endoscopic VGGT (EndoVGGT),
+a generalizable reconstruction framework tailored for endoscopic scenes that
+eliminates per-scene optimization and enables strong zero-shot cross-dataset
+generalization via dynamic graph construction. The EndoVGGT framework
+effectively bridges geometric discontinuities caused by instrument occlusions,
+facilitating coherent depth aggregation across spatially fragmented tissues while
+maintaining robustness in unseen surgical scenes. Our contributions are:
+– We propose a Deformation-aware Graph ATtention module (DeGAT) that
+constructs feature-space neighborhoods to preserve sharp depth discontinuities
+across deformable boundaries in Sec. 3.1, reducing LPIPS by 15.8%.
+– To mitigate severe domain shift in surgical scenes, we train EndoVGGT
+on in-domain surgical data and improve PSNR on SCARED from 14.061
+(VGGT) to 34.348 (+144% relatively), as shown in Fig. 3.
+– We demonstrate EndoVGGT’s zero-shot generalization. As Table 2 shows,
+while the baseline collapses on unseen data, our method maintains robust
+fidelity under extreme deformations, improving SSIM by 24.8% to 0.915.
+2
+Related Work
+Three-dimensional reconstruction and dense depth estimation are critical for
+surgical navigation [2], robotic assistance [7], and skill assessment [6]. While
+early geometric and deep-learning pipelines [20,29] laid the foundation, recent
+paradigms have shifted toward implicit neural representations like NeRFs [14]
+and explicit 3D Gaussian Splatting (3DGS) [11]. In surgical scenes, NeRF and
+3. METHODOLOGY
+3
+3DGS adaptations [26,12] achieve high-fidelity geometry but are fundamentally
+bottlenecked by dense-view requirements and computationally expensive per-
+scene optimization [21], severely limiting their real-time clinical viability.
+To address these efficiency bottlenecks, LRMs [24,9] offer a scene-agnostic,
+feed-forward alternative. Supported by robust transformer-based depth estimation
+[19,3], LRMs directly infer 3D structures from sparse inputs without test-time
+optimization. However, adapting general-domain LRMs to surgical tasks remains
+challenging due to continuous soft-tissue deformation and dynamic instrument
+occlusion [15]. Even recent surgical LRM adaptations, such as EndoLRMGS [25],
+still rely heavily on per-scene optimization to align geometric details. In contrast,
+our approach builds on the VGGT architecture [24] to achieve superior general-
+ization and inference efficiency in dynamic surgical environments, eliminating
+the need for scene-specific training.
+3
+Methodology
+In the following sections, we detail the DeGAT module in Sec. 3.1, the training
+protocol and comprehensive objective functions in Sec. 3.2.
+Fig. 2: Overview of the EndoVGGT framework. The proposed DeGAT module
+enhances the features extracted from DINOv2 [16], and camera tokens interact via both
+global and within-frame attention mechanisms. The depth maps are predicted using a
+DPT head [19], and camera poses are predicted by an MLP to reconstruct the input
+scene, and are constrained by a composite loss introduced in Sec. 3.2.
+Problem setting and geometric formulation. Given a sequence of endoscopic
+images I = {I1, . . . , IN}, our goal is to reconstruct the 3D scene geometry by
+predicting depth maps ˆD =
+ˆ
+{Dt}
+N
+t=1 and camera parameters ˆP = { ˆRt, ˆTt, ˆft}N
+t=1
+in a feed-forward manner without test-time optimization. We learn a mapping
+function Fθ : I →D × P parameterized by θ. Dense depth serves as a direct
+proxy for 3D surface recovery through geometric back-projection. For a pixel
+u = (u, v)⊤with homogeneous coordinates ˜u = (u, v, 1)⊤, the predicted depth
+4
+F. Fan et al.
+ˆDt(u) induces a 3D point in the camera coordinate system, which is subsequently
+transformed to a world reference frame using the predicted camera pose ( ˆRt, ˆTt):
+ˆXt(u) = ˆDt(u) K( ˆft)−1˜u,
+ˆXw(u) = ˆRt ˆXt(u) + ˆTt,
+(1)
+where K( ˆft) denotes the intrinsic matrix formed by the focal length ˆft. Thus, the
+set { ˆXw(u)} forms a dense point cloud to constitute the reconstructed geometry.
+3.1
+Deformation Graph Attention Module
+To promote local geometric consistency, we propose DeGAT. Unlike fixed spatial
+neighborhoods that assume a locally stable structure, DeGAT constructs dynamic
+neighbors that adapt to non-rigid, deformable surgical inputs.
+Dynamic Graph Construction. For each frame t, we denote the patch-token
+features by Xt = [xt,1, . . . , xt,L]⊤∈RL×C, where L = H
+P
+W
+P is the number of
+tokens, and each token i is associated with a normalized spatial coordinate
+pt,i ∈R2. We construct a dynamic graph by computing the semantic cosine
+similarity sij = (x⊤
+t,ixt,j)/(∥xt,i∥2∥xt,j∥2) to determine the K-nearest neighbor
+set N(i) = TopKj̸=i(sij), where K = 9 empirically. This dynamic neighborhood
+ensures that the model connects the same tissue surface even when the tissue is
+spatially fragmented by deformation or instrument occlusion, as shown in Fig. 1.
+Attention-Based Aggregation. Following the GAT framework [22], DeGAT
+aggregates information from N(i) via attention mechanisms (without introducing
+additional handcrafted scalar bias terms). Specifically, the attention logit is:
+ℓij = a⊤LeakyReLU(Wproj [xt,i∥xt,j]) ,
+(2)
+The attention coefficient αij and the aggregated token feature xout
+t,i are:
+αij =
+exp(ℓij)
+P
+m∈N(i) exp(ℓim),
+xout
+t,i = xt,i + σ
+
+X
+j∈N (i)
+αij Wvalxt,j
+
+.
+(3)
+By defining ˜A ∈RL×L as a sparse matrix where ˜Aij = αij for j ∈N(i) and 0
+otherwise, DeGAT can be formulated compactly as
+Xout
+t
+= Xt + σ
+
+˜A Xt W⊤
+val
+
+,
+(4)
+where σ represents the ELU [4] activation to improve learning dynamics. The
+following propositions are established, with proofs in an anonymous Appendix.
+Proposition 1: Stability. For each token i, the DeGAT residual update satisfies
+∥xout
+t,i ∥2 ≤∥xt,i∥2 + maxj∈N (i) ∥Wvalxt,j∥2, ensuring training stability.
+Proof. The ELU function σ is non-expansive (|σ(z)| ≤|z|), ensuring ∥xagg
+t,i ∥2 =
+∥σ(mi)∥2 ≤∥mi∥2. By definition, mi = P
+j∈N (i) αijWvalxt,j. Using the triangle
+inequality and the row-stochasticity of attention weights (P
+j∈N (i) αij = 1), we
+directly obtain ∥mi∥2 ≤maxj∈N (i)∥Wvalxt,j∥2. Finally, applying the triangle
+inequality to the residual update xout
+t,i = xt,i + xagg
+t,i yields Proposition 1.
+■
+4. EXPERIMENTS
+5
+Proposition 2: Permutation Equivariance. DeGAT is permutation-equivariant:
+DeGAT(PX, Pp) = PDeGAT(X, p) for any permutation matrix P.
+We integrate DeGAT into VGGT at three levels (Groups (B)–(D) in Table 1).
+At the token level, we pool the DeGAT-refined patch features into a global
+geometric prior gi =
+1
+|N|
+P
+j∈N (i) xj. This prior is injected into the camera token
+c via a learnable bias (c′ = c + MLP(g)), FiLM [18] (c′ = (1 + γ) ⊙c + β
+with [γ, β] = MLP(g)), or cross-attention (c′ = c + CrossAttn(c, X)). At the
+attention level, we reuse DeGAT affinities to build a learnable bias matrix
+B ∈RL×L, modifying self-attention to Attn(Q, K, V) = softmax
+
+QK⊤
+√
+d + B
+
+V,
+where d is the head dimension. B is derived by either quantizing neighbor
+distances (Learnable Bias Table) or mapping them via a lightweight network
+(Continuous MLP Bias). Finally, at the feature level, DeGAT acts as a residual
+operator (X ←Xout) to refine token representations, enhancing geometry-aware
+modeling under complex deformations. Details are in the Appendix.
+3.2
+Training Objective
+Base Rigid Supervision. We adopt the supervision paradigm from VGGT [24]
+as our objective, Lbase, which optimizes camera parameters and enforces geometric
+fidelity. Let ˆT, ˆR, ˆf represent the predicted translation, rotation, and focal
+length, with T, R, f as their ground truth. The camera loss is computed as
+Lcam = ∥ˆT −T∥1 + ∥ˆR −R∥1 + | ˆf −f|. For depth supervision, following VGGT,
+we predict an auxiliary per-pixel confidence map ˆC ∈RH×W
+>0
+which is an extra
+output channel of the depth head, and learn it implicitly through the training
+objective (details are in Appendix). The complete depth loss integrates standard
+regression, confidence-weighted uncertainty, and spatial gradient consistency:
+Ldepth = ∥ˆD −D∥2
+2
+|
+{z
+}
+Lreg
++
+
+γ ∥ˆD −D∥2
+2 ⊙ˆC −α log( ˆC)
+
+|
+{z
+}
+Lunc
++
+X
+k∈{x,y}
+∥∇k ˆD −∇kD∥1
+|
+{z
+}
+Lgrad
+,
+(5)
+where ⊙denotes element-wise multiplication, and α, γ are weighting hyperpa-
+rameters, and ∇k denotes the spatial gradient in the x and y directions. The
+base objective is thus defined as Lbase = Lcam + Ldepth.
+Proposition 3 (Optimal Confidence). The uncertainty objective Lunc is
+convex in (0, ∞), achieving its unique minimum at ˆC=α/(γ∥ˆD(u) −D(u)∥2
+2),
+enabling implicit confidence learning without labels. Proof is in the Appendix.
+4
+Experiments
+In this section, we present the experimental results for EndoVGGT. Sec. 4.1
+describes the datasets and metrics. Sec. 4.2 evaluates the effectiveness and zero-
+shot generalization of the DeGAT module, highlighting its handling of non-rigid
+scenarios. Sec. 4.3 compares our method with prior approaches.
+6
+F. Fan et al.
+Table 1: Experiment results on different-level DeGAT strategies on SCARED
+dataset. “EndoVGGT-base” refers to the EndoVGGT model without DeGAT.
+Methods
+PSNR ↑
+SSIM ↑
+LPIPS ↓
+(A) Baseline
+EndoSurf [30]
+24.395
+0.769
+0.319
+EndoLRMGS [25]
+27.561
+0.861
+0.323
+EndoVGGT-base
+32.927
+0.918
+0.285
+(B) EndoVGGT + Token-Level DeGAT
+cls token+learnable bias [Sec 3.1]
+34.019
+0.936
+0.246
+cls token + FiLM module [18]
+31.941
+0.869
+0.258
+cls token + cross attention
+32.016
+0.871
+0.257
+(C) EndoVGGT + Attention-Level DeGAT
+Learnable Bias Table
+32.506
+0.921
+0.280
+Continuous MLP Bias
+32.894
+0.923
+0.247
+(D) EndoVGGT + Feature-Level DeGAT
+Post-Transformer DeGAT
+31.738
+0.925
+0.240
+Pre-Transformer DeGAT
+34.348
+0.939
+0.240
+4.1
+Datasets, Baselines, and Evaluation Metrics
+Datasets. We evaluate our method on three open benchmarks: EndoSLAM [17]
+provides ex-vivo and synthetic sequences with accurate 6-DoF poses. SCARED [1]
+offers realistic surgical data from the da Vinci Xi system. We also use the “cutting”
+and “pulling” subsets of EndoNeRF [26] to assess reconstruction robustness under
+topological changes and tissue deformation.
+Metrics. For quantitative evaluation, we adopt photometric measures following
+[26], including PSNR, SSIM, and LPIPS, to compare methods’ performance
+between rendered novel views and ground truth images.
+Baseline. We compare EndoVGGT with general domain VGGT [24], NeRF-
+based EndoSurf [30] and LRM-based EndoLRMGS [25] with Gaussian Splatting.
+4.2
+Effectiveness of DeGAT Mechanism and Visualization
+To investigate the effectiveness of incorporating geometric information, we conduct
+an extensive study on the SCARED dataset. As presented in Table 1, the feature-
+level DeGAT applied before the transformer block consistently yields the best
+reconstruction performance across all evaluated metrics. Compared with the
+baseline, this configuration yields a notable 15.8% reduction in LPIPS (from
+0.285 to 0.240), a 4.3% increase in PSNR (from 32.927 to 34.348), and a 2.3%
+increase in SSIM (from 0.918 to 0.939). Token- and attention-level variants yield
+only marginal gains or even degrade performance, suggesting that aggregating
+feature-space neighborhoods before global attention helps establish stable local
+geometry under tissue deformation and instrument–tissue discontinuities. In
+4. EXPERIMENTS
+7
+Table 2: Cross-dataset evaluation. The models are zero-shot evaluated on the unseen
+SCARED and EndoNeRF datasets. The best results are highlighted in bold.
+Dataset
+EndoSurf
+EndoVGGT (Ours)
+PSNR ↑SSIM ↑
+LPIPS ↓
+PSNR ↑SSIM ↑
+LPIPS ↓
+SCARED-d1k1
+10.672
+0.631
+0.425
+27.945
+0.828
+0.396
+SCARED-d2k1
+10.846
+0.725
+0.322
+31.741
+0.876
+0.229
+SCARED-d3k1
+10.307
+0.535
+0.498
+20.899
+0.854
+0.345
+EndoNeRF-pulling 16.035
+0.770
+0.346
+22.013
+0.907
+0.154
+EndoNeRF-cutting 15.513
+0.733
+0.387
+23.584
+0.915
+0.242
+contrast, late-stage graph aggregation can interfere with higher-level semantics.
+Similar trends on EndoNeRF are reported in the Appendix.
+Qualitative results in Fig. 4 mirror these findings. While token-level enhance-
+ment sharpens organ boundaries, it suffers from fragmented instrument edges. The
+attention-level variant captures more tool boundaries but lacks surface fidelity. In
+contrast, feature-level DeGAT in Fig. 4(d) achieves superior structural continuity,
+yielding more coherent instrument regions and sharper delineation than Fig. 4(b)
+and (c). This confirms that feature-space aggregation before global attention
+effectively preserves complex topological structures under surgical deformation.
+Fig. 1(a–b) further illustrates robustness to dynamic structural changes: the
+green query (⋆) bridges the surgical instrument to retrieve relevant neighbors
+across it, indicating that DeGAT leverages learned context rather than Euclidean
+proximity to handle tool-induced topological breaks. As shown in Fig. 1(c–d), our
+method yields smoother non-rigid surfaces and sharper boundaries in the high-
+lighted region, whereas removing DeGAT leads to blurred details and artifacts.
+4.3
+Quantitative Comparisons of EndoVGGT
+Compared to the zero-shot VGGT baseline, fine-tuning on surgical data yields
+substantial improvements across all metrics in Fig. 3. Additionally, the bars
+show that integrating DeGAT consistently outperforms the variant without it.
+Specifically, on the SCARED dataset, EndoVGGT improves PSNR by 144% to
+34.348 and SSIM by 3.7× to 0.939. On EndoNeRF, LPIPS drops by 75% on the
+“cutting” subset. This demonstrates that while general-domain models trained on
+rigid objects struggle in complex surgical environments, EndoVGGT effectively
+recovers high-fidelity geometric and photometric details in deformable scenes.
+4.4
+Zero-Shot Cross-Dataset Generalization of EndoVGGT
+Unlike conventional NeRF and Gaussian Splatting methods that rely on per-scene
+optimization, EndoVGGT demonstrates exceptional zero-shot generalization. We
+trained the models on the EndoSLAM dataset and evaluated them on unseen
+SCARED and EndoNeRF datasets without test-time fine-tuning. As shown in
+8
+F. Fan et al.
+Fig. 3: Experiment results on EndoNeRF and SCARED dataset. “Average” denotes the
+mean performance across all evaluated subsets.
+Fig. 4: Visualization of DeGAT at different levels. The red boxes highlight complex
+instrument-tissue boundaries. Feature-level DeGAT (d) preserves sharper continuity.
+Table 2, our method outperforms the EndoSurf baseline, achieving PSNRs near
+30 across SCARED subsets. Notably, EndoVGGT achieves high SSIMs of 0.907
+and 0.915 even under extreme soft-tissue deformations in EndoNeRF pulling
+and cutting scenes. These results suggest our DeGAT module captures intrinsic,
+domain-agnostic geometric priors rather than overfitting to scene-specific textures.
+5
+Conclusion
+We present EndoVGGT, a generalizable framework for 3D reconstruction in
+minimally invasive surgery that models tissue deformation and dynamic occlusion.
+We bridge the gap between rigid-scene assumptions and the non-rigid surgical
+environment via an LRM. Our key module, DeGAT, dynamically builds semantic
+graphs in feature space to restore instrument-induced topological breaks and
+enforce depth consistency. Experiments on SCARED demonstrate robustness
+with future extensions toward temporal consistency and robotic navigation.
+5. CONCLUSION
+9
+References
+1. Allan, M., Mcleod, J., Wang, C., Rosenthal, J.C., Hu, Z., Gard, N., Eisert, P.,
+Fu, K.X., Zeffiro, T., Xia, W., et al.: Stereo correspondence and reconstruction of
+endoscopic data challenge. arXiv preprint arXiv:2101.01133 (2021)
+2. Bartholomew, R.A., Zhou, H., Boreel, M., Suresh, K., Gupta, S., Mitchell, M.B.,
+Hong, C., Lee, S.E., Smith, T.R., Guenette, J.P., et al.: Surgical navigation in
+the anterior skull base using 3-dimensional endoscopy and surface reconstruction.
+JAMA Otolaryngology–Head & Neck Surgery 150(4), 318–326 (2024)
+3. Bhat, S.F., Birkl, R., Wofk, D., Wonka, P., Müller, M.: Zoedepth: Zero-shot transfer
+by combining relative and metric depth. arXiv preprint arXiv:2302.12288 (2023)
+4. Clevert, D.A., Unterthiner, T., Hochreiter, S.: Fast and accurate deep network
+learning by exponential linear units (elus). arXiv preprint arXiv:1511.07289 4(5),
+11 (2015)
+5. Cui, B., Islam, M., Bai, L., Ren, H.: Surgical-dino: adapter learning of founda-
+tion models for depth estimation in endoscopic surgery. International Journal of
+Computer Assisted Radiology and Surgery 19(6), 1013–1020 (2024)
+6. Funke, I., Mees, S.T., Weitz, J., Speidel, S.: Video-based surgical skill assessment
+using 3d convolutional neural networks. International journal of computer assisted
+radiology and surgery 14(7), 1217–1225 (2019)
+7. Göbel, B., Huurdeman, J., Reiterer, A., Möller, K.: Robot-based procedure for 3d
+reconstruction of abdominal organs using the iterative closest point and pose graph
+algorithms. Journal of imaging 11(2), 44 (2025)
+8. Han, K., Wang, Y., Guo, J., Tang, Y., Wu, E.: Vision gnn: An image is worth graph
+of nodes. Advances in neural information processing systems 35, 8291–8303 (2022)
+9. He, Z., Wang, T.: Openlrm: Open-source large reconstruction models (2023)
+10. Hirohata, Y., Sogabe, M., Miyazaki, T., Kawase, T., Kawashima, K.: Confidence-
+aware self-supervised learning for dense monocular depth estimation in dynamic
+laparoscopic scene. Scientific Reports 13(1), 15380 (2023)
+11. Kerbl, B., Kopanas, G., Leimkühler, T., Drettakis, G.: 3d gaussian splatting for
+real-time radiance field rendering. ACM Trans. Graph. 42(4), 139–1 (2023)
+12. Liu, Y., Li, C., Yang, C., Yuan, Y.: Endogaussian: Real-time gaussian splatting for
+dynamic endoscopic scene reconstruction. arXiv preprint arXiv:2401.12561 (2024)
+13. Lu, Y., Wei, R., Li, B., Chen, W., Zhou, J., Dou, Q., Sun, D., Liu, Y.h.: Autonomous
+intelligent navigation for flexible endoscopy using monocular depth guidance and
+3-d shape planning. arXiv preprint arXiv:2302.13219 (2023)
+14. Mildenhall, B., Srinivasan, P.P., Tancik, M., Barron, J.T., Ramamoorthi, R., Ng,
+R.: Nerf: Representing scenes as neural radiance fields for view synthesis. Commu-
+nications of the ACM 65(1), 99–106 (2021)
+15. Mountney, P., Yang, G.Z.: Dynamic view expansion for minimally invasive surgery
+using simultaneous localization and mapping. In: 2009 Annual International Con-
+ference of the IEEE Engineering in Medicine and Biology Society. pp. 1184–1187.
+IEEE (2009)
+16. Oquab, M., Darcet, T., Moutakanni, T., Vo, H., Szafraniec, M., Khalidov, V.,
+Fernandez, P., Haziza, D., Massa, F., El-Nouby, A., et al.: Dinov2: Learning robust
+visual features without supervision. arXiv preprint arXiv:2304.07193 (2023)
+17. Ozyoruk, K.B., Gokceler, G.I., Bobrow, T.L., Coskun, G., Incetan, K., Almalioglu,
+Y., Mahmood, F., Curto, E., Perdigoto, L., Oliveira, M., et al.: Endoslam dataset
+and an unsupervised monocular visual odometry and depth estimation approach
+for endoscopic videos. Medical image analysis 71, 102058 (2021)
+10
+F. Fan et al.
+18. Perez, E., Strub, F., De Vries, H., Dumoulin, V., Courville, A.: Film: Visual
+reasoning with a general conditioning layer. In: Proceedings of the AAAI conference
+on artificial intelligence. vol. 32 (2018)
+19. Ranftl, R., Bochkovskiy, A., Koltun, V.: Vision transformers for dense prediction.
+In: Proceedings of the IEEE/CVF international conference on computer vision. pp.
+12179–12188 (2021)
+20. Schonberger, J.L., Frahm, J.M.: Structure-from-motion revisited. In: Proceedings
+of the IEEE conference on computer vision and pattern recognition. pp. 4104–4113
+(2016)
+21. Sun, C., Sun, M., Chen, H.T.: Direct voxel grid optimization: Super-fast convergence
+for radiance fields reconstruction. In: Proceedings of the IEEE/CVF conference on
+computer vision and pattern recognition. pp. 5459–5469 (2022)
+22. Veličković, P., Cucurull, G., Casanova, A., Romero, A., Lio, P., Bengio, Y.: Graph
+attention networks. arXiv preprint arXiv:1710.10903 (2017)
+23. Wagner, A., Rozenblit, J.W.: Augmented reality visual guidance for spatial percep-
+tion in the computer assisted surgical trainer. In: Proceedings of the Symposium
+on Modeling and Simulation in Medicine. pp. 1–12 (2017)
+24. Wang, J., Chen, M., Karaev, N., Vedaldi, A., Rupprecht, C., Novotny, D.: Vggt:
+Visual geometry grounded transformer. In: Proceedings of the Computer Vision
+and Pattern Recognition Conference. pp. 5294–5306 (2025)
+25. Wang, X., Zhang, S., Huang, B., Stoyanov, D., Mazomenos, E.B.: Endolrmgs:
+Complete endoscopic scene reconstruction combining large reconstruction modelling
+and gaussian splatting. arXiv preprint arXiv:2503.22437 (2025)
+26. Wang, Y., Long, Y., Fan, S.H., Dou, Q.: Neural rendering for stereo 3d reconstruction
+of deformable tissues in robotic surgery. In: International conference on medical
+image computing and computer-assisted intervention. pp. 431–441. Springer (2022)
+27. Wei, R., Guo, J., Lu, Y., Zhong, F., Liu, Y., Sun, D., Dou, Q.: Scale-aware
+monocular reconstruction via robot kinematics and visual data in neural radiance
+fields. Artificial Intelligence Surgery 4(3), 187–198 (2024)
+28. Xu, M., Guo, Z., Wang, A., Bai, L., Ren, H.: A review of 3d reconstruction
+techniques for deformable tissues in robotic surgery. In: International Conference
+on Medical Image Computing and Computer-Assisted Intervention. pp. 157–167.
+Springer (2024)
+29. Yao, Y., Luo, Z., Li, S., Fang, T., Quan, L.: Mvsnet: Depth inference for unstructured
+multi-view stereo. In: Proceedings of the European conference on computer vision
+(ECCV). pp. 767–783 (2018)
+30. Zha, R., Cheng, X., Li, H., Harandi, M., Ge, Z.: Endosurf: Neural surface recon-
+struction of deformable tissues with stereo endoscope videos. In: International
+conference on medical image computing and computer-assisted intervention. pp.
+13–23. Springer (2023)
+6. APPENDIX
+11
+6
+Appendix
+7
+Theoretical Properties of DeGAT
+This appendix formalizes several properties of DeGAT that support its use as a
+geometry-consistent feature refinement operator under deformation and occlusion.
+7.1
+Row-stochastic aggregation and convexity
+Lemma 1 (Row-stochasticity of DeGAT attention). For each node i, the
+attention coefficients {αij}j∈N (i) defined in Eq. (3) satisfy: (i) αij ≥0 for all
+j ∈N(i); and (ii) P
+j∈N(i) αij = 1. Equivalently, the induced sparse matrix ˜A
+in Eq. (4) is row-stochastic on the neighbor support.
+Proof. Fix any node i. Since we select Top-K neighbors with K ≥1, the neighbor
+set N(i) is non-empty. Define the normalizer (partition function)
+Zi =
+X
+m∈N (i)
+exp(ℓim).
+Because exp(·) > 0 for any real input and N(i) ̸= ∅, we have Zi > 0. By Eq. (3),
+αij = exp(ℓij)
+Zi
+,
+j ∈N(i).
+Hence αij ≥0 since both numerator and denominator are positive. Summing
+over j ∈N(i) yields
+X
+j∈N(i)
+αij = 1
+Zi
+X
+j∈N (i)
+exp(ℓij) = Zi
+Zi
+= 1.
+For the matrix statement, recall ˜Aij = αij if j ∈N(i) and 0 otherwise. Therefore
+L
+X
+j=1
+˜Aij =
+X
+j∈N (i)
+αij = 1,
+and ˜Aij ≥0, i.e., ˜A is row-stochastic on the neighbor support.
+Corollary 1 (Convex-hull property of the aggregated message). Let
+vj = Wvalxt,j and define the pre-activation message mi = P
+j∈N (i) αijvj. Then
+mi lies in the convex hull of {vj}j∈N (i).
+Proof. By definition, the convex hull of {vj}j∈N (i) is the set
+conv
+ {vj}
+
+=
+
+
+
+X
+j∈N (i)
+wjvj
+
+wj ≥0,
+X
+j∈N (i)
+wj = 1
+
+
+.
+Lemma 1 shows αij ≥0 and P
+j∈N (i) αij = 1. Thus mi = P
+j∈N (i) αijvj is
+exactly a convex combination of neighbor vectors, i.e., mi ∈conv({vj}).
+12
+F. Fan et al.
+Corollary 2 (Coordinate-wise bounds (min–max property)). For any
+coordinate (channel) index c, the c-th component of the message satisfies
+min
+j∈N(i)(vj)c ≤(mi)c ≤
+max
+j∈N (i)(vj)c.
+Proof. For any channel c,
+(mi)c =
+X
+j∈N (i)
+αij(vj)c
+is a weighted average of {(vj)c} with nonnegative weights summing to one
+(Lemma 1). A weighted average must lie between the minimum and maximum of
+the values being averaged; hence the claim.
+7.2
+Stability bounds (why message passing will not explode)
+Proposition 1 (Norm bound of one-hop DeGAT aggregation). Let xagg
+t,i =
+ELU(mi) be the post-activation aggregated message used in Eq. (3). Then for
+each node i,
+∥xagg
+t,i ∥2 ≤∥mi∥2 ≤max
+j∈N (i) ∥Wvalxt,j∥2.
+(6)
+Consequently, the residual update satisfies
+∥xout
+t,i ∥2 ≤∥xt,i∥2 + max
+j∈N (i) ∥Wvalxt,j∥2.
+(7)
+Proof. Step 1 (ELU is non-expansive around zero). Consider the scalar
+ELU function: ELU(z) = z if z ≥0, and ELU(z) = ez −1 if z < 0. For z ≥0,
+|ELU(z)| = |z|. For z < 0, let a = −z > 0. Then |ELU(z)| = |ez −1| = 1 −e−a ≤
+a = |z| (since 1 −e−a ≤a for all a > 0). Hence for any scalar z, |ELU(z)| ≤|z|.
+Applying this element-wise gives
+∥ELU(mi)∥2
+2 =
+X
+c
+|ELU((mi)c)|2 ≤
+X
+c
+|(mi)c|2 = ∥mi∥2
+2,
+i.e., ∥xagg
+t,i ∥2 ≤∥mi∥2.
+Step 2 (bounding the pre-activation message). By definition,
+mi =
+X
+j∈N (i)
+αij Wvalxt,j.
+Using the triangle inequality and Lemma 1,
+∥mi∥2 ≤
+X
+j∈N(i)
+αij ∥Wvalxt,j∥2 ≤
+
+max
+j∈N (i) ∥Wvalxt,j∥2
+ X
+j∈N (i)
+αij = max
+j∈N (i) ∥Wvalxt,j∥2.
+Step 3 (residual bound). Finally, Eq. (3) gives xout
+t,i = xt,i + xagg
+t,i , hence
+∥xout
+t,i ∥2 ≤∥xt,i∥2 + ∥xagg
+t,i ∥2 ≤∥xt,i∥2 + max
+j∈N (i) ∥Wvalxt,j∥2.
+Remark. Lemma 1 and Corollary 1 show that DeGAT forms a controlled convex
+mixture of neighbor information (before the value projection and activation), and
+Proposition 1 provides an explicit stability bound for one-hop message passing.
+8. IMPLEMENTATION DETAILS OF DEGAT
+13
+7.3
+Permutation equivariance (token indexing should not matter)
+Proposition 2 (Permutation equivariance of one-hop DeGAT). Let π be
+a permutation of token indices and P the corresponding permutation matrix. If
+token features and coordinates are permuted consistently, X′ = PX and p′
+π(i) = pi,
+then the DeGAT output permutes in the same way:
+DeGAT(X′, p′) = P DeGAT(X, p),
+(8)
+assuming deterministic tie-breaking in the Top-K operator.
+Proof. Let S denote the cosine-similarity matrix with entries sij computed from
+feature pairs. Under permutation, X′ = PX simply reorders tokens, hence the
+similarity matrix is permuted as
+S′ = PSP⊤,
+i.e.,
+s′
+π(i) π(j) = sij.
+With deterministic tie-breaking, applying Top-K to each row of S′ yields a
+permuted neighbor mapping:
+N ′(π(i)) = {π(j) | j ∈N(i)}.
+Next, the attention logit ℓij (Eq. (2)) is computed by the same shared parameters
+on each ordered pair of tokens. Therefore, logits permute consistently: ℓ′
+π(i) π(j) =
+ℓij for j ∈N(i), and consequently α′
+π(i) π(j) = αij by the softmax definition in
+Eq. (3). Finally, the DeGAT aggregation is a sum over neighbors:
+xout′
+t,π(i) = x′
+t,π(i) + ELU
+
+
+X
+j′∈N ′(π(i))
+α′
+π(i)j′Wvalx′
+t,j′
+
+.
+Substituting x′
+t,π(i) = xt,i, j′ = π(j), N ′(π(i)) = {π(j)}, and α′
+π(i)π(j) = αij
+shows that the right-hand side equals xout
+t,i up to the same permutation. Thus,
+DeGAT(X′, p′) = P DeGAT(X, p).
+8
+Implementation Details of DeGAT
+For each frame t, DeGAT constructs a directed K-NN graph by computing the
+normalized dot-product cosine similarity across token features, applying a TopK
+operation while excluding self-matching. To maintain a linear message-passing
+complexity O(LK) (where L is the token count and K is the neighborhood
+size), the attention coefficients αij are evaluated exclusively for j ∈N(i) and
+conceptually stored as a sparse matrix ˜A. To prevent numerical underflow in
+the attention-level variant (Eq. (??)), we clamp αij to a minimal positive value
+before applying the logarithmic transformation Bij = log(αij). Operationally,
+a single-hop DeGAT layer executes the following sequence: (1) token feature
+normalization; (2) cosine similarity computation and Top-K neighbor retrieval;
+(3) calculation of attention logits ℓij and weights αij; (4) feature aggregation
+across the dynamic neighborhood; and (5) residual addition to produce the
+updated features Xout
+t
+.
+14
+F. Fan et al.
+9
+DeGAT Integration Variants
+This section elaborates on the three DeGAT integration levels introduced in
+Sec. 3.1. For token-level conditioning, we summarize the DeGAT-refined
+features into a pooled geometric prior gt = 1
+L
+PL
+i=1 xout
+t,i , which is then mapped
+via a lightweight, fixed-architecture MLP to additively modulate the camera token
+(c′
+t = ct + MLP(gt)). For attention-level bias injection, we construct a sparse
+bias matrix B from the DeGAT affinities, where Bij = MLP(αij) for j ∈N(i)
+and 0 otherwise. This matrix is directly added to the transformer attention logits
+(Eq. (??)) and broadcasted across all attention heads, ensuring a parameter-
+free integration. Finally, for feature-level refinement, DeGAT functions as a
+residual graph operator on the patch tokens (Xt ←Xout
+t
+) immediately preceding
+the transformer blocks, thereby enriching the representations with geometry-aware
+context before global multi-view reasoning.
+10
+Derivation of Uncertainty-Weighted Regression
+This appendix provides a self-contained justification for the confidence term Lunc
+in Eq. (5). In particular, the confidence map ˆC is learned implicitly and does not
+require ground-truth supervision.
+Proposition 3 (Closed-form optimal confidence for a fixed residual).
+For a single pixel, let r2 = ∥ˆD(u) −D(u)∥2
+2 be the squared depth residual and
+assume r2 > 0. Consider the confidence objective
+J ( ˆC) = γ r2 ˆC −α log( ˆC),
+with ˆC > 0.
+Then J is strictly convex in ˆC and achieves its unique minimum at
+ˆC⋆=
+α
+γ r2 .
+Proof. Step 1 (existence of a minimizer). For r2 > 0 and ˆC > 0, we have
+γr2 ˆC →+∞as ˆC →+∞. Meanwhile, −log( ˆC) →+∞as ˆC →0+. Therefore,
+J ( ˆC) →+∞at both boundaries of (0, ∞), implying J attains a minimum at
+some finite ˆC⋆∈(0, ∞).
+Step 2 (stationary point). Compute the derivative:
+dJ
+d ˆC
+= γr2 −α
+ˆC
+.
+Setting it to zero yields the unique stationary point ˆC⋆= α/(γr2).
+Step 3 (strict convexity and uniqueness). The second derivative is
+d2J
+d ˆC2 = α
+ˆC2 > 0
+for all ˆC > 0,
+hence J is strictly convex, and the stationary point is the unique global minimizer.
+11. EXPERIMENT DETAILS
+15
+Corollary 3 (Equivalent marginal penalty after eliminating confidence).
+For r2 > 0, substituting ˆC⋆= α/(γr2) into J yields
+min
+ˆ
+C>0
+J ( ˆC) = α −α log
+ α
+γr2
+
+= α log(γr2) + const,
+where “const” is independent of the model outputs.
+Proof. Direct substitution gives J ( ˆC⋆) = γr2 · α/(γr2) −α log(α/(γr2)). Rear-
+ranging yields the stated form.
+Remark. The optimal confidence is inversely proportional to the squared residual:
+pixels with larger errors are automatically down-weighted. The log term acts as
+a barrier preventing the trivial solution ˆC →0. In the degenerate case r2 = 0,
+the objective favors increasing confidence, which aligns with the interpretation
+that perfectly predicted pixels should be assigned high confidence; in practice,
+network outputs are bounded and numerically stabilized during training.
+11
+Experiment Details
+11.1
+Feature-Level DeGAT Implementation Details
+Input.
+– Input feature tensor X ∈RB×N×C from the VGGT Aggregator.
+– Number of neighbors K (e.g., K = 10).
+– Trainable parameters:
+• Projection matrix Wproj ∈R2C×C′,
+• Attention vector a ∈RC′,
+• Value transformation matrix Wval ∈RC×C.
+Output. Refined feature tensor Xout ∈RB×N×C.
+Procedure. Given a batch index b ∈{1, . . . , B}, the refinement process is defined
+as follows. The set of trainable parameters is denoted as Θ = {Wproj, a, Wval}.
+1. Initialization:
+Xout ←0.
+2. Graph Construction:
+– Compute the pairwise Euclidean distance matrix:
+D(b)
+ij = ∥xi −xj∥2 ,
+D(b) ∈RN×N.
+– Identify the K nearest neighbors for each patch:
+N(i) = topK
+ −D(b)
+i,:
+
+.
+16
+F. Fan et al.
+The graph topology remains fixed within each forward pass, but evolves dy-
+namically across training iterations as the feature representations change.
+3. Attention-Based Feature Aggregation:
+For each patch i ∈{1, . . . , N}:
+(a) Feature Mixing: For each neighbor j ∈N(i), concatenate the center
+and neighbor features:
+hij = [xi ∥xj] ∈R2C.
+(b) Attention Computation:
+eij = LeakyReLU (Wprojhij) ,
+sij = a⊤eij,
+αij =
+exp(sij)
+P
+m∈N (i)
+exp(sim).
+(c) Weighted Aggregation:
+vj = Wvalxj,
+xagg,i = ELU
+
+X
+j∈N (i)
+αijvj
+
+.
+4. Residual Update:
+Xout[b, i] = X[b, i] + xagg,i.
+5. Backward Propagation. Given the gradient from the task loss L, denoted
+as ∇xagg,i =
+∂L
+∂xagg,i , the gradients for the learnable parameters are computed
+via the chain rule:
+– Update Value Matrix Wval: The gradient flows through the weighted
+sum and the linear projection:
+∇Wval ←
+X
+b,i
+X
+j∈N (i)
+ ∇xagg,i · αij
+
+⊗xj.
+– Update Attention Parameters {a, Wproj}: Let δij = ∇⊤
+xagg,ivj be
+the gradient w.r.t. the attention weight. The gradients propagate through
+the Softmax and LeakyReLU functions:
+∇a ←
+X
+b,i,j
+∂αij
+∂sij
+δij · eij,
+∇Wproj ←
+X
+b,i,j
+∂αij
+∂sij
+δij · a⊤⊙σ′(eij)
+
+⊗hij,
+where σ′ denotes the derivative of LeakyReLU and ⊗represents the outer
+product.
+11. EXPERIMENT DETAILS
+17
+11.2
+Attention-Level DeGAT Implementation Details: MLP Bias
+Reference. Raffel et al., Exploring the Limits of Transfer Learning with a Unified
+Text-to-Text Transformer (T5).
+Input.
+– Semantic features: F ∈RB×N×C, patch tokens extracted from a frozen
+DINOv2 backbone.
+– Attention components: Query Q and Key K ∈RB×H×N×dhead from the
+VGGT frame attention layers.
+– Hyperparameter: Number of quantization buckets K = 8.
+– Trainable parameters: Bias embedding table E ∈RK×H.
+Output. Spatially modulated attention logits.
+Procedure. Given a batch index b ∈{1, . . . , B}, the semantic attention bias is
+computed as follows. The set of learnable parameters is the embedding table
+E ∈RK×H.
+1. Semantic Distance Calculation. We construct a fully connected semantic
+graph in which each node corresponds to a patch token, and the edge weights
+represent semantic dissimilarity. The pairwise Euclidean distance matrix
+D ∈RB×N×N is computed as
+di,j = ∥fi −fj∥2 =
+v
+u
+u
+t
+C
+X
+c=1
+(fi,c −fj,c)2.
+Smaller values of di,j indicate higher semantic similarity, e.g., corresponding
+to similar tissue types.
+2. Logarithmic Transformation. To reduce the influence of outliers while
+increasing sensitivity to highly similar patches, a logarithmic transformation
+is applied:
+˜di,j = log (di,j + 1) .
+3. Linear Mapping and Quantization. The transformed distances are nor-
+malized relative to the maximum semantic distance within the current view
+to ensure scale invariance:
+ratioi,j =
+˜di,j
+max( ˜d) + ϵ
+.
+The normalized distances are then discretized into K integer buckets:
+Idxi,j = Clamp (⌊ratioi,j · K⌋, 0, K −1) ,
+yielding Idx ∈{0, . . . , K −1}B×N×N.
+18
+F. Fan et al.
+4. Bias Lookup. For each attention head h, a learnable scalar bias is retrieved
+from the embedding table:
+b(h)
+i,j = b[Idxi,j]h .
+This mechanism allows the model to learn distinct attention bonuses or
+penalties for different levels of semantic similarity.
+5. Injection into Attention Mechanism. The semantic bias is added directly
+to the attention logits in the VGGT frame attention blocks:
+Attention(h)
+i,j = Softmax
+ 
+qi · k⊤
+j
+√dhead
++ b(h)
+i,j
+!
+.
+6. Backward Propagation. Let L be the total loss. The gradient of the loss
+with respect to the bias term is denoted as δ(h)
+i,j =
+∂L
+∂b(h)
+i,j . Since the bias
+is added directly to the logits, this gradient is derived from the standard
+Softmax backward pass.
+The learnable embedding table b is updated by aggregating gradients from
+all patch pairs within the same bucket. For a specific bucket index k ∈
+{0, . . . , K −1} and head h, the gradient is computed as:
+∇bk,h =
+B
+X
+b=1
+N
+X
+i=1
+N
+X
+j=1
+I
+
+Idx(b)
+i,j = k
+
+· δ(h,b)
+i,j
+,
+where I(·) is the indicator function, which is 1 if the condition is met and 0
+otherwise.
+11.3
+Attention-Level DeGAT Implementation Details: Bias Table
+Reference. Liu et al., Swin Transformer V2: Scaling Up Capacity and Resolution,
+adapted to semantic feature space.
+Input.
+– Feature map: F ∈RB×N×C, flattened patch features from the current
+VGGT layer.
+– Attention components: Query Q and Key K ∈RB×H×N×dhead.
+– Hyperparameters: maximum distance prior τ (e.g.,
+√
+C), and MLP hidden
+dimension M = 512.
+– Trainable parameters: Bias MLP Ψ : R →RH, implemented as a two-layer
+network.
+Output. Content-adaptive attention bias matrix.
+11. EXPERIMENT DETAILS
+19
+Procedure. Given a batch index b ∈{1, . . . , B}, the continuous semantic bias is
+computed as follows.
+1. Semantic Euclidean Distance. We abandon spatial coordinates in favor
+of feature-space representations. The pairwise Euclidean distance matrix
+D ∈RB×N×N is computed between all patch tokens:
+di,j = ∥fi −fj∥2 .
+This distance measures the raw semantic discrepancy between two patch
+tokens.
+2. Log-Space Normalization. To handle the heavy-tailed distribution of
+feature distances while preserving high resolution for semantically similar
+tokens, the distances are transformed and normalized in log space. First, a
+logarithmic transformation is applied:
+ˆdi,j = log(di,j + 1).
+The transformed distances are then normalized using the maximum distance
+within the current view:
+∆i,j =
+ˆdi,j
+log(dmax + 1).
+Finally, the normalized values are scaled and shifted to obtain a continuous
+coordinate in [−1, 1]:
+xi,j = 2 · Clamp(∆i,j, 0, 1) −1.
+This yields a normalized tensor X ∈[−1, 1]B×N×N×1.
+3. Continuous Bias Generation. Instead of a discrete embedding lookup, a
+lightweight MLP Ψ is employed to map the continuous distance coordinate
+to a head-specific attention bias:
+Bi,j = Ψ(xi,j) = W2
+ ReLU(W1xi,j + b1)
+
++ b2.
+Here, W1 ∈RM×1, W2 ∈RH×M, and b1, b2 are learnable bias terms.
+The MLP enables approximation of arbitrary continuous functions, thereby
+allowing nonlinear penalties or bonuses based on semantic dissimilarity.
+4. Injection into Attention Mechanism. The generated continuous bias is
+added directly to the attention logits of the self-attention operation:
+Attention(h)
+i,j = Softmax
+ 
+qi · k⊤
+j
+√dhead
++ B(h)
+i,j
+!
+.
+5. Backward Propagation. Unlike quantization-based methods, the MLP
+projection enables end-to-end gradient flow. Let δ(h)
+i,j =
+∂L
+∂B(h)
+i,j be the gradient
+of the loss with respect to the generated bias.
+20
+F. Fan et al.
+– Update MLP Parameters ΘΨ: Standard backpropagation is applied
+to update the MLP weights. Let zi,j = ReLU(W1xi,j +b1) be the hidden
+activation. The gradients for the second linear layer are:
+∇W2 ←
+X
+b,i,j
+δi,j ⊗zi,j,
+∇b2 ←
+X
+b,i,j
+δi,j.
+Gradients are then backpropagated through the ReLU to update W1
+and b1.
+11.4
+Additive Image-conditioned Camera Token Initialization
+We evaluate a simpler image-conditioned camera-token initialization strategy,
+which we use as a variant in our experiments. This design conditions the camera
+token via an additive bias predicted from global image features, which is the cls
+token + bias in Table 3
+Global Image Feature Extraction. Given the patch tokens extracted from each
+input frame, we compute a global image representation by mean pooling over all
+patch tokens. This pooled feature captures frame-level semantic information and
+serves as the conditioning signal.
+Additive Conditioning via MLP. The global image feature is passed through a
+lightweight multi-layer perceptron (MLP) comprising two linear layers with GELU
+activation. The MLP outputs a feature vector with the same dimensionality as
+the camera token, which represents an image-conditioned offset:
+∆t = fMLP(fglobal),
+(9)
+where fglobal denotes the pooled image feature and ∆t is the predicted token
+offset.
+Camera Token Update. A learnable base camera token is expanded to match the
+batch and temporal dimensions. The image-conditioned offset is then added to
+the base camera token:
+tcam = tbase + ∆t.
+(10)
+This additive formulation shifts the camera token in the embedding space based
+on image content, without introducing feature-wise scaling.
+Initialization and Stability. The base camera token is initialized with a small
+standard deviation, ensuring the overall magnitude of the conditioned token
+remains under control during early training. Compared with FiLM-based affine
+modulation, this additive conditioning provides a lightweight and stable alterna-
+tive with reduced expressiveness; we include it as an ablation to study the effects
+of different conditioning mechanisms.
+11. EXPERIMENT DETAILS
+21
+11.5
+Implementation Details of FiLM-based Camera Token
+Modulation
+We adopt a Feature-wise Linear Modulation (FiLM) mechanism [18] to condition
+the camera token on image content. This design allows the camera token to adapt
+dynamically to the input frames while preserving training stability, as indicated
+by the cls + FiLM modulation in Table 3.
+Global Conditioning Signal. Given the patch tokens extracted from each input
+frame, we first compute a global image representation by mean pooling over
+all patch tokens. This pooled feature serves as the conditioning input for FiLM
+modulation, capturing frame-level semantic information.
+FiLM Parameter Prediction. The global image feature is passed through a
+lightweight modulation network comprising two linear layers with a nonlinear
+activation in between. The modulator outputs a vector twice the embedding
+dimension, split into a feature-wise scale parameter, γ, and a shift parameter, β.
+Camera Token Modulation. A learnable camera token is expanded to match the
+batch and temporal dimensions. FiLM modulation is then applied to the camera
+token as
+tcam = tbase ⊙(1 + γ) + β,
+(11)
+where tbase denotes the static camera token, and γ and β are applied in a feature-
+wise manner. This formulation enables both amplitude scaling and feature shifting
+conditioned on the input frame.
+Initialization and Training Stability. To ensure stable optimization, the final
+linear layer of the modulation network is initialized with zero weights and biases.
+As a result, the FiLM parameters are initially γ = 0 and β = 0, such that the
+modulated camera token is identical to the base token at the start of training. This
+initialization preserves the original token distribution and prevents instability
+during early training.
+Overall, this FiLM-based modulation provides an efficient and effective mech-
+anism for incorporating global image context into the camera token without
+introducing additional attention operations or significant computational overhead.
+11.6
+Cross-Attention-based Camera Token Conditioning
+In this design, the camera token is treated as a learnable query that attends
+to all patch tokens extracted from the input image. Instead of conditioning the
+camera token through an MLP, global image context is incorporated through a
+Transformer-style cross-attention mechanism. This is the cls + cross attention
+in Table 3.
+22
+F. Fan et al.
+Query, Key, and Value Construction. For each input frame, a learnable base
+camera token is expanded to match the batch and temporal dimensions and used
+as the query. All patch tokens corresponding to the same frame are used as keys
+and values:
+q = tcam,
+k = v = {tp}P
+p=1,
+(12)
+where tcam ∈R1×C denotes the camera token and {tp} are the patch tokens.
+Cross-Attention Update. A standard multi-head cross-attention layer is applied,
+followed by a residual connection:
+t′
+cam = tcam + Attn(q, k, v),
+(13)
+where Attn(·) denotes multi-head attention. This operation allows the camera
+token to selectively aggregate information from spatially and semantically relevant
+patches.
+Feed-Forward Refinement. The attention-updated camera token is further pro-
+cessed by a feed-forward network (FFN) with a residual connection:
+tout
+cam = t′
+cam + FFN(t′
+cam),
+(14)
+which increases representational capacity and stabilizes optimization.
+Initialization and Stability. To ensure stable training, the cross-attention layer’s
+output projection and the final linear layer of the FFN are initialized to zero.
+As a result, the cross-attention module initially behaves as an identity mapping,
+preserving the original camera token at the beginning of training and allowing
+the model to gradually learn attention-based conditioning.
+Overall, this cross-attention-based formulation enables explicit and inter-
+pretable aggregation of global image information into the camera token, serving
+as a complementary alternative to MLP-based conditioning mechanisms.
+11.7
+Experiment Datasets
+We evaluate our method on three publicly available endoscopic reconstruction
+datasets. EndoSLAM [17] provides ex vivo and synthetic endoscopic sequences
+with accurate 6-DoF camera poses and dense ground-truth point-cloud maps
+of porcine gastrointestinal organs. SCARED [1] is a stereo-endoscopy dataset
+captured with the da Vinci Xi surgical system and offers ground-truth depth,
+enabling rigorous evaluation of depth estimation in realistic surgical settings.
+EndoNeRF [26] introduces photorealistic synthetic endoscopic videos rendered
+via physically based simulation. We use two subsets: “cutting”, which depicts
+tissue excision with topological changes, and “pulling”, which captures elastic
+deformation induced by traction instruments. This dataset provides perfectly
+aligned depth, pose, and segmentation labels, serving as a valuable benchmark
+for reconstruction under controlled anatomical conditions.
+11. EXPERIMENT DETAILS
+23
+11.8
+Formulas for PSNR, SSIM, and LPIPS
+To quantitatively evaluate the reconstruction quality, we employ three standard
+metrics: Peak Signal-to-Noise Ratio (PSNR), Structural Similarity Index Measure
+(SSIM), and Learned Perceptual Image Patch Similarity (LPIPS). This subsection
+provides definitions of the evaluation metrics; readers familiar with them may
+skip it.
+PSNR PSNR measures the pixel-level fidelity between the ground truth image
+I and the reconstructed image ˆI. It is defined based on the Mean Squared Error
+(MSE):
+MSE =
+1
+MN
+M
+X
+i=1
+N
+X
+j=1
+
+I(i, j) −ˆI(i, j)
+2
+,
+(15)
+where M and N denote the height and width of the image, respectively. The
+PSNR is then calculated as:
+PSNR = 10 · log10
+MAX2
+I
+MSE
+
+,
+(16)
+where MAXI is the maximum possible pixel value of the image (e.g., 1.0 for
+floating-point images or 255 for 8-bit integers). A higher PSNR indicates better
+reconstruction quality in terms of signal fidelity.
+SSIM Unlike PSNR, SSIM evaluates the perceived quality by considering changes
+in structural information, luminance, and contrast. For two image patches x and
+y, SSIM is defined as:
+SSIM(x, y) =
+(2µxµy + C1)(2σxy + C2)
+(µ2x + µ2y + C1)(σ2x + σ2y + C2),
+(17)
+where:
+– µx and µy are the average intensities of x and y.
+– σ2
+x and σ2
+y are the variances of x and y.
+– σxy is the covariance between x and y.
+– C1 = (k1L)2 and C2 = (k2L)2 are constants to stabilize the division with a
+weak denominator, where L is the dynamic range of pixel values, k1 = 0.01,
+and k2 = 0.03.
+The final SSIM score is typically computed as the mean SSIM over all sliding
+windows in the image.
+24
+F. Fan et al.
+LPIPS LPIPS measures the perceptual distance between two images using deep
+features extracted from a pre-trained network (e.g., VGG or AlexNet). Let ϕ
+be the feature extractor. The distance d between the ground truth x and the
+reconstruction x0 is computed as:
+LPIPS(x, x0) =
+X
+l
+1
+HlWl
+X
+h,w
+wl ⊙
+ ˆyl
+hw −ˆyl
+0,hw
+2
+2 ,
+(18)
+where:
+– ˆyl and ˆyl
+0 denote the feature maps extracted at layer l for image x and x0,
+respectively.
+– The features are unit-normalized in the channel dimension.
+– wl represents the learned scaling weights for layer l.
+– ⊙denotes the element-wise product.
+A lower LPIPS score indicates better perceptual similarity to the ground truth.
+12
+Additional Experiments
+12.1
+Ablation Study on Number of Neighbors K
+Fig. 5: Ablation Study on the number of neighbors K on SCARED dataset.
+To investigate the impact of graph connectivity density on feature aggregation,
+we conducted an ablation study in which we varied the number of neighbors
+(K) from 2 to 18 on the SCARED dataset. As illustrated in Figure 5, the model
+performance exhibits a clear convex trend, peaking at K = 9. Specifically, the
+setting with K = 9 achieves the best results across all metrics, yielding a PSNR
+of 34.35, SSIM of 0.939, and LPIPS of 0.240. We observe that with a smaller
+K, the sparse connectivity limits the receptive field, hindering the formation of
+robust local cycles necessary for effective bridge characterization. Conversely,
+increasing K beyond 9 results in noticeable performance degradation, with PSNR
+dropping to 33.38 at K = 18. This suggests that excessive connectivity introduces
+irrelevant long-range noise and results in feature over-smoothing. Consequently,
+we adopt K = 9, following [8], as the optimal hyperparameter for our dynamic
+graph attention.
+12. ADDITIONAL EXPERIMENTS
+25
+Table 3: Experiment results on EndoNeRF and SCARED dataset using PSNR, SSIM,
+and LPIPS metrics. For PSNR and SSIM, the higher ↑the better. For LPIPS, the lower
+↓the better. The best results are highlighted in green, and the second best results are
+underlined.
+Dataset
+Method
+PSNR ↑
+SSIM ↑
+LPIPS ↓
+EndoNeRF-
+pulling
+VGGT
+23.349
+0.659
+0.396
+EndoSurf
+34.093
+0.938
+0.163
+EndoVGGT w/o DeGAT
+34.516
+0.918
+0.108
+EndoVGGT w/ DeGAT
+34.642
+0.918
+0.100
+EndoNeRF-
+cutting
+VGGT
+21.540
+0.872
+0.291
+EndoSurf
+30.606
+0.909
+0.168
+EndoVGGT w/o DeGAT
+31.859
+0.870
+0.159
+EndoVGGT w/ DeGAT
+32.227
+0.888
+0.156
+SCARED-
+d1k1
+VGGT
+14.061
+0.251
+0.379
+EndoSurf
+23.401
+0.669
+0.505
+EndoVGGT w/o DeGAT
+33.309
+0.929
+0.249
+EndoVGGT w/ DeGAT
+34.348
+0.939
+0.240
+SCARED-
+d2k1
+VGGT
+19.386
+0.283
+0.366
+EndoSurf
+24.894
+0.856
+0.254
+EndoVGGT w/o DeGAT
+36.411
+0.856
+0.247
+EndoVGGT w/ DeGAT
+36.634
+0.871
+0.221
+SCARED-
+d3k1
+VGGT
+14.431
+0.295
+0.388
+EndoSurf
+21.357
+0.641
+0.470
+EndoVGGT w/o DeGAT
+25.300
+0.930
+0.190
+EndoVGGT w/ DeGAT
+26.906
+0.930
+0.167
+Average
+VGGT
+18.553
+0.472
+0.364
+EndoSurf
+26.870
+0.803
+0.312
+EndoVGGT w/o DeGAT
+32.279
+0.901
+0.190
+EndoVGGT w/ DeGAT
+32.951
+0.909
+0.177
+26
+F. Fan et al.
+Table 4: Ablation studies on the EndoNeRF-cutting dataset. We report PSNR,
+SSIM, and LPIPS for different deformation modeling strategies and GAT en-
+hancement variants.
+Methods
+PSNR ↑
+SSIM ↑
+LPIPS ↓
+(A) Baseline
+EndoVGGT(Ours)
+31.8594
+0.8700
+0.1588
+(B) EndoVGGT + Token-Level cls Enhancement
+cls token + bias
+31.9641
+0.8748
+0.1570
+cls token + FiLM modulation
+31.9405
+0.8693
+0.1576
+cls token + cross attention
+32.0157
+0.8711
+0.1565
+(C) EndoVGGT + Attention-Level DeGAT
+Learnable Bias Table
+31.9592
+0.8721
+0.1571
+Continuous MLP Bias
+31.9700
+0.8742
+0.1574
+(D) EndoVGGT + Feature-Level DeGAT
+Post-Transformer GAT
+31.5710
+0.8686
+0.1689
+Pre-Transformer GAT
+32.2269
+0.8693
+0.1558

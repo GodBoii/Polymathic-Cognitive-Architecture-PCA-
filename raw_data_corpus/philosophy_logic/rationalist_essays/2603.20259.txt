@@ -1,0 +1,1732 @@
+Polynomial Updates for the Unscented Kalman Filter
+Chiran Binnu Cherian∗and Simone Servadio†
+Iowa State University, Ames, IA, 50011-2030
+Most nonlinear filters used in spacecraft navigation are based on a linear approximation
+of the optimal minimum mean square error estimator. The Unscented Kalman Filter (UKF)
+handles nonlinear dynamics through a sigma-point transform, but the resulting state estimate
+remains a linear function of the measurement. This paper proposes a polynomial approximation
+of the optimal Bayesian update, leading to a Polynomial Unscented Kalman Filter that retains
+the structure of the standard UKF but enriches the measurement update with higher-order
+(polynomial) terms. To compute the moments required by this polynomial estimator, we employ
+a Conjugate Unscented Transformation (CUT), which accurately captures higher-order central
+moments of the state and measurement. Numerical examples, including Clohessy-Wiltshire and
+Circular Restricted 3-Body dynamics with non-Gaussian measurement noise, illustrate that
+the resulting polynomial-CUT filters improve both state estimation accuracy and covariance
+consistency when compared with their linear counterparts.
+I. Introduction
+T
+he Kalman filter provides the canonical solution for linear Gaussian systems, yielding an exact, recursive
+computation of the posterior mean and covariance [1]. Its success led to widespread adoption in guidance,
+navigation, and control and motivated systematic treatments of estimation under uncertainty [2]. Most flight-relevant
+models, however, are nonlinear and often operate outside locally Gaussian regimes, which compromises the optimality
+guaranties of the linear filter.
+To address nonlinearity, the Extended Kalman Filter (EKF) linearizes the dynamics and measurement models
+about the current estimate and applies the Kalman machinery to this first-order approximation [2]. Although simple
+and efficient, the EKF can suffer from truncation bias and covariance inconsistency under strong nonlinearity, as
+emphasized in orbit and attitude applications [3]. The Unscented Kalman Filter (UKF) replaces Jacobian linearization
+with deterministic sigma-point quadrature that more accurately transports mean and covariance through nonlinear
+maps while retaining Gaussian output assumptions [4]. Related sigma-point and ensemble variants; Cubature KF
+(CKF), Ensemble KF (EnKF), and Central-Difference KF (CDKF) offer alternative deterministic or ensemble sampling
+strategies that target third-degree accuracy or finite-difference approximations [5–8]. Collectively, these approaches
+∗Graduate Student, Department of Aerospace Engineering, cbckbc@iastate.edu, and Student Member AIAA.
+†Assistant Professor, Department of Aerospace Engineering, servadio@iastate.edu, and AAS/AIAA Member
+arXiv:2603.20259v1  [eess.SY]  11 Mar 2026
+improve propagation fidelity but still perform an affine measurement update, which can under-fit curvature in the
+state–measurement relation. Beyond first-order or sigma-point propagation, higher-order tools have been developed to
+move uncertainty through nonlinear dynamics more faithfully. State Transition Tensors (STT) capture higher-order
+sensitivities on the flow map, enabling richer moment transport for dynamic systems [9]. Differential Algebra (DA)
+provides algebraic operators that propagate polynomial representations of uncertainty, delivering accurate nonlinear
+mappings for celestial mechanics and related problems [10]. These methods primarily enhance the time-update
+(prediction) step; in many implementations, the measurement update remains affine.
+When the posterior departs strongly from Gaussianity (for example, heavy tails, skewness, or multimodality),
+approximation families that go beyond single-Gaussian representations become attractive. Gaussian Sum Filters (GSF)
+model the state density as a mixture of Gaussians and update each component recursively, approximating nonlinear
+posteriors with controllable expressiveness [11, 12]. Particle Filters (PF), including bootstrap and Gaussianized variants,
+perform Bayesian recursion via weighted particles, accommodating arbitrary likelihoods and dynamics [13, 14]. Recent
+work has focused on proposal design and likelihood handling for challenging aerospace problems [15]. Although these
+mixture/particle approaches can approximate the nonlinear conditional mean with high fidelity, they typically incur
+higher computational cost and face degeneracy or scaling challenges in higher dimensions.
+Kalman-type filters built on linear or sigma-point propagation ultimately apply an affine correction at the measurement
+step. This is efficient and convenient, but it leaves performance on the table whenever the state–measurement relation
+exhibits significant curvature or the prior/likelihood departs from local Gaussianity. The symptoms are familiar to
+practitioners: biased posterior means, mis-calibrated covariances, and residual coverage that drifts from nominal bounds
+in strongly nonlinear regimes.
+The quadratic update replaces the affine correction with a second-order approximation to the optimal Bayesian
+estimator. Intuitively, instead of mapping innovations to state corrections along a single linear direction, the update
+bends with the local geometry of the joint state-measurement distribution. This preserves the recursive structure, state
+covariance bookkeeping, and low-latency character of Kalman filtering while capturing curvature that affine updates
+cannot. Earlier polynomial-update formulations demonstrated this promise, but often required lifted measurements,
+struggled with vector observations, or demanded explicit transport of high-order moments [16–18]. Subsequent work
+addressed these practical hurdles using Taylor-based updates and efficient moment handling, avoiding complicated
+systems while retaining the recursive filter form [19–22].
+We instantiate this idea in two forms. The Quadratic Unscented Kalman Filter (QUKF) constructs the second-order
+correction without analytic derivatives, using sigma-point statistics near the predicted measurement to identify the
+necessary curvature terms. Operationally, QUKF preserves the UKF workflow by predicting via sigma points, assembling
+the required statistics, and applying a closed-form quadratic correction so that it drops into existing unscented pipelines
+with minimal refactoring.
+2
+Recent developments have consolidated these ideas into unified formulations that present both quadratic extended
+and quadratic unscented updates within a common framework. In particular, we provided a treatment of Quadratic
+Extended and Unscented Kalman Filter updates that systematize the derivation, clarifies the required statistics, and
+outlines implementation pathways that fit naturally into EKF and UKF-style pipelines [23]. This line of work emphasizes
+practical considerations such as avoiding explicit high-order moment storage, handling vector measurements without
+singular lifts, and preserving square-root numerics for stability.
+A crucial design choice is augmentation. Practical estimation problems demand that process and measurement
+noise, and often slowly varying biases or constant parameters, be transported through the same nonlinear maps as the
+state. We therefore adopt an augmented formulation in which the quadratic update is applied after jointly propagating
+state and noise variables. This ensures that the captured curvature reflects not only nominal dynamics and sensor models
+but also how uncertainties themselves flow through those models.
+Many guidance, navigation, and control problems require propagating uncertainty through nonlinear models, which
+reduces to evaluating multivariate expectation integrals that rarely admit closed-form solutions outside linear–Gaussian
+cases. In practice, these integrals dominate the computational footprint of uncertainty quantification and filtering
+methods such as stochastic collocation, polynomial chaos, and Gaussian mix approaches [24–29]. When analytic
+expressions are not available, numerical quadrature is required. A wide spectrum of techniques exists for Gaussian and
+uniform priors such as Monte Carlo sampling, Gauss–Hermite and Gauss–Legendre rules, sparse-grid constructions, and
+sigma-point or cubature methods such as unscented and cubature transforms [5, 30–35]. All approximate the expectation
+by a weighted sum of function evaluations and they differ mainly in how they place points and assign weights.
+Classical Gaussian quadrature achieves high accuracy, but its cost grows sharply with dimension and often
+introduces negative weights, which can damage stability and inflate the truncation error for nonpolynomial integrands
+[31, 32, 34, 36]. Sparse grids alleviate growth, but still suffer from anisotropy and complexity in the rule-design in high
+dimensions [32]. Sigma-point rules strike a pragmatic balance: the unscented transform provides third-degree exactness
+with a compact, symmetric set of points that also cancel all odd moments, and reduced or simplex variants shrink the set
+further at the expense of those higher-order symmetries [33, 37]. The Kalman cubature filter adopts an alternative,
+equally third-degree arrangement with a similar point count [5]. These well-known rules can be viewed as special cases
+of more general symmetric cubature structures developed for multivariate integration [35], and have proven attractive
+for real-time nonlinear filtering.
+The Conjugate Unscented Transformation (CUT) extends this family by constructing sets of sigma-points of
+higher-degree, strictly symmetric whose size grows only polynomially with dimension [38–41]. The key idea is to
+assemble conjugate tuples of axis-aligned patterns with balanced signs so that all odd moments vanish by symmetry
+while targeted even moments (up to fourth, sixth, or eighth order, depending on the chosen family) are matched exactly.
+As a result, CUT increases moment fidelity beyond the third degree without resorting to exponentially large grids. It
+3
+retains the familiar workflow of unscented-style methods: compute a square-root factor of the covariance, generate a
+canonical point set, push points through the nonlinear maps, and form weighted reductions. Because the defining radii
+and weights are fixed once per degree and reused at every step, the implementation effort is modest. In addition, CUT’s
+symmetry typically yields nonnegative weights, which aids numerical stability and helps maintain positive-definite
+covariance updates [34, 36, 39, 40].
+CUT has been demonstrated in estimation and control tasks and in demanding space applications, notably accurate
+conjunction analysis under realistic uncertainties [38, 41]. Variants tailored to non-Gaussian priors, including uniform
+distributions, further extend its applicability beyond the Gaussian assumption commonly made in sigma-point filters [42].
+In this work, we employ an arbritary high-order CUT within an augmented state formulation so that the physical state,
+process noise, and measurement noise are transported through the same nonlinear maps. This choice offers a favorable
+accuracy–cost trade since it tightens predicted means, covariances, and cross-covariances in regimes where third-degree
+rules under-represent curvature, yet preserves the runtime and code simplicity valued in on-board implementations
+[38–42].
+The quadratic update, or its polynomial generalization, and CUT are complementary. CUT improves the fidelity
+of predicted moments by enforcing higher-order symmetry conditions with polynomial growth in point count. The
+quadratic update then converts those more accurate prediction and measurement moments into a curvature-aware
+correction. Empirically, this pairing, QUKF with CUT in an augmented setting, produces more faithful tracking of the
+spread of the joint distribution, improved covariance calibration, and lower RMSE, as this paper will show in numerical
+applications across scalar toy problems, nonlinear Clohessy–Wiltshire dynamics with non-Gaussian noise, and Circular
+Restricted Three-Body dynamics.
+The scope and limitations are clear. The quadratic update remains a single-mode approximation. In the presence of
+severe multimodality or extreme heavy tails, mixture-based or particle methods may be preferable. However, within the
+broad class of aerospace estimation problems characterized by pronounced nonlinearity and moderate non-Gaussianity,
+a quadratic update coupled with higher-order sigma-point propagation offers a practical accuracy–cost sweet spot
+that preserves recursive simplicity. Regardless, the proposed methodology can be generalized with multiple model
+mathematics without any loss of generality .
+II. The Optimal Polynomial Estimator
+We interpret the polynomial estimators considered in this work as approximations of the minimum mean square
+error (MMSE) estimator within a finite-dimensional family of polynomial functions of the measurement. In general, we
+restrict the estimate to have the form
+𝑔𝑁(y) = E[x] + K𝑁𝜓𝑁(𝛿y),
+4
+where 𝛿y = y −E[y] denotes the measurement deviation and 𝜓𝑁(𝛿y) collects all centralized monomials in 𝛿y up to
+order 𝑁(only linear terms for 𝑁= 1, linear and quadratic terms for 𝑁= 2, etc.). Among all such degree-𝑁polynomials,
+the optimal estimator 𝑔∗
+𝑁is the one that minimizes the mean square error, i.e., the 𝐿2 projection of x onto span{𝜓𝑁(𝛿y)}.
+By the orthogonality principle, this projection is characterized by
+E
+
+(x −𝑔∗
+𝑁(y)) 𝜓𝑁(𝛿y)𝑇
+= 0,
+which leads to a set of normal equations for the gain matrix K𝑁in terms of joint moments of x and the measurement y.
+The classical linear estimator corresponds to 𝑁= 1, yielding 𝑔𝐿(y) in Eq. (1), while the quadratic case 𝑁= 2 produces
+the quadratic family 𝑔𝑄(y) in terms of 𝛿y and its Kronecker square 𝛿y[2], as derived in the next subsection.
+A. The Optimal Quadratic Estimator
+Previous works [19, 20, 22] derived a new series of polynomial estimators in which the state estimate is a polynomial
+function of the given measurement. They make use of Differential Algebra techniques to calculate high-order central
+moments. In this work, we obtain the quadratic estimator from the definition of the orthogonality principle, but apply
+the unscented transformation to obtain the high-order gains and terms, so that the final results resemble the structure of
+the Unscented Kalman Filter, but with the quadratic term.
+Minimum Mean Square Error (MMSE) estimators aim at minimizing the expected value of the error square; thus,
+their formulation leads to unbiased filters where the mean of the error square coincides with the error covariance.
+Whenever a linear function in the measurement is used, as a family of estimators, we obtain a linear representation of
+the MMSE, the LMMSE. These estimators have the form of
+𝑔𝐿(y) = 𝐴+ E[x] + 𝐵(y −E[y])
+(1)
+and are very common. Equation (1) is used by the UKF and other linear estimators in their state update step. Their
+estimate changes according to the technique used to evaluate the constants 𝐴and 𝐵, dealing with the nonlinearities of
+the measurement model.
+This work applies a quadratic approximation to the MMSE, the QMMSE. Thus, the generic quadratic estimator
+family is as follows,
+𝑔𝑄(y) = 𝐴+ E[x] + 𝐵𝛿y + 𝐶𝛿y[2]
+(2)
+5
+where
+𝛿y = y −E[y]
+(3)
+𝛿y[2] = 𝛿y ⊗𝛿y = (y −E[y]) ⊗(y −E[y])
+(4)
+indicates the residual (or measurement deviation vector) and its square, obtained using the Kronecker product ⊗for the
+square of vectors.
+The orthogonality principle states that, given the optimal estimator 𝑔∗
+𝑄(y), with optimal constants 𝐴∗, 𝐵∗, and 𝐶∗,
+the equation
+E
+
+(x −𝑔∗
+𝑄(y)) 𝑔𝑄(y)𝑇
+= 0
+(5)
+holds for every other generic estimator. Therefore, picking the following values for the generic estimator
+𝐴= −E[x] + I,
+𝐵= 0,
+𝐶= 0
+(6)
+where I is the identity matrix, leads to
+E[𝛿x −𝐴∗−𝐵∗𝛿y −𝐶∗𝛿y[2]] = 0,
+𝐴∗= −𝐶∗v(P𝑦𝑦)
+(7)
+where v(P𝑦𝑦) indicates the stack operator for matrix P𝑦𝑦. Similarly, the two sets were selected
+𝐴= −E[x],
+𝐵= I,
+𝐶= 0
+(8)
+𝐴= −E[x],
+𝐵= 0,
+𝐶= I
+(9)
+leads to
+E[(𝛿x −𝐴∗−𝐵∗𝛿y −𝐶∗𝛿y[2]) 𝛿y𝑇] =
+P𝑥𝑦−𝐵∗P𝑦𝑦−𝐶∗P𝑦[2] 𝑦=0
+(10)
+and
+E[(𝛿x −𝐴∗−𝐵∗𝛿y −𝐶∗𝛿y[2]) 𝛿y[2]𝑇] =
+P𝑥𝑦[2] −𝐵∗P𝑦𝑦[2] + 𝐶∗(v(P𝑦𝑦)v(P𝑦𝑦)𝑇−P𝑦[2] 𝑦[2]) = 0
+(11)
+6
+where we have defined covariances as
+P𝑥𝑦= E[𝛿x 𝛿y𝑇],
+(12)
+P𝑥𝑦[2] = E[𝛿x 𝛿y[2]𝑇],
+(13)
+P𝑦𝑦= E[𝛿y 𝛿y𝑇],
+(14)
+P𝑦𝑦[2] = E[𝛿y 𝛿y[2]𝑇],
+(15)
+P𝑦[2] 𝑦= E[𝛿y[2] 𝛿y𝑇],
+(16)
+P𝑦[2] 𝑦[2] = E[𝛿y[2] 𝛿y[2]𝑇].
+(17)
+with
+𝛿x = x −E[x]
+(18)
+After substituting in Eq. (7), Eqs (10) and (11) can be rewritten as a set of coupled equations.
+
+𝐵∗
+𝐶∗
+ 
+P𝑦𝑦
+P𝑦𝑦[2]
+P𝑦[2] 𝑦
+P𝑦[2] 𝑦[2] −v(P𝑦𝑦)v(P𝑦𝑦)𝑇
+
+=
+
+P𝑥𝑦
+P𝑥𝑦[2]
+
+𝑇
+(19)
+which brings us to the solution for the optimal constants,
+K =
+
+𝐵∗
+𝐶∗
+
+= PxY P−1
+YY
+(20)
+having defined
+PXY =
+
+P𝑥𝑦
+P𝑥𝑦[2]
+
+(21)
+PYY =
+
+P𝑦𝑦
+P𝑦𝑦[2]
+P𝑦[2] 𝑦
+P𝑦[2] 𝑦[2] −v(P𝑦𝑦)v(P𝑦𝑦)𝑇
+
+(22)
+The optimal constants 𝐵∗and 𝐶∗behave similarly to the classic Kalman gain, but are evaluated in its augmented form
+that considers the covariances and cross covariances with the square of the measurement deviation vector.
+Substituting the derived constants from Eq. (7) and (20) back into the definition of the quadratic estimator, it creates
+7
+the optimal quadratic estimator, which is the parabolic approximation of the true MMSE,
+𝑔∗
+𝑄(y) = E[x] + PxYP−1
+YY
+
+𝛿y
+𝛿y[2] −v(P𝑦𝑦)
+
+(23)
+The derived estimator is applied in the update step of the classic Unscented Kalman Filter (UKF) to obtain the quadratic
+version of their formulation, which is linear. Therefore, using the unscented transformation to evaluate the set of central
+moments in Eqs (12) to (17), we propose the Quadratic Unscented Kalman Filter (QUKF).
+B. The Optimal Polynomial Estimator
+The previous process can be generalized up to any arbitrary order. We consider an optimal polynomial estimator,
+i.e., an estimator that is constrained to be a polynomial function of the measurement innovation but is otherwise chosen
+to minimize mean-square error. Concretely, instead of restricting the update to be linear in the innovation (as in the
+Kalman filter), we allow all monomials in the innovation up to the 𝑁th polynomial order.
+Similarly to the quadratic estimator, we can derive an optimal estimator for the 𝑁th polynomial order. Following the
+same procedure as previously described, we would get
+
+𝐵∗
+𝐶∗
+...
+𝑍∗
+
+𝑇
+P𝑦𝑦
+P𝑦𝑦[2]
+...
+P𝑦𝑦[𝑁]
+P𝑦[2] 𝑦
+P𝑦[2] 𝑦[2] −v(P𝑦𝑦)v(P𝑦𝑦)𝑇
+...
+P𝑦[2] 𝑦[𝑁] −v(P𝑦𝑦)v(P𝑦[𝑉] 𝑦[𝑀])𝑇
+...
+...
+...
+...
+P𝑦[𝑁] 𝑦
+P𝑦[𝑁] 𝑦[2] −v(P𝑦[𝑉] 𝑦[𝑀])v(P𝑦𝑦)𝑇
+...
+P𝑦[𝑁] 𝑦[𝑁] −v(P𝑦[𝑉] 𝑦[𝑀])v(P𝑦[𝑉] 𝑦[𝑀])𝑇
+
+=
+
+𝑃𝑥𝑦
+𝑃𝑥𝑦[2]
+...
+𝑃𝑥𝑦[𝑁]
+
+𝑇
+(24)
+where if 𝑁is even, 𝑀= 𝑉= 𝑁/2 and if 𝑁is odd, 𝑀= (𝑁+ 1)/2 and 𝑉= 𝑀−1. The polynomial Kalman gain will be
+𝐾=
+
+𝐵∗
+𝐶∗
+𝐷∗
+...
+
+= PxY P−1
+YY
+(25)
+where
+PXY =
+
+P𝑥𝑦
+P𝑥𝑦[2]
+P𝑥𝑦[3]
+...
+P𝑥𝑦[𝑁]
+
+(26)
+8
+and
+PYY =
+
+P𝑦𝑦
+P𝑦𝑦[2]
+...
+P𝑦𝑦[𝑁]
+P𝑦[2] 𝑦
+P𝑦[2] 𝑦[2] −v(P𝑦𝑦)v(P𝑦𝑦)𝑇
+...
+P𝑦[2] 𝑦[𝑁] −v(P𝑦𝑦)v(P𝑦[𝑉] 𝑦[𝑀])𝑇
+...
+...
+...
+...
+P𝑦[𝑁] 𝑦
+P𝑦[𝑁] 𝑦[2] −v(P𝑦[𝑉] 𝑦[𝑀])v(P𝑦𝑦)𝑇
+...
+P𝑦[𝑁] 𝑦[𝑁] −v(P𝑦[𝑉] 𝑦[𝑀])v(P𝑦[𝑉] 𝑦[𝑀])𝑇
+
+(27)
+still indicate the augmented covariance matrices for state-measurement and measurement. Thus, the optimal polynomial
+estimator of order N will be
+𝑔∗
+𝑁(y) = E[x] + PxYP−1
+YY
+
+𝛿y
+𝛿y[2] −v(P𝑦𝑦)
+𝛿y[3] −v(P𝑦𝑦2)
+...
+𝛿y[𝑁] −v(P𝑦[𝑉] 𝑦[𝑀])
+
+(28)
+III. High Order Central Moments
+Linear estimators require the first two central moments, i.e mean and covariance, to operate. In contrast, quadratic
+estimators, due to their higher order, require information up to the fourth central moment to achieve a correct and
+consistent estimate. Therefore, we define with
+S𝑥𝑥𝑥= E
+
+(𝑥−ˆ𝑥) ⊗ (𝑥−ˆ𝑥)(𝑥−ˆ𝑥)𝑇
+(29)
+the skewness of a distribution, expressed as a three-dimensional tensor, and with
+K𝑥𝑥𝑥𝑥= E
+ (𝑥−ˆ𝑥)(𝑥−ˆ𝑥)𝑇⊗ (𝑥−ˆ𝑥)(𝑥−ˆ𝑥)𝑇
+(30)
+the kurtosis, expressed as a fourth dimensional tensor. It can be shown [20, 22] that for a null mean distribution, where
+central moments and raw moments match, S𝑥𝑥𝑥= P𝑥[2] 𝑥= P𝑇
+𝑥𝑥[2] and K𝑥𝑥𝑥𝑥= P𝑥[2] 𝑥[2].
+In the classical Kalman filter, the measurement noise is characterized solely by its second-order central moment
+(covariance), implicitly assuming that higher-order moments are either negligible or follow the Gaussian relationships.
+In contrast, the proposed polynomial estimator uses a higher-order approximation of the conditional mean and, therefore,
+requires a more detailed description of the measurement noise. Accurately modeling these higher-order central moments
+9
+of the measurement noise leads to a richer statistical representation of the measurement distribution and enables a more
+accurate polynomial MMSE estimator than one based on covariance information alone.
+IV. The Quadratic Unscented Kalman Filter (QUKF)
+Consider the nonlinear equation of motion, with dynamics 𝑓(), affected by noise
+x𝑘= 𝑓(x𝑘−1) + 𝝁𝑘−1
+(31)
+where 𝝁𝑘−1 is a Gaussian process noise of zero-mean with known covariance matrix P𝜇𝜇. The state PDF is approximated
+as a Gaussian with known mean and covariance, which constitutes the prior for the measurement update. An observation
+is provided according to the measurement model ℎ(),
+y = ℎ(x) + 𝜼
+(32)
+affected by zero-mean measurement noise with known covariance P𝜂𝜂, skewness S𝜂𝜂𝜂, and kurtosis K𝜂𝜂𝜂𝜂. The
+predicted measurement mean is indicated with ˆy𝑘. Given the result of the measurement ˜y, the actual numerical value of
+the random value of the sensors, the residual and its square are evaluated as
+𝛿˜y = y −ˆy𝑘
+(33)
+𝛿˜y[2] = 𝛿˜y ⊗𝛿˜y
+(34)
+so that the quadratic update step can be performed according to
+K = P𝑥YP−1
+YY
+(35)
+ˆx+
+𝑘= ˆx−
+𝑘+ K
+
+𝛿y
+𝛿y[2] −v(P𝑦𝑦)
+
+(36)
+P+
+𝑥𝑥,𝑘= P−
+𝑥𝑥,𝑘−KPYYK𝑇
+(37)
+where K is the Kalman gain, in its augmented form, and ˆx+
+𝑘and P+
+𝑥𝑥,𝑘are the updated mean and covariance of the state
+distribution. Such equations are derived following the common Kalman derivation, but with the augmented system.
+The reader can notice that Eqs (36) and (37) resemble the structure of the normal Kalman update but expanded to
+operate with the augmented covariances that include information of the square of the measurement vector. Indeed, the
+10
+state-measurement cross-covariance is evaluated block-wise as in
+P𝑥Y =
+
+P𝑥𝑦
+P𝑥𝑦[2]
+
+(38)
+In a similar pattern, the augmented measurement covariance is evaluated block-wise as in
+PYY =
+
+P𝑦𝑦
+P𝑦𝑦[2]
+P𝑇
+𝑦𝑦[2]
+P𝑦[2] 𝑦[2] −v(P𝑦𝑦)v(P𝑦𝑦)𝑇
+
+(39)
+The state has been updated according to Eqs (36) and (37) and the mean and covariance can undergo a new propagation
+normally. To actively complete the update step, we require a technique to obtain an accurate approximation of covariances
+so that the Kalman gain can be evaluated. We exploit the unscented transformation to obtain the QUKF.
+The scaled unscented transformation (UT) is applied to obtain the mean and covariance of a random variable, y,
+which has a known relation, ℎ(), with respect to the given initial random variable x, of dimension 𝑛. After defining the
+spread parameter 𝛼, the scaling parameter 𝜅and the constant 𝛽, a set of 2𝑛+ 1 sigma points is created from the mean of
+the current state and covariance:
+𝜆= 𝛼2(𝑛+ 𝜅) −𝑛
+(40)
+C𝑘−1C𝑇
+𝑘−1 = (𝑛+ 𝜆)P+
+𝑥𝑥,𝑘−1
+(41)
+X𝑘−1 =
+
+ˆx+
+𝑘−1
+ˆx+
+𝑘−1 + C𝑘−1
+ˆx+
+𝑘−C𝑘−1
+
+(42)
+Each sigma point is associated with a weight given by
+𝑤(𝑚)
+0
+=
+𝜆
+𝑛+ 𝜆
+(43)
+𝑤(𝑐)
+0
+=
+𝜆
+𝑛+ 𝜆+ (1 −𝛼2 + 𝛽)
+(44)
+𝑤(𝑚)
+𝑖
+= 𝑤(𝑐)
+𝑖
+=
+1
+2(𝑛+ 𝜆) ,
+𝑖= 1, . . . , 2𝑛
+(45)
+for the calculation of means, 𝑤(𝑚)
+𝑖
+, and covariances, 𝑤(𝑐)
+𝑖
+.
+The prediction step is performed by propagating, separately, each sigma point and obtaining their weighted means
+11
+for the predicted estimate and covariance.
+X(𝑖)
+𝑘
+= 𝑓(X(𝑖)
+𝑘−1)
+∀𝑖= 0, ..., 2𝑛
+(46)
+ˆx−
+𝑘=
+2𝑛
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑚X(𝑖)
+𝑘
+(47)
+P−
+𝑥𝑥,𝑘=
+2𝑛
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐(X(𝑖)
+𝑘
+−ˆx−
+𝑘)(X(𝑖)
+𝑘
+−ˆx−
+𝑘)𝑇+ P𝜇𝜇
+(48)
+The quadratic update for QUKF follows the same formulation as in Eqs (36) and (37), with the augmented covariances
+reported in Eqs (38) and (39), evaluated block-wise. Each entry is computed via the sigma points weighted summation.
+Therefore, after obtaining the transformed sigma points in the measurement space and their predicted mean,
+Y (𝑖)
+𝑘
+= ℎ(X(𝑖)
+𝑘)
+∀𝑖= 0, ..., 2𝑛
+(49)
+ˆy𝑘=
+2𝑛
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑚Y (𝑖)
+𝑘
+(50)
+each sigma point is augmented with its Kronecker square. Thus, the deviation vectors of the state and the measurement
+are computed as
+𝛿X(𝑖)
+𝑘
+= X(𝑖)
+𝑘
+−ˆx−
+𝑘
+∀𝑖= 0, ..., 2𝑛
+(51)
+𝛿Y (𝑖)
+𝑘
+= Y (𝑖)
+𝑘
+−ˆy𝑘
+∀𝑖= 0, ..., 2𝑛
+(52)
+𝛿Y[2](𝑖)
+𝑘
+= 𝛿Y (𝑖)
+𝑘
+⊗𝛿Y (𝑖)
+𝑘
+∀𝑖= 0, ..., 2𝑛
+(53)
+This definition eases the evaluation of the covariances, which are obtained as a simple summation. The state-measurement
+cross covariances components are
+P𝑥𝑦=
+2𝑛
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿X(𝑖)
+𝑘𝛿Y (𝑖)𝑇
+𝑘
+(54)
+P𝑥𝑦[2] =
+2𝑛
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿X(𝑖)
+𝑘𝛿Y[2](𝑖)𝑇
+𝑘
+(55)
+The measurement covariance is evaluated in two separate steps: first, the transformed covariances in the measurement
+12
+space are computed, then the influence of the noise is added.
+P𝑦𝑦=
+2𝑛
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿Y (𝑖)
+𝑘𝛿Y (𝑖)𝑇
+𝑘
+(56)
+P𝑦𝑦[2] =
+2𝑛
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿Y (𝑖)
+𝑘𝛿Y[2](𝑖)𝑇
+𝑘
+(57)
+P𝑦[2] 𝑦[2] =
+2𝑛
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿Y[2](𝑖)
+𝑘
+𝛿Y[2](𝑖)𝑇
+𝑘
+(58)
+where additive noise leads to a simple noise addition for the contribution:
+P𝑦𝑦= P𝑦𝑦+ P𝜂𝜂
+(59)
+P𝑦𝑦[2] = P𝑦𝑦[2] + S𝜂𝜂𝜂
+(60)
+P𝑦[2] 𝑦[2] = P𝑦[2] 𝑦[2] + K𝜂𝜂𝜂𝜂+
++P𝑦𝑦⊗P𝜂𝜂+ m
+
+v(P𝑦𝑦) ⊗I
+ 
+P𝑇
+𝜂𝜂⊗I
+
++
++P𝜂𝜂⊗P𝑦𝑦+ m
+
+v(P𝜂𝜂) ⊗I
+ 
+P𝑦𝑦
+𝑇⊗I
+
++
++v(P𝑦𝑦)v(P𝜂𝜂)𝑇+ v(P𝜂𝜂)v(P𝑦𝑦)𝑇
+(61)
+where m() is the matrix operator, the inverse of the stack operator v(), and where P𝑦𝑦indicates the measurement
+covariance without any influence of noise, the actual uncertainty transformation. These expressions of the covariances
+are obtained by applying the expected value operator as described in Eqs (12) to (17), where full knowledge of the
+moments of the noise is assumed.
+The QUKF algorithm is complete, where high order covariances are evaluated similarly to the classical one by
+weighted sigma points summations. The higher-order moments provide additional information to the filter with respect
+to its linear version, drastically improving the accuracy of the measurement update, which can now curve in a parabolic
+manner to follow the true shape of the posterior distribution.
+A. The Quadratic Augmented Unscented Kalman Filter (QAUKF)
+The QUKF is a filter that applies the unscented transformation to derive a solution for the QMMSE likewise the UKF
+is a filter that applies the unscented transformation to derive a solution for the LMMSE. In the presented application,
+both process and measurement noises have been assumed to be additive. Consider now the following stochastic nonlinear
+system, where the process noise is not additive anymore, and a measurement function where the measurement noise has
+13
+a nonlinear dependence on the measurement outcome:
+x𝑘+1 = 𝑓(x𝑘, 𝝁𝑘),
+(62)
+y𝑘+1 = ℎ(x𝑘+1, 𝜼𝑘+1)
+(63)
+where 𝝁𝑘and 𝜼𝑘+1 denote the process and the measurement noises, with
+E[𝝁𝑘] = 0,
+E[𝜼𝑘+1] = 0,
+E[𝝁𝑘𝝁𝑇
+𝑘] = P𝜇𝜇,
+E[𝜼𝑘+1𝜼𝑇
+𝑘+1] = P𝜂𝜂.
+(64)
+To embed the random disturbances directly in the unscented mapping, define the augmented state vector and covariance
+matrix in order to create sigma points that directly account for the influence of the noises
+x𝑎
+𝑘=
+
+x𝑘
+𝝁𝑘
+𝜼𝑘+1
+𝑇
+,
+(65)
+ˆx𝑎
+𝑘=
+
+ˆx𝑘
+0
+0
+𝑇
+,
+(66)
+P𝑎
+𝑘=
+
+P𝑥𝑥
+0
+0
+0
+P𝜇𝜇
+0
+0
+0
+P𝜂𝜂
+
+.
+(67)
+The augmented dimension is 𝑛𝑎= 𝑛𝑥+ 𝑛𝜇+ 𝑛𝜂, such that the covariance P𝑎
+𝑘captures both state and noise uncertainty.
+The unscented transformation is applied in this augmented space, creating 2𝑛𝑎+ 1 sigma points. The augmented sigma
+points are generated as
+C𝑎
+𝑘−1C𝑎,𝑇
+𝑘−1 = (𝑛𝑎+ 𝜆)P𝑎
+𝑘
+(68)
+X𝑎
+𝑘−1 =
+
+ˆx𝑎
+𝑘−1
+ˆx𝑎
+𝑘−1 + C𝑎
+𝑘−1
+ˆx𝑎
+𝑘−C𝑎
+𝑘−1
+
+(69)
+after using Eq. (40) to evaluate the value of 𝜆. Each augmented sigma point decomposes as
+X𝑎(𝑖)
+𝑘−1 =
+
+X𝑥(𝑖)
+𝑘−1
+X𝜇(𝑖)
+𝑘−1
+X𝜂(𝑖)
+𝑘−1
+𝑇
+(70)
+14
+representing the state, process noise, and measurement noise components. Each sigma point is propagated through the
+process model:
+X𝑎(𝑖)
+𝑘
+= 𝑓(X𝑥(𝑖)
+𝑘−1, X𝜇(𝑖)
+𝑘−1 )
+∀𝑖= 0, ..., 2𝑛𝑎
+(71)
+yielding the predicted mean and covariance:
+ˆx−
+𝑘=
+2𝑛𝑎
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑚X𝑥(𝑖)
+𝑘
+(72)
+P−
+𝑥𝑥,𝑘=
+2𝑛𝑎
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐(X𝑥(𝑖)
+𝑘
+−ˆx−
+𝑘)(X𝑥(𝑖)
+𝑘
+−ˆx−
+𝑘)𝑇
+(73)
+It can be noted that, with respect to the previous case, the is not a direct addition of the process noise covariance matrix
+as the influence of such noise has been taken care of by the additional sigma points.
+Each predicted sigma point is then passed through the measurement model
+Y (𝑖)
+𝑘
+= ℎ(X𝑥(𝑖)
+𝑘
+, X𝜂(𝑖)
+𝑘−1 )
+∀𝑖= 0, ..., 2𝑛𝑎
+(74)
+ˆy𝑘=
+2𝑛𝑎
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑚Y (𝑖)
+𝑘
+(75)
+Deviations are defined similarly to the additive version of the UKF:
+𝛿X𝑥(𝑖)
+𝑘
+= X𝑥(𝑖)
+𝑘
+−ˆx−
+𝑘
+∀𝑖= 0, ..., 2𝑛𝑎
+(76)
+𝛿Y (𝑖)
+𝑘
+= Y (𝑖)
+𝑘
+−ˆy𝑘
+∀𝑖= 0, ..., 2𝑛𝑎
+(77)
+𝛿Y[2](𝑖)
+𝑘
+= 𝛿Y (𝑖)
+𝑘
+⊗𝛿Y (𝑖)
+𝑘
+∀𝑖= 0, ..., 2𝑛𝑎
+(78)
+so that the state-measurement covariances can be evaluated as
+P𝑥𝑦=
+2𝑛𝑎
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿X𝑥(𝑖)
+𝑘
+𝛿Y (𝑖)𝑇
+𝑘
+(79)
+P𝑥𝑦[2] =
+2𝑛𝑎
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿X𝑥(𝑖)
+𝑘
+𝛿Y[2](𝑖)𝑇
+𝑘
+(80)
+15
+while the measurement covariances are evaluated directly as
+P𝑦𝑦=
+2𝑛𝑎
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿Y (𝑖)
+𝑘𝛿Y (𝑖)𝑇
+𝑘
+(81)
+P𝑦𝑦[2] =
+2𝑛𝑎
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿Y (𝑖)
+𝑘𝛿Y[2](𝑖)𝑇
+𝑘
+(82)
+P𝑦[2] 𝑦[2] =
+2𝑛𝑎
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿Y[2](𝑖)
+𝑘
+𝛿Y[2](𝑖)𝑇
+𝑘
+(83)
+which implicitly contains the measurement-noise covariance P𝜂𝜂since 𝜼𝑘is part of x𝑎
+𝑘.
+By using this augmented version of the unscented transformation, where the influence of the noise is already
+accounted for by the larger set of sigma points, we do not need to adjust the covariance for the measurement noise
+contribution, as shown in Eqs. (59) to (61). Thus, the derivation of each covariance block for the quadratic update
+becomes extremely trivial and easy to compute, as the full algorithm reduces to simple summations. However, it is
+important to underline that this implementation works well for Gaussian noises, while the previous one is more robust to
+any noise color, since high-order moments are directly included by their value rather than approximated by the unscented
+transformation, which implements a Gaussian assumption during the creation of the augmented set of sigma points.
+Nevertheless, this implementation is convenient for most applications, as all noise effects are inherently included within
+the expectations above, yielding a compact and self-consistent formulation suitable for the Quadratic Augmented UKF
+(QAUKF). Indeed, the correction step of the QAUKF follows the QMMSE update, likewise the QUKF, with the only
+difference being how the covariances are evaluated.
+V. Generalization of Quadratic Updates
+A quick consideration regarding the application and generalization of the quadratic update and the QMMSE
+approximation is due. The proposed quadratic update fits any technique that evaluate central moments and expectations,
+and it can be applied to other linear estimators, such as the Cubature Kalman Filter or the Ensemble Kalman Filter,
+where it changes how Eqs (54) to (61) are evaluated, while keeping the same structure for the augmented squaring of the
+measurement update.
+For example, in the preliminary version of this work, a Quadratic Extended Kalman Filter (QEKF) has been
+introduced [23]. The two filters (QEKF and QUKF) have the same structure, similar to how both the EKF and UKF
+follow the Kalman formulation. They create an augmented system that follows the same procedure regardless of the
+uncertainty transformation technique selected: linearization for the QEKF and unscented transformation for the QUKF.
+That is, the quadratic update structure can be utilized with any preferred moments propagation technique, e.g.,
+quadrature or state transition tensors (STT), as long as the evaluation of the high-order central moments is accurate.
+16
+VI. Generalization of the UKF to Arbitrary Order
+The QUKF and QAUKF derived so far are a quadratic approximation of the true QMMSE, which indicates the
+optimal quadratic estimator in a minimum mean square error sense. As the LMMSE is the linear approximation of the
+true MMSE, and the QMMSE is the parabolic approximation, increasing the order of the polynomial estimator will
+yield more accurate results, as the polynomial function better resembles the shape of the true MMSE, which can be
+any generic function, as shown in [43]. Therefore, the polynomial estimator can be increased to better match the true
+MMSE; for example, a third-order polynomial yields the Cubic MMSE (CMMSE).
+Thus, the presented QAUKF can be expanded to the Polynomial Augmented Unscented Kalman Filter (PAUKF),
+where the estimator order is arbitrary high. Using the same assumptions and initial conditions as in Section IV, consider
+𝛿y[𝑁] = 𝛿y ⊗𝛿y ⊗𝛿y ⊗.....(𝑁times)
+(84)
+the 𝑁th order residual, so that the updated mean becomes
+ˆx+
+𝑘= ˆx−
+𝑘+ K
+
+𝛿y
+𝛿y[2] −v(P𝑦𝑦)
+𝛿y[3] −v(P𝑦𝑦[2])
+...
+𝛿y[𝑁] −v(P𝑦[𝑉] 𝑦[𝑀])
+
+(85)
+where the augmented Kalman gain retains the form
+K = PxY P−1
+YY
+(86)
+but in their expanded form, where the state-measurement cross-covariance is evaluated as
+PxY =
+
+P𝑥𝑦
+P𝑥𝑦[2]
+P𝑥𝑦[3]
+.....
+P𝑥𝑦[𝑁]
+
+(87)
+17
+while the augmented measurement covariance is
+PYY =
+
+P𝑦𝑦
+P𝑦𝑦[2]
+...
+P𝑦𝑦[𝑁]
+P𝑦[2] 𝑦
+P𝑦[2] 𝑦[2] −v(P𝑦𝑦)v(P𝑦𝑦)𝑇
+...
+P𝑦[2] 𝑦[𝑁] −v(P𝑦𝑦)v(P𝑦[𝑉] 𝑦[𝑀])𝑇
+...
+...
+...
+...
+P𝑦[𝑁] 𝑦
+P𝑦[𝑁] 𝑦[2] −v(P𝑦[𝑉] 𝑦[𝑀])v(P𝑦𝑦)𝑇
+...
+P𝑦[𝑁] 𝑦[𝑁] −v(P𝑦[𝑉] 𝑦[𝑀])v(P𝑦[𝑉] 𝑦[𝑀])𝑇.
+
+(88)
+Each block-wise entry of the covariances is evaluated directly through the sigma points summation using the unscented
+transformation, in the following way:
+P𝑥𝑦[𝑁] =
+2𝑛𝑎
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿X(𝑖)
+𝑘𝛿Y[𝑁](𝑖)𝑇
+𝑘
+(89)
+P𝑦[𝑉] 𝑦[𝑀] =
+2𝑛𝑎
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿Y[𝑉](𝑖)
+𝑘
+𝛿Y[𝑀](𝑖)𝑇
+𝑘
+(90)
+Eventually, a higher-order polynomial for the representation of the MMSE will stop being beneficial, as the new added
+terms will bring fewer beneficial contributions, the same way (for example) that the difference between the 11th and
+12th order polynomial approximation of a nonlinear function shows almost no improvement when compared to the
+difference in approximation between the 2nd and 3rd order. In a similar way, evaluating extremely high-order central
+moments can be inaccurate with the limited number of sigma points generated by the classic unscented transformation.
+For this reason, we expanded the PAUKF using the Conjugate Unscented Transformation (CUT) to evaluate expectations
+more accurately and with a higher fidelity.
+VII. The Conjugate Unscented Transformation for the Polynomial Update
+The Conjugate Unscented Transformation (CUT) is a high-order sigma-point method for approximating multivariate
+Gaussian expectations, generalizing the classical Unscented Transformation by systematically increasing the polynomial
+degree of exactness. Instead of using a small fixed set of symmetric sigma points, CUT constructs conjugate point sets
+by tensoring one-dimensional Gaussian quadrature rules along conjugate directions, yielding formulated chosen samples
+that exactly integrate multivariate polynomials up to a prescribed order, as shown in the work of Adurthi et al. in [41].
+For a given order, the associated CUT rule matches all mixed moments of the underlying distribution, enabling accurate
+propagation and transformation of not only mean and covariance, but also higher-order central moments required by
+polynomial estimators. That is, when increasing the polynomial update of the PAUKF to high orders, it is expected for
+the UT to fail in the expected values computations. The introduction of the CUT will straighten the filtering technique,
+effectively allowing an arbitrary high polynomial estimator order.
+18
+A. The Conjugate Unscented Transformation
+Nonlinear moment propagation requires evaluating expectations of the form
+E
+
+𝑓(x)
+
+=
+∫
+R𝑛𝑓(x) 𝑝(x) dx,
+(91)
+which rarely admit closed forms beyond special cases. A long line of numerical integration methods approximates such
+integrals with deterministic point-weight rules, from classical Gaussian quadrature and fully symmetric cubature to
+sparse grids [30–32, 35, 36]. Within Bayesian estimation, this perspective underlies sigma-point filters: the UT and its
+variants replace the integral with a small set of weighted evaluations that reproduce low-order moments exactly and
+approximate higher-order ones [33, 34, 37]. The UT family achieves third-degree exactness with O(𝑛) points, offering a
+favorable cost-accuracy trade for many problems; however, third-degree rules can miscalibrate covariances in strongly
+nonlinear regimes or in the presence of non-Gaussian noise, motivating higher-degree but still scalable alternatives.
+The Conjugate Unscented Transformation (CUT) constructs symmetric sets of higher-degree sigma-points from
+conjugate tuples (signed permutations of unit vectors aligned with the axis) so that all odd central moments vanish by
+symmetry and targeted even moments are matched by design, as shown in [39–41].
+The CUT rules (e.g., CUT4, CUT6, CUT8) enforce fourth-, sixth-, or eighth-order moment constraints for a given
+prior family while keeping the number of points polynomial in dimension (typically O(𝑛), O(𝑛2), or O(𝑛3) depending
+on the degree), thus avoiding the exponential growth of Gauss-Hermite formulas while exceeding the accuracy of
+third-degree UT [30, 31, 33, 34, 39–41].
+The CUT generates a set of deterministic sigma points to match the central moments of a Gaussian distribution.
+Considering the state random variable in terms of its scaled deviation with respect to the mean, variable 𝝃, such that
+x = ˆx + C 𝝃,
+(92)
+with P = CC𝑇holds 𝝃∼N (0, I), the integral evaluation requested by the expected value operator is approximated in
+CUT by a weighted sum
+E
+
+𝑓(x)
+
+=
+∫
+R𝑛𝑓(x) 𝑝(x) dx ≈
+∑︁
+𝑖
+𝑤(𝑖) 𝑓(ˆx + C𝝃(𝑖))
+(93)
+where the sigma points 𝝃(𝑖) and weights 𝑤(𝑖) are selected such that this quadrature rule is exact for multivariate
+polynomials up to a prescribed degree under the Gaussian measure. That is, CUT generates weights and sigma points
+to match Gaussian moments. Exactness of the cubature rule for polynomial integrands translates into a hierarchy of
+19
+moment-matching constraints on the sigma points. The zeroth-order constraint
+∑︁
+𝑖
+𝑤(𝑖) = 1
+(94)
+ensures exact integration of constants. First-order exactness requires the weighted mean of the sigma points to vanish,
+∑︁
+𝑖
+𝑤(𝑖)𝝃(𝑖) = 0
+(95)
+while the second-order exactness enforces
+∑︁
+𝑖
+𝑤(𝑖)𝝃(𝑖)𝝃(𝑖)T = I,
+(96)
+which guarantees exact reproduction of the covariance. A defining feature of CUT is the use of conjugate-symmetric
+sigma-point sets, which automatically eliminate all odd-order central moments, yielding
+∑︁
+𝑖
+𝑤(𝑖)𝝃(𝑖) ⊗𝝃(𝑖) ⊗𝝃(𝑖) = 0
+(97)
+This symmetry is crucial for suppressing third-order truncation errors in nonlinear propagation. To achieve fourth-order
+accuracy, CUT enforces exact matching of the fourth central moments of a standard multivariate Gaussian. This is
+expressed compactly by the tensor identity
+∑︁
+𝑖
+𝑤(𝑖) 𝝃(𝑖)
+𝑝𝝃(𝑖)
+𝑞𝝃(𝑖)
+𝑟𝝃(𝑖)
+𝑠
+= 𝛿𝑝𝑞𝛿𝑟𝑠+ 𝛿𝑝𝑟𝛿𝑞𝑠+ 𝛿𝑝𝑠𝛿𝑞𝑟,
+∀𝑝, 𝑞, 𝑟, 𝑠∈{1, . . . , 𝑛}.
+(98)
+which is the same as the kurtosis evaluation of a Gaussian using Isserlis’s formulation [21], as shown in previous works
+[23]. For example, in scalar form, these constraints become
+∑︁
+𝑖
+𝑤(𝑖)  𝜉(𝑖)
+𝑘
+4 = 3,
+∑︁
+𝑖
+𝑤(𝑖)  𝜉(𝑖)
+𝑘
+2 𝜉(𝑖)
+𝑗
+2 = 1
+(𝑘≠𝑗),
+(99)
+corresponding to kurtosis and cross-kurtosis of the multivariate Gaussian [39–41], concluding the constraint equations
+set to implement a 4th order CUT. Importantly, these moment constraint equations depend only on the degree of
+exactness, not on the state dimension 𝑛. Consequently, once a CUT rule of a given order is derived, the associated radii
+and weights can be reused for arbitrary dimensions. The sigma points in the original state space are then obtained via
+the affine mapping Eq. (92).
+Figure 1 gives a visual representation of the set of conjugate sigma points in the bi-dimensional (a) and three-
+dimensional (b) case. Increasing the CUT 𝑐th-order physically means cutting the state space by an additional segment,
+thereby creating a larger set of conjugate sigma points. Therefore, CUT would reduce to the standard UT if an order
+20
+(a)
+(b)
+Fig. 1
+Symmetric set of CUT points and axes in (a) 2D space and (b) 3D first octant space
+𝑐= 2 were selected, as the moment-matching constraint equations would stop at the covariance level, yielding only the
+standard sigma points for the mean and covariance (yellow dots in the figure). The larger sigma-point set, designed to
+match higher moments, provides a more accurate evaluation of the expectations required by the polynomial update.
+Given the nonlinear dynamics system of Eq. (31) and the nonlinear measurement model of Eq. (32), the CUT can
+substitute the standard UT in the evaluation of the predicted means and covariances. Indeed, after creating the set of
+conjugate sigma points, whose number depends on the conjugate transformation order, the measurement mean and
+covariance are evaluated as deterministic summation, likewise in the standard UT.
+Because CUT reproduces higher-order moments of the prior, these weighted reductions incur smaller truncation
+errors than third-degree rules (standard UT), improving covariance calibration and residual consistency in strongly
+nonlinear mappings [33, 34, 39–41]. Once again, when process and measurement noises are not additive, the standard
+augmented-state is used (Eq. (65)), and the CUT generates the corresponding number of conjugate sigma points to
+account for the noise: 𝑛𝑎𝐶𝑈𝑇.
+For CUT4 with single- and pair-axis conjugate tuples, the sigma-point count scales as O 𝑛+ 𝑛(𝑛−1) = O(𝑛2);
+including triple-axis tuples for CUT6/CUT8 yields O(𝑛3) growth. These counts remain polynomial in 𝑛, markedly below
+Gauss-Hermite and comparable to sparse-grid rules at similar accuracy levels [31, 32]. Conjugate symmetry guaranties
+the exact cancellation of all odd central moments and typically admits nonnegative weights, which helps to maintain
+positive-definite covariance updates and improves numerical stability in square-root implementations [39–41]. When
+the prior is non-Gaussian, specialized CUT rules can be designed. For example, for uniform densities, by enforcing the
+appropriate moment conditions for that prior [42].
+CUT requires (i) a one-time solution of the scalar moment equations to obtain radii and weights for the chosen
+21
+degree and prior family; (ii) a square-root factorization at each step; and (iii) vectorized propagation of all sigma points
+through 𝑓() and ℎ(). The resulting means, covariances, and cross-covariances are computed by the same weighted
+sums as UT, making replacement straightforward in PAUKF.
+B. The Polynomial Augmented Conjugate Unscented Kalman Filter (PACUKF-𝑐)
+Building upon the augmented unscented transformation, the Polynomial Augmented Conjugate Unscented Kalman
+Filter (PACUKF-𝑐) extends the PAUKF by replacing the classical sigma set with the CUT𝑐point set of order 𝑐∈{4, 6, 8}.
+This construction preserves moment matching up to order 𝑐while retaining the augmented formulation that embeds
+both process and measurement noises.
+As before, define the augmented state using Eqs. (65), (66), and (67). Let {(𝝃(𝑖), 𝝁(𝑖))}2𝑛𝑎𝐶𝑈𝑇
+𝑖=0
+be the set of
+conjugate points of order 𝑐in R𝑛𝑎that satisfies the moment constraints, so that statistical moments up to order 𝑐are
+matched exactly, e.g., 𝑐= 6 ⇒CUT6 (sixth-order).
+Therefore, the PAUKF is improved to the PACUKF-𝑐by replacing UT with CUT𝑐, where the only difference from
+the previous derivation is the number of deterministic samples, namely, a total of 2𝑛𝑎𝐶𝑈𝑇+ 1 conjugate sigma points.
+After creating the set of conjugate augmented sigma points X𝑎(𝑖) with the desired order of CUT𝑐, the PACUKF-𝑐
+follows the same filtering structure, here summarized:
+X𝑎(𝑖)
+𝑘
+= 𝑓(X𝑥(𝑖)
+𝑘−1, X𝜇(𝑖)
+𝑘−1 )
+∀𝑖= 0, ..., 2𝑛𝑎𝐶𝑈𝑇
+(100)
+ˆx−
+𝑘=
+2𝑛𝑎𝐶𝑈𝑇
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑚X𝑥(𝑖)
+𝑘
+(101)
+P−
+𝑥𝑥,𝑘=
+2𝑛𝑎𝐶𝑈𝑇
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐(X𝑥(𝑖)
+𝑘
+−ˆx−
+𝑘)(X𝑥(𝑖)
+𝑘
+−ˆx−
+𝑘)𝑇
+(102)
+Y (𝑖)
+𝑘
+= ℎ(X𝑥(𝑖)
+𝑘
+, X𝜂(𝑖)
+𝑘−1 )
+∀𝑖= 0, ..., 2𝑛𝑎𝐶𝑈𝑇
+(103)
+ˆy𝑘=
+2𝑛𝑎𝐶𝑈𝑇
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑚Y (𝑖)
+𝑘
+(104)
+P𝑥𝑦[𝐽] =
+2𝑛𝑎𝐶𝑈𝑇
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿X𝑥(𝑖)
+𝑘
+𝛿Y[𝐽](𝑖)𝑇
+𝑘
+∀𝐽= 1, ..., 𝑁
+(105)
+P𝑦[𝐽] 𝑦[𝑆] =
+2𝑛𝑎𝐶𝑈𝑇
+∑︁
+𝑖=0
+𝑤(𝑖)
+𝑐𝛿Y[𝐽](𝑖)
+𝑘
+𝛿Y[𝑆](𝑖)𝑇
+𝑘
+∀𝐽, 𝑆= 1, ..., 𝑁
+(106)
+K = P𝑥YP−1
+YY
+(107)
+ˆx+
+𝑘= ˆx−
+𝑘+ K
+
+𝛿y,
+. . . ,
+𝛿y[𝑁] −v(P𝑦[𝑉] 𝑦[𝑀])
+𝑇
+(108)
+P+
+𝑥𝑥,𝑘= P−
+𝑥𝑥,𝑘−KPYYK𝑇
+(109)
+22
+This PACUKF-𝑐algorithm is a polynomial update filter of order 𝑁that embeds a conjugate unscented transformation of
+order 𝑐to approximate central moments.
+VIII. Numerical Applications
+The proposed algorithms have been applied to three different applications: firstly, the newly developed update
+techniques have been used in a simple scalar toy problem to visually highlight the benefits of the quadratic-CUT
+approach; secondly, they were tested with relative navigation in space application using Clohessy-Wiltshire equations
+with non-Gaussian measurement noises. Finally, the methodology was pitted against the Circular Restricted 3 Body
+Problem with Gaussian measurement noises.
+As multiple filters with a different set of options have been covered, their nomenclature is here summarized. The
+general shorthand filter name is in the form of the form “[estimator order][augmentation][method][Kalman Filter]-𝑐",
+where:
+• [estimation order] ∈{[·],[Q],[C],[P]} indicates the order of the polynomial update, with [·] for linear (e.g. UKF),
+[Q] for quadratic (e.g. QUKF), [C] for cubic (e.g. CUKF), and [P] for the general unspecified order (e.g., PUKF).
+• [augmentation] ∈{[·],[A]} denotes if the UT and CUT have been applied in their augment form, i.e., [A], or in
+their additive noise form, i.e., [·].
+• [method] ∈{[U],[CU]} specifies the selected methodology for the evaluation of expectations: [U] for UT, and
+[CU] for CUT.
+• 𝑐indicates the order of the conjugate unscented transformation in the case that CUT has been selected.
+For example, the selection CACUKF-6 indicates a cubic estimator embedded with the augmented conjugate transformation
+of sixth order. As is evident, each name combination builds upon the standard UKF.
+A quick consideration is due. As the standard UT is evaluated to match the covariance of a Gaussian distribution,
+the lowest order considered in the CUT is 𝑐= 4, as the second order CUT reduces to the UT, i.e., CUT2=UT, and odd
+moments have null contribution in the Gaussian case, e.g., CUT7=CUT6. That is, the filter QAUKF is identical to
+QACUKF-2.
+A. Scalar Problem
+A scalar problem is formulated to verify the improvements of the quadratic update, enabling nonlinear estimation,
+over any linear filtering techniques, such as the UKF. The problem will show how the cubic representation (CMMSE)
+better approximates the true MMSE function, especially when compared to its linear counterpart, the LMMSE, and its
+quadratic counterpart, the QMMSE.
+23
+Define a prior state 𝑥∼N (1, 0.05) and a measurement
+𝑦= arctan(𝑥) + 𝜂
+(110)
+where 𝜂∼N (0, 0.01) is the measurement noise and N indicates a Gaussian distribution.
+We then simulate the true joint distribution of 𝑥and 𝑦using 106 samples, reported in Fig. 2. The optimal (nonlinear)
+MMSE is the conditional mean, which visually is the curved line that divides in half the distribution of 𝑦(horizontal
+spread of gray points) for each value of 𝑥. Starting from a Gaussian distribution, the spread of the points follows the joint
+PDF (thus, the posterior) shape due to the nonlinearity of the measurement equation. The figure also shows different
+estimators in various colors: UKF, QUKF, QAUKF, QACUKF-4, and CACUKF-6. The UKF (cyan) is the straight line
+with the empty circle marker whose slope is the Kalman gain. A more accurate transformation of central moments leads
+to a better prediction in the measurement space and, therefore, to a more reliable Kalman gain. Conceptually, the optimal
+Kalman gain obtainable is represented by the red line, which represents the true LMMSE evaluated directly from the
+particles. Linear estimators, regardless of the technique that can be used to approximate moments, aim asymptotically at
+this line. In contrast, quadratic estimators have the capability of obtaining a curved function. In the figure, the QUKF
+Fig. 2
+Representation of the state-measurement joint distribution and of the relative estimates from different
+estimators.
+calculates 𝑃𝑥𝑦[2] directly from the sigma points, giving a non-null skewed behavior. The result is an estimator line that
+follows a parabolic trend in the variable 𝑦, as shown by the blue line. The QUKF estimate turns and follows the curved
+24
+shape of the posterior distribution, achieving a more accurate estimate. The QUKF curved behavior improves both
+the representation of the tails of the distribution and the region around the mode of the posterior PDF. The QAUKF,
+denoted by the blue star, follows the same logic but shows a little better improvement compared to QUKF due to its
+noise augmented nature in its propagation.
+The figure also shows the QACUKF-4, denoted by the purple full circle, which follows the curve of the PDF more
+accurately compared to the QUKF. This is due to the introduction of quadrature points generated by CUT. For every
+dimension, a combination of symmetric axes is selected from which points on the same set are obtained. Due to this,
+the accuracy of the QACUKF-4 is greatly improved. The curve of QACUKF-4 is observed to be nearly identical to the
+slope of QMMSE which is represented as an orange inverted triangle. Once again, the QMSSE is the optimal quadratic
+estimator, obtained directly form the points of the PDF. Lastly, we have the CACUKF-6 line denoted by the pink square.
+This line resembles the distribution the most when compared to other filters. This is mainly due to its higher order
+moments in the update as well as the higher CUT order, giving us more quadrature points to propagate from.
+The advantages of the quadratic approximation of the MMSE over the linear counterpart can be appreciated in Fig.
+3, where the root mean square error has been evaluated as
+𝑅𝑀𝑆𝐸=
+v
+u
+t𝑁𝑀𝐶
+∑︁
+𝑖=1
+( ˆ𝑥𝑖−𝑥𝑇)2
+(111)
+where 𝑥𝑇is the true value of 𝑥and 𝑁𝑀𝐶is the number of points representing the distribution. The filters have blue bars,
+while the MMSE bars are red to better distinguish between them. The LMMSE bar represents the best possible linear fit
+of the particles that make up the posterior distribution. The UKF is an accurate linear estimator whose performance is
+close to best possible obtainable LMMSE. Regardless of the techniques used, no linear estimator can break the accuracy
+threshold represented by the LMMSE bar. The QUKF is more accurate than the UKF, improving accuracy drastically
+thanks to the quadratic update being more reliable than mere linearization of the MMSE. Next, by augmenting the
+propagation with noise, the QAUKF does a slightly better improvement compared to the QUKF. However, it pales in
+comparison to the performance of the QACUKF-4 filter. This filter takes advantage of the extra sigma points provided by
+the CUT4 and gives an RMSE value which is really close to the QMMSE RMSE, thereby showing it’s effectiveness even
+in only second order filters. Indeed, different quadratic estimators differs on how well they approximate the high order
+central moments, providing more accurate Kalman gain constants. Regardless on the level of accuracy, no quadratic
+estimator can achieve a lower RMSE than the bar represented by the true QMMSE, as it is fitted directly from the
+simulated points.
+To prove that this is not a coincidence, the third order filters are implemented. The CACUKF-6 shows us that even
+with cubic terms, the filter is neck in neck with its corresponding MMSE. However, the CACUKF-6 cannot exceed the
+limit given by the optimal CMMSE, which represents one of the most accurate polynomial estimators achievable. On
+25
+Fig. 3
+RMSE among selected estimators
+the other hand, the CACUKF-6 is able to better follow the shape of the distribution, and its error is much lower than the
+UKF, with an improvement of around 25% in accuracy. Ref [20] showed that, conceptually, by increasing the order
+of the polynomial update higher, the accuracy keeps improving, until asymptotically it reaches the true MMSE. The
+PACUKF-𝑐derived in this paper enhances the use of the unscented transformation (and CUT) to obtain a polynomial
+representation of the true MMSE that outperforms linear estimators.
+B. Clohessy-Wiltshire Relative Motion
+The Clohessy-Wiltshire (CW) equations, also known as Hill’s equations, describe the relative motion of a chaser
+spacecraft with respect to a target spacecraft in a circular orbit. Assuming the target is in a circular orbit and a
+local-vertical-local-horizontal (LVLH) coordinate frame centered on the target, the linearized equations of motion for
+the relative position vector r = [𝑥, 𝑦, 𝑧]𝑇are given by:
+¥𝑥= 2𝛼¤𝑦+ 3𝛼2𝑥
+(112)
+¥𝑦= −2𝛼¤𝑥
+(113)
+¥𝑧= −𝛼2𝑧
+(114)
+where 𝛼is the mean motion of the chief’s circular orbit, defined as 𝛼=
+√︁
+𝜇/𝑎3, with 𝜇the Earth’s standard gravitational
+parameter, and 𝑎the semi-major axis of the chief’s orbit, assumed to be 7000 km. These equations assume linearized
+dynamics, valid for small separations relative to the orbital radius. The initial relative PDF is assumed to be a Gaussian
+26
+distribution with mean x0 = [r0 v0]𝑇given by
+r0 =
+
+2
+10
+−3.5
+𝑇
+km
+(115)
+v0 =
+
+0.01
+−0.005
+0.0005
+𝑇
+km/s
+(116)
+and covariance P0 defined as:
+P0 = blkdiag
+
+10−4I3km2, 10−9I3km/s2
+(117)
+where blkdiag() indicates the diagonal block operator and I3 a 3x3 identity matrix.
+Relative angle measurements are acquired by the chief every minute for 3 hours according to
+𝑦1 = arctan(𝑦/𝑥) + 𝜂1
+(118)
+𝑦2 = arcsin
+ 
+𝑧
+√︁
+𝑥2 + 𝑦2 + 𝑧2
+!
++ 𝜂2
+(119)
+where 𝜂𝑖is a non-Gaussian noise of zero mean, whose distribution is described in Table 1 [17, 19].
+Table 1
+Measurement noise distribution (rad)
+𝜂𝑘
+1e−3
+−3e−3
+−9e−3
+𝑃(𝜂𝑘)
+15
+18
+2
+18
+1
+18
+This application has been chosen since it presents a linear dynamic with nonlinear measurements. The linear system
+guarantees the exact uncertainty propagation of the state distribution, since a Gaussian PDF remains Gaussian after a
+linear transformation, and the standard Kalman filter represents the optimal solution if noises were Gaussians. Therefore,
+the difference and improvement in accuracy are due to the different order of measurement update. Figure 4 shows the
+relative motion of the target with respect to the chief, creating a helical pattern around the origin whose amplitude is
+connected to the mean motion of the reference orbit.
+The accuracy level and consistency of the filter are evaluated by Monte Carlo analysis, reported in Fig. 5 for the
+QUKF. In the figure, the position and velocity state errors for each run are evaluated at each time step, as
+𝜖𝑖= ˆ𝑥𝑖−𝑥𝑇
+(120)
+Each gray line is a separate simulation. The estimated covariance, in terms of the 3𝜎boundary, is calculated directly
+from the diagonal entries of the updated covariance matrix of the filter, and is reported in red. These lines indicate the
+filter’s own estimation of its error spread, and indicate how confident it is in its estimate. In comparison, the effective
+27
+Fig. 4
+Target’s relative motion with respect to the chief satellite.
+Fig. 5
+Monte Carlo Consistency Analysis for the Convergence of the QUKF.
+28
+covariance level, again in terms of the 3𝜎boundary, represents how the filter accuracy actually performs, as these levels
+of standard deviation are calculated directly from the Monte Carlo runs. A consistent filter has an overlap between the
+estimated and effective error covariance levels, meaning that it is able to correctly predict its own uncertainties in the
+estimates it provides. Thus, the QUKF is a consistent estimator that achieves the correct tracking of the target motion.
+QCUKF-4 and CCUKF-6 behave similarly to QUKF, and therefore, the Monte Carlo analysis has not been reported.
+Now that the consistency of QUKF has been assessed, it is of interest to compare its precision to its linear counterparts.
+Figure 6 shows the advantages in accuracy obtained by a QMMSE filter over an LMMSE one. The figure reports the
+error standard deviation levels both for position and velocity. Estimated covariances are evaluated directly from the
+updated step of the filter as
+𝜎𝑝𝑜𝑠,𝐸𝑆𝑇=
+√︁
+𝑃𝑥𝑥+ 𝑃𝑦𝑦+ 𝑃𝑧𝑧
+(121)
+𝜎𝑣𝑒𝑙,𝐸𝑆𝑇=
+√︃
+𝑃𝑣𝑥𝑣𝑥+ 𝑃𝑣𝑦𝑣𝑦+ 𝑃𝑣𝑧𝑣𝑧
+(122)
+while the effective error standard deviation, coming from the Monte Carlo analysis with multiple runs, is evaluated as
+𝜎𝑝𝑜𝑠,𝐸𝐹𝐹=
+v
+u
+u
+t
+∑︁
+𝑗={𝑥,𝑦,𝑧}
+ 𝑁𝑀𝐶
+∑︁
+𝑖=1
+(𝜖𝑗,𝑖−ˆ𝜖𝑗)2
+!
+(123)
+𝜎𝑣𝑒𝑙,𝐸𝐹𝐹=
+v
+u
+u
+t
+∑︁
+𝑗={𝑣𝑥,𝑣𝑦,𝑣𝑧}
+ 𝑁𝑀𝐶
+∑︁
+𝑖=1
+(𝜖𝑗,𝑖−ˆ𝜖𝑗)2
+!
+(124)
+for each time step of the simulation. Once again, a consistent filter is assessed by the overlapping of the two standard
+deviations, reported as continuous and dashed lines in the figure, respectfully. At first sight, the QUKF (in blue) and
+the QCUKF-4 (in green) show evident advantages in accuracy, with error levels well below those of the UKF (in red).
+The two quadratic update estimators better account for the non-Gaussianity of the noise distribution. Thanks to the
+knowledge and inclusion of the non-Gaussian noise high order central moments, both the QUKF and the QCUKF-4
+outperform the UKF, which has no information regarding the shape of the noise PDF and, therefore, assumes it as
+Gaussian.
+C. Circular Restricted 3 Body Problem
+In order to observe the behavior of the higher order filters, we put them against a considerably harder nonlinear
+system to test their robustness. Simulations were performed in many dimensionless planetary systems. In this paper, we
+will focus on the Earth-Moon system. The synodic rotating frame is centered at the Earth-Moon barycenter, with the
+x-axis pointing from Earth to the Moon, the z-axis aligned with the angular momentum of the system, and the y-axis
+29
+Fig. 6
+Error Standard Deviation Comparison between the linear estimators UKF and the quadratic estimators
+QUKF and QCUKF-4.
+completing the right-handed triad. Distances are normalized by the Earth-Moon distance (𝐿), and time is normalized by
+𝑇∗=
+√︄
+(𝐿∗)3
+𝜇𝑔(𝑚𝐸+ 𝑚𝑀) ,
+(125)
+so that the non-dimensional mean motion is unity. The corresponding length and time units are denoted by LU and TU
+respectively. The Earth-Moon mass parameter is taken as
+𝜇=
+𝑚𝑀
+𝑚𝐸+ 𝑚𝑀
+= 1.215058560962404 × 10−2,
+(126)
+so that in the rotating barycentric frame, the Earth and Moon are located at (𝑥, 𝑦, 𝑧) = (−𝜇, 0, 0) and (1 −𝜇, 0, 0)
+respectively. The system state is x = [r v]𝑇= [𝑥𝑦𝑧¤𝑥¤𝑦¤𝑧]𝑇, expressed in LU and LU/TU. The equations of motion
+follow the standard CR3BP form,
+𝑟1 =
+√︁
+(𝑥+ 𝜇)2 + 𝑦2 + 𝑧2,
+(127)
+𝑟2 =
+√︁
+(𝑥−1 + 𝜇)2 + 𝑦2 + 𝑧2,
+(128)
+𝑈𝑥= 𝑥−(1 −𝜇) 𝑥+ 𝜇
+𝑟13
+−𝜇𝑥−1 + 𝜇
+𝑟23
+,
+(129)
+𝑈𝑦= 𝑦−(1 −𝜇) 𝑦
+𝑟13 −𝜇𝑦
+𝑟23 ,
+(130)
+𝑈𝑧= −(1 −𝜇) 𝑧
+𝑟13 −𝜇𝑧
+𝑟23
+(131)
+30
+with the state dynamics;
+¤𝑥= 𝑣𝑥,
+(132)
+¤𝑦= 𝑣𝑦,
+(133)
+¤𝑧= 𝑣𝑧,
+(134)
+¤𝑣𝑥= 2𝑣𝑦+ 𝑈𝑥,
+(135)
+¤𝑣𝑦= −2𝑣𝑥+ 𝑈𝑦,
+(136)
+¤𝑣𝑧= 𝑈𝑧
+(137)
+These equations are implemented directly in the numerical propagator as a first-order ODE system. We used a northern
+halo orbit trajectory about the L1 libration point in the Earth-Moon system, shown in Fig. 7a. The initial condition and
+orbital period are taken from NASA’s JPL periodic orbit catalog for the three-body problem, specifically the Earth-Moon,
+Halo, Northern, L1 family (orbit 896 in the online database∗). The non-dimensional orbital period for this orbit is
+𝑇𝑝𝑒𝑟= 2.1783120807931518 TU, and the corresponding initial state is
+x0 =
+
+0.87592140310093525
+−1.59031517986629 × 10−26
+0.19175810982939320
+−2.93025310878967 × 10−14
+0.23080031482213192
+7.3649704261223776 × 10−14
+
+,
+(138)
+given in LU and LU/TU in the rotating barycentric frame.
+For the Monte Carlo experiments, the truth trajectory is generated by numerically integrating the CR3BP equations
+for the 𝑁𝑟𝑒𝑣= 2 orbital periods, i.e, 𝑡∈[0, 𝑡𝑓],
+𝑡𝑓= 𝑁𝑟𝑒𝑣𝑇𝑝𝑒𝑟with a sampling interval Δ𝑡= 𝑇𝑝𝑒𝑟/20. State
+propagation is performed using the variable-step ode45 (Runge-Kutta-Fehlberg) MATLAB’s integrator with relative
+and absolute tolerances of 10−12. Figure 7b shows the possible 100 trajectories taken by the satellite.
+To emulate unmodeled accelerations and modeling errors, zero-mean Gaussian process noise is added to the truth
+dynamics. The continuous-time process noise covariance is chosen as Q = 10−7I3, so that the injected perturbations
+primarily affect the velocity components at each propagation step. In the Monte Carlo implementation, process noise is
+∗NASA JPL, "Periodic Orbits in the Circular Restricted Three-Body Problem"
+31
+(a)
+(b)
+Fig. 7
+Example of a zoomed-in trajectory of a satellite in the CR3BP Earth-Moon system (a) and trajectory
+spread of CR3BP Monte Carlo simulation(b)
+applied additively to the velocity states at each sampling time:
+v(𝑡𝑘+) = v(𝑡𝑘−) + L𝑞w𝑘,
+w𝑘∼N (0, I3),
+(139)
+where L𝑞is a Cholesky factor of the velocity block of Q.
+Measurements are constructed as line-of-sight range and range-rate evaluated from the system barycenter. The range
+and range rate measurement models are
+𝜌= |r| ,
+¤𝜌= r𝑇v
+𝜌,
+(140)
+Thus, the measurement vector at time 𝑡𝑘provided to the filter includes noise
+y𝑘=
+
+𝜌𝑘
+¤𝜌𝑘
+𝑇
++ v𝑘,
+v𝑘∼N (0, R),
+(141)
+with a diagonal measurement covariance R = diag(𝜎𝑟2, 𝜎2
+¤𝑟), with 𝜎𝑟= 10−3LU and 𝜎¤𝑟= 10−3LU/TU. Higher-order
+central moments of the measurement noise (third- and fourth order) are also computed using the Isserlis theorem to
+support the polynomial update filter. The initial covariance of the state is taken as P0 = blkdiag(10−5I3, 10−5I3), which
+corresponds to small uncertainties in both position and velocity about the nominal halo orbit.
+Similarly to the Clohessy-Wiltshire application, consistency checks were implemented via Monte Carlo analysis.
+The position and velocity state errors were calculated in the same way as in the previous case, as shown in Fig. 8. The
+figure shows how the CACUKF-6 filter slowly converges the uncertainties even in highly unstable orbits or with high
+levels of Gaussian noise. The lower-order filters, such as the UKF, do not converge as well as the QACUKF-4 and
+32
+CACUKF-6 filters.
+Fig. 8
+Monte Carlo Consistency Analysis for the Convergence of the CACUKF-6
+To observe the quantitative difference among the UKF, QUKF, QACUKF-4, and CACUKF-6, Fig. 9 compares
+their respective Monte Carlo analysis. This figure compares the precision of the filters similar to the error standard
+deviation comparison for the CW case. The CACUKF-6 (green lines) shows the highest consistency and robustness in
+precision, followed by QACUKF-4 (red lines), as highlighted in the last section of the simulation when the trajectory
+of the spacecraft considerably leaves the periodic halo orbit. The UKF (black lines) loses tracking of the spacecraft,
+diverging right before 3 TU. Lastly, the QUKF (blue lines) is more accurate than the UKF, but not quite as precise as the
+filters embedded with the CUT.
+The filters proposed in this paper provide a natural improvement of the UKF in the sense that a parabolic fitting
+provides a more accurate representation than the linear approximation. We were able to obtain a quadratic approximation
+of the MMSE using well-known uncertainty propagation techniques such that the resulting QUKF and QAUKF are
+easily accessible to the general reader as new filter benchmarks. Moreover, the quadratic formulation of the update,
+which is the core of the QMMSE, can be expanded to any uncertainty transformation technique, as the Kronecker
+formulations provided work regardless of how P𝑦𝑦has been evaluated. Replacement of the unscented transformation
+with CUT improves the robustness and accuracy of the polynomial filters. An increase in the number of sigma points
+allows these filters to excel in highly nonlinear environments, provided that the calculations of radii and weights are
+done correctly depending on the dimension of the predicted and measured states.
+33
+Fig. 9
+Error Standard Deviation Comparison between the linear estimator (UKF), the Quadratic Estimators
+(QUKF and QACUKF-4) and the Cubic Estimator (CACUKF-6).
+IX. Conclusion
+The paper derived a quadratic approximation of the true MMSE, implemented alongside the standard UKF
+mathematics. That is, the proposed QUKF is the parabolic improvement of the linear UKF, so that the estimator
+better follows any curved shape of the true posterior distribution. The theoretical derivation of the quadratic estimator,
+approximation of the QMMSE, is extendable to any moment propagation technique, as long as they accurately provide a
+reliable evaluation of expectations. Indeed, the QUKF and QAUKF have been improved by including the conjugate
+unscented transformation to replace the standard UT, yielding more robust and consistent filters: QCUKF-𝑘and
+QACUKF-𝑘.
+The quadratic update approximates the true MMSE more accurately than the linear update, especially when
+influenced by non-Gaussian noise that requires information of high-order central moments, such as skewness and
+kurtosis. The QUKF and QACUKF-4 obtain additional information during the evaluation of the augmented Kalman
+gain, thereby providing a more accurate estimate, as they better understand the influence of the measurement noise
+distribution.
+Conceptually, the technique can be extended to any arbitrary high-order polynomial approximation of the update, as
+shown by the cubic representation of the MMSE: the CACUKF-𝑘filter, which is based on the CMMSE derivation. It
+requires a precise, attentive evaluation of the noise’s influence on expected-value estimates whenever dealing with the
+residual. In fact, as the order of the update increases, the knowledge of higher-order central moments of the distributions
+must be provided or approximated to guarantee the correct evaluation of the augmented Kalman gain and the proper
+34
+functionality of the filter.
+Regarding the benefits in estimation shown by the proposed numerical applications, the QUKF and QAUKF achieve
+significant improvements using well-known techniques and minor changes to the original UKF algorithm, so that the
+gains in accuracy come at a limited additional computational cost. When required by a more complex scenario with
+particularly strong nonlinearities, the inclusion of the CUT (QACUKF-𝑘and CACUKF-𝑘) ensures higher accuracy
+levels.
+References
+[1] Kalman, R. E., “A New Approach to Linear Filtering and Prediction Problems,” Journal of Basic Engineering, Vol. 82, No. 1,
+1960, pp. 35–45. https://doi.org/10.1115/1.3662552.
+[2] Gelb, A. (ed.), Applied Optimal Estimation, MIT Press, Cambridge, MA, 1974.
+[3] Junkins, J. L., and Singla, P., “How nonlinear is it? A tutorial on nonlinearity of orbit and attitude dynamics,” The Journal of
+the Astronautical Sciences, Vol. 52, 2004, pp. 7–60.
+[4] Julier, S. J., and Uhlmann, J. K., “Unscented filtering and nonlinear estimation,” Proceedings of the IEEE, Vol. 92, No. 3, 2004,
+pp. 401–422.
+[5] Arasaratnam, I., and Haykin, S., “Cubature Kalman Filters,” IEEE Transactions on Automatic Control, Vol. 54, No. 6, 2009, pp.
+1254–1269. https://doi.org/10.1109/TAC.2009.2019800.
+[6] Servadio, S., and Zanetti, R., “Differential algebra-based multiple Gaussian particle filter for orbit determination,” Journal of
+Optimization Theory and Applications, Vol. 191, No. 2, 2021, pp. 459–485.
+[7] Valli, M., Armellin, R., Di Lizia, P., and Lavagna, M., “A Gaussian Particle Filter Based on Differential Algebra for Spacecraft
+Navigation,” Proceedings of the 63rd International Astronautical Congress (IAC 2012), International Astronautical Federation,
+Naples, Italy, 2012, pp. 5178–5187.
+[8] Schei, T. S., “A finite-difference method for linearization in nonlinear estimation algorithms,” Automatica, Vol. 33, No. 11,
+1997, pp. 2053–2058.
+[9] Majji, M., Junkins, J. L., and Turner, J. D., “A high order method for estimation of dynamic systems,” The Journal of the
+Astronautical Sciences, Vol. 56, No. 3, 2008, pp. 401–440.
+[10] Valli, M., Armellin, R., Di Lizia, P., and Lavagna, M. R., “Nonlinear mapping of uncertainties in celestial mechanics,” Journal
+of Guidance, Control, and Dynamics, Vol. 36, No. 1, 2013, pp. 48–63.
+[11] Sorenson, H. W., and Alspach, D. L., “Recursive Bayesian estimation using Gaussian sums,” Automatica, Vol. 7, No. 4, 1971,
+pp. 465–479.
+35
+[12] Alspach, D., and Sorenson, H., “Nonlinear Bayesian estimation using Gaussian sum approximations,” IEEE transactions on
+automatic control, Vol. 17, No. 4, 2003, pp. 439–448.
+[13] Gordon, N. J., Salmond, D. J., and Smith, A. F. M., “Novel Approach to Nonlinear/Non-Gaussian Bayesian State Estimation,” IEE
+Proceedings F (Radar and Signal Processing), Vol. 140, No. 2, 1993, pp. 107–113. https://doi.org/10.1049/ip-f-2.1993.0015.
+[14] Hutter, F., and Dearden, R., “The gaussian particle filter for diagnosis of non-linear systems,” IFAC Proceedings Volumes,
+Vol. 36, No. 5, 2003, pp. 909–914.
+[15] Servadio, S., “Likelihood Scouting via Map Inversion for a Posterior-Sampled Particle Filter,” IEEE Transactions on Aerospace
+and Electronic Systems, 2024. https://doi.org/10.1109/TAES.2024.3446757, early Access.
+[16] De Santis, A., Germani, A., and Raimondi, M., “Optimal quadratic filtering of linear discrete-time non-Gaussian systems,”
+IEEE Transactions on Automatic Control, Vol. 40, No. 7, 1995, pp. 1274–1278.
+[17] Carravetta, F., Germani, A., and Raimondi, N., “Polynomial filtering of discrete-time stochastic linear systems with multiplicative
+state noise,” IEEE Transactions on Automatic Control, Vol. 42, No. 8, 1997, pp. 1106–1126.
+[18] Germani, A., Manes, C., and Palumbo, P., “Polynomial extended Kalman filter,” IEEE Transactions on Automatic Control,
+Vol. 50, No. 12, 2005, pp. 2059–2064.
+[19] Servadio, S., and Zanetti, R., “Recursive polynomial minimum mean-square error estimation with applications to orbit
+determination,” Journal of Guidance, Control, and Dynamics, Vol. 43, No. 5, 2020, pp. 939–954.
+[20] Servadio, S., Zanetti, R., and Jones, B. A., “Nonlinear filtering with a polynomial series of Gaussian random variables,” IEEE
+Transactions on Aerospace and Electronic Systems, Vol. 57, No. 1, 2020, pp. 647–658.
+[21] Isserlis, L., “On a formula for the product-moment coefficient of any order of a normal frequency distribution in any number of
+variables,” Biometrika, Vol. 12, No. 1/2, 1918, pp. 134–139.
+[22] Servadio, S., and Zanetti, R., “Estimation of the conditional state and covariance with taylor polynomials,” Journal of Advances
+in Information Fusion, Vol. 16, No. 2, 2021, p. 126.
+[23] Servadio, S., and Cherian, C., “Quadratic Extended and Unscented Kalman Filter Updates,” proceedings of the 2025 IEEE
+INTERNATIONAL CONFERENCE ON MULTISENSOR FUSION AND INTEGRATION FOR INTELLIGENT SYSTEMS, 2025.
+[24] Madankan, R., Pouget, S., Singla, P., Bursik, M., Dehn, J., Jones, M., Patra, A., Pavolonis, M., Pitman, E. B., Singh, T., and
+Webley, P., “Computation of Probabilistic Hazard Maps and Source Parameter Estimation for Volcanic Ash Transport and
+Dispersion,” Journal of Computational Physics, Vol. 271, 2014, pp. 39–59. https://doi.org/10.1016/j.jcp.2013.10.046.
+[25] Xiu, D., and Karniadakis, G. E., “The Wiener–Askey Polynomial Chaos for Stochastic Differential Equations,” SIAM Journal
+on Scientific Computing, Vol. 24, No. 2, 2002, pp. 619–644. https://doi.org/10.1137/S1064827501387826.
+36
+[26] Madankan, R., Singla, P., Singh, T., and Scott, P. D., “Polynomial-Chaos-Based Bayesian Approach for State and Parameter
+Estimation,” Journal of Guidance, Control, and Dynamics, Vol. 36, No. 4, 2013, pp. 1058–1074. https://doi.org/10.2514/1.58377.
+[27] Terejanu, G., Singla, P., Singh, T., and Scott, P. D., “Uncertainty Propagation for Nonlinear Dynamic Systems Using
+Gaussian Mixture Models,” Journal of Guidance, Control, and Dynamics, Vol. 31, No. 6, 2008, pp. 1623–1633. https:
+//doi.org/10.2514/1.36247.
+[28] Terejanu, G., Singla, P., Singh, T., and Scott, P. D., “Adaptive Gaussian Sum Filter for Nonlinear Bayesian Estimation,” IEEE
+Transactions on Automatic Control, Vol. 56, No. 9, 2011, pp. 2151–2156. https://doi.org/10.1109/TAC.2011.2141550.
+[29] Vishwajeet, K., Singla, P., and Jah, M., “Nonlinear Uncertainty Propagation for Perturbed Two-Body Orbits,” Journal of
+Guidance, Control, and Dynamics, Vol. 37, No. 5, 2014, pp. 1415–1425. https://doi.org/10.2514/1.G000472.
+[30] Stroud, A. H., Approximate Calculation of Multiple Integrals, Prentice-Hall, Englewood Cliffs, NJ, 1971.
+[31] Stroud, A. H., and Secrest, D., Gaussian Quadrature Formulas, Prentice-Hall, Englewood Cliffs, NJ, 1966.
+[32] Gerstner, T., and Griebel, M., “Numerical Integration Using Sparse Grids,” Numerical Algorithms, Vol. 18, No. 3–4, 1998, pp.
+209–232. https://doi.org/10.1023/A:1019129717644.
+[33] Julier, S., Uhlmann, J., and Durrant-Whyte, H. F., “A New Method for the Nonlinear Transformation of Means and
+Covariances in Filters and Estimators,” IEEE Transactions on Automatic Control, Vol. 45, No. 3, 2000, pp. 477–482.
+https://doi.org/10.1109/9.847726.
+[34] Wu, Y., Hu, D., Wu, M., and Hu, X., “A Numerical-Integration Perspective on Gaussian Filters,” IEEE Transactions on Signal
+Processing, Vol. 54, No. 8, 2006, pp. 2910–2921.
+[35] Stroud, A. H., “Numerical Integration Formulas of Degree Two,” Mathematics of Computation, Vol. 14, No. 69, 1960, pp.
+21–26.
+[36] McNamee, J., and Stenger, F., “Construction of Fully Symmetric Numerical Integration Formulas,” Numerische Mathematik,
+Vol. 10, No. 4, 1967, pp. 327–344. https://doi.org/10.1007/BF02162160.
+[37] Julier, S., and Uhlmann, J., “Reduced Sigma Point Filters for the Propagation of Means and Covariances Through Nonlinear
+Transformations,” Proceedings of the American Control Conference (ACC), IEEE, Anchorage, AK, USA, 2002, pp. 887–892.
+[38] Adurthi, N., and Singla, P., “Conjugate Unscented Transformation-Based Approach for Accurate Conjunction Analysis,” Journal
+of Guidance, Control, and Dynamics, Vol. 38, No. 9, 2015, pp. 1642–1658. https://doi.org/10.2514/1.G001027.
+[39] Adurthi, N., Singla, P., and Singh, T., “The Conjugate Unscented Transform–An Approach to Evaluate Multi-Dimensional
+Expectation Integrals,” Proceedings of the American Control Conference (ACC), IEEE, Montreal, QC, Canada, 2012, pp.
+5556–5561.
+37
+[40] Adurthi, N., “The Conjugate Unscented Transform–A Method to Evaluate Multidimensional Expectation Integrals,” Master’s
+thesis, University at Buffalo, The State University of New York, Buffalo, NY, 2012.
+[41] Adurthi, N., Singla, P., and Singh, T., “Conjugate Unscented Transformation: Applications to Estimation and Control,” Journal
+of Dynamic Systems, Measurement, and Control, Vol. 140, No. 3, 2018, p. 030907. https://doi.org/10.1115/1.4037783, published
+online November 8, 2017.
+[42] Adurthi, N., Singla, P., and Singh, T., “Conjugate Unscented Transform Rules for Uniform Probability Density Functions,”
+Proceedings of the American Control Conference (ACC), IEEE, Washington, DC, USA, 2013, pp. 2454–2459. https:
+//doi.org/10.1109/ACC.2013.6580202.
+[43] Zanetti, R., Popov, A. A., Michaelson, K., Giraldo-Grueso, F., Durant, D., Servadio, S., and Hanebeck, U. D., “A Survey of
+Nonlinear Estimation Filters,” Journal of Advances in Information Fusion, ????
+38

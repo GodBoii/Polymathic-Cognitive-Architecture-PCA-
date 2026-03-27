@@ -1,0 +1,1720 @@
+MARCHUK∗: EFFICIENT GLOBAL WEATHER FORECASTING FROM
+MID-RANGE TO SUB-SEASONAL SCALES VIA FLOW MATCHING
+Arsen Kuzhamuratov1,2, †, Mikhail Zhirnov1,2, Andrey Kuznetsov1,2, Ivan Oseledets1, and Konstantin Sobolev1,2
+1AXXX
+2FusionBrain Lab
+†kuzhamuratov@fusionbrainlab.com
+ABSTRACT
+Accurate subseasonal weather forecasting remains a major challenge due to the inherently chaotic
+nature of the atmosphere, which limits the predictive skill of conventional models beyond the mid-
+range horizon (approximately 15 days). In this work, we present Marchuk, a generative latent
+flow-matching model for global weather forecasting spanning mid-range to subseasonal timescales,
+with prediction horizons of up to 30 days. Marchuk conditions on current-day weather maps
+and autoregressively predicts subsequent days’ weather maps within the learned latent space. We
+replace rotary positional encodings (RoPE) with trainable positional embeddings and extend the
+temporal context window, which together enhance the model’s ability to represent and propagate
+long-range temporal dependencies during latent forecasting. Marchuk offers two key advantages:
+high computational efficiency and strong predictive performance. Despite its compact architecture of
+only 276 million parameters, the model achieves performance comparable to LaDCast, a substantially
+larger model with 1.6 billion parameters, while operating at significantly higher inference speeds. We
+open-source our inference code and model at: https://v-gen-ai.github.io/Marchuk/
+Keywords Weather Forecasting · Flow Matching · DiT · Latent Diffusion
+1
+Introduction
+Subseasonal-to-seasonal (S2S) weather forecasting, encompassing the 2-to-6-week timeframe, is of critical importance
+to a wide range of economic sectors and societal activities. The ability to provide early warnings of anomalous
+conditions and support long-range planning hinges on the accuracy of predictions at these extended lead times. However,
+this temporal regime remains a formidable challenge for numerical weather prediction. The predictive skill of most
+operational models degrades rapidly beyond two weeks, often failing to outperform simple climatological benchmarks –
+i.e., the average values of the past decades. This predictability barrier is fundamentally driven by the chaotic nature
+of the atmosphere. As highlighted by recent studies [1], unavoidable errors in initial conditions grow approximately
+exponentially over time-governed by the system’s leading Lyapunov exponents – leading to a catastrophic accumulation
+of error that fundamentally limits deterministic predictability.
+Contemporary deep learning models have revolutionized mid-term forecasting. Models such as GenCast [2], Weath-
+erNext2 [3], and Aurora [4] have demonstrated state-of-the-art performance for lead times up to 15 days, often
+surpassing traditional physics-based methods. While these models represent a significant leap forward, their skill is
+approaching a point of saturation within this 15-day window. Furthermore, their primary challenge remains surpassing
+the climatology baseline at longer horizons, and this performance comes at the cost of substantial computational
+resources for both training and inference.
+∗Gury Marchuk was a Soviet mathematician who significantly advanced weather forecasting by creating mathematical models
+of the atmosphere and ocean and developing numerical algorithms for prediction. His key innovation was the method of splitting
+(fractional steps), which made solving complex weather equations more efficient.
+arXiv:2603.24428v1  [cs.LG]  25 Mar 2026
+Marchuk: Technical report
+Figure 1: Marchuk operates in the latent space learned by the DC-AE model introduced in LaDCast. Within this latent
+space, we train a flow-matching Diffusion Transformer (DiT) to model the conditional distribution of future weather
+fields given the current state, enabling efficient and accurate probabilistic forecasting.
+In response to the demand for longer-range forecasts, specialized S2S prediction systems are being developed. Models
+like the one from the Subseasonal-to-Seasonal (S2S) project - FuXi-S2S [5] are designed to operate on horizons
+extending well beyond two weeks. FuXi-S2S, for instance, simplifies the forecasting task by predicting daily mean
+values rather than high-frequency (e.g., 6-hourly or hourly) states, which is a pragmatic approach for extended ranges.
+Concurrently, generative modeling has emerged as a powerful paradigm for weather forecasting. LaDCast [6] introduced
+a latent diffusion framework, drawing a direct parallel to video and image generation models. By operating in the
+compressed latent space of a DC-AE (Deep Compressed AutoEncoder) [7], LaDCast demonstrated that high-quality
+forecasts could be generated with reduced computational demands.
+Despite recent advances, important challenges remain. The current state-of-the-art latent diffusion model for weather
+forecasting, LaDCast, continues to exhibit degraded accuracy at extended lead times and is constrained in operational
+settings by its large parameter size and slow inference throughput. These limitations reduce its practical utility for
+extended-range probabilistic forecasting and impede deployment in time-sensitive or resource-constrained environments.
+To address these gaps, we introduce Marchuk, a novel latent flow-matching Diffusion Transformer (DiT) architected for
+efficient and accurate forecasting from short-range through subseasonal horizons. Marchuk replaces the geometry-aware
+rotary positional encodings (e.g., GeoRoPE) used in LaDCast with a temporal RoPE-1D complemented by trainable
+spatial positional embeddings, and substantially extends the conditional context window to better capture long-range
+temporal variability. We further adopt a variable-length training strategy across prediction sequences, and validate our
+design choices through an extensive set of ablation experiments. By combining an optimized architecture with the
+computational advantages of latent diffusion, Marchuk attains competitive or superior predictive performance while
+dramatically reducing computational cost and improving inference speed, thereby making extended-range probabilistic
+forecasting substantially more practical.
+2
+Related work
+Recent progress in machine learning for weather forecasting has produced a variety of data-driven models that
+significantly improve short- and medium-range prediction skill. Most state-of-the-art mid-term global forecasting
+models (up to 10–15 days) operate directly on pixel-level atmospheric fields. These models are typically trained on
+large reanalysis datasets such as ERA5 (i.e., the 5th generation of ECMWF reanalysis data) [8] and adopt architectures
+inspired by computer vision. For instance, GraphCast [9] employs graph neural networks (GNNs) to better represent
+the spherical structure of the Earth and capture long-range spatial dependencies. Other prominent approaches, including
+Pangu-Weather [10], FuXi [11], and Aurora [4] rely on convolutional neural networks or transformer-based vision
+architectures (e.g., DiT-style blocks) to process global weather maps.
+Despite their success, pixel-space models remain computationally expensive due to the extremely high dimensionality
+of atmospheric data. To address this limitation, recent work has explored latent-space forecasting, where atmospheric
+fields are first compressed before prediction. LaDCast [6] represents a key development in this direction. It introduces
+the first multi-modal diffusion transformer (MM-DiT) based latent model for global weather prediction. The approach
+employs a deep compression autoencoder (DC-AE) that compresses spatial weather fields by up to 64×, after which
+a transformer-based model performs the temporal forecasting in the learned latent space. Operating in latent space
+substantially reduces memory and computational requirements while maintaining high forecast quality. Empirical
+2
+Marchuk: Technical report
+results show that latent approaches can outperform several pixel-space baselines, including Pangu-Weather, GenCast
+[2], and even traditional numerical weather prediction systems such as IFS-ENS for medium-range forecasts.
+Evaluation of machine-learning weather models is typically performed using the WeatherBench family of benchmarks
+[12] (WeatherBench, WeatherBench-2, and WeatherBench-X). These frameworks provide standardized datasets and
+metrics for evaluating deterministic and probabilistic forecasting performance across multiple atmospheric variables,
+and they have become the de facto standard for benchmarking global weather prediction models.
+Extending machine learning methods to subseasonal forecasting (2-6 week lead times) presents additional challenges.
+This regime is often referred to as the predictability desert, where forecast skill arises from both atmospheric initial
+conditions and slowly evolving boundary conditions, but neither source alone provides sufficient predictive signal.
+Traditional numerical weather prediction (NWP) systems address this uncertainty through ensemble forecasting;
+however, operational ensembles are typically limited to 4-51 members, whereas theoretical studies suggest that 100-200
+members would be required to adequately represent uncertainty. Furthermore, generating dynamically balanced
+perturbations of the initial state remains a difficult problem.
+Recent machine learning models have begun addressing these limitations. FuXi-S2S [5] extends earlier FuXi architec-
+tures to subseasonal forecasting by incorporating a richer set of atmospheric variables (including multiple pressure
+levels and surface variables) and introducing a VAE-inspired perturbation module that learns flow-dependent pertur-
+bations directly in latent space. This approach improves both deterministic and probabilistic forecast skill relative to
+operational NWP systems and demonstrates enhanced capability in predicting large-scale climate phenomena such as
+the Madden-Julian Oscillation (MJO).
+Parallel advances have been made in probabilistic forecasting using diffusion models. GenCast showed that diffusion-
+based approaches operating directly in physical space can outperform traditional ensemble prediction systems in
+probabilistic metrics, albeit at high computational cost. Building on this idea, LaDCast introduces the first global
+latent diffusion framework for medium-range ensemble forecasting, combining a deep compression autoencoder with
+a transformer-based diffusion model. Additional architectural innovations – including Geometric Rotary Position
+Embedding (GeoRoPE) to encode spherical geometry and dual-stream attention for efficient conditioning – enable the
+model to generate hourly ensemble forecasts up to 15 days ahead. Notably, LaDCast demonstrates strong performance
+in predicting extreme events, producing accurate ensemble trajectories for tropical cyclones outside the training
+distribution.
+Overall, these developments highlight two emerging directions in machine learning weather prediction: pixel-space
+architectures inspired by vision models and latent-space generative models that significantly reduce computational
+complexity while enabling probabilistic forecasting.
+3
+Methods
+Overview. We present Marchuk, a latent generative weather-forecasting model developed within the LaDCast paradigm
+(see Figure 1). Marchuk comprises two principal components. First, a 2D deep-compression autoencoder (DC-AE)
+maps high-dimensional atmospheric fields into a compact latent space with approximately 64× spatial compression; for
+our experiments we employ the pretrained DC-AE from LaDCast. Second, a Diffusion Transformer (DiT) – trained
+in the DC-AE latent space – models the temporal dynamics of these latent representations. Forecast generation is
+implemented using a Flow Matching (FM) formulation, which allows effective deterministic sampling using a relatively
+small number of inference steps. A batched forecasting strategy (producing four-day forecasts per forward pass)
+combined with autoregressive rollout supports ensemble prediction horizons of up to 30 days. Below we provide details
+of the dataset, model architecture, training procedure, inference strategy, and evaluation protocol.
+3.1
+Data and Preprocessing
+We use the ERA5 reanalysis dataset from ECMWF, provided in the WeatherBench2 format. The dataset contains
+global atmospheric fields on a 1.5◦grid (240 × 121 spatial resolution) with hourly temporal resolution.
+Following LaDCast [6], the input variable set includes 13 pressure levels for six atmospheric variables (geopotential,
+temperature, zonal wind, meridional wind, specific humidity, and vertical velocity), as well as six surface variables:
+2-m temperature, 10-m zonal and meridional wind, mean sea level pressure, sea surface temperature, and 6-hour
+accumulated precipitation. This results in a total of 84 input channels.
+WeatherBench2 provides a cloud-hosted ERA5 dataset covering the period 1979-2022. For training we use the period
+1979-2017, while 2018-2021 is reserved for evaluation. Additionally, a case study from January 2026 is used for
+qualitative validation.
+3
+Marchuk: Technical report
+Figure 2: Marchuk is conditioned on weather maps from the previous K days and is provided with noised weather maps
+for the subsequent N days as input. The model generates refined forecasts for the next N days, effectively denoising
+and predicting future weather states.
+Figure 3: Marchuk is flow matching DiT model with additional architecture optimizations.
+During training, a random temporal anchor is sampled at hourly resolution. From this anchor, a sequence of 20 time
+steps is extracted at 6-hour intervals (1 day of context and 4 days of forecast horizon). Global atmospheric fields are
+represented as 2D tensors obtained by unfolding the spherical grid. Static fields such as land-sea mask and orography
+are incorporated as additional channels and processed by the autoencoder.
+3.2
+Model Architecture
+Latent Diffusion Transformer (DiT).
+Latent representations are processed by a transformer-based diffusion model
+that predicts their temporal evolution. The model takes as input K days of conditioning information (i.e., the current
+atmospheric state) together with a noisy version of the subsequent N days of weather states (Figure 2). The model
+then outputs a refined estimate of the future N-day weather trajectory. In our experiments, we explore different
+configurations of K and N to optimize predictive performance while reducing the number of autoregressive steps.
+We adopt the Cross-DiT architecture [13] and further optimize the MLP-based modulation layers following the same
+work. In particular, the authors propose a more parameter-efficient design for diffusion timestep conditioning by
+replacing per-block MLP modulation with a shared MLP layer across all DiT blocks, complemented by lightweight
+LoRA adaptations specific to each block. This approach significantly reduces the number of parameters associated
+with timestep modulation – from approximately 40% to less than 10%, depending on the chosen LoRA configuration –
+4
+Marchuk: Technical report
+while allowing the model to allocate more capacity to the attention layers. A schematic overview of the architecture is
+provided in Figure 3.
+Another key architectural component is the incorporation of timestamp embeddings within the Cross-Attention blocks
+of the DiT architecture (Figure 3). We represent timestamp in the format month:day:hour and assign a distinct trainable
+embedding to each possible timestamp (366 days × 24 hours, yielding exactly 8,784 distinct embeddings). These
+embeddings are concatenated with the input spatial-temporal latent tokens prior to the Cross-Attention operation. This
+design enables the model to capture long-range temporal dependencies at the annual scale, while the joint representation
+with visual tokens allows the attention mechanism to selectively focus on temporally relevant features.
+Positional and Temporal Encoding.
+Because the latent representation preserves global spatial geometry, positional
+encoding must take the spherical structure of the Earth into account. LaDCast addresses this with GeoRoPE, a geometric
+rotary positional embedding that decomposes spatial encoding into latitude and longitude components and extends the
+scheme to the temporal axis; the original authors select rotary frequencies using domain knowledge.
+In Marchuk, we adopt a simplified strategy consisting of learnable 2-D spatial positional embeddings together with
+1-D rotary positional embeddings (RoPE) applied along the temporal dimension. As Marchuk operates at a fixed
+spatial resolution, the principal advantage of 2-D RoPE – its ability to generalize across resolutions – is not required;
+consequently, a fixed set of trainable spatial embeddings provides sufficient representational flexibility while reducing
+the strength of hard-coded geometric priors.
+3.3
+Training Procedure: Variable Horizon Training
+During training, we employ a Variable Horizon Training (VHT) strategy to improve the model’s robustness across
+multiple temporal scales. The input context is fixed at 24 hours (four time steps at 6-hour intervals), while the prediction
+horizon for each training example is sampled uniformly between 1 and 8 days. This variable horizon strategy – in which
+target lengths vary across batches – was found to yield better predictive performance and more stable autoregressive
+rollouts than training with a single fixed window or applying post hoc fine-tuning.
+3.4
+Inference and Ensemble Forecasting
+Table 1: Inference Speed. The model performs predictions entirely in the latent space for a 30-day forecast horizon
+with an ensemble size of 50, executed on an H100 GPU. Reported measurements account only for the forecasting
+component, excluding encoding / decoding.
+Model
+# params
+#diffusion steps
+Speed, min
+LaDCast
+375M
+10
+11
+LaDCast
+1.6B
+10
+45
+Marchuk
+276M
+20
+7.5
+During inference, forecasts are produced autoregressively in the latent space. For each forward pass the model predicts
+latent states for the next four days (16 time steps at 6-hour intervals); these predicted latents are then appended to
+the conditioning context and used as input for the subsequent prediction step, permitting rollouts to horizons of up
+to 30 days. Probabilistic (ensemble) forecasts are obtained by repeating the generation process with independent
+noise seeds: in our experiments we typically employ ensembles of 20-50 members. Sampling is carried out with the
+flow-matching sampler using approximately 20 integration (denoising) steps per trajectory. Operating in a highly
+compressed latent space substantially reduces memory and computational costs and enables efficient parallel evaluation
+of many trajectories. For example, Marchuk produces a 30-day ensemble forecast of 50 members in roughly 7.5 minutes
+on a single NVIDIA H100 GPU (see Table 1).
+4
+Experiments
+4.1
+Evaluation Metrics
+Model performance is evaluated using the WeatherBench-2 [12] evaluation framework. We report both deterministic
+and probabilistic forecast metrics.
+Deterministic metrics include:
+• Latitude-weighted Root Mean Squared Error (RMSE)
+5
+Marchuk: Technical report
+Table 2: Comparison to LaDCast. We report RMSE metrics at 15-day forecast horizons. The evaluated variables
+include atmospheric fields – UW500 (u-component of wind at 500 hPa), T500 (temperature at 500 hPa), G500
+(geopotential at 500 hPa), and SH500 (specific humidity at 500 hPa) – as well as surface fields – SLP (sea level
+pressure), 10m-UW and 10m-VW (u- and v-components of wind at 10 meters), and T2M (temperature at 2 meters).
+Method
+UW500
+T500
+G500
+SH500, 10−3
+SLP
+10m-UW
+10m-VW
+T2M
+LaDCast, 375M
+8.14
+3.07
+784.21
+0.832
+690.74
+3.81
+3.93
+2.59
+LaDCast, 1.6B
+8.08
+3.04
+774.18
+0.796
+684.29
+3.77
+3.91
+2.54
+Marchuk, 276M
+8.15
+3.08
+785.91
+0.803
+697.89
+3.80
+3.95
+2.52
+Climatology
+8.55
+3.18
+810.57
+0.857
+711.21
+3.96
+4.02
+2.66
+Table 3: Comparison to LaDCast. We report RMSE metrics at 30-day forecast horizons. The evaluated variables
+include atmospheric fields – UW500 (u-component of wind at 500 hPa), T500 (temperature at 500 hPa), G500
+(geopotential at 500 hPa), and SH500 (specific humidity at 500 hPa) – as well as surface fields – SLP (sea level
+pressure), 10m-UW and 10m-VW (u- and v-components of wind at 10 meters), and T2M (temperature at 2 meters).
+Method
+UW500
+T500
+G500
+SH500, 10−3
+SLP
+10m-UW
+10m-VW
+T2M
+LaDCast, 375M
+8.47
+3.26
+840.58
+0.883
+727.40
+3.93
+4.01
+2.80
+LaDCast, 1.6B
+8.40
+3.17
+815.53
+0.825
+713.08
+3.87
+3.97
+2.66
+Marchuk, 276M
+8.40
+3.16
+809.15
+0.836
+715.79
+3.86
+3.99
+2.64
+Climatology
+8.55
+3.18
+810.57
+0.857
+711.21
+3.96
+4.02
+2.66
+• Anomaly Correlation Coefficient (ACC)
+Probabilistic metrics include:
+• Continuous Ranked Probability Score (CRPS)
+• CRPS Skill
+• CRPS Spread
+Metrics are averaged over latitude and time and evaluated on standard meteorological variables such as Z500 and T850.
+Performance is compared against LaDCast models family: small (375M) and big (1.6B).
+Evaluation Protocol.
+All evaluation metrics presented in the subsequent figures and tables (Figures 4–9 and Tables 2–
+5) were computed using 100 initialization dates sampled uniformly from the test years 2018 and 2021, strictly following
+the WeatherBench-2 evaluation framework.
+Executive summary. The 276M-parameter Marchuk model consistently outperforms the LaDCast 375M baseline
+across the evaluated metrics and attains performance comparable to the much larger LaDCast 1.6B model. Moreover,
+the 276M variant of Marchuk achieves an approximately 6× speedup relative to LaDCast 1.6B (see Table 1) while
+maintaining similar quantitative accuracy.
+Deterministic metrics. Deterministic performance is reported in terms of latitude-weighted RMSE and anomaly
+correlation coefficient (ACC) in Figures 4 and 7; these plots also include the DC-AE reconstruction error and climatology
+baselines for reference. We evaluate forecasts up to a 30-day horizon: for lead times shorter than 30 days, both Marchuk
+and LaDCast outperform climatology on nearly all considered variables. Tables 2 and 3 summarize aggregated error
+statistics at 15- and 30-day horizons, complementing the figures which display the temporal evolution of forecast error
+over the entire 30-day period.
+Ensemble metrics. Figures 5, 8 and 9, together with Tables 4 5, present probabilistic (ensemble) evaluation metrics
+that distinguish a generative forecasting system from a deterministic regression baseline. The skill metric quantifies the
+average agreement between the ensemble and the observations, whereas the spread measures the ensemble’s internal
+dispersion (pairwise differences between members). The Continuous Ranked Probability Score (CRPS) provides a
+single summary of probabilistic performance by jointly reflecting agreement (skill) and dispersion (sharpness/spread).
+Our results indicate that Marchuk attains higher ensemble skill than the baseline while exhibiting a modestly reduced
+spread. We attribute this pattern primarily to the larger conditioning window used by Marchuk (one day of context)
+relative to LaDCast (single-step context, i.e., 6 hours): a longer conditioning interval improves trajectory agreement but
+can also constrain ensemble variability, yielding lower spread even as average forecast accuracy increases.
+6
+Marchuk: Technical report
+0
+5
+10
+15
+20
+25
+30
+2
+3
+4
+5
+6
+7
+8
+RMSE
+u_component_of_wind @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+temperature @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0
+100
+200
+300
+400
+500
+600
+700
+800
+geopotential @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0003
+0.0004
+0.0005
+0.0006
+0.0007
+0.0008
+0.0009
+specific_humidity @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+1
+2
+3
+4
+5
+6
+RMSE
+u_component_of_wind @ 700 hPa
+0
+5
+10
+15
+20
+25
+30
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+temperature @ 700 hPa
+0
+5
+10
+15
+20
+25
+30
+0
+100
+200
+300
+400
+500
+600
+geopotential @ 700 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0006
+0.0008
+0.0010
+0.0012
+0.0014
+0.0016
+specific_humidity @ 700 hPa
+0
+5
+10
+15
+20
+25
+30
+1
+2
+3
+4
+5
+6
+RMSE
+u_component_of_wind @ 850 hPa
+0
+5
+10
+15
+20
+25
+30
+1.0
+1.5
+2.0
+2.5
+3.0
+3.5
+temperature @ 850 hPa
+0
+5
+10
+15
+20
+25
+30
+0
+100
+200
+300
+400
+500
+geopotential @ 850 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0008
+0.0010
+0.0012
+0.0014
+0.0016
+0.0018
+specific_humidity @ 850 hPa
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0
+100
+200
+300
+400
+500
+600
+700
+RMSE
+mean_sea_level_pressure
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+3.5
+4.0
+10m_u_component_of_wind
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+3.5
+4.0
+10m_v_component_of_wind
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+1.0
+1.5
+2.0
+2.5
+2m_temperature
+AE error
+Climatology 0.25°
+Marchuk 276M
+LaDCast 375M
+LaDCast 1.6B
+Figure 4: RMSE comparison. We evaluate LaDCast and Marchuk on the WeatherBench-2 benchmark over a 30-day
+prediction horizon. The atmospheric variables include the u-component of wind, temperature, geopotential, and specific
+humidity at 500, 750, and 850 hPa levels. Surface variables include mean sea level pressure, 10-meter wind u- and
+v-components, and temperature at 2 meters. Marchuk outperforms the small LaDCast model and achieves comparable
+performance to the large LaDCast model. Beyond approximately 30 days, both models’ forecasts converge toward
+climatology, indicating that extending the prediction horizon further provides limited practical value.
+4.2
+Extreme Event Case Study: The January 2026 Moscow Cold Wave
+To evaluate the model’s capacity to predict extreme out-of-distribution events, we conducted a case study of the severe
+cold wave that struck Moscow in late January 2026. During this event, nighttime temperatures plummeted below
+−20◦C. For this experiment, we defined the target region using a bounding box over Moscow (55–58° N, 35–39° E)
+and generated predictive ensembles of 250 members.
+7
+Marchuk: Technical report
+0
+5
+10
+15
+20
+25
+30
+1.0
+1.5
+2.0
+2.5
+3.0
+3.5
+4.0
+4.5
+CRPS
+u_component_of_wind @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+temperature @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+50
+100
+150
+200
+250
+300
+350
+400
+geopotential @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.00015
+0.00020
+0.00025
+0.00030
+0.00035
+0.00040
+specific_humidity @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+50
+100
+150
+200
+250
+300
+CRPS
+mean_sea_level_pressure
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+1.8
+10m_u_component_of_wind
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+1.1
+1.2
+2m_temperature
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.00020
+0.00025
+0.00030
+0.00035
+0.00040
+0.00045
+0.00050
+total_precipitation_6hr
+AE error
+Marchuk 276M
+LaDCast 375M
+LaDCast 1.6B
+Figure 5: CRPS Ensemble Metrics Comparison. Figure illustrates the evolution of CRPS over a 30-day forecast
+horizon. The first row presents results for atmospheric variables at the 500 hPa level, including the u-component of
+wind, temperature, geopotential, and specific humidity. The second row shows CRPS for surface variables, namely
+mean sea level pressure, the 10-meter u-component of wind, 2-meter temperature, and total accumulated precipitation
+over 6 hours.
+Table 4: Comparison to LaDCast. We report CRPS metrics at 15-day forecast horizons. The evaluated variables
+include atmospheric fields – UW500 (u-component of wind at 500 hPa), T500 (temperature at 500 hPa), G500
+(geopotential at 500 hPa), and SH500 (specific humidity at 500 hPa) – and surface fields – SLP (sea level pressure), 10m-
+UW (u-component of wind at 10 meters), T2M (temperature at 2 meters), and TP-6h (total accumulated precipitation
+over the last 6 hours).
+Method
+UW500
+T500
+G500
+SH500, 10−3
+SLP
+10m-UW
+T2M
+TP-6h, 10−3
+LaDCast, 375M
+4.23
+1.49
+354.07
+0.394
+305.53
+1.85
+1.13
+0.520
+LaDCast, 1.6B
+4.19
+1.45
+338.43
+0.377
+299.99
+1.82
+1.09
+0.515
+Marchuk, 276M
+4.26
+1.47
+343.34
+0.385
+310.33
+1.85
+1.10
+0.519
+The results in Figure 6 demonstrate that at lead times greater than 15 days, the model predicts only baseline climatological
+probabilities (∼5–10%). However, as the event approaches, Marchuk predicts increasing anomaly probability reaching
+approximately 80–90% close to the event date.
+4.3
+Ablations
+We performed a set of controlled ablation experiments to quantify the influence of several architectural and training
+choices on Marchuk’s forecasting performance. Specifically, we evaluated (i) positional encoding schemes including
+trainable spatial embeddings, (ii) fixed input window lengths, (iii) temporal skip intervals between latent frames, (iv)
+training-horizon strategies (variable vs. fixed horizons), (v) explicit timestamp conditioning via cross-attention, and (vi)
+reductions of the initial context length at inference.
+For all ablation experiments, we report RMSE metrics computed on eight selected weather maps at the 15-day forecast
+horizon. The atmospheric maps include the u-component of wind, temperature, geopotential, and specific humidity
+at the 500 hPa level. The surface maps consist of sea level pressure, the 10-meter u- and v-components of wind, and
+temperature at 2 meters.
+Positional encodings (RoPE, GeoRoPE, and learned embeddings).
+We evaluated the impact of different positional-
+encoding schemes on forecast skill by comparing three configurations: (i) full 3-D RoPE (rotary positional embeddings
+applied over both spatial and temporal dimensions), (ii) GeoRoPE as proposed in the LaDCast paper (a geometry-aware
+decomposition into latitude and longitude components), and (iii) a hybrid scheme combining 1-D RoPE along the
+temporal axis with learnable 2-D spatial embeddings. Replacing GeoRoPE with the hybrid, trainable-embedding
+scheme produces consistent improvements in RMSE metrics. The results for the 15 day RMSE horizon are reported in
+Table 6.
+8
+Marchuk: Technical report
+Table 5: Comparison to LaDCast. We report CRPS metrics at 30-day forecast horizons. The evaluated variables
+include atmospheric fields – UW500 (u-component of wind at 500 hPa), T500 (temperature at 500 hPa), G500
+(geopotential at 500 hPa), and SH500 (specific humidity at 500 hPa) – and surface fields – SLP (sea level pressure), 10m-
+UW (u-component of wind at 10 meters), T2M (temperature at 2 meters), and TP-6h (total accumulated precipitation
+over the last 6 hours).
+Method
+UW500
+T500
+G500
+SH500, 10−3
+SLP
+10m-UW
+T2M
+TP-6h, 10−3
+LaDCast, 375M
+4.43
+1.64
+398.00
+0.419
+325.58
+1.92
+1.24
+0.530
+LaDCast, 1.6B
+4.38
+1.53
+364.10
+0.393
+316.72
+1.88
+1.15
+0.522
+Marchuk, 276M
+4.42
+1.53
+354.93
+0.401
+318.99
+1.89
+1.16
+0.527
+Figure 6:
+Extreme-Event Forecasting Ability. We evaluate the model’s capability to predict extreme events by
+analyzing the probability of a cold-weather event preceding the Moscow frost day (midnight, January 26, 2026).
+Specifically, we plot the probability as a function of lead time, defined as the number of days before the event. The
+probability is computed as the fraction of ensemble members predicting temperatures within the range of −22◦C ±3◦C.
+This analysis provides insight into the model’s ability to capture the likelihood of extreme temperature events over
+extended forecast horizons.
+Training with Fixed Window. We train Marchuk using varying context sizes, corresponding to fixed video durations of
+6, 12, 24, and 48 hours, which map to 1, 2, 4, and 8 global weather frames, respectively. As the context size increases,
+we observe a consistent improvement in quantitative performance metrics, indicating that longer temporal context
+enhances the model’s predictive capability Table 7.
+Skip Interval: 1 Hour vs. 6 Hours vs. 12 Hours. We conduct an ablation study on the temporal skip interval used
+during training and inference. Given that the ERA5 dataset provides data at an hourly resolution, we vary the skip
+interval to reduce the number of autoregressive steps required for long-term forecasting. Specifically, we evaluate
+intervals of 1, 6, and 12 hours. Our results show that a 6-hour skip interval achieves the best performance for forecasts
+extending up to 15 days, providing a favorable trade-off between predictive accuracy and the number of autoregressive
+steps Table 8.
+Inference Strategy. We evaluate the model under varying prediction horizons at inference time while employing a
+dynamic sequence length during training. To determine the optimal context size, we conduct four experiments with
+configurations spanning from 1-day to 8-day input sequences. This approach enables the model to adapt to different
+temporal contexts and facilitates a systematic analysis of how input length influences forecasting performance Table 9.
+Adding Timestamp in Cross-Attention. We investigate the effect of incorporating timestamp information as a
+conditioning signal in the cross-attention mechanism. Our experiments compare models trained with and without
+timestamp conditioning. The results demonstrate that including timestamp consistently improves performance, yielding
+lower RMSE across all evaluated parameters Table 10.
+Initial Context Length. We evaluate the impact of reducing the input context length on model performance. Decreasing
+the context to 4 points (corresponding to 1 day of weather maps) does not degrade predictive accuracy. To optimize
+computational efficiency while maintaining acceptable metric values, we adopt this reduced context length. Predictions
+9
+Marchuk: Technical report
+Table 6: Evaluation of Marchuk with different positional encoding schemes: RoPE3D, GeoRoPE, and RoPE 1D with
+trainable spatial embeddings. The hybrid configuration achieves the best performance in terms of RMSE over a 15-day
+forecast horizon.
+Config
+UW500
+T500
+G500
+SH500, 10−3
+SLP
+10m-UW
+10m-VW
+T2M
+RoPE 3D
+8.63
+3.23
+829.83
+0.851
+730.81
+3.98
+4.11
+2.66
+GeoRoPE
+8.53
+3.20
+821.28
+0.848
+729.82
+3.97
+4.09
+2.67
+RoPE 1D + trainable 2D
+8.42
+3.18
+808.11
+0.841
+719.79
+3.94
+4.05
+2.65
+Table 7: Effect of fixed-window training on model performance. Increasing the context window length consistently
+improves RMSE across all evaluated variables.
+Config
+UW500
+T500
+G500
+SH500, 10−3
+SLP
+10m-UW
+10m-VW
+T2M
+6 hours
+8.61
+3.21
+820.05
+0.864
+727.83
+4.02
+4.10
+2.68
+12 hours
+8.54
+3.15
+806.22
+0.842
+714.67
+3.93
+4.08
+2.63
+24 hours
+8.51
+3.17
+809.98
+0.834
+715.94
+3.95
+4.08
+2.66
+48 hours
+8.39
+3.14
+804.05
+0.828
+713.98
+3.93
+4.08
+2.61
+are generated autoregressively by sampling the next 4 days, selecting the fourth day, and rolling out subsequent forecasts
+in a similar manner Table 11.
+10
+Marchuk: Technical report
+Table 8: Effect of temporal skip interval on model performance. Training with different timestep intervals (1, 6,
+and 12 hours) shows that a 6-hour interval achieves the best RMSE performance, balancing temporal resolution and
+autoregressive efficiency.
+Config
+UW500
+T500
+G500
+SH500, 10−3
+SLP
+10m-UW
+10m-VW
+T2M
+1 hour
+8.60
+3.20
+829.13
+0.847
+733.35
+3.98
+4.10
+2.72
+6 hours
+8.49
+3.14
+814.46
+0.834
+717.28
+3.94
+4.05
+2.65
+12 hours
+8.65
+3.32
+851.86
+0.858
+744.54
+4.02
+4.21
+2.75
+Table 9: Impact of inference configuration on model performance. Varying the input context length from 1 to 8 days
+shows that intermediate horizons (2-4 days) yield the best RMSE performance.
+Config
+UW500
+T500
+G500
+SH500, 10−3
+SLP
+10m-UW
+10m-VW
+T2M
+1 day
+8.43
+3.15
+808.56
+0.827
+717.27
+3.92
+4.06
+2.68
+2 days
+8.34
+3.13
+800.60
+0.816
+715.86
+3.92
+4.04
+2.59
+4 days
+8.31
+3.15
+815.62
+0.816
+728.41
+3.89
+4.08
+2.57
+8 days
+8.53
+3.20
+826.77
+0.817
+741.44
+3.93
+4.11
+2.65
+Table 10: Ablation study on the effect of including timestamp information in Cross-Attention. Incorporating timestamp
+as a conditioning signal improves RMSE across all evaluated variables.
+Config
+UW500
+T500
+G500
+SH500, 10−3
+SLP
+10m-UW
+10m-VW
+T2M
+w/o timestamp
+8.39
+3.14
+804.05
+0.828
+713.98
+3.93
+4.08
+2.61
+w timestamp
+8.39
+3.14
+799.18
+0.827
+708.66
+3.92
+4.05
+2.59
+Table 11: Ablation study on input context length. Reducing the context to 4 points (1 day of weather maps) maintains
+predictive accuracy while improving computational efficiency.
+Config
+UW500
+T500
+G500
+SH500, 10−3
+SLP
+10m-UW
+10m-VW
+T2M
+12 hours
+8.50
+3.17
+822.71
+0.838
+739.36
+4.00
+4.12
+2.62
+1 day
+8.42
+3.18
+811.02
+0.839
+727.00
+3.96
+4.09
+2.65
+2 days
+8.51
+3.20
+817.01
+0.835
+715.08
+3.96
+4.09
+2.65
+11
+Marchuk: Technical report
+5
+Conclusion
+We have introduced Marchuk, a latent flow-matching model for probabilistic global weather forecasting on mid-range
+to sub-seasonal timescales (up to 30 days). Marchuk leverages a highly compressed latent representation (64× spatial
+compression) and flow-matching, achieving an excellent balance between accuracy and efficiency. In experiments on
+ERA5-based WeatherBench data, Marchuk (276M parameters) matches or exceeds the performance of much larger
+models (e.g. LaDCast at 1.6B params) while running an order of magnitude faster. Notably, Marchuk yields comparable
+lat-weighted RMSE and ACC, and competitive CRPS/Spread scores, demonstrating that compact latent transformers
+can capture the essential atmospheric dynamics. We also show that Marchuk’s ensembles accurately characterize
+uncertainty, as evidenced by case studies of extreme events (e.g. the January 2026 Moscow frost) where the probabilistic
+forecasts successfully identified the impending anomaly.
+The ablation studies inform our design choices. We find that learnable 2D spatial embeddings combined with temporal
+RoPE outperform hand-coded GeoRoPE, and that a moderate 1-day context window (4 six-hour frames) strikes a
+good trade-off between accuracy and compute. Training with a variable horizon of 1-8 day horizons produces robust
+multi-week forecasts. These insights help us select the final Marchuk configuration used in the main experiments.
+Despite these successes, limitations remain. The primary bottleneck is the DC-AE’s reconstruction error, which
+inherently bounds forecast fidelity. Like LaDCast, Marchuk is trained on reanalysis data, so its deployment to real-time
+forecasting would require integrating data-assimilation or multi-encoder schemes. The spatial resolution (1.5°) also
+constrains fine-scale features such as tropical cyclone intensity. Future work should explore higher-resolution latent
+compressions, physics-informed losses, and assimilation of live observations to further improve skill.
+12
+Marchuk: Technical report
+0
+5
+10
+15
+20
+25
+30
+0.2
+0.4
+0.6
+0.8
+1.0
+ACC
+u_component_of_wind @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+temperature @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+geopotential @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+specific_humidity @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+ACC
+u_component_of_wind @ 700 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+temperature @ 700 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+geopotential @ 700 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+specific_humidity @ 700 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+ACC
+u_component_of_wind @ 850 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+temperature @ 850 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+geopotential @ 850 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.2
+0.4
+0.6
+0.8
+specific_humidity @ 850 hPa
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+ACC
+mean_sea_level_pressure
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+10m_u_component_of_wind
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+10m_v_component_of_wind
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+2m_temperature
+AE error
+Marchuk 276M
+LaDCast 375M
+LaDCast 1.6B
+Figure 7: ACC score. We evaluate model performance using ACC across several weather variables. The results,
+illustrated in the figure, show that our model exhibits the smallest decline in ACC over time compared to both LaDCast
+models.
+13
+Marchuk: Technical report
+0
+5
+10
+15
+20
+25
+30
+1
+2
+3
+4
+5
+6
+7
+8
+9
+Skill
+u_component_of_wind @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+temperature @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0
+100
+200
+300
+400
+500
+600
+700
+800
+geopotential @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0002
+0.0003
+0.0004
+0.0005
+0.0006
+0.0007
+0.0008
+specific_humidity @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0
+100
+200
+300
+400
+500
+600
+Skill
+mean_sea_level_pressure
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+3.5
+4.0
+10m_u_component_of_wind
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+2.00
+2.25
+2.50
+2m_temperature
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.0002
+0.0003
+0.0004
+0.0005
+0.0006
+0.0007
+0.0008
+0.0009
+0.0010
+total_precipitation_6hr
+AE error
+Marchuk 276M
+LaDCast 375M
+LaDCast 1.6B
+Figure 8: The CRPS Skill score evaluates how closely ensemble predictions align with the observed outcomes on
+average. Our model outperforms both the small and large LaDCast variants, demonstrating improved probabilistic
+forecasting accuracy.
+0
+5
+10
+15
+20
+25
+30
+0
+2
+4
+6
+8
+Spread
+u_component_of_wind @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+temperature @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0
+100
+200
+300
+400
+500
+600
+700
+geopotential @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+0.0000
+0.0001
+0.0002
+0.0003
+0.0004
+0.0005
+0.0006
+0.0007
+0.0008
+specific_humidity @ 500 hPa
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0
+100
+200
+300
+400
+500
+600
+700
+Spread
+mean_sea_level_pressure
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+3.5
+4.0
+10m_u_component_of_wind
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+2m_temperature
+0
+5
+10
+15
+20
+25
+30
+Lead time (days)
+0.0000
+0.0002
+0.0004
+0.0006
+0.0008
+total_precipitation_6hr
+AE error
+Marchuk 276M
+LaDCast 375M
+LaDCast 1.6B
+Figure 9: CRPS Spread. The CRPS spread reflects the diversity among ensemble members by measuring pairwise
+differences within the ensemble. Our model exhibits lower spread compared to LaDCast, indicating reduced ensemble
+diversity. This effect can be attributed to stronger conditioning: while LaDCast conditions on a single weather map,
+Marchuk conditions on the four most recent maps, leading to more constrained and less diverse predictions.
+14
+Marchuk: Technical report
+References
+[1] Aayush Gupta, Akshay Subramaniam, Michael S. Pritchard, Karthik Kashinath, Sergey Frolov, Kelsey Lieberman,
+Christopher Miller, Nicholas Silverman, and Noah D. Brenowitz. Healda: Highlighting the importance of initial
+errors in end-to-end ai weather forecasts, 2026.
+[2] Ilan Price, Alvaro Sanchez-Gonzalez, Ferran Alet, Tom R. Andersson, Andrew El-Kadi, Dominic Masters,
+Timo Ewalds, Jacklynn Stott, Shakir Mohamed, Peter Battaglia, Remi Lam, and Matthew Willson. Gencast:
+Diffusion-based ensemble forecasting for medium-range weather, 2024.
+[3] Ferran Alet, Ilan Price, Andrew El-Kadi, Dominic Masters, Stratis Markou, Tom R. Andersson, Jacklynn Stott,
+Remi Lam, Matthew Willson, Alvaro Sanchez-Gonzalez, and Peter Battaglia. Skillful joint probabilistic weather
+forecasting from marginals, 2025.
+[4] Cristian Bodnar, Wessel P. Bruinsma, Ana Lucic, Megan Stanley, Anna Vaughan, Johannes Brandstetter, Patrick
+Garvan, Maik Riechert, Jonathan A. Weyn, Haiyu Dong, Jayesh K. Gupta, Kit Thambiratnam, Alexander T.
+Archibald, Chun-Chieh Wu, Elizabeth Heider, Max Welling, Richard E. Turner, and Paris Perdikaris. A foundation
+model for the earth system, 2024.
+[5] Lei Chen, Xiaohui Zhong, Hao Li, Jie Wu, Bo Lu, Deliang Chen, Shangping Xie, Qingchen Chao, Chensen Lin,
+Zixin Hu, and Yuan Qi. Fuxi-s2s: A machine learning model that outperforms conventional global subseasonal
+forecast models, 2024.
+[6] Yilin Zhuang and Karthik Duraisamy. Ladcast: A latent diffusion model for medium-range ensemble weather
+forecasting, 2025.
+[7] Junyu Chen, Han Cai, Junsong Chen, Enze Xie, Shang Yang, Haotian Tang, Muyang Li, Yao Lu, and Song Han.
+Deep compression autoencoder for efficient high-resolution diffusion models, 2025.
+[8] Hans Hersbach, Bill Bell, Paul Berrisford, Shoji Hirahara, András Horányi, Joaquín Muñoz-Sabater, Julien Nicolas,
+Carole Peubey, Raluca Radu, Dinand Schepers, Adrian Simmons, Cornel Soci, Saleh Abdalla, Xavier Abellan,
+Gianpaolo Balsamo, Peter Bechtold, Gionata Biavati, Jean Bidlot, Massimo Bonavita, Giovanna De Chiara,
+Per Dahlgren, Dick Dee, Michail Diamantakis, Rossana Dragani, Johannes Flemming, Richard Forbes, Manuel
+Fuentes, Alan Geer, Leo Haimberger, Sean Healy, Robin J. Hogan, Elías Hólm, Marta Janisková, Sarah Keeley,
+Patrick Laloyaux, Philippe Lopez, Cristina Lupu, Gabor Radnoti, Patricia de Rosnay, Iryna Rozum, Freja
+Vamborg, Sebastien Villaume, and Jean-Noël Thépaut. The era5 global reanalysis. Quarterly Journal of the Royal
+Meteorological Society, 146(730):1999–2049, 2020.
+[9] Remi Lam, Alvaro Sanchez-Gonzalez, Matthew Willson, Peter Wirnsberger, Meire Fortunato, Ferran Alet, Suman
+Ravuri, Timo Ewalds, Zach Eaton-Rosen, Weihua Hu, Alexander Merose, Stephan Hoyer, George Holland, Oriol
+Vinyals, Jacklynn Stott, Alexander Pritzel, Shakir Mohamed, and Peter Battaglia. Graphcast: Learning skillful
+medium-range global weather forecasting, 2023.
+[10] Kaifeng Bi, Lingxi Xie, Hengheng Zhang, Xin Chen, Xiaotao Gu, and Qi Tian. Pangu-weather: A 3d high-
+resolution model for fast and accurate global weather forecast, 2022.
+[11] Lei Chen, Xiaohui Zhong, Feng Zhang, Yuan Cheng, Yinghui Xu, Yuan Qi, and Hao Li. Fuxi: A cascade machine
+learning forecasting system for 15-day global weather forecast, 2023.
+[12] Stephan Rasp, Stephan Hoyer, Alexander Merose, Ian Langmore, Peter Battaglia, Tyler Russel, Alvaro Sanchez-
+Gonzalez, Vivian Yang, Rob Carver, Shreya Agrawal, Matthew Chantry, Zied Ben Bouallegue, Peter Dueben,
+Carla Bromberg, Jared Sisk, Luke Barrington, Aaron Bell, and Fei Sha. Weatherbench 2: A benchmark for the
+next generation of data-driven global weather models, 2024.
+[13] Agrim Gupta, Lijun Yu, Kihyuk Sohn, Xiuye Gu, Meera Hahn, Li Fei-Fei, Irfan Essa, Lu Jiang, and José Lezama.
+Photorealistic video generation with diffusion models, 2023.
+15

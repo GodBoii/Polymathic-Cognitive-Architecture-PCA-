@@ -1,0 +1,2911 @@
+Preprint
+CRAFT: Grounded Multi-Agent Coordination Under Partial
+Information
+Abhijnan Nath
+Hannah VanderHoeven
+Nikhil Krishnaswamy
+Situated Grounding and Natural Language (SIGNAL) Lab∗
+Department of Computer Science, Colorado State University
+Fort Collins, CO 80523 USA
+{abhijnan.nath,nkrishna}@colostate.edu
+Abstract
+We introduce CRAFT, a multi-agent benchmark for evaluating pragmatic
+communication in large language models under strict partial information.
+In this setting, multiple agents with complementary but incomplete views
+must coordinate through natural language to construct a shared 3D struc-
+ture that no single agent can fully observe. We formalize this problem as
+a multi-sender pragmatic reasoning task and provide a diagnostic frame-
+work that decomposes failures into spatial grounding, belief modeling,
+and pragmatic communication errors—including a taxonomy of behav-
+ioral failure profiles in both frontier and open-weight models. Across
+a diverse set of models—including 8 open-weight and 7 frontier mod-
+els including reasoning models—we find that stronger reasoning ability
+does not reliably translate to better coordination: smaller open-weight
+models often match or outperform frontier systems, and improved indi-
+vidual communication does not guarantee successful collaboration. These
+results suggest that multi-agent coordination remains a fundamentally un-
+solved challenge for current language models. Our code can be found at
+https://github.com/csu-signal/CRAFT
+1
+Introduction
+Large language models (LLMs) have evolved from single-turn assistants into components
+of multi-agent systems, powering coding workflows, scientific discovery pipelines, and
+autonomous task execution environments where multiple agents must coordinate toward
+shared goals (Kazemitabaar et al., 2023; Zhang et al., 2024b; Cui et al., 2024; Davidson
+et al., 2025). In such settings, agents—often built on different models—must communicate
+and collaborate effectively, making coordination a central challenge for both research and
+deployment.
+However, recent work shows that coordination between LLM agents remains fragile even in
+simple settings (Lupu et al., 2021; Agashe et al., 2025; Singh et al., 2025; Eisenstein et al., 2026;
+Nath & Krishnaswamy, 2025). Models struggle with partner modeling and joint decision-
+making even when interacting with identical copies of themselves. This challenge becomes
+substantially harder in realistic scenarios where agents operate under partial observability,
+hold complementary private information, and must communicate through open-ended
+natural language to achieve a shared goal.
+We argue that the missing capability is pragmatic communication—deciding what to say, how
+much to say, and when to say it based on other agents’ knowledge and needs (Grice, 1975;
+Frank & Goodman, 2012). While frameworks such as Rational Speech Acts (RSA) (Goodman
+& Stuhlmüller, 2013) and the Bounded Pragmatic Speaker (BPS) model (Nguyen, 2024)
+∗https://www.signallab.ai
+1
+arXiv:2603.25268v1  [cs.CL]  26 Mar 2026
+Preprint
+CRAFT's
+Structure
+Generator
+Agent Archetype + Personality
+Spatial Orientation
+Conversation History
+Partial Target View
+Interpretation of View
+Reasoning Rules
+Speaking rules
+Curr. Board State
+Builder Agent
+Director Perspective Guide
+Frame of Reference Rules
+Oracle Moves (bool)
+Director Discussion
+Block Stacking Rules
+Output Format
+Builder
+Target 3-D Structure 
+Director Prompt  
+Builder Prompt
+<think>...[reasoning trace]... </think>
+<message> ...[hey, place small red one on]... </message>
+~150 toks
+~12 turns memory  
+2-D “Private” Partial Views
+Textualized
+2-D views
+Curr. Board State
+Curr. Grid
+~95 toks
+~95 toks
+~94 toks
+Information Asymmetry
+~94 toks
+CRAFT
+Game
+Engine
+[PLACE/REMOVE/CLARIFY]
+next turn
+Completion %
+IoU Distance
+Pos. Accuracy
+Failure Rate 
+Progress  
+Updated Board
+Mind Model (MM) Judge
+Spatial Grounding (SG) Judge
+Pragmatic Sufficiency (PS) Judge
+Task
+Performance  
+[Places large orange domino] ✓
+ <think>
+....hmm, for the base layer at front wall, I see a small orange at back, small red in middle,
+small green at front. Board is empty, start here.
+</think>
+<message>
+  On my side, bottom layer has a small orange at the back, 
+  small red in the middle, small green up front.
+ </message>
+ <think>
+ well, D1 said small orange is at the back-left. But that orange seems large.. it stretches
+one cell sideways toward me. D1 can only see one face of it. Huh, Builder might
+place wrong block if I don't correct this now. 
+</think>
+<message>
+  Hey, that orange at the back is actually a big one — 
+  it reaches over one spot toward my side. Use the 
+  large orange there, not a small.
+ </message>
+<message>
+..Wait, so the orange stretches toward D2? Like one long piece across two spots?
+ </message>
+Director 1
+Director 2
+Builder
+success: updated board
+fail: error msg.
+evalutes <message> 
+evalutes <think> 
+evaluates group 
+ oracle moves
+conflict detected (MM 7)
+Offline LLM Judge Evaluation
+~8 Open-weight  
+~7 Proprietary
+15 Directors
+Fixed GPT-4o-mini Builder
+Collaborative Reasoning Agents For Construction Tasks (CRAFT) 
+Figure 1: CRAFT framework overview. A structure generator creates a target 3D object and three
+private 2D views for directors, enforcing information asymmetry. At each turn, directors produce
+instructions from their partial views, which a builder executes via PLACE, REMOVE, or CLARIFY actions in
+the CRAFT engine. The system logs task progress and evaluates communication using LLM judges
+for spatial grounding, mind modeling, and pragmatic sufficiency.
+formalize this behavior, existing evaluations largely focus on single-agent reasoning or
+offline interpretation (Jian & Siddharth, 2024; Zhu et al., 2026a). This misses out on a key
+gap: LLMs may exhibit strong internal reasoning (formal competence) but fail to use it
+effectively in interaction (functional competence) (Mahowald et al., 2024; Davidson et al.,
+2025). Prior work has studied pragmatic understanding in controlled reference games,
+typically in dyadic settings (Khani et al., 2018; Louis et al., 2020; Hu et al., 2023). In contrast,
+we focus on pragmatic generation in multi-agent environments with partial information.
+Although Nguyen (2024) suggests RLHF-trained LLMs can be interpreted as bounded
+pragmatic speakers (Stiennon et al., 2020), it remains unclear whether this extends to
+settings requiring sustained coordination under information asymmetry.
+This gap is most evident in tasks such as the Distributed Partial Information Puzzle
+(DPIP; Zhu et al. (2026b)), where agents must iteratively establish common ground when
+given complementary but distinct information. Humans succeed through sustained prag-
+matic repair across multiple turns1, but current LLM evaluations rely on offline analysis or
+dyadic-agent tasks (Wu et al., 2024) for evaluating LLMs. Such works do not test whether
+models can produce effective communication in multi-agent, partially observable settings.
+To address this, we introduce CRAFT (Collaborative Reasoning Agents For Construction
+Tasks), a multi-agent benchmark for evaluating pragmatic communication in grounded,
+partially observable environments. In CRAFT, three director agents, each with a private
+view of a 3D target structure, must coordinate via natural language to guide a builder toward
+the correct configuration. Crucially, success depends not on individual reasoning alone, but
+on how effectively agents communicate complementary information to support joint action
+via the builder. We provide novel theory on CRAFT as a “multi-sender” BPS problem,
+1Table 5 shows a snippet from a DPIP “game” where humans take ≈30s and 23 turns (of dialogic
+exchanges) involving pragmatic repair to resolve an action.
+2
+Preprint
+where agents must consider integrating others’ privately-held goal state information via
+pragmatic “communication” across a horizon of conversation turns in order to successfully
+complete the task. This provides a principled look at disentangling core communicative
+failure modes that LLMs—both frontier as well as smaller open-weight models—face in
+effective communication. To measure this, we propose a novel LLM “grader” evaluation
+framework that scales efficiently to thousands of dialogue turns.
+Key results. Our evaluation reveals several surprising patterns. First, frontier and pro-
+prietary models do not reliably outperform smaller open-weight models: models such
+as Mistral-7B and Qwen-2.5-7B Instruct outperform the majority of frontier systems on
+the task. Second, higher-quality individual communication does not translate to better
+overall collaboration—LLM-Judge metrics of communication quality are often negatively
+correlated with task progress. Third, we identify a consistent behavioral failure mode we
+term correction spirals, where agents over-correct perceived errors (e.g., excessive removal
+actions) after failing to overcome the information asymmetry via communication, leading to
+wasted turns and degraded performance. Together, these results show that capabilities that
+improve individual reasoning—such as perspective-taking—is necessary but not sufficient
+for collective task success in CRAFT’s multi-sender setting.
+We make three contributions:
+1. CRAFT benchmark. A multi-agent, grounded construction benchmark with proce-
+durally generated structures across three complexity levels, a physics-constrained
+game engine, and fine-grained trajectory logging. We introduce an oracle-assisted
+builder interface to disentangle builder capability from director communication,
+enabling proper credit assignment in multi-agent systems (Huh & Mohapatra, 2024).
+2. Multi-sender BPS framework. A theoretical formalization of directors in CRAFT
+as bounded pragmatic speakers (Frank & Goodman, 2012), grounded in Rational
+Speech Acts, providing a principled model of collaborative communication under
+partial observability and a framework for diagnosing communicative failures.
+3. Empirical evaluation. A large-scale evaluation across open-weight and proprietary
+models using a suite of LLM “graders” that decompose failures into spatial ground-
+ing, reasoning, and pragmatic communication. Our analysis provides interpretable,
+per-turn diagnostics and reveals how model scale and communication behavior
+impact collaborative performance.
+2
+Related Works
+Spatial reasoning and multi-agent coordination under partial observability.
+Recent work
+has made significant progress in spatial reasoning for LLMs and multimodal models, includ-
+ing viewpoint consistency, 3D reasoning, and object localization (Liu et al., 2025; Kamath
+et al., 2023; Du et al., 2024; Li et al., 2025; Ma et al., 2025b; Zhang et al., 2025; Yeh et al., 2026;
+Xu et al., 2026), with extensions to dialogue, navigation, and spatio-temporal understand-
+ing (Bickmore & Cassell, 2005; Gao et al., 2022; Zhang et al., 2024a; Hou et al., 2025; Zheng
+et al., 2025; Martorell, 2025). In parallel, recent work studies LLM coordination in symmetric
+games, zero-shot partner matching, and agentic collaboration pipelines (Lupu et al., 2021;
+Agashe et al., 2025; Singh et al., 2025; Grötschla et al., 2025; Maslej et al., 2025; Chen et al.,
+2026; Jiang et al., 2024; Hayler et al., 2026; Nath et al., 2025a;b; Nath & Krishnaswamy). How-
+ever, these two lines of work largely evolve independently: spatial reasoning benchmarks
+are typically framed as single-agent perception or QA tasks, while multi-agent coordination
+studies often focus on symmetric or abstract settings with limited grounding in a shared
+physical state (Tran et al., 2025; Chen et al., 2026; Mohammadi et al., 2025; Liu et al., 2025).
+Real-world collaboration often instead requires agents to operate under partial observability,
+where each agent holds complementary private evidence and must communicate spatial
+beliefs over multiple turns. While some work begins to explore such settings (Tian et al.,
+2020; Grötschla et al., 2025; Wu et al., 2025; Davidson et al., 2024; 2025), coordination re-
+mains fragile even in simplified environments, and effective collaboration demands not
+just correct reasoning but informative and concise communication (Garrod & Pickering,
+2004; Davidson et al., 2025). Motivated by distributed partial information tasks (Zhu et al.,
+3
+Preprint
+2025) for human collaboration and reference games (Andreas & Klein, 2016; Ma et al.,
+2025a; Nunberg, 1978)—a testbed for pragmatic communication, CRAFT addresses this gap
+by evaluating pragmatic communication in LLMs in grounded multi-agent settings with
+asymmetric spatial information, where success is measured not just by improvements in
+downstream task completion, but also the “quality” of such communication—rather than
+mere consensus (Amirkhani & Barshooi, 2022).
+Pragmatic reasoning and bounded pragmatic speakers.
+Pragmatic language use has
+been widely studied through Gricean accounts and Rational Speech Acts (RSA), where
+speakers select utterances by modeling a listener’s beliefs and informational needs (Grice,
+1975; Frank & Goodman, 2012; Goodman & Stuhlmüller, 2013). Prior work has explored
+pragmatics in controlled reference games, typically in two-agent settings (Khani et al., 2018;
+Louis et al., 2020; Hu et al., 2023; Nematzadeh et al., 2018; Fried et al., 2018; Ruis et al.,
+2023; Zhang et al., 2023; Estienne et al., 2025), while recent work extends this perspective to
+LLMs via the Bounded Pragmatic Speaker (BPS) framework (Nguyen, 2024). Benchmarking
+efforts such as DiPlomat show that LLMs struggle with context-sensitive implicature and
+situated interpretation (Li et al., 2023), and surveys highlight that existing evaluations
+emphasize understanding rather than producing pragmatically calibrated utterances under
+uncertainty (Krause & Vossen, 2024; Park et al., 2024). This aligns with recent work dis-
+tinguishing formal linguistic competence from functional communicative competence in
+LLMs (Mahowald et al., 2024): models may encode rich representations yet fail to use them
+effectively in interaction. CRAFT operationalizes this distinction by evaluating pragmatic
+production in a multi-agent, partially observable setting, where agents must integrate private
+spatial beliefs with others’ utterances to support joint action. Closest to our setting, Wu et al.
+(2024) studies collaborative reasoning for block-building tasks in dyadic agent interactions.
+CRAFT extends this line of work to a multi-sender setting with asymmetric information,
+richer grounding constraints, and a broader evaluation across model families, enabling
+analysis of communication quality beyond task completion. Consistent with prior findings
+that LLMs exhibit a “collaboration gap” in multi-agent settings (Davidson et al., 2025), our
+framework provides an interactive, execution-grounded benchmark to disentangle internal
+reasoning from functional communicative competence.
+3
+CRAFT as a Multi-Sender Bounded Pragmatic Speaker Framework
+The Bounded Pragmatic Speaker (BPS) framework (Nguyen, 2024) provides a unified
+account of pragmatic language production in LLMs and serves as the theoretical lens
+through which we analyse CRAFT director behaviour. A pragmatic speaker selects utterances
+by jointly reasoning about a base generative model and a Theory-of-Mind (ToM) listener
+that evaluates how well an utterance communicates an intended meaning.
+Definition 3.1 (Bounded Pragmatic Speaker). Let Sbase(u | z⋆, c) be a base speaker distribution
+over utterances u ∈U, conditioned on an intention z⋆∈Z and context c. Let LToM(z⋆| u, c)
+be a Theory-of-Mind (ToM) listener that scores how faithfully u communicates z⋆. A Bounded
+Pragmatic Speaker (BPS) selects utterances as:
+Sbps(u | z⋆, c) ∝Sbase(u | z⋆, c) · LToM(z⋆| u, c).
+(1)
+Importantly, prior work (Nguyen, 2024) show that any language model Sθ can be viewed
+as a BPS by setting both modules to Sθ, and that RLHF fine-tuning (Stiennon et al., 2020;
+Tunstall et al., 2023) is equivalent to variational inference on a BPS whose ToM listener
+is a learned reward function Rϕ. We extend this framework to the multi-agent, grounded,
+partial-information setting of CRAFT.
+3.1
+Directors as Bounded Pragmatic Speakers
+We now cast each CRAFT director (Section 1) within the BPS framework. Director Di at
+turn t has an intention z⋆
+i,t = ∆i(st, T )—the grounded gap between Di’s target view and the
+current board state restricted to Wi—and a context ci,t = (oi,t, ht, {uj,t}j̸=i) comprising their
+4
+Preprint
+private observation, the conversation history, and the current-turn utterances of the other
+two directors.
+Under the BPS framework, director Di’s policy is:
+πDi(ui,t | z⋆
+i,t, ci,t) ∝Sbasei(ui,t | z⋆
+i,t, ci,t) · LToMi(z⋆
+i,t | ui,t, ci,t),
+(2)
+where Sbasei is the pre-trained language model generating candidate utterances and LToMi
+is the director’s internal model of how the Builder will interpret ui,t given the already-
+communicated context. The standard single-sender BPS treats LToMi as a model of one
+listener. In this setting, however, the Builder integrates utterances from all three directors
+simultaneously, so the effective listener that each director must model is a joint listener that
+aggregates three information sources.
+Definition 3.2 (Joint ToM Listener). The joint ToM listener for the Builder is:
+LToMjoint(z⋆| u1, u2, u3, c) ∝exp
+ 
+3
+∑
+i=1
+λi Ri(ui, st, T )
+!
+,
+(3)
+where Ri(ui, st, T ) is a reward signal measuring the downstream task progress attributable to
+director Di’s utterance ui,t, and λi ≥0 are weighting coefficients.
+This leads to the first main theoretical result of this section.
+Theorem 3.3 (CRAFT as a Multi-Sender BPS). Under Equation (1) and Equation (3), let
+Sbasei(· | z⋆
+i , ci) denote the base speaker of director Di and let z⋆= (z⋆
+1, z⋆
+2, z⋆
+3) denote the joint
+intention vector, where ci = (oi,t, ht, {uj,t}j̸=i) is director Di’s private context (Section 3.1) and
+c = (ht, st) is the shared public context available to all agents. The joint director policy in a CRAFT
+game is equivalent to a multi-sender Bounded Pragmatic Speaker, in which each director Di is a
+BPS with base speaker Sbasei, and the shared ToM listener is LToMjoint. Formally, the optimal joint
+director policy satisfies:
+π⋆(u1, u2, u3 | z⋆, c) ∝
+ 
+3
+∏
+i=1
+Sbasei(ui | z⋆
+i , ci)
+!
+· LToMjoint(z⋆| u1, u2, u3, c).
+(4)
+Intuitively, Theorem 3.3 says that optimal director behavior in CRAFT requires each director
+to choose utterances that are (i) consistent with her private observations (via Sbasei) and
+(ii) maximally useful to the Builder given what the other directors have already communicated
+(via LToMjoint). A director who ignores condition (ii), for example, by repeating information
+already conveyed by another director, behaves as a sub-optimal BPS with a deficient ToM
+listener. This operationalizes the Gricean Maxim of Quantity in a grounded, multi-agent
+setting: each director should contribute exactly the information the Builder needs that has not
+already been provided. Notably, CRAFT is designed in a way such that deviations from opti-
+mal BPS behavior—as expected under multi-agent settings and partial observability (Tran
+et al., 2025)—are not merely observable but structurally inevitable when any component of
+the multi-sender BPS fails.
+Failure Modes in Multi-sender BPS.
+Nguyen (2024) identifies three failure modes for
+a single-sender BPS. F1 (limited search) occurs when Sbasei fails to identify the correct
+missing block from Di’s visible wall. F2 (flawed pragmatics) occurs when LToMi produces
+redundant or collectively ambiguous messages, violating the Gricean Maxim of Quantity
+and Manner. F3 (inefficient inference) occurs when correct private reasoning fails to transfer
+into a sufficiently specified public message. While F1 and F3 remain agent-local, F2 in
+CRAFT is strictly harder: each director must model LToMjoint rather than a single listener,
+accounting for what all other directors have already communicated. Crucially, a director
+may avoid all three failures individually yet still contribute to a communication failure at
+the group level if the collective director output does not sufficiently identify a correct move
+to the builder—a fourth diagnostic that transcends individual agent quality and is only
+measurable at the group level.
+5
+Preprint
+4
+Agent Architecture with LLMs
+In this section, we describe the role-specific agents in the CRAFT games including their
+prompt-based scaffolding, the communication protocol with conditions of partial observ-
+ability both in their inputs (e.g., information asymmetry of the target between directors)
+and in the communication protocol (e.g., in how their internal reasoning scratchpads are
+invisible to other directors or the builder).
+Figure 2: Director perspective views for structure_016 (25 blocks, complex tier). D1 (left
+wall), D2 (far wall), and D3 (right wall) each observe a fixed 2D projection across all vertical
+layers. The full grid minimap shows ground-truth stack heights.
+4.1
+Task and Agent Setup
+As shown in Figure 2, three Director agents (D1, D2 and D3) and one Builder agent
+collaborate in a “turn-by-turn” synchronous manner (Ivison et al., 2023; Nath et al., 2025b)
+to reconstruct a target 3D structure on a 3×3 grid, where each position holds a stack of
+up to three colored blocks drawn from five colors in small or large (domino) form. Each
+Director receives a private 2D projection of the target corresponding to one wall of the
+structure—D1 the left wall, D2 the far wall, D3 the right wall—while the Builder observes
+only the current board state and the directors’ natural language messages. Notice that
+here partial observability operates at two distinct levels—target structure asymmetry across
+directors and private reasoning hidden from other directors.
+Because projections are non-overlapping except at a single shared anchor position, no
+director can reconstruct the full target unilaterally, and the same physical block can appear
+as a different size to different directors depending on whether both cells of a domino fall
+within their projection (Figure 2). As such, successful construction in this task requires
+each director to reason about what information they uniquely hold and calibrate their
+utterances accordingly—exactly the communicative demand formalized by the multi-sender
+BPS framework in Section 3.1.
+4.2
+Director Agent
+Each Director agent receives its private target view, the current board state, and the shared
+conversation history, and produces two outputs per turn: a private <think> block containing
+unconstrained spatial reasoning, and a public <message>. This two-part structure directly
+operationalizes the BPS base speaker and ToM listener distinction: the think block is where
+the director identifies missing blocks from its visible wall (Sbasei), and the public message
+is where that reasoning is distilled into an utterance calibrated to what the builder and
+other directors already know (LToMi). Since only the public message is broadcast to the
+other agents, this requires agents to be informative and concise at the same time. This
+creates another layer of information asymmetry2 that is a challenge in successful task
+2In contrast to the asymmetry in partial views, this asymmetry can lead to agents doing some
+perspective-taking (Byrne & Johnson-Laird, 1989) in their private reasoning traces (Wei et al., 2023),
+but facing a challenge in converting that into an informative, short message conditioned on the former.
+6
+Preprint
+completion. Figure 1 illustrates this: D1 correctly describes a base-layer orange block as
+small from its projection, while D2—whose view reveals the same block is a large domino
+spanning into its wall—detects the underspecification and issues a correction before the
+builder acts, exemplifying the think/message split where private spatial reasoning (Sbasei)
+drives a publicly calibrated correction (LToMi). Also, D2’s projection overlaps with both
+D1 at position (0,0) and D3 at position (0,2), making unique information contribution
+structurally harder for D2 than for D1 or D3. Prompt breakdown into the constituent parts
+shown in Figure 9 (I-III) in Appendix Section D.
+4.3
+Builder Agent
+The builder agent observes all director messages and conversation history each turn and
+executes a single block placement or removal or clarification action. It has no access to
+the target structure and must resolve color, size, location, and layer entirely from director
+descriptions—analogous to a listener in a reference game (Andreas & Klein, 2016) who must
+identify a referent from partial, multi-speaker descriptions. Importantly, to eliminate builder
+spatial reasoning as a confound, the builder’s observation is augmented with a restricted
+set of oracle-verified or “ground-truth” candidate3 moves per turn drawn from the current
+board state and target structure. The builder’s decision problem is therefore a selection
+task—identify which candidate a director is describing—rather than a generation task
+over the full action space. This preserves the full pragmatic inference requirement while
+attributing performance differences to director communication quality (say, in comparison
+to a communication failure) rather than builder execution capacity. Note that we distinguish
+between a “move failure” vs. a director communication failure—the former happens at
+the builder’s final action level as determined by the game engine, while the latter depends
+on the directors’ output, and requires our automatic LLM “grader” to identify. These two
+are not mutually exclusive. Figure 10 (I-III) in Appendix Section D shows the full builder
+prompts.
+Definition 4.1. A turn is a communication failure if and only if oracle (or correct) candidates
+were available but the builder did not select one; the builder had the correct answer in its observation
+and the director group failed to make it identifiable.
+5
+Experiments
+We describe our experimental setup in this section. Section 5.1 describes the 3D structure
+generation process for evaluation, specifics of director participation per-turn and roles and
+builder agent related task settings. Section 5.2 describes our task-completion performance
+metrics and the LLM-Judge based evaluation strategy. Finally, we specify the open-weight
+and frontier-proprietary models selected for our experiments.
+5.1
+Generating Target 3D Structures
+All selected models play 20 structures drawn from CRAFT’s structure evaluation set,
+spanning 7 simple, 8 medium, and 5 complex configurations with block counts ranging
+from 21 to 25 (mean 23.2). Every game starts from an empty board4. Each director is assigned
+a personality archetype (Jung & Hull, 2023) or “personas” (Sun et al., 2024) deterministically
+via a seeded hash of (structure_index, run) to ensure consistent role assignments across
+all model evaluations. Each model–structure pair is run for 20 turns, where each turn
+consists of collecting responses from a randomized selection of one to three unique directors,
+followed by a builder move selection conditioned on the director discussion and up to five
+oracle-verified candidate moves.5 The selected move is validated by the CRAFT game
+3These are physically valid moves that makes verified forward progress towards the target structure.
+Not all board states may have such a move, and we use up to five such moves per turn as an upper
+bound on what the builder can observe.
+4CRAFT supports pre-filled boards for evaluation. For consistency across games with varying
+complexity, we only consider empty boards for all games.
+5The builder may select from oracle candidates when available; on turns where no valid oracle
+move exists the builder infers a move from director instructions alone.
+7
+Preprint
+engine, which records per-turn construction progress metrics. To reflect natural multi-party
+conversation dynamics (Ganesh et al., 2023), director participation varies per turn—on
+average two directors contribute per turn. In the next turn, the current conversation
+history consisting of all6 prior director responses are shown the the directors, whereas the
+builder only gets to observe the current turn’s director responses. For additional details
+on structures, oracle implementation and selected archetypes-personalities, see Table 3 in
+Appendix B.
+5.2
+Task Completion and LLM-Judges for Communication Failures
+Task Performance Metrics.
+We report overall progress and completion rate at turn 20, both
+measuring how close the final board state is to the target structure. We additionally report
+remove gap (Gap = REMOVE −oracle remove rate), averaged across turns, where a positive
+gap indicates directors instructed more removals than the board required. Section B.5 in
+Appendix provides more details on task metrics.
+Automatic Grading
+Motivated by prior work (Zheng et al., 2023; Davidson et al., 2025),
+we use LLMs as “graders” for scalable evaluation of director outputs. A pragmatically
+competent director produces a message that is not a transcription of its internal reasoning
+but a selective, non-redundant instruction calibrated to current shared knowledge. The
+three failure modes defined in Section 3.1 each leave a distinct signature in CRAFT’s two-
+component turn log: F1 manifests as incorrect block identification in the <think> block, F2
+as redundant or collectively ambiguous public messages, and F3 as divergence between
+a correct think block and an underspecified public message, directly motivating three
+complementary “graders”.7 Specifically, the Spatial Grounding (SG) judge evaluates each
+director’s private reasoning in isolation — whether the think block correctly identifies
+the missing block, its layer, size, and physical executability (F1; prompt with questions in
+Figure 13). The Mind Modeling8 (MM) judge evaluates whether the director modeled the
+mental states of the builder and other directors when producing its message. Specifically,
+it evaluates whether the public message adds novel information, leverages the director’s
+unique wall perspective, and acknowledges conflicts with other directors (F2; Figure 14).
+These two judges allows us to measure how good a director’s individual reasoning is, and
+whether that transfers to its public message, but scoring high on these two judging criteria
+by itself does not guarantee task performance success. For example, a communication
+failure (Definition 4.1) can still happen if the collective director output was insufficient for a
+rational builder to identify an oracle move. As such, the Pragmatic Sufficiency (PS) judge
+operates at the group level—whether the collective director output provided a rational
+builder with sufficient information to identify at least one oracle-correct move, a property
+irreducible to any individual director’s F1 or F2 score (Figure 12). Notably, the three judges
+are diagnostically independent by design: SG never sees the public message, MM never
+sees the private reasoning, and PS evaluates collective output without decomposing it by
+director.
+Metrics from Grader Outputs
+We score each grader question by mapping the model
+response to a binary value: Yes = 1, No = 0, and Unclear = 0.5. Overall SG and MM
+scores are the mean across all questions for a given director turn; the PS score is the mean
+across applicable questions for a given collective turn. All scores are averaged across three
+independent grader runs for SG and MM scores and two such runs for PS scores to reduce
+variance from stochastic model outputs. All judge prompts with questions are provided in
+Figures 12 to 14 (Appendix Section E).
+6For turns where the conversation history contains > 50 total messages, we truncate it to at most
+40 previous messages to avoid context bloat.
+7Due to the large scale experiments in our evaluations involving thousands of trajectory logs with
+long prompts, human evaluation was not feasible.
+8We use “Mind Model” in the literal sense of evaluating LToMjoint qualities in director mes-
+sages (Riemer et al., 2024; Xu et al., 2024), not as a claim about functional ToM capacities (Mahowald
+et al., 2024).
+8
+Preprint
+Model
+Prog.↑
+Comp.↑
+Pos. Acc.↑
+Dist.↑
+Fail↓†
+REMOVE↓
+Gap↓
+Proprietary models
+Gemini-3-Flash
+0.675±0.052 0.716±0.045 0.594±0.065 0.817±0.034
+0.625±0.125
+0.196
+0.018
+GPT-4o
+0.588±0.051 0.633±0.048 0.500±0.061
+0.753±0.038
+0.421±0.116
+0.280
+0.056
+GPT-4o-Mini
+0.333±0.041 0.383±0.040 0.233±0.047
+0.531±0.041
+0.550±0.114
+0.432
+0.254
+GPT-4.1-Mini
+0.312±0.053 0.352±0.054 0.233±0.056
+0.481±0.053
+0.500±0.115
+0.463
+0.388
+Claude-Sonnet-4.6
+0.285±0.036 0.332±0.038 0.189±0.039
+0.479±0.041
+0.350±0.109
+0.395
+0.265
+Gemini-2.5-Flash
+0.257±0.030 0.279±0.033 0.206±0.033
+0.428±0.039
+0.300±0.105
+0.467
+0.402
+Gemini-3.1-Flash-lite 0.257±0.052 0.273±0.055 0.286±0.054 0.211±0.0514 0.550±0.114
+0.540
+0.467
+Open-weight models
+Mistral-7B
+0.631±0.053 0.673±0.046 0.539±0.067 0.793±0.033
+0.500±0.129
+0.124
+−0.124
+Qwen-7B
+0.612±0.044 0.665±0.040 0.517±0.052
+0.778±0.031
+0.556±0.121
+0.205
+−0.116
+Llama-8B
+0.586±0.052 0.630±0.049 0.506±0.056
+0.741±0.057
+0.684±0.110
+0.277
+0.080
+Gemma-9B
+0.578±0.044 0.628±0.039 0.483±0.054
+0.751±0.033
+0.600±0.112
+0.122
+−0.084
+Qwen-72B
+0.557±0.049 0.606±0.042 0.461±0.064
+0.733±0.036
+0.421±0.116
+0.245
+0.047
+Qwen-14B
+0.476±0.063 0.514±0.061 0.394±0.068
+0.642±0.055
+0.611±0.118
+0.355
+0.229
+DeepSeek-Lite
+0.419±0.041 0.474±0.039 0.317±0.048
+0.617±0.038
+0.400±0.112
+0.148
+−0.275
+Qwen-32B
+0.339±0.045 0.378±0.048 0.250±0.046
+0.530±0.048
+0.850±0.082
+0.448
+0.374
+↑higher is better. ↓lower is better. Bold = best within group. Underline = worst across all models.
+All progress/completion/pos. acc./dist./failed values are mean±SEM over 20 structures from the
+evaluation set at turn 20. REMOVE and gap values are aggregated over all turns.
+Table 1: Task performance in CRAFT across 7 frontier-proprietary models and 8 open-
+weight models across 20 games after end of turns (turn=20). The builder receives up to
+5 “legal” moves per turn and selects among them based solely on director instructions.
+Progress, Completion, Pos. Acc., and Dist. are continuous metrics; Failed is a binary per-turn
+outcome.
+Models and Implementation.
+We evaluate 15 director models: 8 open-weight models
+spanning 7B–72B parameters—Qwen-2.5-Instruct 7B/14B/32B/72B (Qwen et al., 2025),
+Llama-3-8B Instruct (AI@Meta, 2024), Mistral-7B (Jiang et al., 2023), Gemma-2-9B (Team
+et al., 2024), DeepSeek-V2-Lite (Shao et al., 2024)— and 7 frontier models—GPT-4o, GPT-4o-
+Mini, GPT-4.1-Mini (OpenAI, 2023), Claude-Sonnet-4.69, Gemini-2.5-Flash, Gemini-3-Flash,
+Gemini-3.1-Flash-Lite10, all paired with a fixed GPT-4o-mini (OpenAI et al., 2024) builder
+across all experiments. Each model is evaluated on 20 held-out structures over 20 turns for
+3 independent runs. Open-weight models use a 512-token output budget; frontier models
+use 2,000 tokens (GPT series) or 3,000 tokens (Claude, Gemini) to accommodate extended
+chain-of-thought generation without truncating reasoning traces. For automatic LLM-based
+grading communicative quality evaluation (Section 5.2), we use OpenAI’s GPT-4o-mini
+model. For brevity, we refer to models by shortened names throughout (e.g., Qwen-7B for
+Qwen-2.5-Instruct-7B, Gemini-3-Flash for Gemini-3-Flash-Preview).
+6
+Results
+6.1
+Task Performance and Failure Taxonomy
+We provide main task performance results in Table 1 along with a detailed taxonomy and
+quantitative analysis of the builder’s failure modes in Figure 3.
+Frontier models do not uniformly dominate open-weight models.
+Table 1 shows sub-
+stantial variation within both groups. Among frontier models, Gemini-3-Flash leads all
+15 models at 0.675 progress while GPT-4.1-Mini (0.312), Claude-Sonnet-4.6 (0.285), and
+both Gemini-Flash variants (0.257) fall below the majority of open-weight models. This
+shows that perspective-based spatial reasoning can be challenging for even frontier models,
+consistent with prior work (Li et al., 2025).
+9https://www.anthropic.com/news/claude-sonnet-4-6
+10https://deepmind.google/models/gemini/
+9
+Preprint
+What Went Wrong at Move Level
+Figure 3 shows the failure taxonomy across all 15 mod-
+els, computed by replaying saved game logs and classifying each oracle-available turn11 by
+its dominant failure mode. Layer errors (red) dominate across nearly all models, confirming
+that 3D layer inference is the primary move-level bottleneck—directors likely correctly
+identify target positions but specify the wrong vertical layer, causing the game engine to
+reject the move. Wrong position errors (blue) are concentrated in Claude-Sonnet and the
+two lowest-performing Gemini models, indicating that their directors issue instructions that
+map to likely incorrect board locations. Span errors (orange) are elevated for Gemini-3-Flash
+relative to its otherwise strong performance: despite directors correctly identifying block
+type and position, the builder fails to infer the required second-cell endpoint for large
+domino blocks from the director instructions. This is compounded by the partial observabil-
+ity design—a large block spanning two cells appears as size 2 to the director whose view
+contains both cells but as size 1 to directors who see only one face, making it difficult for
+directors to consistently communicate domino placement with sufficient precision for the
+builder to resolve the span (see Appendix B.2 for details on block encoding and partial view
+projection).
+0%
+20%
+40%
+60%
+80%
+100%
+Fraction of oracle-turn budget
+Gemini-3-Flash
+Qwen-7b
+Mistral-7b
+GPT-4o
+Llama-8b
+DeepSeek-Lite
+Gemma-9b
+Qwen-72b
+Qwen-14b
+GPT-4o-Mini
+Claude-Sonnet
+GPT-4.1-Mini
+Qwen-32b
+Gemini-2.5-Flash
+Gemini-3.1-Flash-Lite
+0.70
+0.69
+0.66
+0.66
+0.66
+0.62
+0.61
+0.61
+0.56
+0.48
+0.44
+0.43
+0.42
+0.41
+0.40
+Correct
+Layer error
+Span error
+Wrong color
+Wrong position
+Other / no attempt
+Figure 3: Failure taxonomy over all turns
+across 15 director models.
+Behavioral failure profiles diverge across
+model groups.
+The remove gap, defined as
+the difference between the fraction of turns
+where directors instruct a remove action and
+the fraction where the oracle prescribes one,
+separates the two groups most clearly and
+is strongly negatively correlated with ora-
+cle adherence (ρ = −0.543, p < 0.001),
+which in turn is the primary driver of task
+progress (r = 0.962, p < 0.001).
+Open-
+weight models exhibit a consistent pattern
+of moderate progress (0.419–0.631), low re-
+move gap (−0.275 to +0.080), and failures
+concentrated in execution mechanics. Models
+such as Llama-8B and Qwen-7B fail primar-
+ily because moves are rejected by the envi-
+ronment rather than due to incorrect instruc-
+tions. Frontier models show higher variance:
+Gemini-3-Flash matches or exceeds the best
+open-weight models on every metric, while
+the remaining six fall below the open-weight
+median and exhibit remove gaps two to five times larger (+0.254–+0.467). This pattern
+suggests that frontier model directors respond to board complexity with correction-heavy
+instruction strategies, which induce unnecessary removals and consume the turn budget
+without improving progress (Figure 5; Appendix F).
+Correction spirals as a behavioral signature of communication failure.
+Figure 5 plots
+the evolution of builder remove actions across turns against oracle-prescribed remove ac-
+tions across all evaluation games12. While oracle-prescribed moves are overwhelmingly
+placements (95.4% overall), the fraction of turns requiring any removal grows sharply after
+turn 10 as boards accumulate errors—reaching 0.70 or higher by turn 18 for models such
+as Llama-8B and DeepSeek-Lite, whose directors systematically under-remove relative to
+oracle need throughout the game (gap = −0.057 and −0.275 respectively). Low-performing
+models diverge in the opposite direction: Qwen-32B over-removes from the earliest turns
+(attempted remove rate 44.8% vs. oracle near zero, gap = +0.374), and frontier models
+such as GPT-4.1-Mini and Gemini-3.1-Flash-Lite show over-removal beginning at turn 1–3,
+before any board errors have accumulated—indicating that over-removal is a proactive
+11No-oracle turns rarely exceed 15% of total turns across all models on average. Figure 8 provides
+details.
+12Full per-model evolution plots for all base and frontier models appear in Figures 16 and 17 in
+Appendix F.
+10
+Preprint
+Figure 4: LLM grader scores across three evaluation dimensions—spatial grounding (left),
+mind modeling (center), and pragmatic sufficiency (right)—broken down by question and
+model group. Error bars denote ±1 standard error of the mean across all structure–turn–
+director observations per model (from independent LLM grader runs: SG and MM n=3; PS
+n=2).
+1
+5
+10
+15
+20
+Turn
+0.00
+0.25
+0.50
+0.75
+1.00
+Remove rate
+Llama-8b  [Under-remove · Base]
+gap=-0.057  prog=0.59
+1
+5
+10
+15
+20
+Turn
+Remove rate
+Qwen-32b  [Over-remove · Base]
+gap=+0.374  prog=0.34
+1
+5
+10
+15
+20
+Turn
+Remove rate
+Gemini-3-Flash  [Under-remove · Frontier]
+gap=+0.018  prog=0.68
+1
+5
+10
+15
+20
+Turn
+Remove rate
+GPT-4.1-Mini  [Over-remove · Frontier]
+gap=+0.388  prog=0.31
+Oracle remove
+Attempted remove
+Figure 5: Oracle-prescribed vs. attempted remove rate per turn, averaged across all 20
+structures (shading = gap between lines). Each subplot title shows the mean gap and
+final-turn task progress.
+director communication pattern rather than a reactive response to mistakes. In contrast,
+well-performing models (Llama-8B, Gemini-3-Flash) track the oracle remove signal closely
+throughout the game. This “correction spiral” reflects a fundamental property of the CRAFT
+stacking constraint: a wrong block placed early can only be removed after clearing all correct
+blocks above it, and while directors observe the current board state and can issue remove
+instructions, the multi-perspective coordination requirement means three directors may
+simultaneously identify different blocks to remove, leaving the builder to resolve conflict-
+ing priorities across turns without guaranteed progress. In general, oracle adherence and
+remove behavior characterize what goes wrong and how often—but not why, where the
+knowing the latter requires investigating individual vs overall director communication
+failures with LLM graders. We provide this in Section 6.2.
+6.2
+LLM Grader Results
+Individual reasoning and message quality does not distinguish successful from unsuc-
+cessful turns
+Figure 4 shows automatic grading results13 for spatial grounding (left),
+mind modeling (middle), and pragmatic sufficiency (right) of director internal reasoning
+and public messages, grouped by whether the builder executes the oracle-recommended
+move. The results reveal a key diagnostic at the turn-level: SG and MM scores are nearly
+identical across both cases, indicating that directors reason and communicate at similar
+quality regardless of whether the builder ultimately follows the oracle. In contrast, PS scores
+drop sharply on turns where the builder does not execute the oracle-recommended move,
+with block type specification decreasing from 0.69–0.73 on successful execution turns to
+0.11–0.18 otherwise. This suggests that individual communication quality—as measured
+13Detailed results are shown in Table 6 and Figure 15
+11
+Preprint
+by SG and MM scores—does not distinguish successful from unsuccessful turns (Defini-
+tion 4.1), whereas collective sufficiency does. That PS scores have higher discriminative
+power to make this distinction is not surprising since the builder is provided with the
+director responses “collectively” every turn before it selects an action.
+Higher individual communication quality does not produce better collective outcomes.
+Table 6 (Appendix E) reports per-model judge scores with standard errors. The group-
+level pattern is clear: frontier models score higher on spatial grounding (0.829±0.036 vs
+0.658±0.069) and message calibration (0.642±0.067 vs 0.502±0.024), yet achieve lower task
+progress (0.387 vs 0.525). The GPT family illustrates this most directly: GPT-4.1-Mini
+scores the highest SG (0.937±0.003) and MM (0.787±0.003) of any model yet achieves only
+0.312 progress, while GPT-4o scores lower on both (0.792, 0.706) but achieves nearly twice
+the progress (0.588). Claude-Sonnet-4.6 follows the same pattern (SG=0.910, MM=0.775,
+progress=0.285). Better individual reasoning and message quality, in other words, does not
+produce better task outcomes—and within the GPT family, higher scores are associated
+with worse performance. Together, these two findings point away from individual commu-
+nication quality as the explanatory variable and toward something in the content of what
+high-quality directors communicate—specifically, what they choose to instruct the builder
+to do when they reason carefully about their private wall view.
+Reconciling Individual Communication of Directors to Collaborative Task Performance
+To answer the above question, we correlated all judge features with progress across the 15
+models. This result is shown in Table 7 in Appendix E. Most judge metrics show negative
+correlations with progress, but unique perspective utilization (MM5) stands out: it is the
+only MM dimension14 that directly measures whether a director reasons about what is
+“exclusively visible” from their wall, which is precisely the reasoning that would lead a
+director to identify board-state corrections invisible to other directors and issue removal
+instructions accordingly.
+Therefore, we did a mediation analysis to confirm the likely causal chain. Unique perspective
+utilization alone explains R2=0.330 of the task progress variance, remove gap alone explains
+R2=0.609, and both together explain R2=0.633, a gain of only 0.024. The partial correlation
+of unique perspective with progress controlling for remove gap is non-significant (r =
+−0.247, p=0.374), establishing full mediation: directors who carefully leverage their private
+wall view produce more correction-oriented instructions—those instructions drive over-
+removal particularly in frontier models, and over-removal consumes the turn budget (20
+turns) without advancing progress. Overall, this result suggests that sophistication that
+makes frontier directors better individual communicators is precisely what makes them
+relatively worse collective coordinators in CRAFT’s multi-sender setting.
+6.3
+Qualitative Error Analysis
+We provide an example error analysis from the game runs for the Qwen-32B model as
+directors. Table 2 shows representative samples of errors from multiple open-weight and
+frontier-proprietary models, broken down by the director model, turn of error, director
+instructions for that turn and failure details. Figure 6 shows the board state at turn 13 of the
+Qwen-32B correction spiral. Reading D1’s panel from bottom to top: layer 0 shows a small
+yellow block at (0,0) and a large blue domino spanning (1,0)–(2,0); layer 1 shows a large
+orange domino spanning (0,0)–(1,0) and a small green at (2,0); layer 2 is entirely empty.
+The orange domino D1 wants to remove therefore sits at layer 1, directly accessible as the
+top block at both (0,0) and (1,0). However, D1’s instruction says “remove the large orange
+block from the middle-left of my bottom layer” — specifying layer 0, which is occupied
+by the blue domino, not the orange one. The game engine rejects the move with Cannot
+remove layer 0 at (1,0) — must remove top block first (layer 1). D2 makes the
+same error independently: it sees orange at layer 1 on (0,0) but instructs removal from the
+bottom corner, again specifying layer 0. D3 sees only a single orange block at (2,2) and
+14Novel information (MM1) and message calibration (MM4) are also negatively correlated, but
+these are downstream consequences of the same underlying behavior rather than its source.
+12
+Preprint
+Model
+Turn
+Director instruction
+Failure & cause
+F1 — Wrong block (base speaker failure)
+DeepSeek-Lite
+T8
+D1 & D3 (identical): “place a large orange block
+spanning (0,1) and (0,2)”
+Builder places os at layer 2; oracle needs bs .
+Both directors describe target state not current
+state; redundant identical messages add zero in-
+formation.
+DeepSeek-Lite
+T1
+D2 & D3: “large orange block spanning middle
+and right of my bottom layer”
+Builder places ol at (1,2) →
+(2,2) ; oracle
+needs ol at (0,0) span (0,1). Frame-of-reference
+ambiguity: “middle and right” resolves to wrong
+global coordinates.
+F2 — Correction spiral (ToM listener failure)
+Qwen-32B
+T13
+D1: “remove the large orange block from the
+middle-left of my bottom layer”; D2: “remove the
+orange block from my bottom left corner”
+Cannot remove layer 0 at (1,0) — ol sits at
+layer 1 not layer 0; both directors specify “bottom
+layer” without checking current stack depth. Or-
+acle recommends place gs @ (0,0) layer 2 .
+Qwen-32B
+T14–15
+D1 & D3: same remove instruction as T13
+Identical error, identical board state. Three consecu-
+tive turns consumed; no director issues prerequi-
+site remove (1,0) layer 1 needed to unblock
+target.
+F3 — Span omission (reasoning–communication gap)
+Gemini-3-Flash
+T10
+D3: “put a small yellow block on my bottom
+right”
+Builder places
+yl
+without
+span_to ; oracle
+needs yl at (1,0) span (2,0). Director said
+small; builder upgraded to large but omitted
+span endpoint.
+Gemini-3-Flash
+T6
+D3 message truncated; D2 silent
+Builder
+places
+bl
+at
+correct
+position
+but
+span_to=None ; oracle needs span (2,2). No
+span context in messages.
+F3 — Layer miscounting (stacking constraint violation)
+Qwen-32B
+T7
+D2: “swap out the yellow block at bottom left”
+Stack at (0,0):
+[ys, ol].
+Builder attempts
+remove layer 0 ; must remove ol at layer 1
+first. Director describes target without checking
+current stack depth.
+Claude-Sonnet-4.6
+T8
+D1: “place small green at the near end of my left
+wall, second level”
+Stack depth at (0,0) is 2;
+correct layer is
+layer=2
+but builder maps “second level” to
+layer=1 . Natural language level indexing mis-
+aligns with zero-indexed stack depth.
+wrong value
+correct oracle value.
+Block codes: orange, blue, green, yellow , red.
+Table 2: Representative turn-level failures organized by BPS failure mode, as identified in
+Section 3.1. The Qwen-32B deadlock (Figure 18) across turns 10–15 illustrates how a single
+wrong early placement traps directors in an irrecoverable correction spiral when no agent
+tracks the repair plan across turns.
+has no visibility into either problem position. Critically, this board state and these director
+instructions are identical across turns 13, 14, and 15 — because neither the board nor the
+directors’ instructions change after a failed remove attempt. Without any mechanism to
+track that the previous instruction failed and why, directors re-issue the same “bottom layer”
+instruction each turn, consuming three turns without any forward progress while the oracle
+continues to recommend placement moves at other positions.
+7
+Conclusion
+We introduced CRAFT, a multi-agent benchmark for evaluating pragmatic communication
+in partially observable, spatially grounded environments. By combining a controlled
+construction task with a multi-sender communication setting, CRAFT enables fine-grained
+analysis of how language models coordinate under asymmetric information. Our central
+finding is a clean empirical dissociation: frontier or proprietary models score higher on
+13
+Preprint
+Figure 6: Three turns of zero progress in Qwen-32B (structure_001, T10–T14): D1 and D2
+repeatedly instruct removal from the wrong layer while the oracle recommends forward
+placement, and the builder follows director consensus over oracle, consuming three turns
+without any board state change (full trace in Table 9).
+most individual communication dimensions yet achieve lower task progress than smaller
+open-weight models. The mechanism is specific—directors who reason carefully about
+their unique wall view issue more correction-oriented instructions, driving over-removal
+that consumes the turn budget without advancing progress, and no model successfully
+models the joint listener in practice. Individual pragmatic competence is necessary but not
+sufficient for collective task success in CRAFT’s multi-sender setting. More broadly, CRAFT
+demonstrates that benchmarks measuring individual reasoning quality are insufficient for
+evaluating multi-agent coordination — the two capabilities are empirically dissociable and
+can move in opposite directions. We release the game engine, judge prompts, and evaluation
+code to support future work on training and evaluating models that are not only strong
+individual reasoners but effective collaborators under partial information.
+Limitations and Future Directions
+CRAFT is evaluated in a text-only setting and does
+not consider models with direct access to visual inputs (Li et al., 2025; Liu et al., 2025).
+While multimodal inputs may improve individual spatial grounding, it remains unclear
+whether such gains transfer to multi-agent coordination, where communication and conflict
+resolution are critical.
+Our experiments also use a fixed builder with access to oracle-assisted candidate moves.
+This controlled design isolates the effect of director communication and enables clearer
+credit assignment, but does not fully reflect real-world settings where agents must act
+without access to ground-truth guidance or may need to “explore” moves within a defined
+action space (e.g., with a move exploration tool that simulates moves on the CRAFT game
+engine for feedback). We leave exploration of these directions for future work.
+We also do not explore settings with heterogeneous director models (e.g., mixing open
+and proprietary models within a game) (Davidson et al., 2025). Such configurations could
+provide further insight into how differences in alignment algorithms, pretraining, and post-
+training data influence collaborative performance and agent behavior, including partner-
+aware coordination in information-asymmetric settings (Curvo, 2025; Liang et al., 2025; Hu
+et al., 2021; Nath & Krishnaswamy, 2025). While our controlled setup reduces variability and
+improves interpretability, it limits conclusions about joint optimization in heterogeneous
+multi-agent systems, where communication and execution policies may co-adapt.
+References
+Saaket Agashe, Yue Fan, Anthony Reyna, and Xin Eric Wang. LLM-coordination: Evaluat-
+ing and analyzing multi-agent coordination abilities in large language models. In Luis
+Chiruzzo, Alan Ritter, and Lu Wang (eds.), Findings of the Association for Computational
+Linguistics: NAACL 2025, pp. 8053–8072, Albuquerque, New Mexico, April 2025. Asso-
+ciation for Computational Linguistics. ISBN 979-8-89176-195-7. doi: 10.18653/v1/2025.
+findings-naacl.448. URL https://aclanthology.org/2025.findings-naacl.448/.
+14
+Preprint
+AI@Meta.
+Llama 3 model card.
+https://github.com/meta-llama/llama3/blob/main/
+MODEL_CARD.md, 2024. Accessed: 2026.
+Abdollah Amirkhani and Amir Hossein Barshooi. Consensus in multi-agent systems: a
+review. Artificial Intelligence Review, 55(5):3897–3935, 2022.
+Jacob Andreas and Dan Klein. Reasoning about pragmatics with neural listeners and
+speakers. In Proceedings of the 2016 conference on empirical methods in natural language
+processing, pp. 1173–1182, 2016.
+Timothy Bickmore and Justine Cassell. Social dialogue with embodied conversational
+agents. Advances in natural multimodal dialogue systems, 30:23–54, 2005.
+Ruth MJ Byrne and Philip N Johnson-Laird. Spatial reasoning. Journal of memory and
+language, 28(5):564–575, 1989.
+Jingdi Chen, Hanqing Yang, Zongjun Liu, and Carlee Joe-Wong. The five ws of multi-agent
+communication: Who talks to whom, when, what, and why – a survey from marl to
+emergent language and llms, 2026. URL https://arxiv.org/abs/2602.11583.
+Can Cui, Yunsheng Ma, Xu Cao, Wenqian Ye, Yang Zhou, Kaizhao Liang, Jintai Chen,
+Juanwu Lu, Zichong Yang, Kuei-Da Liao, et al. A survey on multimodal large language
+models for autonomous driving. In Proceedings of the IEEE/CVF winter conference on
+applications of computer vision, pp. 958–979, 2024.
+Pedro MP Curvo. The traitors: Deception and trust in multi-agent language model simula-
+tions. arXiv preprint arXiv:2505.12923, 2025.
+Tim R Davidson, Veniamin Veselovsky, Martin Josifoski, Maxime Peyrard, Antoine Bosse-
+lut, Michal Kosinski, and Robert West. Evaluating language model agency through
+negotiations. arXiv preprint arXiv:2401.04536, 2024.
+Tim R. Davidson, Adam Fourney, Saleema Amershi, Robert West, Eric Horvitz, and Ece
+Kamar. The collaboration gap, 2025. URL https://arxiv.org/abs/2511.02687.
+Mengfei Du, Binhao Wu, Zejun Li, Xuan-Jing Huang, and Zhongyu Wei. Embspatial-bench:
+Benchmarking spatial understanding for embodied tasks with large vision-language
+models. In Proceedings of the 62nd Annual Meeting of the Association for Computational
+Linguistics (Volume 2: Short Papers), pp. 346–355, 2024.
+Jacob Eisenstein, Fantine Huot, Adam Fisch, Jonathan Berant, and Mirella Lapata. Mt-
+pingeval: Evaluating multi-turn collaboration with private information games, 2026. URL
+https://arxiv.org/abs/2602.24188.
+Lautaro Estienne, Gabriel Ben Zenou, Nona Naderi, Jackie CK Cheung, and Pablo Pi-
+antanida. Collaborative rational speech act: Pragmatic reasoning for multi-turn dialog.
+In Christos Christodoulopoulos, Tanmoy Chakraborty, Carolyn Rose, and Violet Peng
+(eds.), Proceedings of the 2025 Conference on Empirical Methods in Natural Language Process-
+ing, pp. 22509–22523, Suzhou, China, November 2025. Association for Computational
+Linguistics. ISBN 979-8-89176-332-6. doi: 10.18653/v1/2025.emnlp-main.1145. URL
+https://aclanthology.org/2025.emnlp-main.1145/.
+Michael C Frank and Noah D Goodman. Predicting pragmatic reasoning in language games.
+Science, 336(6084):998–998, 2012.
+Daniel Fried, Jacob Andreas, and Dan Klein. Unified pragmatic models for generating and
+following instructions. In Proceedings of the 2018 Conference of the North American Chapter of
+the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long
+Papers), pp. 1951–1963, 2018.
+Ananya Ganesh, Martha Palmer, and Katharina von der Wense. A survey of challenges and
+methods in the computational modeling of multi-party dialog. In Proceedings of the 5th
+Workshop on NLP for Conversational AI (NLP4ConvAI 2023), pp. 140–154, 2023.
+15
+Preprint
+Xiaofeng Gao, Qiaozi Gao, Ran Gong, Kaixiang Lin, Govind Thattai, and Gaurav S Sukhatme.
+Dialfred: Dialogue-enabled agents for embodied instruction following. IEEE Robotics and
+Automation Letters, 7(4):10049–10056, 2022.
+Simon Garrod and Martin J Pickering. Why is conversation so easy? Trends in cognitive
+sciences, 8(1):8–11, 2004.
+Noah D Goodman and Andreas Stuhlmüller. Knowledge and implicature: Modeling
+language understanding as social cognition. Topics in cognitive science, 5(1):173–184, 2013.
+Herbert P Grice. Logic and conversation. In Speech acts, pp. 41–58. Brill, 1975.
+Florian Grötschla, Luis Müller, Jan Tönshoff, Mikhail Galkin, and Bryan Perozzi.
+Agentsnet: Coordination and collaborative reasoning in multi-agent llms. arXiv preprint
+arXiv:2507.08616, 2025.
+Adrian Hayler, Shashank Reddy Chirra, Andrei Lupu, Johannes Forkel, Bidipta Sarkar,
+Siheng Feng, and Jakob Nicolaus Foerster. Zero-shot coordination among LLM agents.
+In Workshop on Multi-Agent Learning and Its Opportunities in the Era of Generative AI, 2026.
+URL https://openreview.net/forum?id=HHPbQlyA7Y.
+Xinmeng Hou, Wuqi Wang, Long Yang, Hao Lin, Jinglun Feng, Haigen Min, and Xiangmo
+Zhao. Driveagent: Multi-agent structured reasoning with llm and multimodal sensor
+fusion for autonomous driving. IEEE Robotics and Automation Letters, 2025.
+Hengyuan Hu, Adam Lerer, Brandon Cui, David Wu, Luis Pineda, Noam Brown, and Jakob
+Foerster. Off-belief learning, 2021. URL https://arxiv.org/abs/2103.04000.
+Jennifer Hu, Sammy Floyd, Olessia Jouravlev, Evelina Fedorenko, and Edward Gibson. A
+fine-grained comparison of pragmatic language understanding in humans and language
+models. In Proceedings of the 61st Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pp. 4194–4213, 2023.
+Dom Huh and Prasant Mohapatra. Multi-agent reinforcement learning: A comprehensive
+survey, 2024. URL https://arxiv.org/abs/2312.10256.
+Hamish Ivison, Yizhong Wang, Valentina Pyatkin, Nathan Lambert, Matthew Peters,
+Pradeep Dasigi, Joel Jang, David Wadden, Noah A Smith, Iz Beltagy, et al. Camels in a
+changing climate: Enhancing lm adaptation with tulu 2. arXiv preprint arXiv:2311.10702,
+2023.
+Mingyue Jian and N Siddharth. Are llms good pragmatic speakers?
+In NeurIPS 2024
+Workshop on Behavioral Machine Learning, 2024.
+Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh
+Chaplot, Diego de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile
+Saulnier, Lélio Renard Lavaud, Marie-Anne Lachaux, Pierre Stock, Teven Le Scao, Thibaut
+Lavril, Thomas Wang, Timothée Lacroix, and William El Sayed. Mistral 7b, 2023.
+Jiechuan Jiang, Kefan Su, and Zongqing Lu. Fully decentralized cooperative multi-agent
+reinforcement learning: A survey, 2024. URL https://arxiv.org/abs/2401.04934.
+Carl Gustav Jung and Richard Francis Carrington Hull. The archetypes of the collective
+unconscious. In Collected works of CG Jung, pp. v7_90–v7_113. Routledge, 2023.
+Amita Kamath, Jack Hessel, and Kai-Wei Chang. What’s “up” with vision-language models?
+investigating their struggle with spatial reasoning. In Proceedings of the 2023 Conference on
+Empirical Methods in Natural Language Processing, pp. 9161–9175, 2023.
+Majeed Kazemitabaar, Xinying Hou, Austin Henley, Barbara Jane Ericson, David Weintrop,
+and Tovi Grossman. How novices use llm-based code generators to solve cs1 coding tasks
+in a self-paced learning environment. In Proceedings of the 23rd Koli calling international
+conference on computing education research, pp. 1–12, 2023.
+16
+Preprint
+Fereshte Khani, Noah D. Goodman, and Percy Liang. Planning, inference and pragmatics in
+sequential language games, 2018. URL https://arxiv.org/abs/1805.11774.
+Lea Krause and Piek T.J.M. Vossen. The Gricean maxims in NLP - a survey. In Saad
+Mahamood, Nguyen Le Minh, and Daphne Ippolito (eds.), Proceedings of the 17th Interna-
+tional Natural Language Generation Conference, pp. 470–485, Tokyo, Japan, September 2024.
+Association for Computational Linguistics. doi: 10.18653/v1/2024.inlg-main.39. URL
+https://aclanthology.org/2024.inlg-main.39/.
+Dingming Li, Hongxing Li, Zixuan Wang, Yuchen Yan, Hang Zhang, Siqi Chen, Guiyang
+Hou, Shengpei Jiang, Wenqi Zhang, Yongliang Shen, Weiming Lu, and Yueting Zhuang.
+Viewspatial-bench: Evaluating multi-perspective spatial localization in vision-language
+models, 2025. URL https://arxiv.org/abs/2505.21500.
+Hengli Li, Song-Chun Zhu, and Zilong Zheng. Diplomat: A dialogue dataset for situated
+pragmatic reasoning. Advances in Neural Information Processing Systems, 36:46856–46884,
+2023.
+Fangzhou Liang, Tianshi Zheng, Chunkit Chan, Yauwai Yim, and Yangqiu Song. Llm-
+hanabi: Evaluating multi-agent gameplays with theory-of-mind and rationale inference
+in imperfect information collaboration game, 2025. URL https://arxiv.org/abs/2510.
+04980.
+Weichen Liu, Qiyao Xue, Haoming Wang, Xiangyu Yin, Boyuan Yang, and Wei Gao. Spatial
+reasoning in multimodal large language models: A survey of tasks, benchmarks and
+methods, 2025. URL https://arxiv.org/abs/2511.15722.
+Annie Louis, Dan Roth, and Filip Radlinski. “i’d rather just go to bed”: Understanding
+indirect answers. In Proceedings of the 2020 Conference on Empirical Methods in Natural
+Language Processing (EMNLP), pp. 7411–7425, 2020.
+Andrei Lupu, Brandon Cui, Hengyuan Hu, and Jakob Foerster. Trajectory diversity for
+zero-shot coordination. In International conference on machine learning, pp. 7204–7213.
+PMLR, 2021.
+Bolei Ma, Yuting Li, Wei Zhou, Ziwei Gong, Yang Janet Liu, Katja Jasinskaja, Annemarie
+Friedrich, Julia Hirschberg, Frauke Kreuter, and Barbara Plank. Pragmatics in the era of
+large language models: A survey on datasets, evaluation, opportunities and challenges.
+In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics
+(Volume 1: Long Papers), pp. 8679–8696, 2025a.
+Wufei Ma, Haoyu Chen, Guofeng Zhang, Yu-Cheng Chou, Jieneng Chen, Celso de Melo, and
+Alan Yuille. 3dsrbench: A comprehensive 3d spatial reasoning benchmark. In Proceedings
+of the IEEE/CVF International Conference on Computer Vision, pp. 6924–6934, 2025b.
+Kyle Mahowald, Anna A. Ivanova, Idan A. Blank, Nancy Kanwisher, Joshua B. Tenenbaum,
+and Evelina Fedorenko. Dissociating language and thought in large language models,
+2024. URL https://arxiv.org/abs/2301.06627.
+Nicolas Martorell. From text to space: Mapping abstract spatial models in llms during a
+grid-world navigation task, 2025. URL https://arxiv.org/abs/2502.16690.
+Nestor Maslej, Loredana Fattorini, Raymond Perrault, Yolanda Gil, Vanessa Parli, Njenga
+Kariuki, Emily Capstick, Anka Reuel, Erik Brynjolfsson, John Etchemendy, Katrina Ligett,
+Terah Lyons, James Manyika, Juan Carlos Niebles, Yoav Shoham, Russell Wald, Toby
+Walsh, Armin Hamrah, Lapo Santarlasci, Julia Betts Lotufo, Alexandra Rome, Andrew
+Shi, and Sukrut Oak. Artificial intelligence index report 2025, 2025. URL https://arxiv.
+org/abs/2504.07139.
+Mahmoud Mohammadi, Yipeng Li, Jane Lo, and Wendy Yip. Evaluation and benchmarking
+of llm agents: A survey. In Proceedings of the 31st ACM SIGKDD Conference on Knowledge
+Discovery and Data Mining V.2, KDD ’25, pp. 6129–6139. ACM, August 2025. doi: 10.1145/
+3711896.3736570. URL http://dx.doi.org/10.1145/3711896.3736570.
+17
+Preprint
+Abhijnan Nath and Nikhil Krishnaswamy. Learning “partner-aware” collaborators in multi-
+party collaboration. In The Thirty-ninth Annual Conference on Neural Information Processing
+Systems.
+Abhijnan Nath and Nikhil Krishnaswamy. Learning “partner-aware” collaborators in multi-
+party collaboration. In The Thirty-ninth Annual Conference on Neural Information Processing
+Systems, 2025.
+Abhijnan Nath, Carine Graff, Andrei Bachinin, and Nikhil Krishnaswamy.
+Frictional
+agent alignment framework: Slow down and don’t break things. In Wanxiang Che,
+Joyce Nabende, Ekaterina Shutova, and Mohammad Taher Pilehvar (eds.), Proceedings
+of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long
+Papers), pp. 11042–11089, Vienna, Austria, July 2025a. Association for Computational
+Linguistics. ISBN 979-8-89176-251-0. doi: 10.18653/v1/2025.acl-long.542. URL https:
+//aclanthology.org/2025.acl-long.542/.
+Abhijnan Nath, Carine Graff, and Nikhil Krishnaswamy. Collaborate, deliberate, eval-
+uate: How llm alignment affects coordinated multi-agent outcomes.
+arXiv preprint
+arXiv:2509.05882, 2025b.
+Aida Nematzadeh, Kaylee Burns, Erin Grant, Alison Gopnik, and Tom Griffiths. Evaluating
+theory of mind in question answering. In Proceedings of the 2018 Conference on Empirical
+Methods in Natural Language Processing, pp. 2392–2400, 2018.
+Duc Thien Nguyen, Akshat Kumar, and Hoong Chuin Lau. Credit assignment for collective
+multiagent rl with global rewards. Advances in neural information processing systems, 31,
+2018.
+Khanh Nguyen. Language models are bounded pragmatic speakers: Understanding rlhf
+from a bayesian cognitive modeling perspective, 2024. URL https://arxiv.org/abs/
+2305.17760.
+Geoffrey D Nunberg. The pragmatics of reference. City University of New York, 1978.
+OpenAI. Gpt-4 technical report, 2023.
+OpenAI, :, Aaron Hurst, Adam Lerer, Adam P. Goucher, Adam Perelman, Aditya Ramesh,
+Aidan Clark, AJ Ostrow, Akila Welihinda, Alan Hayes, Alec Radford, Aleksander M ˛adry,
+Alex Baker-Whitcomb, Alex Beutel, Alex Borzunov, Alex Carney, Alex Chow, Alex Kirillov,
+Alex Nichol, Alex Paino, Alex Renzin, Alex Tachard Passos, Alexander Kirillov, Alexi
+Christakis, Alexis Conneau, Ali Kamali, Allan Jabri, Allison Moyer, Allison Tam, Amadou
+Crookes, Amin Tootoochian, Amin Tootoonchian, Ananya Kumar, Andrea Vallone, An-
+drej Karpathy, Andrew Braunstein, Andrew Cann, Andrew Codispoti, Andrew Galu,
+Andrew Kondrich, Andrew Tulloch, Andrey Mishchenko, Angela Baek, Angela Jiang,
+Antoine Pelisse, Antonia Woodford, Anuj Gosalia, Arka Dhar, Ashley Pantuliano, Avi
+Nayak, Avital Oliver, Barret Zoph, Behrooz Ghorbani, Ben Leimberger, Ben Rossen, Ben
+Sokolowsky, Ben Wang, Benjamin Zweig, Beth Hoover, Blake Samic, Bob McGrew, Bobby
+Spero, Bogo Giertler, Bowen Cheng, Brad Lightcap, Brandon Walkin, Brendan Quinn,
+Brian Guarraci, Brian Hsu, Bright Kellogg, Brydon Eastman, Camillo Lugaresi, Carroll
+Wainwright, Cary Bassin, Cary Hudson, Casey Chu, Chad Nelson, Chak Li, Chan Jun
+Shern, Channing Conger, Charlotte Barette, Chelsea Voss, Chen Ding, Cheng Lu, Chong
+Zhang, Chris Beaumont, Chris Hallacy, Chris Koch, Christian Gibson, Christina Kim,
+Christine Choi, Christine McLeavey, Christopher Hesse, Claudia Fischer, Clemens Win-
+ter, Coley Czarnecki, Colin Jarvis, Colin Wei, Constantin Koumouzelis, Dane Sherburn,
+Daniel Kappler, Daniel Levin, Daniel Levy, David Carr, David Farhi, David Mely, David
+Robinson, David Sasaki, Denny Jin, Dev Valladares, Dimitris Tsipras, Doug Li, Duc Phong
+Nguyen, Duncan Findlay, Edede Oiwoh, Edmund Wong, Ehsan Asdar, Elizabeth Proehl,
+Elizabeth Yang, Eric Antonow, Eric Kramer, Eric Peterson, Eric Sigler, Eric Wallace, Eugene
+Brevdo, Evan Mays, Farzad Khorasani, Felipe Petroski Such, Filippo Raso, Francis Zhang,
+Fred von Lohmann, Freddie Sulit, Gabriel Goh, Gene Oden, Geoff Salmon, Giulio Starace,
+Greg Brockman, Hadi Salman, Haiming Bao, Haitang Hu, Hannah Wong, Haoyu Wang,
+Heather Schmidt, Heather Whitney, Heewoo Jun, Hendrik Kirchner, Henrique Ponde
+18
+Preprint
+de Oliveira Pinto, Hongyu Ren, Huiwen Chang, Hyung Won Chung, Ian Kivlichan, Ian
+O’Connell, Ian O’Connell, Ian Osband, Ian Silber, Ian Sohl, Ibrahim Okuyucu, Ikai Lan,
+Ilya Kostrikov, Ilya Sutskever, Ingmar Kanitscheider, Ishaan Gulrajani, Jacob Coxon, Jacob
+Menick, Jakub Pachocki, James Aung, James Betker, James Crooks, James Lennon, Jamie
+Kiros, Jan Leike, Jane Park, Jason Kwon, Jason Phang, Jason Teplitz, Jason Wei, Jason
+Wolfe, Jay Chen, Jeff Harris, Jenia Varavva, Jessica Gan Lee, Jessica Shieh, Ji Lin, Jiahui Yu,
+Jiayi Weng, Jie Tang, Jieqi Yu, Joanne Jang, Joaquin Quinonero Candela, Joe Beutler, Joe
+Landers, Joel Parish, Johannes Heidecke, John Schulman, Jonathan Lachman, Jonathan
+McKay, Jonathan Uesato, Jonathan Ward, Jong Wook Kim, Joost Huizinga, Jordan Sitkin,
+Jos Kraaijeveld, Josh Gross, Josh Kaplan, Josh Snyder, Joshua Achiam, Joy Jiao, Joyce
+Lee, Juntang Zhuang, Justyn Harriman, Kai Fricke, Kai Hayashi, Karan Singhal, Katy
+Shi, Kavin Karthik, Kayla Wood, Kendra Rimbach, Kenny Hsu, Kenny Nguyen, Keren
+Gu-Lemberg, Kevin Button, Kevin Liu, Kiel Howe, Krithika Muthukumar, Kyle Luther,
+Lama Ahmad, Larry Kai, Lauren Itow, Lauren Workman, Leher Pathak, Leo Chen, Li Jing,
+Lia Guy, Liam Fedus, Liang Zhou, Lien Mamitsuka, Lilian Weng, Lindsay McCallum,
+Lindsey Held, Long Ouyang, Louis Feuvrier, Lu Zhang, Lukas Kondraciuk, Lukasz
+Kaiser, Luke Hewitt, Luke Metz, Lyric Doshi, Mada Aflak, Maddie Simens, Madelaine
+Boyd, Madeleine Thompson, Marat Dukhan, Mark Chen, Mark Gray, Mark Hudnall,
+Marvin Zhang, Marwan Aljubeh, Mateusz Litwin, Matthew Zeng, Max Johnson, Maya
+Shetty, Mayank Gupta, Meghan Shah, Mehmet Yatbaz, Meng Jia Yang, Mengchao Zhong,
+Mia Glaese, Mianna Chen, Michael Janner, Michael Lampe, Michael Petrov, Michael Wu,
+Michele Wang, Michelle Fradin, Michelle Pokrass, Miguel Castro, Miguel Oom Temudo
+de Castro, Mikhail Pavlov, Miles Brundage, Miles Wang, Minal Khan, Mira Murati,
+Mo Bavarian, Molly Lin, Murat Yesildal, Nacho Soto, Natalia Gimelshein, Natalie Cone,
+Natalie Staudacher, Natalie Summers, Natan LaFontaine, Neil Chowdhury, Nick Ryder,
+Nick Stathas, Nick Turley, Nik Tezak, Niko Felix, Nithanth Kudige, Nitish Keskar, Noah
+Deutsch, Noel Bundick, Nora Puckett, Ofir Nachum, Ola Okelola, Oleg Boiko, Oleg
+Murk, Oliver Jaffe, Olivia Watkins, Olivier Godement, Owen Campbell-Moore, Patrick
+Chao, Paul McMillan, Pavel Belov, Peng Su, Peter Bak, Peter Bakkum, Peter Deng, Peter
+Dolan, Peter Hoeschele, Peter Welinder, Phil Tillet, Philip Pronin, Philippe Tillet, Prafulla
+Dhariwal, Qiming Yuan, Rachel Dias, Rachel Lim, Rahul Arora, Rajan Troll, Randall Lin,
+Rapha Gontijo Lopes, Raul Puri, Reah Miyara, Reimar Leike, Renaud Gaubert, Reza
+Zamani, Ricky Wang, Rob Donnelly, Rob Honsby, Rocky Smith, Rohan Sahai, Rohit
+Ramchandani, Romain Huet, Rory Carmichael, Rowan Zellers, Roy Chen, Ruby Chen,
+Ruslan Nigmatullin, Ryan Cheu, Saachi Jain, Sam Altman, Sam Schoenholz, Sam Toizer,
+Samuel Miserendino, Sandhini Agarwal, Sara Culver, Scott Ethersmith, Scott Gray, Sean
+Grove, Sean Metzger, Shamez Hermani, Shantanu Jain, Shengjia Zhao, Sherwin Wu,
+Shino Jomoto, Shirong Wu, Shuaiqi, Xia, Sonia Phene, Spencer Papay, Srinivas Narayanan,
+Steve Coffey, Steve Lee, Stewart Hall, Suchir Balaji, Tal Broda, Tal Stramer, Tao Xu, Tarun
+Gogineni, Taya Christianson, Ted Sanders, Tejal Patwardhan, Thomas Cunninghman,
+Thomas Degry, Thomas Dimson, Thomas Raoux, Thomas Shadwell, Tianhao Zheng, Todd
+Underwood, Todor Markov, Toki Sherbakov, Tom Rubin, Tom Stasi, Tomer Kaftan, Tristan
+Heywood, Troy Peterson, Tyce Walters, Tyna Eloundou, Valerie Qi, Veit Moeller, Vinnie
+Monaco, Vishal Kuo, Vlad Fomenko, Wayne Chang, Weiyi Zheng, Wenda Zhou, Wesam
+Manassra, Will Sheu, Wojciech Zaremba, Yash Patil, Yilei Qian, Yongjik Kim, Youlong
+Cheng, Yu Zhang, Yuchen He, Yuchen Zhang, Yujia Jin, Yunxing Dai, and Yury Malkov.
+Gpt-4o system card, 2024. URL https://arxiv.org/abs/2410.21276.
+Dojun Park, Jiwoo Lee, Hyeyun Jeong, Seohyun Park, and Sungeun Lee.
+Pragmatic
+competence evaluation of large language models for the korean language, 2024. URL
+https://arxiv.org/abs/2403.12675.
+Qwen, :, An Yang, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu,
+Chengyuan Li, Dayiheng Liu, Fei Huang, Haoran Wei, Huan Lin, Jian Yang, Jianhong Tu,
+Jianwei Zhang, Jianxin Yang, Jiaxi Yang, Jingren Zhou, Junyang Lin, Kai Dang, Keming
+Lu, Keqin Bao, Kexin Yang, Le Yu, Mei Li, Mingfeng Xue, Pei Zhang, Qin Zhu, Rui Men,
+Runji Lin, Tianhao Li, Tianyi Tang, Tingyu Xia, Xingzhang Ren, Xuancheng Ren, Yang
+Fan, Yang Su, Yichang Zhang, Yu Wan, Yuqiong Liu, Zeyu Cui, Zhenru Zhang, and Zihan
+Qiu. Qwen2.5 technical report, 2025. URL https://arxiv.org/abs/2412.15115.
+19
+Preprint
+Matthew Riemer, Zahra Ashktorab, Djallel Bouneffouf, Payel Das, Miao Liu, Justin D
+Weisz, and Murray Campbell. Position: Theory of mind benchmarks are broken for large
+language models. arXiv preprint arXiv:2412.19726, 2024.
+Laura Ruis, Akbir Khan, Stella Biderman, Sara Hooker, Tim Rocktäschel, and Edward
+Grefenstette. The goldilocks of pragmatic understanding: Fine-tuning strategy matters
+for implicature resolution by llms. Advances in Neural Information Processing Systems, 36:
+20827–20905, 2023.
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang,
+Mingchuan Zhang, YK Li, Y Wu, et al. Deepseekmath: Pushing the limits of mathematical
+reasoning in open language models. arXiv preprint arXiv:2402.03300, 2024.
+Harsh Singh, Rocktim Jyoti Das, Mingfei Han, Preslav Nakov, and Ivan Laptev. Malmm:
+Multi-agent large language models for zero-shot robotic manipulation. In 2025 IEEE/RSJ
+International Conference on Intelligent Robots and Systems (IROS), pp. 20386–20393. IEEE,
+2025.
+Nisan Stiennon, Long Ouyang, Jeffrey Wu, Daniel Ziegler, Ryan Lowe, Chelsea Voss, Alec
+Radford, Dario Amodei, and Paul F Christiano. Learning to summarize with human
+feedback. Advances in Neural Information Processing Systems, 33:3008–3021, 2020.
+Guangzhi Sun, Xiao Zhan, and Jose Such. Building better ai agents: A provocation on the
+utilisation of persona in llm-based conversational agents, 2024. URL https://arxiv.org/
+abs/2407.11977.
+Gemma Team, Morgane Riviere, Shreya Pathak, Pier Giuseppe Sessa, Cassidy Hardin, Surya
+Bhupatiraju, Léonard Hussenot, Thomas Mesnard, Bobak Shahriari, Alexandre Ramé,
+et al. Gemma 2: Improving open language models at a practical size. arXiv preprint
+arXiv:2408.00118, 2024.
+Yuandong Tian, Qucheng Gong, and Yu Jiang. Joint policy search for multi-agent collabo-
+ration with imperfect information. Advances in neural information processing systems, 33:
+19931–19942, 2020.
+Khanh-Tung Tran, Dung Dao, Minh-Duong Nguyen, Quoc-Viet Pham, Barry O’Sullivan,
+and Hoang D. Nguyen. Multi-agent collaboration mechanisms: A survey of llms, 2025.
+URL https://arxiv.org/abs/2501.06322.
+Lewis Tunstall, Edward Beeching, Nathan Lambert, Nazneen Rajani, Shengyi Huang,
+Kashif Rasul, Alexander M. Rush, and Thomas Wolf. The alignment handbook. https:
+//github.com/huggingface/alignment-handbook, 2023.
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Brian Ichter, Fei Xia, Ed Chi,
+Quoc Le, and Denny Zhou. Chain-of-thought prompting elicits reasoning in large lan-
+guage models, 2023.
+Guande Wu, Chen Zhao, Claudio Silva, and He He. Your co-workers matter: Evaluating
+collaborative capabilities of language models in blocks world. In Findings of the Association
+for Computational Linguistics: ACL 2024, pp. 4941–4957, 2024.
+Shirley Wu, Michel Galley, Baolin Peng, Hao Cheng, Gavin Li, Yao Dou, Weixin Cai, James
+Zou, Jure Leskovec, and Jianfeng Gao. Collabllm: From passive responders to active
+collaborators. arXiv preprint arXiv:2502.00640, 2025.
+Peiran Xu, Sudong Wang, Yao Zhu, Jianing Li, Gege Qi, and Yunjian Zhang. Spatialbench:
+Benchmarking multimodal large language models for spatial cognition, 2026.
+URL
+https://arxiv.org/abs/2511.21471.
+Rongwu Xu, Zian Zhou, Tianwei Zhang, Zehan Qi, Su Yao, Ke Xu, Wei Xu, and Han
+Qiu. Walking in others’ shoes: How perspective-taking guides large language models in
+reducing toxicity and bias. In Proceedings of the 2024 Conference on Empirical Methods in
+Natural Language Processing, pp. 8341–8368, 2024.
+20
+Preprint
+Chun-Hsiao Yeh, Chenyu Wang, Shengbang Tong, Ta-Ying Cheng, Ruoyu Wang, Tianzhe
+Chu, Yuexiang Zhai, Yubei Chen, Shenghua Gao, and Yi Ma.
+Seeing from another
+perspective: Evaluating multi-view understanding in mllms. In Proceedings of the AAAI
+Conference on Artificial Intelligence, volume 40, pp. 12000–12008, 2026.
+Mike Zhang, Kaixian Qu, Vaishakh Patil, Cesar Cadena, and Marco Hutter. Tag map: A
+text-based map for spatial reasoning and navigation with large language models, 2024a.
+URL https://arxiv.org/abs/2409.15451.
+Tianyi Zhang, Tao Yu, Tatsunori Hashimoto, Mike Lewis, Wen-tau Yih, Daniel Fried, and
+Sida Wang. Coder reviewer reranking for code generation. In International Conference on
+Machine Learning, pp. 41832–41846. PMLR, 2023.
+Wenyu Zhang, Wei En Ng, Lixin Ma, Yuwen Wang, Junqi Zhao, Allison Koenecke, Boyang
+Li, and Wanglu Wanglu. Sphere: Unveiling spatial blind spots in vision-language models
+through hierarchical evaluation. In Proceedings of the 63rd Annual Meeting of the Association
+for Computational Linguistics (Volume 1: Long Papers), pp. 11591–11609, 2025.
+Yu Zhang, Xiusi Chen, Bowen Jin, Sheng Wang, Shuiwang Ji, Wei Wang, and Jiawei Han.
+A comprehensive survey of scientific large language models and their applications in
+scientific discovery. In Proceedings of the 2024 Conference on Empirical Methods in Natural
+Language Processing, pp. 8783–8817, 2024b.
+Haozhen Zheng, Beitong Tian, Mingyuan Wu, Zhenggang Tang, Klara Nahrstedt, and Alex
+Schwing. Spatio-temporal llm: Reasoning about environments and actions, 2025. URL
+https://arxiv.org/abs/2507.05258.
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao
+Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric Xing, et al. Judging LLM-as-a-judge with
+MT-Bench and Chatbot Arena. In NeurIPS Datasets and Benchmarks Track, 2023.
+Yifan Zhu, Changsoo Jung, Kenneth Lai, Videep Venkatesha, Mariah Bradford, Jack Fitzger-
+ald, Huma Jamil, Carine Graff, Sai Kiran Ganesh Kumar, Bruce Draper, Nathaniel Blan-
+chard, James Pustejovsky, and Nikhil Krishnaswamy. Multimodal common ground
+annotation for partial information collaborative problem solving. In Bunt Harry (ed.),
+Proceedings of the 21st Joint ACL - ISO Workshop on Interoperable Semantic Annotation (ISA-
+21), pp. 85–91, Düsseldorf, Germany, September 2025. Association for Computational
+Linguistics. ISBN 979-8-89176-319-7. URL https://aclanthology.org/2025.isa-1.9/.
+Yifan Zhu, Mariah Bradford, Kenneth Lai, Timothy Obiso, Videep Venkatesha, James Puste-
+jovsky, and Nikhil Krishnaswamy. Distributed partial information puzzles: Examining
+common ground construction under epistemic asymmetry. arXiv preprint arXiv:2603.05450,
+2026a.
+Yifan Zhu, Mariah Bradford, Kenneth Lai, Timothy Obiso, Videep Venkatesha, James
+Pustejovsky, and Nikhil Krishnaswamy. Distributed partial information puzzles: Ex-
+amining common ground construction under epistemic asymmetry, 2026b. URL https:
+//arxiv.org/abs/2603.05450.
+A
+Proofs
+Proof. We proceed in three steps in order to prove Theorem 3.3.
+Step 1: Per-director optimisation.
+Each director Di selects her utterance ui to maximise
+expected utility under the joint listener. Since the joint listener LToMjoint evaluates the full
+tuple (u1, u2, u3), the optimal utterance for Di solves:
+u⋆
+i = arg max
+ui∈U
+log Sbasei(ui | z⋆
+i , ci) + log LToMjoint(z⋆| u1, u2, u3, c),
+(5)
+where we work in log space for convenience. This is the standard BPS objective (Equation 1)
+applied to Di, with LToMjoint playing the role of the ToM listener.
+21
+Preprint
+Step 2: Conditional independence of base speakers.
+Each base speaker Sbasei is pa-
+rameterized independently and therefore it conditions on Di’s private context ci =
+(oi,t, ht, {uj,t}j̸=i) and intention z⋆
+i , and does not depend on the utterances or intentions
+of the other directors except through the shared conversation history ht already included in
+ci. Formally, for i ̸= j:
+Sbasei(ui | z⋆
+i , ci) ⊥⊥Sbasej(uj | z⋆
+j , cj)
+ c,
+(6)
+where c = (ht, st) is the shared public context. Under this conditional independence, the
+joint distribution over all three utterances given the shared context factorizes as:
+p(u1, u2, u3 | z⋆, c) =
+3
+∏
+i=1
+Sbasei(ui | z⋆
+i , ci).
+(7)
+Step 3: Deriving the joint policy.
+Combining Equation 7 with the joint listener LToMjoint
+(Equation (3)), the optimal joint policy is obtained by multiplying the factorized base speaker
+distribution by the joint listener and normalizing:
+π⋆(u1, u2, u3 | z⋆, c) ∝p(u1, u2, u3 | z⋆, c) · LToMjoint(z⋆| u1, u2, u3, c)
+=
+ 
+3
+∏
+i=1
+Sbasei(ui | z⋆
+i , ci)
+!
+· LToMjoint(z⋆| u1, u2, u3, c).
+(8)
+This is exactly Equation 4, completing the derivation.
+To verify that Equation 8 preserves the BPS form, substitute Equation 3 for LToMjoint:
+π⋆(u1, u2, u3 | z⋆, c) ∝
+ 
+3
+∏
+i=1
+Sbasei(ui | z⋆
+i , ci)
+!
+· exp
+ 
+3
+∑
+i=1
+λiRi(ui, st, T )
+!
+=
+3
+∏
+i=1
+[Sbasei(ui | z⋆
+i , ci) · exp(λiRi(ui, st, T ))] ,
+(9)
+where the last step uses the fact that the exponential of a sum factorizes into a product of
+exponentials. Each factor in Equation 9 has exactly the BPS form of Equation 1, with Sbasei
+as the base speaker and exp(λiRi/Zi) as the per-director ToM listener, confirming that the
+multi-sender joint policy is a product of individual BPS policies.
+B
+Oracle Settings, Structure Generation and Director View Computation
+B.1
+Oracle Evaluation
+Motivation and hypothesis.
+A core question in evaluating multi-agent coordination is
+whether observed performance differences across models reflect failures of director com-
+munication or failures of builder execution. This is a core question of credit assignment and
+attribution multi-agent systems (MAS) (Nguyen et al., 2018; Huh & Mohapatra, 2024). A
+director model that reasons correctly about what needs to be placed but communicates it
+poorly will produce low task completion, as will a director that communicates clearly but
+reasons incorrectly. To disentangle these failure modes, we introduce an oracle-constrained
+evaluation condition in which the builder is provided a set of verified candidate moves at
+each turn. Under this condition, execution errors arising from invalid positions, wrong lay-
+ers, or illegal spans are eliminated by construction, and the remaining performance variation
+reflects the degree to which director instructions are interpretable enough for the builder
+to select the correct candidate. We hypothesize that if director communication quality is
+the binding constraint, performance under oracle conditions will vary substantially across
+models even when execution is constrained to verified moves.
+22
+Preprint
+Oracle move enumeration.
+At each turn, we enumerate all moves that make verified
+progress toward the target structure given the current board state. The enumeration consid-
+ers every grid position and compares the current block stack to the target stack, handling
+three cases: (i) placement — if the current stack is shorter than the target, the next required
+block (including color, size, and for large blocks, the span partner cell) is generated as a
+candidate place move; (ii) excess removal — if the current stack exceeds the target depth, a
+remove move for the topmost block is generated; (iii) wrong block correction — if the stacks
+are the same depth but a block at some layer is incorrect, a remove move is generated
+for the topmost block if it is the wrong one, or for the correct block above it if the wrong
+block is buried, exposing it for subsequent correction. All candidate moves are verified by
+simulating their execution against a copy of the current game state before inclusion. Only
+moves that succeed in simulation and produce correct structural placement are retained. Up
+to N=5 verified candidates are sampled per turn using a deterministic seed derived from
+the structure index and turn number, ensuring reproducibility across model comparisons.
+Large block candidates include the span partner cell explicitly, since both endpoints must
+be specified for valid execution.
+Builder selection criterion.
+At each turn, the verified candidate moves are injected into
+the builder’s prompt alongside the director discussion. Candidates are presented in a
+lightweight natural language format — for example, PLACE gs @ (0,1) layer 0 for a small
+block placement or PLACE bl @ (1,0) layer 0 →(2,0) for a large block spanning two cells.
+The builder is instructed to select the candidate that it believes at least one director is asking
+for, based on the director discussion in the current turn. If no candidate clearly matches any
+director’s description, the builder is instructed to issue a clarification request rather than
+selecting arbitrarily. This framing preserves the pragmatic inference requirement — the
+builder must still interpret director natural language and map it to a specific candidate —
+while eliminating the possibility of physically invalid moves to some extent. The builder’s
+confirmation field is also extended to include a brief rationale identifying which director(s)
+were followed and whether directors agreed or conflicted on the move, providing rich signal
+for subsequent analysis.
+Upper bound interpretation.
+The oracle condition represents a soft upper bound on task
+completion: if the builder perfectly followed the oracle at every turn and oracle moves
+were always available, the structure would be completed optimally, given a sufficient turn
+budget. In practice, oracle availability is not guaranteed at every turn—irrecoverable board
+states may arise from earlier wrong placements produce turns where no verified forward-
+progress move exists but this is relatively rare (mean availability: 0.83–0.92 across models,
+see Figure 8).
+B.2
+Block Encoding and the World State
+The world is represented as a 3 × 3 grid of positions, each identified by a coordinate pair
+(i, j) where i, j ∈{0, 1, 2}. Each position holds an ordered stack of blocks, where the stack
+index corresponds to vertical layer. A block is encoded as a two-character string where the
+first character denotes color—green, blue, red, yellow, or orange—and the second denotes
+size: small (s) or large (l). The full set of valid block types is:
+B = {gs, gl, bs, bl, rs, rl, ys, yl, os, ol}
+The world state at any point is a function S : C →B∗, mapping each coordinate c ∈C =
+{(i, j) | i, j ∈{0, 1, 2}} to an ordered sequence of blocks (possibly empty), with stacks
+capped at height 3.
+B.3
+Structure Generation
+Target structures are generated by a two-stage process: first assigning stack heights to grid
+positions, then tiling each vertical layer independently with blocks.
+23
+Preprint
+Figure 7: Director perspective views for structure_016, a complex-tier structure with 25
+total blocks. D1 (left column, j=0) sees a large yellow domino spanning (0, 0)–(1, 0) at L2, a
+small red at (0, 0) and large yellow domino spanning (1, 0)–(2, 0) at L1, and small orange,
+red, green blocks at L0. D2 (top row, i=0) sees a large orange domino spanning (0, 0)–(0, 1)
+with small red at (0, 2) at L0, a large red domino spanning (0, 0)–(0, 1) with small red at
+(0, 2) at L1, and small yellow, red, blue at L2. D3 (right column, j=2) sees small blue, red,
+orange at L2, small red, yellow, green at L1, and a large red domino spanning (0, 2)–(1, 2)
+with small red at (2, 2) at L0. The shared position (0, 0) is visible to both D1 and D2, serving
+as the sole grounding anchor between views. The Full Grid minimap shows all seven
+required positions at height 3; the optional positions (1, 1) and (2, 1) have heights 1 and 2
+respectively, both topped by green blocks. No director can reconstruct the full structure
+unilaterally: D1 and D3 observe vertical depth along their respective walls but cannot see
+interior or opposite-wall positions, while D2 has exclusive visibility into interior positions
+but cannot observe vertical structure below the topmost block. Notably, the large orange
+domino spanning (0, 0)–(0, 1) at L0 is seen as a full domino by D2 (both cells visible) but
+appears as a small block to D1, which can only see (0, 0) and has no visibility into (0, 1).
+Similarly, the large red domino spanning (0, 2)–(1, 2) at L0 is seen as a full domino by
+D3 but appears small to D2, which sees (0, 2) but not (1, 2). These cases illustrate how
+the same physical block can have different apparent sizes depending on the observing
+director’s projection, a direct consequence of the partial observability design.
+Stack Height Assignment.
+Grid positions are partitioned into two sets. Seven required
+positions—all positions except (1, 1) and (2, 1)—always receive exactly three layers of blocks.
+The two optional positions, (1, 1) and (2, 1), receive a height sampled uniformly from {0, 1, 2},
+independently. This design ensures a dense, consistently tall structure at the periphery of
+the grid while allowing variable interior depth.
+Layer Tiling.
+Each layer is tiled independently. For a given layer, the set of positions
+that require a block at that depth is determined by the height assignments above. These
+positions are then filled using a mix of small blocks and large blocks. A large block occupies
+two orthogonally adjacent positions on the same layer—forming a domino pair—and is never
+stacked vertically. Small blocks occupy a single position. For each position, the generator
+probabilistically attempts to form a domino with an available orthogonal neighbor; if no
+neighbor is free or the attempt fails, a small block is placed instead. Colors are sampled
+uniformly from the five available colors. To discourage structurally repetitive configurations,
+the generator makes a small number of retry attempts to avoid assigning the same block
+type to the same position on consecutive layers.
+Complexity Classification.
+Structures are labeled post-hoc by total block count. Structures
+with at most 22 blocks are labeled simple, those with 23–24 blocks are labeled medium, and
+those exceeding 24 blocks are labeled complex. Because required positions always contribute
+21 blocks (seven positions at three layers each), complexity variation is driven almost entirely
+by the optional positions and the proportion of large blocks, which can increase the count
+when domino pairs span positions that would otherwise be unfilled.
+24
+Preprint
+B.4
+Director View Projections
+Each director agent is assigned a fixed 2D projection of the 3D world state, capturing a
+different face of the grid. The three projections are:
+D1 — Left Column View.
+D1 observes positions (0, 0), (1, 0), and (2, 0) across all three
+vertical layers, corresponding to the left-facing wall of the structure.
+D2 — Top Row View.
+D2 observes positions (0, 0), (0, 1), and (0, 2) across all three vertical
+layers, corresponding to the far-facing wall.
+D3 — Right Column View.
+D3 observes positions (0, 2), (1, 2), and (2, 2) across all three
+vertical layers, corresponding to the right-facing wall.
+In each view, blocks are presented left-to-right according to the physical seating orientation
+of each director. Each cell in a view is encoded as a color–size pair; empty cells are repre-
+sented as color none. A large block appears as size 2 only when both cells of its domino span
+fall within the director’s visible positions; otherwise it appears as size 1, since only one face
+of the block is visible from that angle.
+Information Coverage.
+D1 and D3 share exactly one position, (0, 0), providing a single
+grounding anchor between the two lateral views. D2 is the only director with visibility into
+interior positions such as (1, 1) and (2, 1)—the optional positions—making D2 information-
+ally pivotal for structures with non-trivial interior depth. No single director can reconstruct
+the full 3D state unilaterally; productive coordination requires each director to surface the
+information that the others structurally cannot observe.
+Archetype
+Description
+D1
+D2
+D3
+Total
+Assertive
+Confident and direct; forms hypotheses quickly and
+shares them, updates when others provide compelling
+evidence.
+75
+60
+30
+165
+Cautious
+Methodical and verification-focused; synthesizes oth-
+ers’ observations before adding interpretation.
+60
+90
+75
+225
+Observant
+Notices patterns and anomalies; flags inconsistencies
+and connects information across directors.
+15
+30
+90
+135
+Skeptical
+Questions assumptions including its own; probes
+claims to ensure group correctness, comfortable with
+uncertainty.
+45
+75
+75
+195
+Synthesizer
+Integrates all directors’ observations into a coherent
+picture; reconciles contradictions and drives shared
+understanding.
+105
+45
+30
+180
+Total
+300
+300
+300
+900
+Table 3: Director personality archetypes used in CRAFT experiments. Each archetype shapes the
+director’s internal reasoning style and public communication tone. Assignments are deterministic per
+(structure_index, run, director_id) ensuring consistency across all model evaluations.
+B.5
+Metrics
+Progress toward the target structure S∗is measured after each successful move and computes
+four complementary metrics over the normalized representations of the current state St and
+target S∗.
+Intersection over Union (IoU).
+For each position c ∈C, let Ac = {b ∈St(c)} and
+Bc = {b ∈S∗(c)} be the multisets of blocks treated as sets. The IoU score aggregates overlap
+across all positions:
+25
+Preprint
+IoU(St, S∗) = ∑c∈C |Ac ∩Bc|
+∑c∈C |Ac ∪Bc|
+This metric is insensitive to block order within a stack and rewards partial position matches.
+Completion Percentage.
+This metric measures layer-exact correctness — a block at position
+c and layer k counts as correct only if it matches S∗(c)[k]:
+CP(St, S∗) = ∑c∈C ∑|S∗(c)|−1
+k=0
+1[St(c)[k] = S∗(c)[k]]
+∑c∈C |S∗(c)|
+Position Accuracy.
+A coarser metric that rewards positions where the set of blocks matches
+exactly, regardless of layer order:
+PA(St, S∗) = 1
+9 ∑
+c∈C
+1[{b : b ∈St(c)} = {b : b ∈S∗(c)}]
+Overall Progress.
+The scalar summary used for termination and trend analysis is the
+unweighted mean of the three metrics:
+OP(St, S∗) = IoU + CP + PA
+3
+C
+Failure Taxonomy Details
+To obtain the failure counts reported in the main paper, we replayed all saved game logs
+from the CRAFT evaluation and applied a deterministic taxonomy to every turn containing
+at least one oracle move. Each turn was first checked for a game-engine error stored in
+progress_data["error"]; turns whose error message contained the substring “layer” or
+“span” were labeled engine-layer or engine-span, and all remaining engine failures were
+labeled engine-other. For engine-clean turns, the attempted move was compared against the
+oracle set at three levels of strictness: a mismatch on action or position yielded wrong-position;
+a match on position but not block colour yielded wrong-color; and a match on block but not
+span yielded wrong-span. Turns satisfying the full oracle match and accepted by the engine
+were counted as correct. Counts were normalized by the total number of oracle-labeled turns
+per model.
+Oracle-based Outcome Breakdown
+Figure 8 complements Table 4 by showing how the
+turn budget is allocated across all five outcome categories relative to total turns rather than
+oracle-available turns. Oracle availability is uniformly high (≥85%) across all models,
+confirming that the performance differences in the taxonomy table are not confounded by
+irrecoverable board states — the oracle budget was available to be followed in the vast
+majority of turns. The gap between oracle available and oracle followed in Figure 8 directly
+corresponds to the correct bar in Table 4: models with small gaps (Gemini-3-Flash, Qwen-7b)
+show high correct rates in the table, while models with large gaps (Claude-Sonnet, Gemini-
+3.1-Flash-Lite) show low correct rates and high layer or wrong-position error fractions. The
+execution success rate (blue diamonds) diverges from oracle adherence most sharply for
+Claude-Sonnet-4.6 and Gemini-2.5-Flash, consistent with their elevated wrong-position
+error rates in the taxonomy table—the builder executes moves confidently but at incorrect
+locations as directed.
+26
+Preprint
+Table 4: Failure taxonomy for base and frontier models across CRAFT evaluation runs
+on 20 target structures. Each cell shows the fraction of oracle-available turns; Correct is
+the full oracle match rate. Engine errors are diagnosed from the game-engine response
+after the builder agent makes a move; positional, color, and span errors reflect oracle-level
+mismatches.
+Type
+Model
+Correct
+Layer
+Span
+Other
+Wrong-Color
+Wrong-Pos
+Base
+DeepSeek-Lite
+.711
+.086
+.086
+—
+.089
+.026
+Gemma-9b
+.738
+.120
+.069
+—
+.066
+.006
+Llama-8b
+.774
+.119
+.036
+.003
+.062
+.006
+Mistral-7b
+.759
+.094
+.085
+—
+.053
+.009
+Qwen-7b
+.817
+.070
+.034
+—
+.061
+.018
+Qwen-14b
+.616
+.209
+.088
+.025
+.051
+.011
+Qwen-32b
+.453
+.306
+.100
+.014
+.038
+.089
+Qwen-72b
+.682
+.170
+.081
+.003
+.047
+.017
+Frontier
+Gemini-3-Flash
+.823
+.061
+.095
+—
+.009
+.012
+GPT-4o
+.734
+.132
+.070
+.006
+.045
+.014
+GPT-4o-Mini
+.513
+.281
+.064
+.024
+.067
+.051
+Claude-Sonnet
+.449
+.258
+.041
+.020
+.102
+.130
+GPT-4.1-Mini
+.457
+.297
+.064
+.035
+.056
+.091
+Gemini-2.5-Flash
+.412
+.284
+.048
+.025
+.075
+.156
+Gemini-3.1-Flash-Lite
+.401
+.365
+.046
+.058
+.056
+.074
+Figure 8: Turn-level outcome rates per model sorted by oracle adherence. Oracle available
+(orange) is uniformly high; the gap between oracle available and oracle followed (green)
+directly corresponds to the failure fractions in Table 4. No-oracle turns (purple) are rare
+across all models (< 15%).
+27
+Preprint
+We provide detailed prompts used in our experiments for both the director (Figure 9 (I-II)
+and builder agents (Figure 10 (I-III)) in this section.
+Director Prompt (I): Identity and Perspective
+You are Director {D_i} in a collaborative LEGO construction task. You are sitting around a physical board with a Builder
+and two other Directors. From where the builder sits, D1 is to their left, D2 is across from them, and D3 is to their right.
+YOU ARE {archetype}.
+YOUR PERSONALITY:
+{personality}
+VERY IMPORTANT: You must adopt this personality in both your internal reasoning and your public utterances.
+YOUR PERSPECTIVE:
+From left to right, you see the following cells across all layers:
+{perspective_description}
+SPATIAL ORIENTATION (use only in your thinking)
+The coordinate grid from above:
+(0,0) (0,1) (0,2)
+←this is the "far" / "back" row
+(1,0) (1,1) (1,2)
+(2,0) (2,1) (2,2)
+←this is the "near" / "front" row
+Large blocks span SIDEWAYS or FORWARD/BACK — never stacked vertically.
+HOW TO INTERPRET YOUR TARGET VIEW
+- IMPORTANT: In the JSON, keys are named row_0/row_1/row_2, but they refer to LAYERS (vertical stack depth), not
+grid rows.
+- row_0 = layer_0 (bottom layer / stack depth 0)
+- row_1 = layer_1 (middle layer / stack depth 1)
+- row_2 = layer_2 (top layer / stack depth 2)
+- in each layer, blocks are listed from LEFT to RIGHT according to YOUR VIEW
+- In your PUBLIC message, say "bottom layer / middle layer / top layer" (avoid saying "bottom row").
+- color=none means that cell should be empty
+- size of 1 = the block is a small block, size of 2 = the block is a large block and spans two adjacent cells
+- if two adjacent cells in your target view have the same color and BOTH are size 2, this means that a SINGLE large block
+occupies both those cells
+EXAMPLE ANALYSIS OF TARGET VIEW AND BOARD STATE
+D2’s target view:
+"D2": {
+"row_0": [
+{ "color": "blue", "size": 1 },
+{ "color": "orange", "size": 2 },
+{ "color": "orange", "size": 2 }
+],
+"row_1": [
+{ "color": "yellow", "size": 1 },
+{ "color": "yellow", "size": 1 },
+{ "color": "orange", "size": 1 }
+],
+"row_2": [
+{ "color": "yellow", "size": 1 },
+{ "color": "blue", "size": 1 },
+{ "color": "green", "size": 1 }
+]
+}
+Figure 9: Director prompt used in the experiments, composed of Blocks I–II. Note that
+personality and archetypes are populated from Table 3.
+28
+Preprint
+Time (s)
+∆t (s)
+Speaker
+Utterance
+Role
+570.0
+-29.6
+Builder
+This green?
+Clarification query
+571.1
+-28.5
+Director
+Yes.
+Confirmation
+571.3
+-28.3
+Director
+Yeah, stick that on top of the blue.
+Instruction
+572.7
+-26.9
+Builder
+Right here?
+Clarification query
+572.9
+-26.7
+Director
+No, no, no, no.
+Correction
+574.1
+-25.5
+Director
+The yellow that we have, for me it is
+showing green.
+Perceptual mismatch
+577.6
+-22.0
+Director
+It’s not yellow.
+Correction
+579.3
+-20.3
+Builder
+Cause, uh, is it like a, like a darkish
+green?
+Hypothesis proposal
+583.6
+-16.0
+Director
+No.
+Rejection
+584.6
+-15.0
+Director
+It’s normal green.
+Refinement
+585.9
+-13.7
+Builder
+I cannot see any yellow over there.
+Perceptual conflict
+587.2
+-12.4
+Builder
+So this is green?
+Clarification query
+588.1
+-11.5
+Director
+Yes.
+Confirmation
+588.4
+-11.2
+Director
+That’s yellow for me.
+Misalignment signal
+589.8
+-9.8
+Builder
+This is yellow?
+Clarification query
+590.6
+-8.9
+Director
+No.
+Correction
+591.1
+-8.5
+Director
+The long.
+Referential refinement
+591.9
+-7.7
+Builder
+This is yellow.
+Hypothesis proposal
+592.7
+-6.9
+Director
+Yeah, that one’s yellow.
+Alignment confirmation
+594.9
+-4.7
+Builder
+So this is yellow.
+Grounding confirmation
+596.1
+-3.5
+Builder
+Which one’s this color?
+Clarification query
+597.3
+-2.2
+Builder
+Green?
+Hypothesis proposal
+598.0
+-1.6
+Director
+Yeah, the bottom one is green.
+Final alignment
+599.6
+0.0
+—
+Action: REMOVE RS at LAYER 1
+Execution
+Table 5: Dialogue segment illustrating ambiguity resolution, perceptual misalignment, and
+multi-agent grounding prior to moving the small red block (RS) at layer 1. ∆t is measured
+relative to the action at t = 599.6s from Group 3
+D
+Agent-specific Prompts
+Director Prompt (II): Board State and Analysis
+Current board state:
+{ (0,0):[], (0,1):[], (0,2)[]; (1,0):[], (1,1):[], (1,2):[]; (2,0):[], (2,1):[], (2,2):[] }
+Correct D2 analysis:
+[From my perspective, the current board state has all cells empty. My target view specifies that layer 0
+should have a blue small block in my bottom left corner (0,0), and then a large orange block spanning the
+middle and right cells (0,1) and (0,2).
+Going left to right, layer 1 should have two small yellow blocks at (0,0) and (0,1), and a small orange
+block at (0,2).
+Finally, layer 2 should consist of a yellow small block at (0,0), a blue small block at (0,1), and a green
+small block at (0,2).
+To start, I need the builder to place a large orange block spanning (0,1) and (0,2), which are the middle
+and right cells of my bottom layer. This is the first action to align with my target view.]
+Correct D2 utterance based on this analysis:
+[Put a large orange block across the middle and the right side of my bottom layer.]
+YOUR JOB:
+Help the builder complete the structure by giving clear and correct instructions based on your private view.
+RULES FOR REASONING (use only in your thinking):
+- Carefully compare your target view with the current board state.
+- Identify missing blocks, incorrect blocks, or incorrectly placed blocks.
+- Determine the correct color, size, and layer for each required block.
+- Respect physical constraints: blocks must be placed on valid support and large blocks must span correctly.
+- Plan instructions that move the current board closer to your target view.
+- Do not assume access to other directors’ views; reason only from your own perspective.
+29
+Preprint
+Director Prompt (III): Speaking Rules, Examples, Inputs, and Response Format
+RULES FOR SPEAKING (in your public message):
+- Give clear, concise, and actionable instructions to the builder.
+- Use natural language descriptions (e.g., “left”, “right”, “middle”) based on your perspective.
+- Refer to layers as “bottom”, “middle”, or “top” (not row numbers).
+- Specify block color, size, and placement clearly.
+- Avoid mentioning coordinates or JSON-style representations.
+- Do not include internal reasoning in your message.
+- Focus on one step or a small number of steps that the builder can execute reliably.
+EXAMPLE UTTERANCES:
+{examples}
+CURRENT BOARD STATE:
+{current_board_state}
+TARGET VIEW:
+{target_view}
+CONVERSATION HISTORY:
+{conversation_history}
+RESPONSE FORMAT:
+Return your response in the following format:
+<analysis>
+[Your internal reasoning here]
+</analysis>
+<message>
+[Your instruction to the builder here]
+</message>
+30
+Preprint
+Builder Prompt (I): Role, Perspective, Action Space and Environment Rules
+You are a Builder in a collaborative LEGO construction task.
+The three Directors (D1, D2, and D3) have to instruct you to build a single structure that is consistent with the private
+views of the structure they have.
+Your job is to place, move, or remove blocks on the board to build the structure.
+From a top-down view of the target structure, D1’s private view is of the left wall of the structure, D2’s view is of the top
+wall of the structure, and D3’s view of the right wall of the structure.
+From where the builder sits, D1 is to their left, D2 is across from them, and D3 is to their right.
+SPATIAL ORIENTATION (use only in your thinking)
+The coordinate grid from above:
+(0,0) (0,1) (0,2)
+←this is the "far" / "back" row
+(1,0) (1,1) (1,2)
+(2,0) (2,1) (2,2)
+←this is the "near" / "front" row
+Large blocks span SIDEWAYS or FORWARD/BACK — never stacked vertically.
+DIRECTOR PERSPECTIVE GUIDE:
+D1: From left to right, sees cells (0,0), (1,0), (2,0) across all layers.
+D2: From left to right, sees cells (0,0), (0,1), (0,2) across all layers.
+D3: From left to right, sees cells (0,2), (1,2), (2,2) across all layers.
+When interpreting the instructions from D1, D2, or D3, you MUST adopt the frame of reference of the speaker.
+For instance, to D1, "my bottom left corner" is coordinate (0,0) at layer 0 and "my top right corner" is coordinate (2,0) at
+layer 2.
+To D2, "my bottom left corner" is coordinate (0,0) at layer 0 and "my top right corner" is coordinate (0,2) at layer 2.
+To D3, "my bottom left corner" is coordinate (0,2) at layer 0 and "my top right corner" is coordinate (2,2) at layer 2.
+EXAMPLE FRAME OF REFERENCE ANALYSIS:
+Given board state
+{
+"(0,0)": [],
+"(0,1)": [],
+"(0,2)": [],
+"(1,0)": [],
+"(1,1)": [],
+"(1,2)": [],
+"(2,0)": [],
+"(2,1)": [],
+"(2,2)": []
+}
+Given utterance
+[D1: Could you please place a small orange block in my bottom left corner?]
+Correct move
+[PLACE:os:(0,0):0:CONFIRM:Placing small orange block at bottom-left of D1’s side as requested]
+Given utterance
+[D2: Please remove the large orange block from my bottom left and middle cells.]
+Correct move
+[REMOVE:(0,0):0:(0,1):CONFIRM:Removing the large orange block from bottom-left+bottom-middle of D2’s side
+as requested]
+Given utterance
+[D3: Let’s begin by placing a large green block across the left and middle cells of my bottom layer.]
+Correct move
+[PLACE:gl:(0,2):0:(1,2):CONFIRM:Placing large green block across the left and middle cells of D3’s bottom
+layer as requested]
+Figure 10: Builder prompt used in the experiments, composed of Blocks I–III. Block IV
+(tool-based move exploration) is included for completeness but not used.
+31
+Preprint
+Builder Prompt (II): Board State, Oracle Candidates, and Execution Rules
+Positions invisible to ALL directors: (1,1) and (2,1).
+A large block that is visible to ANY of the directors CANNOT span EITHER (1,1) or (2,1).
+— only inferred from what’s missing in other views.
+CURRENT BOARD STATE:
+{json.dumps(current_state, indent=2)}
+AVAILABLE BLOCKS:
+{', '.join(available_blocks)}
+BLOCK REFERENCE:
+{block_reference}
+COORDINATE REFERENCE:
+{coordinate_reference}
+CANDIDATE MOVES (verified physically valid for this turn):
+{oracle_section}
+DIRECTOR DISCUSSION:
+{director_discussion}
+DECISION RULE:
+If 2+ directors agree on a block or position, do that first.
+If all three disagree, pick the most specific instruction.
+STACKING RULES:
+- “layer” means stack depth, NOT grid row.
+- ALWAYS calculate layer from CURRENT BOARD STATE, never trust director-specified layers.
+- Before ANY place: count blocks at target position from CURRENT BOARD STATE.
+→You MUST place new blocks one layer above the number of blocks at that position (e.g., if position (0,1) has [’gs’,
+’ol’] →next block goes at layer 2; if position (0,1) has [”] →next block goes at layer 0).
+- Before ANY remove: verify position is non-empty in CURRENT BOARD STATE.
+→If empty, do NOT attempt removal — tell directors and suggest placing instead.
+FRAME OF REFERENCE RULE:
+IMPORTANT: When choosing where to place a block, you MUST adopt the frame of reference of the director whose
+instruction you are following.
+REMINDER: “The left” of D1’s view is coordinate (0,0) and “the right” is coordinate (2,0).
+“The left” of D2’s view is coordinate (0,0) and “the right” is coordinate (0,2).
+“The left” of D3’s view is coordinate (0,2) and “the right” is coordinate (2,2).
+NEVER deviate from these frames of reference when executing instructions.
+LARGE BLOCK RULE:
+Large blocks span TWO adjacent cells — you MUST specify both endpoints.
+To choose span_to:
+- Identify the TWO director-relative cells explicitly referenced (e.g., “left+middle”, “middle+right”, “bottom left+bottom
+middle”).
+- Convert those two cells into global coordinates using the DIRECTOR PERSPECTIVE GUIDE.
+- Ensure BOTH cells lie on the correct wall for that director.
+- Set position to one endpoint and span_to to the other endpoint.
+- Before outputting, verify:
+(a) position and span_to are orthogonal neighbors,
+(b) both endpoint stacks have the SAME height (so placement/removal is on the same layer),
+(c) neither endpoint is an invisible cell ((1,1) or (2,1)).
+32
+Preprint
+Builder Prompt (III): Span Resolution, Failure Handling, and Output Format
+NEVER place OR remove a large block if span_to is None — it will always fail.
+Format:
+PLACE:block:position:layer:span_to:CONFIRM:reason
+Example:
+PLACE:gl:(0,0):0:(1,0):CONFIRM:Placing large green block across the left and middle cells of D1’s bottom
+layer as requested
+If a director says “green large in the corner”, you must figure out which two adjacent cells it spans from the CURRENT
+BOARD STATE.
+NEVER place OR remove a large block if span_to is None — it will always fail.
+If you try to remove a large block, you MUST check the board state to see where spans contain the same block.
+EXAMPLE SPAN ANALYSIS:
+Given board state
+\texttt{\{
+(0,0): [], (0,1): [], (0,2): []; \\
+(1,0): [], (1,1): [], (1,2): []; \\
+(2,0): [], (2,1): ["gl"], (2,2): ["gl"]
+\}}
+Given raw move
+[REMOVE:(2,2):0:CONFIRM:Removing the large green block from the bottom layer as requested by D3.]
+Correct move
+[REMOVE:(2,2):0:(2,1):CONFIRM:Removing the large green block from the bottom layer as requested by D3.]
+WHEN MOVES FAIL:
+- Explain WHY: e.g., “I can’t remove any block from the middle cell on the bottom layer. There is no block there. Suggest
+placing [block] instead.”
+- Never silently retry the same failed move
+BEFORE PLACING:
+Think step by step to make sure that you have interpreted the instructions, including block color and size, and the
+director’s frame of reference, correctly. Do not place a block at the same place where you have previously removed a
+block of the same color. Count blocks at target position from CURRENT BOARD STATE.
+EXAMPLE BLOCK COUNT AT TARGET POSITION:
+Given board state:
+\texttt{\{
+(0,0): ["os"], (0,1): [], (0,2): []; \\
+(1,0): [], (1,1): [], (1,2): ["bl"]; \\
+(2,0): ["gl","bl"], (2,1): ["gl","bl"], (2,2): ["bl"]
+\}}
+Given raw move
+[PLACE:gl:(2,2):0:(2,1):CONFIRM:Placing large green block across the left and middle cells of D3’s bottom
+layer as requested.]
+Correct move
+[PLACE:gl:(2,2):2:(2,1):CONFIRM:Placing large green block across the left and middle cells of D3’s bottom
+layer as requested.]
+OUTPUT FORMAT — Choose ONE of these exact formats:
+1. To place small block:
+PLACE:block_code:position:layer:CONFIRM:interpretation
+Example: PLACE:bs:(0,0):0:CONFIRM:Placing blue small block at bottom-left of D1’s side as requested
+2. To place large block:
+PLACE:block_code:position:layer:span_to:CONFIRM:interpretation
+Example: PLACE:gl:(0,0):0:(1,0):CONFIRM:Placing large green block across left and middle cells of D1’s
+bottom layer
+3. To remove small block:
+REMOVE:position:layer:CONFIRM:interpretation
+Example: REMOVE:(1,2):0:CONFIRM:Removing the block from middle-right of D3’s side as requested
+4. To remove large block:
+REMOVE:position:layer:span_to:CONFIRM:interpretation
+Example: REMOVE:(2,2):0:(2,1):CONFIRM:Removing large green block from D3’s bottom layer as requested
+NOTE: REMOVE never includes block code — do NOT write REMOVE:bl:(0,0):...
+5. To clarify:
+CLARIFY:your specific question
+Example: CLARIFY:Which blue block should I move - the one on top or bottom?
+Always include CONFIRM section to show what you understood from their instructions.
+33
+Preprint
+Builder Prompt (IV): Tool Calling and Move Exploration
+TOOL MODE — simulate_move available ({max_simulations} calls max):
+WORKFLOW:
+1. Simulate each director’s instruction once directly and literally.
+2. Pick the result with greatest value for "progress".
+3. Submit that exact move as your FINAL answer. DO NOT INVENT NEW MOVE AFTER SIMULATING.
+4. If a sim fails (ok=False) →fix ONLY the field the hint specifies, retry once.
+5. NEVER submit a move that returned ok=False.
+6. NEVER submit a remove move where simulate shows structurePlacement=False — even if it’s the only ok=True
+simulation. In that case, CLARIFY instead.
+7. NEVER clarify just because directors disagree — simulate and pick the best.
+8. NEVER remove a block where simulate shows structurePlacement=False for that remove.
+Figure 11: Builder’s More Exploration Tool Call Prompt. Note that although CRAFT
+provides this facility, this is not explored in our current benchmark. After initial experimen-
+tation, we decided to instead use oracle moves in the builder’s observation space in order to
+restrict the action space of the builder for controlled experiments.
+Pragmatic Sufficiency Judge (PS)
+Given the current board state, oracle correct moves, director messages, and builder confirma-
+tion, evaluate whether the collective director messages were pragmatically sufficient to guide
+the builder toward a correct move.
+PS1. Do the director messages collectively identify at least one specific location on the board
+that needs a block placed or removed?
+PS2. Do the director messages collectively specify the correct block type — both color and size
+(small vs. large) — for at least one oracle correct move?
+PS3. Would a rational builder reading only these messages have sufficient information to
+select at least one oracle correct move without independent spatial reasoning about the
+target structure?
+PS4. Do the messages use precise spatial anchors that uniquely identify the target location,
+rather than vague relative language that could map to multiple grid positions?
+PS5. Does the builder confirmation indicate it correctly understood the directors’ collective
+intent, regardless of whether execution succeeded?
+PS6. If the builder did not execute the correct move, was the failure primarily attributable to
+director underspecification rather than builder execution mechanics (wrong layer, missing
+span, stacking violation)? N/A if oracle move was executed.
+Each question answered Yes / No / Unclear (or N/A for PS6) with a one-sentence justification.
+Response format: JSON with keys PS1–PS6, each containing answer and reason.
+Figure 12: Pragmatic Sufficiency (PS) judge. Evaluated once per turn over the collective
+director messages. Six binary questions targeting location specificity, block type precision,
+rational sufficiency, spatial anchoring, builder understanding, and failure attribution.
+E
+LLM Judge Prompts and Experiments
+Spatial Grounding Judge (SG).
+Evaluates the director’s private <think> block in isolation,
+assessing whether Sbasei correctly identifies missing blocks, respects stacking constraints,
+and produces reasoning that corresponds to at least one oracle-correct move (Figure 13).
+Diagnoses F1.
+Mind Model Judge (MM).
+Evaluates the director’s public <message> in the context of
+other directors’ utterances and conversation history, assessing whether LToMjoint produces a
+34
+Preprint
+Spatial Grounding Judge (SG)
+Given the director’s private target view, current board state, oracle correct moves, and
+internal reasoning, evaluate the spatial grounding quality of the director’s reasoning.
+SG1. Does the internal reasoning correctly identify at least one block missing from this
+director’s visible wall?
+SG2. Does the reasoning avoid describing blocks or positions already correctly placed on the
+board?
+SG3. Does the reasoning reference the correct layer for the missing block, accounting for what
+is already stacked?
+SG4. Does the reasoning identify at least one action matching or closely corresponding to an
+oracle correct move?
+SG5. Is the implied action executable given the current board state, respecting stacking order?
+SG6. Does the reasoning correctly interpret the size of the missing block (small vs. large) from
+the target view?
+SG7. Does the reasoning stay within this director’s visible wall cells rather than describing
+cells belonging to another director?
+Each question answered Yes / No / Unclear with a one-sentence justification. Response
+format: JSON with keys SG1–SG7, each containing answer and reason.
+Figure 13: Spatial Grounding (SG) judge. Evaluated once per turn across 20 structures and
+20 overall turns over the collective director messages.
+Mind Model Judge (MM)
+Given the director’s internal reasoning, public message, other directors’ messages, and
+recent conversation history, evaluate the Theory-of-Mind quality of the director’s public
+communication.
+MM1. Does the public message add information not already communicated by other directors
+in this or the immediately preceding turn?
+MM2. Does the message avoid repeating an instruction already given and acted upon in a
+previous turn?
+MM3. Does the message reflect awareness of what the builder already knows from the con-
+versation history?
+MM4. Does the message accurately translate the key finding from internal reasoning into
+natural language without losing critical spatial information?
+MM5. Does the message focus on information uniquely visible from this director’s wall rather
+than information another director could equally provide?
+MM6. Is the message specific enough for the builder to execute without further clarification,
+naming a block type, location, and action?
+MM7. If another director gave a conflicting instruction this turn, does the message acknowl-
+edge or attempt to resolve the conflict?
+MM8. Does the message show awareness of the boundary between what this director uniquely
+sees and what other directors can also see?
+Each question answered Yes / No / Unclear with a one-sentence justification. Response
+format: JSON with keys MM1–MM8, each containing answer and reason.
+Figure 14: Mind Model (MM) Judge. Evaluated once per turn across 20 structures and 20
+overall turns over the collective director messages. Note that oracle correct moves are not
+provided to the MM judge during evaluation.
+35
+Preprint
+Model
+SG ± SEM
+MM ± SEM
+PS ± SEM
+Progress
+Frontier Models
+Gemini-3-Flash
+0.669 ± 0.010
+0.237 ± 0.009
+0.354 ± 0.019
+0.675
+GPT-4o
+0.792 ± 0.006
+0.706 ± 0.004
+0.494 ± 0.012
+0.588
+GPT-4o-Mini
+0.741 ± 0.005
+0.632 ± 0.005
+0.457 ± 0.007
+0.333
+GPT-4.1-Mini
+0.937 ± 0.003
+0.787 ± 0.003
+0.481 ± 0.007
+0.312
+Claude-Sonnet-4.6
+0.910 ± 0.006
+0.775 ± 0.006
+0.444 ± 0.007
+0.285
+Gemini-2.5-Flash
+0.932 ± 0.003
+0.757 ± 0.006
+0.484 ± 0.013
+0.257
+Gemini-3.1-Flash-Lite-Preview
+0.819 ± 0.006
+0.597 ± 0.007
+0.325 ± −
+0.257
+Open-Weight Models
+Mistral-7B
+0.716 ± 0.007
+0.555 ± 0.005
+0.510 ± 0.011
+0.631
+Qwen-7B
+0.753 ± 0.006
+0.530 ± 0.005
+0.513 ± 0.014
+0.612
+Llama-8B
+0.744 ± 0.006
+0.491 ± 0.006
+0.501 ± 0.013
+0.586
+Gemma-9B
+0.673 ± 0.007
+0.507 ± 0.005
+0.481 ± 0.012
+0.578
+Qwen-72B
+0.745 ± 0.007
+0.503 ± 0.008
+0.379 ± 0.012
+0.557
+Qwen-14B
+0.748 ± 0.005
+0.523 ± 0.004
+0.511 ± 0.009
+0.476
+DeepSeek-Lite
+0.142 ± 0.005
+0.334 ± 0.004
+0.620 ± 0.013
+0.419
+Qwen-32B
+0.742 ± 0.006
+0.571 ± 0.005
+0.476 ± 0.007
+0.339
+Group Averages
+Open-Weight Avg
+0.658 ± 0.069
+0.502 ± 0.024
+0.499 ± 0.022
+0.525
+Frontier Avg
+0.829 ± 0.036
+0.642 ± 0.067
+0.452 ± 0.019
+0.387
+Table 6: LLM grader scores (mean ± SEM) for spatial grounding (SG), mind modeling
+(MM), and pragmatic sufficiency (PS), alongside task progress. Frontier models achieve
+higher SG and MM scores but lower progress than open-weight models. SG and MM are
+averaged over three independent grader runs; PS is averaged over two runs, except for
+Gemini-3.1-Flash-Lite-Preview, which uses a single run (no SEM reported).
+non-redundant, uniquely informative message the builder can act on without clarification
+(Figure 14). Diagnoses F2.
+Pragmatic Sufficiency Judge (PS).
+Evaluates the collective director output — all three
+public messages together — against the oracle candidate set, assessing whether the group
+jointly provided sufficient information for a rational builder to identify a correct move with-
+out independent spatial reasoning (Figure 12). Diagnoses the group-level communication
+failure defined in Definition 4.1, irreducible to any individual director’s SG or MM score.
+E.1
+Reconciling Task Performance with LLM Judge results
+To test whether remove gap mediates the relationship between unique perspective utilization
+(MM5) and task progress, we regressed progress on MM5 alone (R2 = 0.330), remove gap
+alone (R2 = 0.609), and both jointly (R2 = 0.633). Adding MM5 to remove gap increases
+explained variance by only 2.4 percentage points, and the partial correlation between
+MM5 and progress controlling for remove gap is non-significant (r = −0.247, p = 0.374).
+Remove gap fully mediates the MM5–progress relationship: directors who leverage their
+unique perspective produce more correction-oriented instructions, driving over-removal
+that consumes the turn budget without advancing task progress. The direct effect of
+communication quality on task outcomes is entirely absorbed by the behavioral signature it
+produces.
+36
+Preprint
+Figure 15: Per-model judge scores across selected questions for spatial grounding (top),
+mind modeling (middle), and pragmatic sufficiency (bottom). Models are sorted by overall
+judge score descending; dashed vertical line separates base (green) from frontier (orange)
+models. Error bars denote ±1 standard error of the mean across all structure–turn–director
+observations per model (from independent LLM grader runs: SG and MM n=3; PS n=2).
+F
+Additional Experimental Results
+Failed Moves
+During our evaluation runs on 20 target structures, we found 47 turns with
+no recorded move attempt (30 for base models, 17 for proprietary models). Inspection of
+the raw logs revealed these are attributable to malformed or empty director responses that
+left the builder with insufficient information to construct a valid action, rather than any
+systematic model failure. Qwen-72b accounts for the majority of base model cases (23 of
+30). These turns are excluded for the involved models in the FAIL or failed move rates in
+Table 1. Additionally, the builder agent’s clarification rate is negligible across all models—at
+most one CLARIFY response per model across 385–400 turns (rate ≤0.003)—confirming that
+builders consistently attempt moves rather than request additional information, even when
+director instructions could be ambiguous.
+37
+Preprint
+1
+5
+10
+15
+20
+Turn
+0.00
+0.25
+0.50
+0.75
+1.00
+Remove rate
+DeepSeek-Lite
+gap=-0.275  prog=0.42
+1
+5
+10
+15
+20
+Turn
+Gemma-9b
+gap=-0.084  prog=0.58
+1
+5
+10
+15
+20
+Turn
+Llama-8b
+gap=-0.057  prog=0.59
+1
+5
+10
+15
+20
+Turn
+Mistral-7b
+gap=-0.124  prog=0.63
+1
+5
+10
+15
+20
+Turn
+0.00
+0.25
+0.50
+0.75
+1.00
+Remove rate
+Qwen-7b
+gap=-0.116  prog=0.61
+1
+5
+10
+15
+20
+Turn
+Qwen-14b
+gap=+0.229  prog=0.48
+1
+5
+10
+15
+20
+Turn
+Qwen-32b
+gap=+0.374  prog=0.34
+1
+5
+10
+15
+20
+Turn
+Qwen-72b
+gap=+0.047  prog=0.56
+Oracle remove
+Att. remove
+Figure 16: Oracle-prescribed vs. attempted remove rate per turn for all base open-weight
+models.
+1
+5
+10
+15
+20
+Turn
+0.00
+0.25
+0.50
+0.75
+1.00
+Remove rate
+Gemini-3-Flash
+gap=+0.018  prog=0.68
+1
+5
+10
+15
+20
+Turn
+GPT-4o
+gap=+0.056  prog=0.59
+1
+5
+10
+15
+20
+Turn
+GPT-4o-Mini
+gap=+0.254  prog=0.33
+1
+5
+10
+15
+20
+Turn
+GPT-4.1-Mini
+gap=+0.388  prog=0.31
+1
+5
+10
+15
+20
+Turn
+0.00
+0.25
+0.50
+0.75
+1.00
+Remove rate
+Claude-Sonnet-4.6
+gap=+0.265
+1
+5
+10
+15
+20
+Turn
+Gemini-2.5-Flash
+gap=+0.402  prog=0.26
+1
+5
+10
+15
+20
+Turn
+Gemini-3.1-Flash-Lite-Preview
+gap=+0.467
+Oracle remove
+Att. remove
+Figure 17: Oracle-prescribed vs. attempted remove rate per turn for all frontier and propri-
+etary models.
+38
+Preprint
+Table 7: Pearson and Spearman correlations of director communication features with task
+progress at turn 20 (n = 15 models). Features are ordered by absolute Pearson r. Judge
+question codes in parentheses refer to the evaluation framework in Section E. Significance:
+∗p<0.05, ∗∗p<0.01, ∗∗∗p<0.001.
+Feature
+Pearson r
+p
+Spearman ρ
+p
+Behavioral
+Remove gap
+−0.780∗∗∗
+0.001
+−0.785∗∗∗
+0.001
+Message calibration (MM)
+Novel information (MM1)
+−0.619∗
+0.014
+−0.652∗∗
+0.008
+Overall MM score
+−0.603∗
+0.017
+−0.613∗
+0.015
+Unique perspective (MM5)
+−0.575∗
+0.025
+−0.536∗
+0.039
+Action specificity (MM6)
+−0.514
+0.050
+−0.311
+0.259
+Conflict resolution (MM7)
+−0.284
+0.304
+−0.199
+0.478
+Spatial reasoning (SG)
+Layer inference (SG3)
+−0.483
+0.068
+−0.472
+0.076
+Move executability (SG5)
+−0.443
+0.098
+−0.302
+0.274
+Overall SG score
+−0.273
+0.326
+−0.554∗
+0.032
+Surface
+Message length (words)
++0.046
+0.870
+−0.295
+0.286
+Mediation: unique perspective →remove gap →progress
+Unique perspective alone
+R2 = 0.330
+Remove gap alone
+R2 = 0.609
+Unique perspective + remove gap
+R2 = 0.633
+(∆R2 = 0.024)
+Partial r (unique perspective | remove gap)
+r = −0.247, p = 0.374 (n.s.)
+Table 8: Remove action rates per model. Oracle remove rate reflects what the CRAFT game
+engine considers necessary given the current board state; attempted remove rate reflects
+what directors instructed the builder to do. Negative gap indicates under-removal (builder
+removes less than oracle prescribes); positive gap indicates over-removal. Bold = best within
+group. Underline = largest absolute gap. Turn-level Spearman correlations use full oracle
+adherence as outcome (n = 5382).
+Model
+Orc_Remove↓
+Att_Remove
+Gap
+Open-weight models
+DeepSeek-Lite
+0.433
+0.148
+−0.275
+Mistral-7b
+0.238
+0.124
+−0.124
+Qwen-7b
+0.238
+0.205
+−0.116
+Gemma-9b
+0.211
+0.122
+−0.084
+Llama-8b
+0.232
+0.277
+−0.057
+Qwen-72b
+0.162
+0.245
++0.047
+Qwen-14b
+0.062
+0.355
++0.229
+Qwen-32b
+0.027
+0.448
++0.374
+Frontier models
+Gemini-3-Flash
+0.073
+0.196
++0.018
+GPT-4o
+0.146
+0.280
++0.056
+Claude-Son.-4.6
+0.130
+0.395
++0.265
+GPT-4o-Mini
+0.139
+0.432
++0.254
+GPT-4.1-Mini
+0.040
+0.462
++0.388
+Gemini-2.5-Flash
+0.065
+0.468
++0.402
+Gemini-3.1-Flash-Lite
+0.066
+0.540
++0.467
+Overall
+0.148
+0.314
++0.135
+Turn-level Spearman ρ vs oracle adherence
+Gap
+ρ = −0.543, p<0.001
+Att_Remove
+ρ = −0.569, p<0.001
+39
+Preprint
+Turn
+Oracle (top move)
+Director messages & outcome
+T10
+place gs @(0,0) L2
+D1: “remove the large orange block from the middle-
+left of my
+bottom layer ” · D2:
+“remove orange
+from bottom left corner” · Builder follows D1 →
+Cannot remove layer 0 at (1,0)
+T11
+place gs @(0,0) L2
+D2: same remove instruction · D3: “confirm small
+orange in bottom right” · Builder follows D3 →
+remove os @(0,2) L0 ✓progress=0.355
+T12
+place gs @(0,0) L2
+D1:
+same remove instruction · D3:
+“add small
+orange to bottom right” · Builder follows D3 →
+place os @(2,2) L0 ✓progress=0.386
+T13
+place gs @(0,0) L2
+D1:
+“get rid of large orange from
+bottom layer
+middle-left”
+·
+D2:
+“remove
+orange
+from
+bottom left corner ” · D3:
+unaware of deadlock,
+confirms own wall · Builder follows D1+D2 consensus →
+Cannot remove layer 0 at (1,0)
+T14
+place gs @(0,0) L2
+D1: identical instruction as T13 · D3: “focus on remov-
+ing the large orange from D1’s bottom layer” (endorses
+wrong instruction) · Builder follows D1+D3 consensus →
+Cannot remove layer 0 at (1,0)
+Board state at (1,0) is [bl,
+ol] throughout T10–T14: bl at layer 0, ol at layer 1.
+The orange block is accessible at layer 1 but directors consistently specify layer 0 .
+Oracle recommends placement moves throughout; no director ever issues the correct
+prerequisite remove ol @(1,0) L1 .
+Table 9: Turn-by-turn trace of the Qwen-32B correction spiral on structure_001. Despite the
+oracle recommending forward placement moves at every turn, D1 and D2 repeatedly issue
+remove instructions targeting the wrong layer, while D3 remains unaware of the deadlock.
+The builder escapes the spiral on T11 and T12 by following D3 instead, but returns to the
+failed pattern when D1 and D2 reach consensus on T13–14.
+40
+Preprint
+Figure 18:
+Three turns, zero progress:
+a CRAFT correction spiral (Qwen-32B,
+structure_001, T10–T14) (see Table 9 for the full turn-by-turn trace). D1 (left wall) sees
+a large orange domino at layer 1 spanning (0,0)–(1,0) sitting directly on top of a small
+yellow at (0,0) layer 0 and a large blue domino spanning (1,0)–(2,0) at layer 0. The
+orange domino is therefore the top block at both positions and is directly accessible for
+removal — yet D1 instructs “remove the large orange block from the bottom layer,” targeting
+layer 0 which is occupied by the blue domino. D2 (far wall) independently sees orange
+small blocks at layer 1 on (0,0) and (0,1) but similarly instructs removal from “bottom left
+corner,” again specifying layer 0. D3 (right wall) sees only a single orange block at (2,2)
+layer 0 and has no visibility into either problem position, remaining entirely unaware of the
+“deadlock”. The full grid minimap shows five occupied positions with maximum height 3
+at (0,1); the orange blocks at (0,0) and (1,0) each sit at height 2 as the topmost block,
+confirming they are accessible. Despite this, neither D1 nor D2 corrects the layer specifi-
+cation across turns 10, 13, and 14 — the builder’s oracle recommends forward placement
+moves throughout ( place gs @(0,0) L2 , place rl @(1,0) L2 ) but the builder follows
+the director consensus and attempts the same failed remove three times, consuming turns
+without any board state change.
+41

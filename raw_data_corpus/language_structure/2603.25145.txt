@@ -1,0 +1,1816 @@
+Learning to Rank Caption Chains for Video-Text
+Alignment
+Ansel Blume⋆1, Burak Uzkent2, Shalini Chaudhuri2, and Garin Kessler2
+1 University of Illinois Urbana-Champaign
+blume5@illinois.edu
+2 Amazon Prime Video
+Abstract. Direct preference optimization (DPO) is an effective tech-
+nique to train language models to generate preferred over dispreferred re-
+sponses. However, this binary “winner-takes-all” approach is suboptimal
+for vision-language models whose response quality is highly dependent
+on visual content. In particular, a response may still be faithful to the vi-
+sual inputs even if it is less preferable than an alternative. The standard
+Bradley-Terry DPO formulation lacks this nuance, upweighting winning
+responses without sufficient regard for whether the “losing” response still
+maintains high visual fidelity. In this work, we investigate ranking opti-
+mization as an alternative that more precisely situates responses’ faith-
+fulness to visual inputs. We focus on video-text alignment using detailed
+video captions, proposing a method to generate challenging, totally or-
+dered caption chains at scale through repeated caption degradation. Our
+results show ranking optimization outperforms binary DPO for long-
+form content generation and assessment, and importantly, we find that
+these approaches require finetuning of the vision encoder to be effective,
+challenging the view of DPO as purely a language-reweighting process.
+1
+Introduction
+Vision-language models (VLMs) have made great strides in recent years, driving
+progress in embodied reasoning and a wide range of visual understanding tasks,
+including retrieval, detection, segmentation, and video analysis. [10,13,25,26,38].
+Despite their strengths, VLMs often struggle to understand fine-level visual de-
+tails, spatial relationships, and object parts, and may have difficulty identifying
+straightforward actions in videos [3,23,42,43]. This is in part because they are
+insensitive to details in their visual and textual inputs, causing them to miss
+fine-level information and generate inaccurate statements [23,27,50].
+Techniques to improve VLMs’ vision-language alignment diverge depending
+on the VLMs’ architectures. On the one hand, CLIP-style [36], dual-encoder
+architectures are contrastively trained using in-batch negatives, with some works
+including specially selected hard negatives to develop robust, language-aligned
+visual representations [35, 44]. On the other hand, generative VLMs typically
+⋆Work performed as an intern at Amazon Prime Video.
+arXiv:2603.25145v1  [cs.CV]  26 Mar 2026
+2
+A. Blume et al.
+Cap 1: A powerful
+pickup truck navigates
+through a snow-covered
+industrial area on a win-
+ter day. ..... handle harsh
+winter environments.
+Cap 2: A powerful
+pickup truck navigates
+through a snow-covered
+industrial area on a
+sunny day. ..... handle
+harsh winter environ-
+ments.
+Cap 3: A powerful
+pickup truck navigates
+through a snow-covered
+industrial area on a
+sunny day. .... handle
+easy winter environ-
+ments.
+GT
+1 Err
+2 Err
+Query: Rank captions
+VLM
+Prediction:
+1, 3, 2 ✗
+Ground Truth:
+1, 2, 3 ✓
+Fig. 1: Existing models struggle to differentiate between visual details in long-form
+and detailed captions. We propose caption ranking to capture fine-grained differences
+for video-language alignment.
+borrow post-training concepts like PPO [40], DPO [37], and GRPO [41] from
+the LLM literature. Existing works on generative VLM alignment typically apply
+these techniques by freezing the vision encoder and tuning the LLM, approaching
+issues like hallucination from a purely language modeling perspective.
+Current approaches to VLM post-training suffer from a limitation in their
+ability to distinguish between fine-grained visual and textual details. For exam-
+ple, assume for a video we have a ground truth caption a dog playing with a toy,
+and two negative captions (1) a cat playing with a toy and (2) a cat playing with
+a child. Both captions contain inaccurate information, but caption (1) is more
+accurate than caption (2) in light of the reference caption. The binary training
+objective implemented most often for DPO, where a caption is either positive or
+negative, cannot capture nuances in caption quality, instead treating both minor
+misrepresentations and fully unrelated captions as “incorrect”.
+Motivated by the limits of this training paradigm, we propose a caption-
+ranking approach that trains models to attend to increasingly fine-grained visual
+details. To achieve this, we focus on video detailed captioning [5], where a model
+must generate a detailed caption for a provided video. Indeed, a model which
+is able to produce an accurate and comprehensive caption has a strong under-
+standing of its visual inputs. Our approach leverages an LLM to create ranked
+caption sequences, beginning with rich, comprehensive descriptions that are sys-
+tematically mutated to produce lower-quality variants. This iterative process
+generates captions with high similarity to force models to attend to differences
+in visually-grounded details. We argue that an ideal objective should reflect the
+nuanced reality that some captions are better than others rather than being sim-
+ply correct or incorrect. To achieve this, we employ the Plackett-Luce ranking
+formulation of DPO [37] and train models with our generated caption chains.
+We benchmark our generated chains against standard on- and off-policy ap-
+proaches and evaluate ranking against three baselines: binary DPO, supervised
+fine-tuning (SFT), and Multi-Preference Optimization (MPO), which uses multi-
+ple negatives. Our evaluation spans three types of benchmarks: (1) detailed video
+caption generation tasks (MSRVTT, PVD, VDC, and ARGUS) [4,5,39,47], (2)
+a custom Long-Form Multiple Choice Question Answering benchmark designed
+Learning to Rank Caption Chains for Video-Text Alignment
+3
+Response Chain Generation
+Training
+Error Types
+Object
+Attribute
+...
+t1
+GT : People
+are protesting
+in the street
+t2
+People are party-
+ing in the street
+...
+tn−1 People are party-
+ing in the house
+LLM
+...
+Output
+Frozen
+2
+1
+3
+Ranked Responses
+GT : People
+are protesting
+in the street
+t2
+People are
+partying in
+the street
+t3
+People are
+partying in
+the park
+...
+tn
+Two boys
+are partying
+in the house
+VLM
+Video
+Enc.
+Text
+Enc.
+...
+Score
+Trainable
+2
+1
+3
+Predicted
+Ranking
+P(c1)
+P(c2)
+P(c3)
+P(cn)
+...
+2
+1
+3
+Ground Truth
+Ranking
+1
+2
+3
+N
+...
+Decreasing
+Ranking Loss
+Gradient Update
+Fig. 2: Our proposed framework. Given a set of high-quality video captions, an LLM
+generates a totally ordered caption chain by repeatedly introducing visually-grounded
+errors into the previous caption. These caption chains are then used to train VLMs
+by having them rank the generated captions using ranking-based DPO. The captions’
+similarity forces the models to pay attention to fine, visually-grounded details.
+to assess fine-grained comprehension of question and answer choices, and (3) a
+caption matching task (TempCompass) [28].
+Our results show that standard Bradley-Terry DPO improves captioning
+quality over SFT, and that ranking outperforms both DPO and MPO. We further
+observe that these gains from ranking may only be achieved if the vision encoder
+is finetuned with the LLM backbone, suggesting that the widespread language-
+focused perspective of DPO may not realize its full potential. In summary, our
+contributions are as follows:
+1. We identify a deficiency in the use of DPO for vision-language alignment
+and propose to use a ranking objective to ameliorate it.
+2. We propose a degradation paradigm for generating ranked caption chains
+at scale, enabling effective ranking optimization. We contribute the Rcc
+Ranked Caption Chain dataset generated using this approach.
+3. We demonstrate how to transform caption chains into multiple choice and
+yes/no questions, extending the ranking paradigm to question answering.
+4. We perform comprehensive experiments demonstrating ranking’s effective-
+ness for vision-language alignment, we thoroughly explore the design space
+of our ranking framework, and we provide a new perspective on using DPO
+for visual representation learning.
+2
+Related Work
+DPO for Vision-Language Models. Direct Preference Optimization (DPO) has
+emerged as a prominent technique for mitigating hallucination in Vision-Language
+Models (VLMs) [12, 31, 34, 45, 52]. CLIP-DPO [31] employs GPT-4 to system-
+atically inject hallucinations into image-caption pairs, targeting three distinct
+4
+A. Blume et al.
+categories: object existence, attribute misrepresentation, and relational inaccu-
+racies. The method subsequently applies a standard DPO objective for model
+refinement. By contrast, V-DPO [45] adopts a visual manipulation approach, uti-
+lizing Stable Diffusion to modify objects referenced in captions, thereby creating
+preference pairs for DPO-based training. MDPO leverages model-generated cap-
+tions alongside GPT-augmented outputs to construct preference pairs, enabling
+self-supervised refinement through the DPO framework.
+Contrastive Learning Paradigms. Contrastive learning has been used predom-
+inantly in self-supervised representation learning for vision encoders [7, 9, 18].
+The methodology relies on constructing positive pairs through systematic data
+augmentation while deriving negative pairs from distinct samples within mini-
+batches or memory banks. CLIP and related models [20,22,36,51] perform vision-
+language alignment through contrastive learning, aligning an image with its cap-
+tion and treating other in-batch images and captions as negatives. DPO can be
+analogized as contrastive learning for generative language models, increasing the
+likelihood that one response is generated over another.
+Video Captioning Methods. Distinct from existing DPO applications targeting
+image-text alignment, our approach addresses the more complex challenge of
+video-text alignment. Contemporary video captioning research has primarily
+concentrated on architectural innovations [21, 24, 46, 54] or leveraging propri-
+etary models for enhanced caption generation
+[6, 8, 53]. By contrast, we con-
+tribute a novel framework that generates ranked caption chains through LLM-
+based degradation, advancing fine-grained, long-form text comprehension and
+generation capabilities in video-language models.
+3
+Learning to Rank Captions
+3.1
+Data Generation
+The primary challenge in training models to rank is obtaining high-quality rank-
+ing data. Prior work [32] obtains ranking data by having human annotators rank
+model outputs for a fixed prompt. They then train a reward model on all
+ k
+2
+
+pairwise preferences. This approach has two key drawbacks. First, it is time-
+consuming and expensive to have human annotators generate ranking data at
+scale. An automated framework that produces high-quality rankings would be
+preferable. Second, model responses may admit only a partial order. Consider
+the following hypothetical generations for an image of an empty table: “A bowl
+of fruit on a table”, “A pitcher of water on a table”. Both answer choices have
+errors, and it is unclear which is better. Enforcing an ordering upon potentially
+incomparable responses introduces noise into the training process.
+With these challenges in mind, we propose to generate ranking data by us-
+ing an LLM to progressively degrade captions. We begin the chain generation
+process with a ground truth caption c1. To generate the caption ck+1 from ck,
+we start by sampling an error type from a pre-defined set of visually-grounded
+Learning to Rank Caption Chains for Video-Text Alignment
+5
+errors. An LLM then mutates ck to introduce an error of the selected type, while
+ensuring that the mutated caption ck+1 maintains ck’s structure and all previ-
+ously introduced errors. This mutation procedure is repeated to generate a chain
+of captions of decreasing quality, so that c1 ≻c2 ≻. . . ≻cn. This generation
+process has the following advantages:
+1. Generated chains are totally ordered. A caption’s rank corresponds
+to the number of errors it contains, and caption ck+1 includes all of ck’s
+errors. Hence, the ordering is well-defined and generated chains are totally
+ordered by their faithfulness to the visual inputs.
+2. Captions in a chain have consistent structure. As the mutation
+process maintains previous captions’ structure, we ensure that the rel-
+ative likelihood of one caption to another is solely due to the captions’
+introduced errors, and not due to linguistic variation (e.g. differences in
+phrasing, length).
+3. Control over the error distribution. Sampling from a pre-defined
+set of error types ensures one may diversify the introduced errors or focus
+sample generation on areas a model struggles on. Early experiments found
+that allowing the LLM to freely introduce errors biased the distribution
+towards object and attribute-centric alterations.
+4. Chains can be safely generated at scale. Due to the simplicity of
+the mutation step—one needs only modify the caption to introduce an
+error—chain generation can be performed at scale by an LLM.
+As a caption’s rank in a chain corresponds to the number of errors it contains,
+we require that the ground truth caption c1 be sufficiently descriptive. This
+allows one to introduce errors by modifying the caption instead of extending it,
+maintaining length consistency across the chain.
+3.2
+The Ranked Caption Chain (RCC) Dataset
+We apply our data generation procedure to subsets of the PE-Video (PVD) [4]
+and MSR-VTT [47] datasets, creating the Rcc-PVD and Rcc-MSR datasets.
+Fig. 3: Error types used to generate caption chains through repeated caption mutation.
+6
+A. Blume et al.
+Before chain generation, we ensure that the starting captions for each chain
+are of sufficient length by having the frontier LLM Claude 3.7-Sonnet recaption
+them. For a given example, we provide Claude with the human-annotated cap-
+tions (PE-Video has one per video, MSR-VTT has multiple), prompting it to use
+the provided captions and video to generate a detailed video caption. Manual in-
+spection shows that providing the ground truth captions mitigates hallucination,
+resulting in high-quality detailed captions.
+To maximize the controllability of our chain generation process, we define a
+set of error types that we have Claude apply to captions (Fig. 3). These errors
+are designed to capture a wide range of visually-grounded inaccuracies that one
+may find in video captions. We use part-of-speech tagging and keyword-based
+heuristics to determine the set of error types that are applicable to a caption.
+We sample from this filtered set uniformly before prompting Claude to introduce
+an error of that type. Claude is allowed to reject the request if the error cannot
+reasonably be applied.
+After chain generation, Rcc-PVD and Rcc-MSR have train/test splits of
+8K/2K and 8K/1K chains, respectively. The Rcc dataset is useful for both cap-
+tion ranking and detailed video captioning (by taking the chains’ first captions).
+3.3
+Ranking Optimization
+To optimize models on our generated chains, we turn to the Plackett-Luce formu-
+lation of Direct Preference Optimization (DPO) [37]. The standard formulation
+of DPO follows the Bradley-Terry preference model, which defines the likelihood
+that a response y1 is preferred over response y2 given input x as
+  P( y _1  \s u
+cc y_2 \ mid 
+x) = \fr ac { \ exp (r(x ,y_1))}{\exp (r(x, y_1)) + \exp (r(x, y_2))}, 
+(1)
+where r denotes a scalar reward model. The Plackett-Luce model generalizes the
+Bradley-Terry model from pairwise rankings to full rankings. The probability of
+observing a ranking yi1 ≻. . . ≻yin is modeled as
+  P( y _ 1  \ su c c \
+l
+d
+ots
+ \succ y _n \
+mi
+d x ) = \pro d _{i = 1}^n \frac {\exp (r(x, y_i))}{\sum _{j = i}^n \exp (r(x,y_j))}. \label {eq:plackett_luce} 
+(2)
+Intuitively, Eq. (2) states that the probability that response yi is preferred over
+all lower ranked responses yj (j ≥i) is proportional to its exponentiated reward
+relative to the total reward of remaining candidates. The product is taken over
+all responses to ensure that each response at position i “wins” over all subsequent
+ones in the ranking.
+DPO starts from a KL-constrained reward maximization objective for rein-
+forcement learning, expressing the reward model r in terms of the optimal policy
+π∗and a reference policy πref. The preference model is then reparametrized with
+the expression for the reward model. Using the Plackett-Luce model, one obtains
+Learning to Rank Caption Chains for Video-Text Alignment
+7
+  P( y _ 1  \ su c c \
+l
+d
+ots
+ \s
+u
+c c y _n \mid 
+x) = \prod
+ 
+_{
+i =  1}
+^
+n  \f rac {\ex
+p \left (\
+beta \log \frac {\pi ^*(y_i \mid x)}{\pi _\text {ref}(y_i \mid x)}\right )}{\sum _{j = i}^n \exp \left ( \beta \log \frac {\pi ^*(y_j \mid x)}{\pi _\text {ref}(y_j \mid x)}\right )}. \label {eq:plackett_luce_dpo} 
+(3)
+Replacing π∗with the parametrized policy πθ lets us take the negative log-
+likelihood of Eq. (3) as our loss.
+4
+Experiments
+To assess the effectiveness of our caption ranking objective, we use VLMs from
+two state-of-the-art model families, PerceptionLM-1B (PLM) [11] and Qwen2.5-
+VL-3B [2], and train them on our Rcc dataset. We compare the pretrained
+models prompted zero-shot to models trained with 1) binary, Bradley-Terry DPO
+trained using the top-two captions of each chain; 2) Multi-Preference Optimiza-
+tion (MPO) [17], a generalization of DPO that can utilize the entire chain by
+setting the top caption as the winning one and the rest as losing ones, and 3)
+our proposed ranking optimization, where we use Plackett-Luce DPO to learn to
+rank the entire chain. Additionally, we evaluate different objectives utilizing our
+ordered caption chains and compare them to our Ranking objective. We then
+evaluate all models on video captioning and multiple choice question answering
+tasks.
+Unless otherwise stated, models are trained for 1K steps with a learning rate
+of 1e-6 on a benchmark’s corresponding training set. We use a batch size of
+8 and the AdamW [29] optimizer. Models are trained end-to-end with LoRA
+adapters [19]. DPO, MPO, and ranking models use β = .3 and include a next-
+token-prediction loss with weight .1 to prevent generation collapse [14, 33]. We
+fine-tune models using our data generation approach and traditional approaches
+to show that our caption degradation method achieves strong performance, and
+that ranking objectives enabled by our data provides additional gains. We run
+experiments on a single node with 8 A100 GPUs.
+4.1
+Video Detailed Captioning
+The video detailed captioning task requires a model to produce a detailed de-
+scription of a video, going beyond key objects, actors, and events to discuss
+Table 1: Comparison of our proposed Caption Degradation method to other on- and
+off-policy DPO data generation methods with the PLM model. Captions are evaluated
+by LLM-as-a-Judge along Relevance (Rel.), Descriptiveness (Descr.), Temporal Con-
+sistency (Temp C.), and Fluency (Flu.) on PE-Video.
+Method
+On-Policy
+Rel.
+Descr.
+Temp C.
+Flu.
+Error Injection (MPO)
+✗
+4.90
+4.62
+5.38
+8.46
+Ours - Caption Degradation (Rank)
+✗
+5.27
+4.92
+5.75
+8.47
+Response Improvement
+✓
+5.07
+4.92
+5.32
+7.61
+Response Comparison
+✓
+5.12
+4.71
+5.47
+8.60
+RLAIF-V
+✓
+5.13
+4.83
+5.52
+8.57
+8
+A. Blume et al.
+fine details [5]. Detailed captioning is an effective way to assess models’ visual
+understanding—by requiring comprehensive descriptions, the task reveals how
+the model interprets visual inputs and how effectively it can communicate that
+understanding. Video detailed captioning introduces an extra layer of difficulty
+compared to image captioning by adding a temporal dimension.
+Video Detailed Captioning on Rcc Motivated by existing work on caption
+evaluation [30], we define the following axes along which we evaluate generated
+captions.
+– Relevance: The caption should contain accurate and relevant statements,
+avoiding fabrications or errors.
+– Descriptiveness: The caption should be comprehensive, capturing key ob-
+jects, attributes, details, and events.
+– Temporal Consistency: Events should be described as occurring in the
+correct order.
+– Fluency: Descriptions should be coherent and fluent.
+We perform a reference-based LLM-as-a-judge [16] evaluation where we pro-
+vide the LLM judge with the predicted and reference captions, prompting it to
+score each of the above metrics from one to ten.
+Evaluation of Our Data Generation Method. Our proposed method differs from
+standard DPO in two ways: 1) data generation, by generating chains through
+caption degradation, and 2) in its use of a ranking objective, enabled by the
+generation of ranked chains. We start by comparing our Caption Degradation
+method to other automated DPO data generation pipelines. Our baselines rep-
+resent the most common procedures to obtain preference pairs at scale [48]: 1)
+Error Injection into ground truth responses (without repeated degradation), 2)
+Response Improvement by a teacher LLM, 3) Pairwise Response Comparison by
+a teacher LLM, and 4) RLAIF-V, a claim extraction, assessment, and subsequent
+response ranking paradigm [49] (details in Appendix). For this comparison, we
+use GPT-OSS-20B [1] for data generation and evaluation on PE-Video as it
+maintains strong performance while being more economical than Claude Sonnet
+3.7 for generating multiple datasets.
+Tab. 1 shows the results of training PLM on each dataset. Our caption degra-
+dation method obtains the highest scores of all on- and off-policy methods as
+measured by Relevance, Descriptiveness, and Temporal Consistency, while main-
+taining competitive Fluency. Our approach’s simplicity as an extension of error
+injection, coupled with its strong performance and scalability, demonstrate its
+practicality.
+Evaluation of Our Ranking Objective. Having demonstrated the effectiveness of
+our caption degradation method for preference data generation, we use Claude
+Sonnet 3.7 to generate the Ranked Caption Chain (Rcc) dataset as described
+in Sec. 3.2. To ensure equivalent training and evaluation regimes, all subsequent
+Learning to Rank Caption Chains for Video-Text Alignment
+9
+results are obtained by training on Rcc and evaluating using Sonnet 3.7 as the
+LLM judge.
+Table 2: Captioning results on PE-Video and MSR-VTT splits of Rcc. Models
+trained with the ranking objective perform best across the board, with DPO-based
+methods outperforming SFT. We note that MPO and DPO benefit from captions gen-
+erated with our Caption Degradation method as they are fine-tuned on it.
+Method
+PerceptionLM
+Qwen2.5-VL
+MSR-VTT
+PE-Video
+MSR-VTT
+PE-Video
+Rel.
+Descr. Temp C.
+Flu.
+Rel.
+Descr. Temp C.
+Flu.
+Rel.
+Descr. Temp C.
+Flu.
+Rel.
+Descr. Temp C.
+Flu.
+Pretrained
+6.29
+5.49
+6.18
+7.19
+6.72
+6.04
+5.82
+6.98
+6.73
+6.14
+6.61
+8.69
+6.74
+6.12
+6.63
+8.69
+SFT
+6.44
+6.37
+6.98
+8.54
+6.35
+5.60
+6.07
+8.15
+7.13
+6.83
+7.76
+9.14
+7.31
+7.24
+7.64
+9.35
+DPO
+7.29
+7.34
+8.02
+9.33
+7.57
+7.59
+7.78
+9.43
+7.12
+6.86
+7.77
+9.13
+7.33
+7.25
+7.60
+9.36
+MPO
+7.31
+7.38
+8.08
+9.32
+7.57
+7.59
+7.80
+9.42
+7.11
+6.89
+7.84
+9.15
+7.35
+7.27
+7.66
+9.34
+Rank
+7.38
+7.46
+8.11
+9.37 7.67
+7.72
+7.93
+9.49 7.21
+6.93
+7.86
+9.15 7.46
+7.40
+7.75
+9.40
+Tab. 2 shows the results on the Rcc evaluation splits. We find that perfor-
+mance generally correlates with data utilization. Ranking, which uses the
+whole chain and its ordering, performs best across the board. MPO also uses our
+ordered caption chain but discards the ordering, performing worse than Ranking
+on all metrics. DPO uses only the top two captions of our ordered caption chains,
+and SFT has no negatives to compare against, with PLM’s variant performing
+far worse than the DPO variants. Fluency has the smallest increase amongst the
+DPO variants, suggesting our data generation process successfully targets visual
+details while retaining caption fluency.
+To ensure that evaluations are not biased due to use of the same LLM for data
+generation and evaluation, we recompute the scores of Tab. 2 using GPT-OSS-
+20B, then compute the Spearman correlation between GPT-OSS’ and Claude 3.7
+Sonnet’s captioning scores. Outside of a Fluency correlation of .45, we observe
+moderately strong correlations of .72 for Relevance, .62 for Descriptiveness, and
+.65 for Temporal Consistency. This indicates that the judges tend to agree when
+a caption deserves a higher or lower score. Full results are in the Appendix.
+Table 3: Head-to-head human eval-
+uation of PLM on Rcc-PVD. Rank-
+ing objective combined with ordered
+caption chains outperform DPO and
+MPO 20% and 21%. On the other
+hand, our ordered caption chain data
+improves the MPO and DPO base-
+lines by 7% and 5%.
+Cap. Chains
+Err. Inj.
+Rank.
+Other
+Rank. Other
+vs. MPO
+53%
+47%
+60%
+40%
+vs. DPO
+56%
+44%
+61%
+39%
+Human Evaluation.
+We also perform a
+head-to-head human evaluation of PLM
+trained on captions from Rcc-PVD with
+Ranking, MPO, and DPO (Tab. 3). We
+sample 100 videos from the evaluation set
+for each comparison. When all methods are
+trained using our proposed caption chains,
+Ranking is preferred over MPO 53% of the
+time and over DPO 56% of the time. When
+we only train the Ranking model with cap-
+tion chains and MPO and DPO are trained
+using error injection, Ranking is preferred
+over MPO 60% of the time and over DPO
+10
+A. Blume et al.
+61% of the time. These results show that
+our data generation method (caption chains) combined with the ranking ob-
+jective is preferred ≈20% of the time more than MPO and DPO. In the rest of
+the experiments section, we fine-tune the baselines using only our data genera-
+tion approach (Ordered Caption Chains) as it achieves the best results for both
+baselines and our Ranking objective.
+Table 4: Results on the VDC and ARGUS video captioning benchmarks. Ranking-
+based models show strong performance from both families. MPO and DPO benefit
+from our data generation approach (ordered captions) as they are fine-tuned on it.
+PerceptionLM
+Qwen2.5-VL
+Method
+VDC
+Argus
+VDC
+Argus
+Score
+Accuracy
+Cost-H (↓)
+Cost-O (↓)
+Score
+Accuracy
+Cost-H (↓)
+Cost-O (↓)
+Pretrained
+2.01
+.382
+.679
+.895
+2.30
+.443
+.664
+.820
+SFT
+1.95
+.373
+.712
+.875
+2.33
+.453
+.703
+.786
+DPO
+2.26
+.436
+.570
+.806
+2.34
+.454
+.683
+.786
+MPO
+2.27
+.438
+.572
+.801
+2.35
+.455
+.684
+.772
+Rank
+2.30
+.445
+.562
+.786
+2.34
+.453
+.681
+.772
+Video Detailed Captioning on VDC and ARGUS Next, we evaluate
+models trained on RCC-PVD and RCC-MSR with existing video captioning
+benchmarks. The VDC [5] and ARGUS [39] benchmarks both focus on detailed
+video captions but evaluate them in different ways. VDC takes a polling ap-
+proach, with a set of questions for each caption used for evaluation. An external
+LLM is used to answer these questions predicated on the evaluated model’s pre-
+dicted caption and evaluate the predicted caption’s quality. These correctness
+and quality scores are averaged to produce the final VDCscore.
+ARGUS evaluates captions on hallucination (Cost-H), whether the the pre-
+dicted caption contains untrue statements, and omission (Cost-O), whether in-
+formation in the reference captions is contained in the prediction. These costs
+are computed by splitting the predicted and reference captions into sentences,
+determining whether each predicted sentence is entailed by a reference sentence,
+and combining an alignment cost between the predicted and reference sentences
+with an order penalty if events are described out of order. We use Claude 3.7
+Sonnet to perform the natural language entailment.
+Results on these benchmarks are shown in Tab. 4. The ranking variant of Per-
+ceptionLM performs better than the non-ranking baselines on both VDC and
+ARGUS. The results with Qwen2.5 are mixed, with all variants performing com-
+parably on VDC. The ranking model performs best on ARGUS (the pretrained
+model obtains low hallucination and high omission costs by generating short
+responses). The consistently strong performance of the ranking-trained models
+demonstrates the utility of our approach.
+Learning to Rank Caption Chains for Video-Text Alignment
+11
+4.2
+Multiple Choice Question Answering
+To assess whether our caption ranking method improves models on tasks be-
+yond caption generation, we evaluate our models on multiple-choice question
+answering.
+Long-form Multiple Choice Question Answering We define long-form
+multiple choice question answering (LF-MCQA) as a task where the model is
+asked a question about a provided input (text or visual) and is asked to select
+from multiple long, detailed answer choices. Such answer choices may be descrip-
+tive, having the model select the answer choice which best describes the input;
+analytical, prompting the model to interpret the input; and inferential, pushing
+the model to draw conclusions based on the input.
+As our focus is on video understanding, we create an evluation benchmark by
+starting from PE-Video’s [4] test set and sampling 2K human-annotated video
+descriptions. We provide each description to Claude and prompt it to generate
+a question with five answer choices, each of which is a rich paragraph. Manual
+inspection shows that the questions and answer choices are challenging and of
+high quality. One such example is shown below, with full examples provided in
+the Appendix.
+Question: Based on the aerial footage of the construction site, what conclusions can be
+drawn about the nature of the development, its planning context, and potential environ-
+mental and community impacts?
+A. Typical urban infill development integrated with surrounding buildings . . .
+B. Large-scale residential development expanding an existing area and coordinated with
+current roads/buildings (Correct)
+C. Emergency post-disaster housing with temporary structures and hastily built access
+roads . . .
+D. Environmentally focused development with solar panels and rehabilitated green spaces
+. . .
+E. Government-subsidized affordable housing with uniform structures and separation
+from higher-value properties . . .
+To evaluate a model on our LF-MCQA dataset, we provide them with a video,
+question, and all five answer choices. Answers are predicted by selecting the
+answer choice whose letter has the highest log probability (e.g. the log probability
+of the string “A”).
+Tab. 5 shows the results. The SFT variants of both models perform no better
+than the pretrained ones. DPO, MPO, and ranking models all obtain higher
+performance than the SFT variants, with the ranking model performing best.
+These results suggest that caption ranking not only allows the model to better
+generate its own captions, but also trains it to better evaluate the phrases in the
+prompt—in this case, each individual answer choice.
+Transforming Captions for Question Answering In Sec. 4.2 we showed
+that our caption ranking approach improved long-form multiple choice question
+answering, a task it was not directly optimized for. Here, we ask the following:
+can we rephrase our caption chains as question-answer chains to benefit other
+tasks? To test this possibility, we turn to the Something-Something v2 (SSv2) [15]
+dataset. We generate caption chains by repeatedly modifying a caption’s object
+12
+A. Blume et al.
+or action, then have an LLM reformat the captions into questions where the
+varying object/actions in the chain serve as the answer choices of decreasing
+quality. We train models on these MCQ chains by having them rank the answer
+choice strings (e.g. “(a)”, “(b)”) given a question listing all the answer choices.
+For yes/no question (YNQ) chains, we similarly provide an LLM with the
+caption chain and prompt it to reformat each caption into a yes/no question
+focused on the varying objects/actions in the chain (e.g. “Is there an [object]
+in the video?”. Unlike with caption or multiple choice ranking which varies the
+response for a fixed prompt, here we vary the prompt for the fixed response “no”.
+Intuitively, as the questions become increasingly erroneous, the model should
+become more confident in answering “no”. We hence reverse the order of the
+chain and rank the likelihood of the response “no” for each question in the chain.
+We evaluate models trained on these caption, MCQ, and yes/no question
+chains on the TempCompass Caption Matching benchmark. For this task, a
+model must generate the answer choice that corresponds to the best-matching
+caption for a video. We assess the effectiveness of reformatting caption chains
+into question-answer chains by training one model with only MCQ chains, one
+model with data split between MCQ and YNQ chains, and a third model with
+data split between MCQ, YNQ, and caption chains. The results in Tab. 6 show
+that even with a small compute budget of 500 optimization steps, rephrasing
+the caption chains as question-answering chains provides data diversity that
+improves performance on the downstream task.
+4.3
+Design Choices
+Finetuning the Vision Encoder In Tab. 7 we examine the impact of freez-
+ing the vision encoder while finetuning Qwen2.5-VL on Rcc-PVD. The results
+reveal a notable difference between training paradigms: while SFT and DPO
+exhibit marginal performance variations between frozen and trainable vision en-
+coder configurations, the ranking method achieves substantial gains when the
+vision encoder is optimized jointly with the language model. This disparity sug-
+gests that finetuning the language model alone is insufficient to rank the
+captions. End-to-end training enables the vision encoder to learn the fine-grained
+Table 5: Results on our Long-form Mul-
+tiple Choice Question Answering bench-
+mark. Models trained using the Rcc-
+PVD caption chains improve on this task
+despite not being trained for it.
+PerceptionLM
+Acc.
+Qwen2.5-VL
+Acc.
+Pretrained
+.618
+Pretrained
+.820
+SFT
+.619
+SFT
+.819
+DPO
+.644
+DPO
+.826
+MPO
+.642
+MPO
+.825
+Rank
+.644
+Rank
+.832
+Table 6: Effect of different ranking for-
+mulations during training. MCQ indicates
+the model is trained to rank multiple-
+choice answers, YNQ that it is trained
+to rank yes/no question-answer pairs, and
+Cap that it is trained with normal caption
+ranking. Numbers are average accuracy
+on TempCompass Caption Matching.
+PerceptionLM
+MCQ
+MCQ/YNQ
+MCQ/YNQ/Cap
+Rank
+62.61
+64.27
+64.94
+Pretrained
+43.25
+Learning to Rank Caption Chains for Video-Text Alignment
+13
+Fig. 4: Performance of Qwen2.5-VL and PLM w.r.t number of captions utilized in the
+chain. Model performance generally increases with chain length.
+visual representations necessary to discriminate between subtle changes in the
+caption chains. These findings suggest that the common practice of freezing the
+vision encoder during DPO is suboptimal for vision-heavy tasks, preventing the
+vision encoder from benefiting from the contrastive learning induced by DPO.
+Impact of Chain Length We investigate the impact of chain length on model
+performance in Fig. 4. The results demonstrate that increasing chain length
+consistently yields improved performance across both Qwen2.5-VL and PLM
+architectures. Further exploration of the scalability limits with extended chain
+lengths remains a promising direction for future research.
+Choice of Ranking Loss For a fixed set of responses, the Plackett-Luce loss en-
+courages larger probability ratios between higher-ranked responses and all lower-
+ranked ones. While this appears to exert downward pressure on lower ranks, this
+may not occur in practice, even for binary DPO [33]. Because this loss places
+no constraint on the trajectory of individual likelihoods, an undesirable response
+may increase in probability. Indeed, we found that a next-token prediction (NTP)
+loss was necessary to prevent VLMs’ generation abilities from collapsing.
+These considerations motivate examining the margin-free hinge loss as an
+alternative, since it penalizes the model only when a lower-ranked response re-
+ceives a higher score than a higher-ranked one. As it acts only on score inversions,
+it avoids the margin-widening pressure exerted by the Plackett-Luce loss.
+Table 7: Performance of Qwen2.5-VL with a frozen (✗) or fine-tuned (✓) vision encoder
+on PE-Video. Fine-tuning the Vision Encoder is critical for our Ranking objective.
+Metric
+SFT
+DPO
+Rank
+✗
+✓
+✗
+✓
+✗
+✓
+Relevance
+7.31
+7.34
+7.33
+7.35
+7.34
+7.46
+Descriptiveness
+7.24
+7.25
+7.23
+7.25
+7.25
+7.40
+Temporal Consistency
+7.64
+7.62
+7.61
+7.60
+7.64
+7.75
+Fluency
+9.35
+9.35
+9.34
+9.36
+9.36
+9.40
+14
+A. Blume et al.
+A sequence from the Disney movie ‘The Little
+Mermaid’ showing the interior of a castle with a
+fireplace. The scene begins with a window view of
+a snowy landscape outside where a character in a
+purple outfit is sitting by a tree. Inside the cas-
+tle, a teapot with a crown on its lid sits on a table
+next to a golden candlestick holder. The sequence
+appears to be from a special effects sequence or a
+dramatic scene from the movie, capturing a dra-
+matic confrontation between the creature and the
+woman.
+A sequence from an animated Disney film showing
+a snowy winter scene viewed through a window.
+The sequence begins with a golden candlestick
+holder with burning flames on the left side of the
+window. As the scene progresses, a teapot with a
+crown on its lid appears in the center, accompa-
+nied by a clock figure to its right. The characters
+then transition to a red room where a woman in
+a pink dress stands near a fireplace. The sequence
+concludes with the teapot and clock figure reap-
+pearing on the window sill, with the burning can-
+dlestick holder still visible on the left.
+A series of frames show a brown goat on a road
+interacting with a woman in a white top and blue
+pants. The goat approaches the woman sitting on
+the road, raises its head, and is fed by the woman.
+A man in a striped shirt walks towards them,
+jumps onto the woman, and then exits the frame.
+Vehicles are parked along the road, and trees are
+visible in the background. The sequence captures
+the interaction between the goat, the woman, and
+the man, set against a rural or suburban road en-
+vironment.
+A sequence of images showing a goat on a street
+attempting to cross a road. The goat, with its
+brown coat and white markings, is seen walk-
+ing along the road, seemingly unaware of the ap-
+proaching traffic. A woman in a white top and
+blue pants sits on the roadside. A man in a striped
+shirt and dark pants approaches the scene, at-
+tempting to interact with the goat. The goat con-
+tinues to walk along the road, seemingly unde-
+terred by the man’s presence. The setting appears
+to be a suburban or rural area with parked cars
+and trees lining the road.
+Video
+SFT
+Ranking
+Fig. 5: Qualitative comparison of our Ranking model vs. an SFT baseline. Green high-
+lights video-grounded descriptions. The Ranking model captures finer details better
+than SFT. See Appendix for more in-depth comparison and examples.
+We therefore train models with hinge loss and NTP loss and compare them
+to our models trained with Plackett-Luce + NTP. Given log probabilities si
+corresponding to responses ordered as y1 ≻. . . ≻yn, we compute the margin-
+free pairwise hinge loss as
+  
+\
+mat h ca
+l {
+L
+} =
+\
+f
+rac {
+2}{n(n  -  1)}\sum _{i = 1}^{n - 1} \sum _{j = i + 1}^n \max (0, s_j - s_i). 
+(4)
+Tab. 8 shows the results. Despite the conceptual appeal of limiting the loss to
+inversions, the Plackett-Luce models generally perform better in practice.
+Conditioned vs. Unconditioned Caption Mutation To build the Rcc
+dataset, we uniformly sampled error types and conditioned the LLM’s prompt
+on the sampled error. An alternative could have been to allow the language
+model to freely introduce errors of its own choosing, without any error type
+conditioning. To ablate this design choice, we regenerated caption chains on
+PE-Video without error type conditioning. The PerceptionLM model trained on
+the error-conditioned chains achieved significantly higher scores across all four
+LLM-as-a-judge metrics (table in Appendix).
+Table 8: Comparison between models trained with different losses on Rcc-PVD.
+Loss
+PerceptionLM
+Qwen2.5-VL
+Rel.
+Descr.
+Temp C.
+Flu.
+Rel.
+Descr.
+Temp C.
+Flu.
+Hinge
+7.58
+7.72
+7.88
+9.47
+7.34
+7.36
+7.79
+9.38
+Plackett-Luce DPO
+7.67
+7.72
+7.93
+9.49
+7.46
+7.40
+7.75
+9.40
+Learning to Rank Caption Chains for Video-Text Alignment
+15
+5
+Conclusion
+In this work, we addressed limitations of binary preference optimization for vi-
+sion language models by introducing ranking optimization as a more nuanced
+alternative. Through experiments on detailed video captioning and VQA, we
+showed that ranking methods combined with our ordered captions generation
+consistently outperform DPO baselines, particularly for detailed content. Our
+caption degradation technique enables creation of totally ordered training data
+that better captures the spectrum of response quality. Critically, ranking opti-
+mization requires vision encoder finetuning to achieve meaningful improvements,
+revealing that preference optimization in VLMs extends beyond simple language
+reweighting. Our results suggest that future work should embrace graded pref-
+erence structures and jointly optimize both vision and language components.
+References
+1. Introducing GPT-OSS, https://openai.com/index/introducing-gpt-oss/ 8
+2. Bai, S., Chen, K., Liu, X., Wang, J., Ge, W., Song, S., Dang, K., Wang, P., Wang,
+S., Tang, J., et al.: Qwen2. 5-vl technical report. arXiv preprint arXiv:2502.13923
+(2025) 7
+3. Blume, A., Kim, J., Ha, H., Chatikyan, E., Jin, X., Nguyen, K.D., Peng, N.,
+Chang, K.W., Hoiem, D., Ji, H.: Partonomy: Large multimodal models with
+part-level visual understanding. ArXiv abs/2505.20759 (2025), https://api.
+semanticscholar.org/CorpusID:278911816 1
+4. Bolya, D., Huang, P.Y., Sun, P., Cho, J.H., Madotto, A., Wei, C., Ma, T., Zhi, J.,
+Rajasegaran, J., Rasheed, H.A., Wang, J., Monteiro, M., Xu, H., Dong, S., Ravi,
+N., Li, S.W., Doll’ar, P., Feichtenhofer, C.: Perception encoder: The best visual
+embeddings are not at the output of the network. ArXiv abs/2504.13181 (2025),
+https://api.semanticscholar.org/CorpusID:277856792 2, 5, 11
+5. Chai, W., Song, E., Du, Y., Meng, C., Madhavan, V., Bar-Tal, O., Hwang, J.N.,
+Xie, S., Manning, C.D.: Auroracap: Efficient, performant video detailed cap-
+tioning and a new benchmark. ArXiv abs/2410.03051 (2024), https://api.
+semanticscholar.org/CorpusID:273162259 2, 8, 10
+6. Chen, L., Wei, X., Li, J., Dong, X., Zhang, P., Zang, Y., Chen, Z., Duan, H., Tang,
+Z., Yuan, L., et al.: Sharegpt4video: Improving video understanding and genera-
+tion with better captions. Advances in Neural Information Processing Systems 37,
+19472–19495 (2024) 4
+7. Chen, T., Kornblith, S., Norouzi, M., Hinton, G.: A simple framework for con-
+trastive learning of visual representations. In: International conference on machine
+learning. pp. 1597–1607. PmLR (2020) 4
+8. Chen, T.S., Siarohin, A., Menapace, W., Deyneka, E., Chao, H.w., Jeon, B.E.,
+Fang, Y., Lee, H.Y., Ren, J., Yang, M.H., et al.: Panda-70m: Captioning 70m
+videos with multiple cross-modality teachers. In: Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition. pp. 13320–13331 (2024)
+4
+9. Chen, X., Fan, H., Girshick, R., He, K.: Improved baselines with momentum con-
+trastive learning. arXiv preprint arXiv:2003.04297 (2020) 4
+16
+A. Blume et al.
+10. Chen, Z., Wu, J., Wang, W., Su, W., Chen, G., Xing, S., Muyan, Z., Zhang,
+Q., Zhu, X., Lu, L., Li, B., Luo, P., Lu, T., Qiao, Y., Dai, J.: Intern vl: Scaling
+up vision foundation models and aligning for generic visual-linguistic tasks. 2024
+IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) pp.
+24185–24198 (2023), https://api.semanticscholar.org/CorpusID:266521410 1
+11. Cho, J.H., Madotto, A., Mavroudi, E., Afouras, T., Nagarajan, T., Maaz, M., Song,
+Y., Ma, T., Hu, S., Jain, S., et al.: Perceptionlm: Open-access data and models for
+detailed visual understanding. arXiv preprint arXiv:2504.13180 (2025) 7
+12. Ding, X., Zhang, K., Han, J., Hong, L., Xu, H., Li, X.: Pami-vdpo: Mitigating
+video hallucinations by prompt-aware multi-instance video preference learning.
+ArXiv abs/2504.05810 (2025), https://api.semanticscholar.org/CorpusID:
+277627967 3
+13. Driess, D., Xia, F., Sajjadi, M.S.M., Lynch, C., Chowdhery, A., Ichter, B., Wahid,
+A., Tompson, J., Vuong, Q.H., Yu, T., Huang, W., Chebotar, Y., Sermanet, P.,
+Duckworth, D., Levine, S., Vanhoucke, V., Hausman, K., Toussaint, M., Greff, K.,
+Zeng, A., Mordatch, I., Florence, P.R.: Palm-e: An embodied multimodal language
+model. In: International Conference on Machine Learning (2023), https://api.
+semanticscholar.org/CorpusID:257364842 1
+14. Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle, A., Letman, A., Mathur,
+A., Schelten, A., Yang, A., Fan, A., et al.: The llama 3 herd of models. arXiv
+e-prints pp. arXiv–2407 (2024) 7
+15. Goyal, R., Ebrahimi Kahou, S., Michalski, V., Materzynska, J., Westphal, S., Kim,
+H., Haenel, V., Fruend, I., Yianilos, P., Mueller-Freitag, M., et al.: The" something
+something" video database for learning and evaluating visual common sense. In:
+Proceedings of the IEEE international conference on computer vision. pp. 5842–
+5850 (2017) 11
+16. Gu, J., Jiang, X., Shi, Z., Tan, H., Zhai, X., Xu, C., Li, W., Shen, Y., Ma, S.,
+Liu, H., Wang, Y., Guo, J.: A survey on llm-as-a-judge. ArXiv abs/2411.15594
+(2024), https://api.semanticscholar.org/CorpusID:274234014 8
+17. Gupta, T., Madhavan, R., Zhang, X., Natarajan, N., Bansal, C., Rajmohan,
+S.: Multi-preference optimization: Generalizing dpo via set-level contrasts. arXiv
+preprint arXiv:2412.04628 (2024) 7
+18. He, K., Fan, H., Wu, Y., Xie, S., Girshick, R.: Momentum contrast for unsupervised
+visual representation learning. In: Proceedings of the IEEE/CVF conference on
+computer vision and pattern recognition. pp. 9729–9738 (2020) 4
+19. Hu, J.E., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Chen, W.: Lora:
+Low-rank adaptation of large language models. ArXiv abs/2106.09685 (2021),
+https://api.semanticscholar.org/CorpusID:235458009 7
+20. Huang, W., Wu, A., Yang, Y., Luo, X., Yang, Y., Hu, L., Dai, Q., Dai, X., Chen,
+D., Luo, C., Qiu, L.: Llm2clip: Powerful language model unlocks richer visual
+representation. ArXiv abs/2411.04997 (2024), https://api.semanticscholar.
+org/CorpusID:273877534 4
+21. Islam, M.M., Ho, N., Yang, X., Nagarajan, T., Torresani, L., Bertasius, G.: Video
+recap: Recursive captioning of hour-long videos. In: Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition. pp. 18198–18208 (2024)
+4
+22. Jia, C., Yang, Y., Xia, Y., Chen, Y.T., Parekh, Z., Pham, H., Le, Q., Sung, Y.H.,
+Li, Z., Duerig, T.: Scaling up visual and vision-language representation learning
+with noisy text supervision. In: International conference on machine learning. pp.
+4904–4916. PMLR (2021) 4
+Learning to Rank Caption Chains for Video-Text Alignment
+17
+23. Kim, J., Ji, H.: Finer: Investigating and enhancing fine-grained visual concept
+recognition in large vision language models. In: Conference on Empirical Meth-
+ods in Natural Language Processing (2024), https://api.semanticscholar.org/
+CorpusID:267938790 1
+24. Kim, M., Kim, H.B., Moon, J., Choi, J., Kim, S.T.: Do you remember? dense video
+captioning with cross-modal memory retrieval. In: Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition. pp. 13894–13904 (2024)
+4
+25. Kim, M.J., Pertsch, K., Karamcheti, S., Xiao, T., Balakrishna, A., Nair, S.,
+Rafailov, R., Foster, E.P., Lam, G., Sanketi, P.R., Vuong, Q., Kollar, T., Burch-
+fiel, B., Tedrake, R., Sadigh, D., Levine, S., Liang, P., Finn, C.: Openvla: An
+open-source vision-language-action model. ArXiv abs/2406.09246 (2024), https:
+//api.semanticscholar.org/CorpusID:270440391 1
+26. Lin, B., Zhu, B., Ye, Y., Ning, M., Jin, P., Yuan, L.: Video-llava: Learning united
+visual representation by alignment before projection. ArXiv abs/2311.10122
+(2023), https://api.semanticscholar.org/CorpusID:265281544 1
+27. Liu, N.F., Lin, K., Hewitt, J., Paranjape, A., Bevilacqua, M., Petroni, F., Liang,
+P.: Lost in the middle: How language models use long contexts. Transactions of
+the Association for Computational Linguistics 12, 157–173 (2023), https://api.
+semanticscholar.org/CorpusID:259360665 1
+28. Liu, Y., Li, S., Liu, Y., Wang, Y., Ren, S., Li, L., Chen, S., Sun, X., Hou, L.: Tem-
+pcompass: Do video llms really understand videos? In: Annual Meeting of the As-
+sociation for Computational Linguistics (2024), https://api.semanticscholar.
+org/CorpusID:268201547 3
+29. Loshchilov, I., Hutter, F.: Decoupled weight decay regularization. In: International
+Conference on Learning Representations (2017), https://api.semanticscholar.
+org/CorpusID:53592270 7
+30. Matsuda, K., Wada, Y., Hirano, S., Otsuki, S., Sugiura, K.: Vela: An llm-hybrid-
+as-a-judge approach for evaluating long image captions. ArXiv abs/2509.25818
+(2025), https://api.semanticscholar.org/CorpusID:281681513 8
+31. Ouali, Y., Bulat, A., Martinez, B., Tzimiropoulos, G.: Clip-dpo: Vision-language
+models as a source of preference for fixing hallucinations in lvlms. In: European
+Conference on Computer Vision. pp. 395–413. Springer (2024) 3
+32. Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright, C.L., Mishkin, P.,
+Zhang, C., Agarwal, S., Slama, K., Ray, A., Schulman, J., Hilton, J., Kelton,
+F., Miller, L.E., Simens, M., Askell, A., Welinder, P., Christiano, P.F., Leike, J.,
+Lowe, R.J.: Training language models to follow instructions with human feedback.
+ArXiv abs/2203.02155 (2022), https://api.semanticscholar.org/CorpusID:
+246426909 4
+33. Pal, A., Karkhanis, D., Dooley, S., Roberts, M., Naidu, S., White, C.: Smaug:
+Fixing failure modes of preference optimisation with dpo-positive. arXiv preprint
+arXiv:2402.13228 (2024) 7, 13
+34. Poppi, T., Uzkent, B., Garg, A., Porto, L., Kessler, G., Yang, Y., Cornia, M.,
+Baraldi, L., Cucchiara, R., Schiffers, F.: Countervid: Counterfactual video gener-
+ation for mitigating action and temporal hallucinations in video-language models.
+arXiv preprint arXiv:2601.04778 (2026) 3
+35. Radenovic, F., Dubey, A., Kadian, A., Mihaylov, T., Vandenhende, S., Patel, Y.,
+Wen, Y., Ramanathan, V., Mahajan, D.: Filtering, distillation, and hard negatives
+for vision-language pre-training. In: Proceedings of the IEEE/CVF conference on
+computer vision and pattern recognition. pp. 6967–6977 (2023) 1
+18
+A. Blume et al.
+36. Radford, A., Kim, J.W., Hallacy, C., Ramesh, A., Goh, G., Agarwal, S., Sastry,
+G., Askell, A., Mishkin, P., Clark, J., Krueger, G., Sutskever, I.: Learning trans-
+ferable visual models from natural language supervision. In: International Confer-
+ence on Machine Learning (2021), https://api.semanticscholar.org/CorpusID:
+231591445 1, 4
+37. Rafailov, R., Sharma, A., Mitchell, E., Ermon, S., Manning, C.D., Finn, C.: Di-
+rect preference optimization: Your language model is secretly a reward model.
+ArXiv abs/2305.18290 (2023), https://api.semanticscholar.org/CorpusID:
+258959321 2, 6
+38. Rasheed, H.A., Maaz, M., Mullappilly, S.S., Shaker, A.M., Khan, S.H., Cholakkal,
+H., Anwer, R.M., Xing, E.P., Yang, M.H., Khan, F.S.: Glamm: Pixel ground-
+ing large multimodal model. 2024 IEEE/CVF Conference on Computer Vi-
+sion and Pattern Recognition (CVPR) pp. 13009–13018 (2023), https://api.
+semanticscholar.org/CorpusID:265043538 1
+39. Rawal, R., Shirkavand, R., Huang, H., Somepalli, G., Goldstein, T.: Argus: Hal-
+lucination and omission evaluation in video-llms. ArXiv abs/2506.07371 (2025),
+https://api.semanticscholar.org/CorpusID:279251247 2, 10
+40. Schulman, J., Wolski, F., Dhariwal, P., Radford, A., Klimov, O.: Proximal
+policy optimization algorithms. ArXiv abs/1707.06347 (2017), https://api.
+semanticscholar.org/CorpusID:28695052 2
+41. Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J.M., Zhang, M., Li, Y.K., Wu, Y.,
+Guo, D.: Deepseekmath: Pushing the limits of mathematical reasoning in open lan-
+guage models. ArXiv abs/2402.03300 (2024), https://api.semanticscholar.
+org/CorpusID:267412607 2
+42. Tong, S., Liu, Z., Zhai, Y., Ma, Y., LeCun, Y., Xie, S.: Eyes wide shut? exploring the
+visual shortcomings of multimodal llms. 2024 IEEE/CVF Conference on Computer
+Vision and Pattern Recognition (CVPR) pp. 9568–9578 (2024), https://api.
+semanticscholar.org/CorpusID:266976992 1
+43. Wang, Z., Blume, A., Li, S., Liu, G., Cho, J., Tang, Z., Bansal, M., Ji,
+H.: Paxion: Patching action knowledge in video-language foundation models.
+ArXiv abs/2305.10683 (2023), https://api.semanticscholar.org/CorpusID:
+258762310 1
+44. Xie, C., Wang, B., Kong, F., Li, J., Liang, D., Zhang, G., Leng, D., Yin, Y.: Fg-clip:
+Fine-grained visual and textual alignment. arXiv preprint arXiv:2505.05071 (2025)
+1
+45. Xie, Y., Li, G., Xu, X., Kan, M.Y.: V-dpo: Mitigating hallucination in large vision
+language models via vision-guided direct preference optimization. arXiv preprint
+arXiv:2411.02712 (2024) 3, 4
+46. Xu, J., Huang, Y., Hou, J., Chen, G., Zhang, Y., Feng, R., Xie, W.: Retrieval-
+augmented egocentric video captioning. In: Proceedings of the IEEE/CVF Confer-
+ence on Computer Vision and Pattern Recognition. pp. 13525–13536 (2024) 4
+47. Xu, J., Mei, T., Yao, T., Rui, Y.: Msr-vtt: A large video description dataset for
+bridging video and language. 2016 IEEE Conference on Computer Vision and Pat-
+tern Recognition (CVPR) pp. 5288–5296 (2016), https://api.semanticscholar.
+org/CorpusID:206594535 2, 5
+48. Yang, Z., Luo, X., Han, D., Xu, Y., Li, D.: Mitigating hallucinations in large
+vision-language models via dpo: On-policy data hold the key. In: Proceedings of
+the Computer Vision and Pattern Recognition Conference. pp. 10610–10620 (2025)
+8
+Learning to Rank Caption Chains for Video-Text Alignment
+19
+49. Yu, T., Zhang, H., Li, Q., Xu, Q., Yao, Y., Chen, D., Lu, X., Cui, G., Dang, Y., He,
+T., et al.: Rlaif-v: Open-source ai feedback leads to super gpt-4v trustworthiness.
+In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp.
+19985–19995 (2025) 8
+50. Yuksekgonul, M., Bianchi, F., Kalluri, P., Jurafsky, D., Zou, J.Y.: When and
+why vision-language models behave like bags-of-words, and what to do about it?
+ArXiv abs/2210.01936 (2022), https://api.semanticscholar.org/CorpusID:
+252734947 1
+51. Zhai, X., Mustafa, B., Kolesnikov, A., Beyer, L.: Sigmoid loss for language im-
+age pre-training. In: Proceedings of the IEEE/CVF international conference on
+computer vision. pp. 11975–11986 (2023) 4
+52. Zhang, R., Gui, L., Sun, Z., Feng, Y., Xu, K., Zhang, Y., Fu, D., Li, C., Hauptmann,
+A.G., Bisk, Y., et al.: Direct preference optimization of video large multimodal
+models from language model reward. In: Proceedings of the 2025 Conference of the
+Nations of the Americas Chapter of the Association for Computational Linguistics:
+Human Language Technologies (Volume 1: Long Papers). pp. 694–717 (2025) 3
+53. Zhao, Y., Zhao, L., Zhou, X., Wu, J., Chu, C.T., Miao, H., Schroff, F., Adam, H.,
+Liu, T., Gong, B., et al.: Distilling vision-language models on millions of videos.
+In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition. pp. 13106–13116 (2024) 4
+54. Zhou, X., Arnab, A., Buch, S., Yan, S., Myers, A., Xiong, X., Nagrani, A., Schmid,
+C.: Streaming dense video captioning. In: Proceedings of the IEEE/CVF Confer-
+ence on Computer Vision and Pattern Recognition. pp. 18243–18252 (2024) 4
+Appendix
+A
+Mitigating Bias in Caption Evaluations
+A.1
+Experimenting with Another Judge
+As noted in the main text, we experiment with GPT-OSS 20B as a judge to
+ensure that the evaluations are not biased due to our using Claude 3.7 Sonnet to
+both generate the caption chains and evaluate all of the models. Tab. 1 shows the
+complete results. While GPT-OSS has lower baseline scores for all but fluency,
+the trends we observed with the Claude evaluations generally hold with GPT-
+OSS as a judge, confirming that our findings are not an artifact of judge
+selection.
+Table 1: Captioning results on PE-Video and MSR-VTT splits of Rcc using GPT-
+OSS as a judge to ensure that evaluations are not biased by Claude. Captions are
+evaluated by Relevance (Rel.), Descriptiveness (Descr.), Temporal Consistency (Temp
+C.), and Fluency (Flu.). Our ranking method achieves the best or tied-best
+results across nearly all metrics and datasets.
+Method
+MSR-VTT
+PE-Video
+Rel.
+Descr.
+Temp C.
+Flu.
+Rel.
+Descr.
+Temp C.
+Flu.
+PerceptionLM
+Pretrained
+3.16
+2.83
+3.32
+6.89
+3.65
+3.09
+2.83
+6.62
+SFT
+3.68
+3.55
+4.41
+7.95
+3.81
+3.14
+3.53
+8.06
+DPO
+4.45
+4.32
+5.60
+8.56
+5.03
+4.60
+5.30
+8.69
+MPO
+4.45
+4.36
+5.56
+8.57
+5.06
+4.61
+5.29
+8.70
+Rank
+4.54
+4.42
+5.67
+8.62
+5.14
+4.69
+5.42
+8.69
+Qwen2.5-VL
+Pretrained
+4.04
+3.36
+4.02
+8.03
+4.05
+3.36
+4.05
+8.03
+SFT
+4.31
+4.11
+5.23
+8.34
+4.84
+4.40
+5.24
+8.63
+DPO
+4.26
+4.07
+5.30
+8.34
+4.87
+4.45
+5.23
+8.64
+MPO
+4.31
+4.14
+5.41
+8.31
+4.91
+4.48
+5.23
+8.63
+Rank
+4.39
+4.17
+5.41
+8.34
+4.97
+4.59
+5.42
+8.63
+A.2
+Non-LLM-based Metrics
+While LLM-as-a-judge exhibits high correlations with human judgments and is
+a standard approach to perform captioning evaluations [3–6], we acknowledge
+2
+Table 2: Non-LLM-as-judge metrics for PLM on Rcc-PVD. We note that DPO and
+MPO benefit from the data generated by our caption degradation method as they are
+fine-tuned on it. The Ranking provides further gains compared to MPO given that
+both are fine-tuned on the dataset generated by our method.
+Method
+METEOR
+ROUGE-L
+Pretrained
+.152
+.234
+SFT
+.124
+.201
+DPO
+.196
+.292
+MPO
+.196
+.293
+Ranking
+.199
+.293
+heavy usage of LLMs for both generating training data and evaluating the re-
+sults. Therefore, outside of the human evaluation discussed in Sec. 4, we provide
+the results for n-gram based metrics in Tab. 2. Higher values indicate greater
+overlap between the predicted and ground truth captions. Notably, the rank-
+ing method achieves the best METEOR score and ties for the best
+ROUGE-L, corroborating the LLM-based evaluations with traditional metrics.
+Finally, we want to highlight that MPO and DPO benefit from our dataset
+generated by our caption degradation method as they are fine-tuned on it.
+B
+Ranked Caption Chain Algorithm
+In Fig. 1, we detail the algorithm to construct ranked caption chains for the Rcc
+dataset. Since each error reliably lowers a caption’s faithfulness to the video, the
+resulting captions form a clean, totally ordered chain.
+C
+Data Generation Design Choices
+In this section, we expand on some of the design choices touched upon in Table
+1 in the main paper, providing additional details, motivations, and results.
+C.1
+Effect of Error Sampling
+In the main paper, we noted that the PerceptionLM model trained on chains
+generated by our error-conditioned chain generation algorithm performed better
+than one trained on chains generated while allowing the LLM to freely insert
+errors. Tab. 3 shows the results. The model trained on error-conditioned chains
+performs better across all four metrics, suggesting that diversity in intro-
+duced errors helps the model obtain broad performance gains.
+Appendix
+3
+def
+gen_caption_chain (
+orig_caption: str ,
+video ,
+chain_len: int
+) -> list[str]:
+chain = [orig_caption ]
+for i in range(chain_len ):
+err_types = get_applicable_errors (chain [ -1])
+err_type = sample(err_types)
+mutated_caption = apply_error_type (
+err_type ,
+chain [:i],
+video
+)
+chain.append( mutated_caption )
+return
+chain
+def
+apply_err_type (
+err_type ,
+chain: list[str],
+video
+) -> str:
+"""
+Uses an LLM to apply an error
+type to the
+latest
+caption in a chain
+while
+preserving
+previously
+introduced
+errors.
+"""
+...
+Fig. 1: Algorithm to generate a chain of totally ordered captions from a starting cap-
+tion. An LLM mutates the latest caption in the chain by introducing an error, pre-
+serving previously introduced errors and as much of the prior caption’s structure as
+possible.
+Table
+3:
+Comparison between PLM trained on chains generated with error-
+conditioning vs. PLM trained on chains with freely introduced errors.
+Model
+Error
+Condition.
+Rcc-PVD
+Relevance
+Descriptiveness
+Temporal C.
+Flu.
+PerceptionLM
+✗
+7.48
+7.41
+7.62
+8.80
+PerceptionLM
+✓
+7.67
+7.72
+7.93
+9.49
+4
+C.2
+Effect of Conditional Caption Generation
+A key element of our data generation method is that each generated caption is
+the same as the one prior, except with an additional error. So the caption ck at
+rank k ≥1 has k −1 errors in it, and the set of errors of caption k is a strict
+subset of those of the next: Errors(ck) ⊊Errors(ck+1).
+One might wonder whether maintaining the set of previous errors provides
+any benefit. For example, instead of caption ck+1 containing all of the errors of
+ck, we could instead have each caption contain a single error introduced into the
+original caption, independent of all other captions. Thus, we would have c1 as
+the original caption and ck for k ≥2 each with a single error independent of the
+other captions. One might expect, also, that training on these negatives would
+yield better performance due to their each being closer to the original caption
+than progressively degrading captions, thereby serving as harder negatives.
+To evaluate this setting, we generate these “independent negatives” using
+GPT-OSS 20B and train PLM with MPO to ensure all captions in the set are
+used. We compare the model to PLM trained with ranking on the caption chains
+in Tab. 4 with GPT-OSS as a judge. This baseline is described as “error injection”
+in Tab. 1 (results repeated here for completeness).
+Table 4: Comparison between progressively degraded caption chains vs. sets of cap-
+tions where each caption contains a single, independent error based on the original
+caption. Captions are generated and evaluations performed by GPT-OSS 20B. Pro-
+gressive degradation with ranking outperforms independent errors across
+all metrics.
+Model
+Relevance
+Descriptiveness
+Temporal Consist.
+Fluency
+MPO (Indep. Errs)
+4.90
+4.62
+5.38
+8.46
+Ranking
+5.27
+4.92
+5.75
+8.47
+C.3
+On-Policy Evaluation
+One major element of our proposed method is that data is generated off-policy.
+While off-policy data’s reusability across models makes it highly efficient, prior
+work has shown that on-policy data drives strong performance which can out-
+perform off-policy DPO [8].
+To compare our proposed off-policy ranking framework with on-policy meth-
+ods, we train several baselines with on-policy data generated using our PE-Video
+training set. [8] describes two classes of on-policy DPO methods. The first uses
+an external LLM judge to improve existing generations, with the improved gen-
+erations serving as the preferred responses in DPO. The second class uses an
+external LLM judge to perform pairwise comparisons of the target model’s re-
+sponses, constructing preference pairs from the existing responses. For this eval-
+uation, we include representative methods from each of these classes, each of
+Appendix
+5
+which is described below. Each method starts by constructing initial on-policy
+captions, generating five captioning responses per video.
+Response Improvement. We take each of the five generated responses and have
+GPT-OSS 20B [1] refine each of the responses based on the ground truth caption,
+fixing errors and incorporating missed elements. This process yields five win/loss
+pairs which we use for our DPO training data.
+Response Comparison. We take all ten combinations of caption pairs and feed
+them to GPT-OSS 20B, asking it to indicate which caption better represents
+the video given the ground truth caption. GPT-OSS is allowed to say that the
+captions are of approximately equal quality, in which case a preference pair is
+not generated. The vast majority of videos generate nine or ten caption pairs,
+so we select all examples with at least nine preference pairs, sampling nine such
+pairs per video (using a uniform number of pairs allows for efficient distributed
+training).
+RLAIF-V. RLAIF-V [9] uses an LLM to extract claims from each response, then
+evaluates each of the claims’ correctness to produce a score for each response
+based on the number of incorrect claims. Preference pairs are then constructed
+between captions with differing scores. This method is similar to our proposed
+approach, which orders captions based on the number of introduced errors.
+As this method is only designed to reduce hallucinations by evaluating re-
+sponses based on their precision, we extend the RLAIF-V framework to also
+compute the number of ground truth claims entailed by the response (recall).
+We then compute each response’s score as the harmonic mean of these values
+(F1 score). We call this version Bidirectional RLAIF-V (Bidir).
+Evaluation. We use GPT-OSS 20B to recaption the PE-Video dataset and
+regenerate chains for our ranking method. All models are trained for 500 op-
+timization steps with a batch size of eight videos using DPO/ranking loss and
+next-token prediction on the ground truth caption with a weight of .1. For each
+of the on-policy methods, we also experiment with performing a pre-SFT step
+on the ground truth captions for on-policy adaptation prior to generating initial
+responses [8].
+Tab. 5 shows the results on PE-Video captioning, with evaluations performed
+by GPT-OSS 20B as a judge. While all methods significantly improve perfor-
+mance over the baseline, our off-policy ranking approach demonstrates
+the strongest performance on relevance, descriptiveness, and tempo-
+ral consistency. We attribute this both to the challenge that the ranking task
+poses, and to the next-token prediction loss, which serves both to prevent gener-
+ation collapse and to shift the preferred response to be in-distribution [8]. LLM-
+based response refinement is the best-performing on-policy baseline, followed by
+response comparison and RLAIF-V. RLAIF-V has much lower descriptiveness
+as it is a primarily hallucination-centric method—its response scores are based
+6
+on the number of incorrect claims made in a response. Our bidirectional variant
+improves its scores on three out of four metrics, but it still does not outperform
+ranking on those same metrics.
+Table 5: Comparison between on- and off-policy data generation methods training
+PLM on Rcc-PVD. Despite having model-tailored data generation, the on-policy
+baselines do not outperform our ranking approach on video detailed captioning. Data
+generated and evaluated with GPT-OSS 20B.
+Method
+On-
+Policy
+PE-Video
+Rel.
+Descr.
+Temp C.
+Flu.
+PerceptionLM
+Pretrained
+✗
+3.65
+3.09
+2.83
+6.62
+Rank
+✗
+5.27
+4.92
+5.75
+8.47
+Response Comparison
+✓
+5.03
+4.79
+5.51
+8.45
+With Pre-SFT
+✓
+5.12
+4.71
+5.47
+8.60
+Response Improvement
+✓
+5.07
+4.83
+5.57
+8.52
+With Pre-SFT
+✓
+5.07
+4.92
+5.32
+7.61
+RLAIF-V
+✓
+5.06
+4.35
+5.21
+8.67
+With Pre-SFT/Bidir
+✓
+5.13
+4.83
+5.52
+8.57
+D
+Validity of Chain Order
+Generated chains are totally ordered by construction, as each successive caption
+has the same content as the one prior (maintaining existing errors), but with
+the addition of one extra error. However, order can be disrupted if the LLM
+fails to maintain the prior text or inadvertently makes a caption more faithful.
+To quantify chain validity, we sample 100 chains from Rcc-PVD for human
+inspection, finding that 89% of chains maintain the total order. Moreover,
+8 out of 11 failures are due to errors already present in the original caption. This
+means that only 3% of the chains contain noise introduced by our data
+generation approach, highlighting our method’s robustness.
+E
+Choice of Ranking Loss
+In the main text, we compared the Plackett-Luce loss to Hinge loss due to the
+latter’s not enforcing a margin. Here, we perform an additional experiment using
+the RankNet loss of [2]. Models are trained on GPT-OSS chains and evaluated
+by the same model. We find that RankNet outperforms Hinge loss but performs
+worse than Plackett-Luce. As the RankNet loss is essentially DPO without a
+reference model, this suggests that the KL constraint is a beneficial element
+of the Plackett-Luce formulation.
+Appendix
+7
+Table 6: Comparison of ranking losses with PLM on Rcc-PVD. The Plackett-Luce
+loss achieves the best results on three out of four metrics.
+Method
+Relevance
+Descriptiveness
+Temporal C.
+Fluency
+RankNet [2]
+4.91
+4.67
+5.42
+8.52
+Hinge
+4.86
+4.63
+5.36
+8.43
+Plackett-Luce
+5.27
+4.92
+5.75
+8.47
+F
+Captioning Example
+Fig. 2 provides an example of model-generated captions on an MSR-VTT video
+with GPT-OSS 20B as a judge. While the DPO and Ranking models are more
+informative than the pretrained model’s description, both contain inaccuracies
+highlighted by the LLM judge.
+G
+Examples of Long-Form Multiple Choice Questions
+Fig. 3 provides examples from our Long-Form Multiple Choice Question An-
+swering benchmark. Note the questions’ complexity and the long-form nature of
+each of the answer choices, the latter of which challenges models’ attention to
+visual detail.
+H
+Limitations
+While our proposed method demonstrates scalability and strong performance
+over close alternatives, it is not without drawbacks.
+First, our method generally assumes access to detailed captions to ensure
+we can generate a chain with an increasing number of errors. While this pro-
+cess results in cleanly ordered captions, it may require recaptioning of existing
+datasets so each caption contains sufficient claims that can be modified. Alter-
+natively, one may repeatedly modify a single statement to become less and less
+faithful to the visual inputs, as demonstrated in Sec. 4.2. This tends to generate
+less cleanly ordered chains, however, as introducing errors into a long caption is
+a much easier task for an LLM than is repeatedly making an existing statement
+less faithful to the video.
+One key property of our method is that the caption chain data is gener-
+ated off-policy. This has both advantages and drawbacks. By generating model-
+independent caption chains, one is able to rapidly fine-tune new models on the
+data without needing to regenerate model-specific data. Sec. 4 shows that these
+chains are useful across two strong model families, despite the data being gener-
+ated off-policy. Further, the fact that our data generation framework is off-policy
+allows one to bias the generated data to target particular weak points by over-
+sampling certain error types. On the other hand, on-policy DPO has generally
+8
+Pretrained
+Prediction: This video features a scene from the anime series "Pokémon," specifically a conversation between two characters. The scene is set outdoors, with a
+green background and a blue sky visible. The characters are dressed in colorful clothing, with one wearing a yellow shirt and red suspenders, and the other
+wearing a blue shirt and a white and red hat. The video is in color and features a mix of close-up and wide shots, with the characters' faces and bodies
+prominently displayed. The overall atmosphere is lighthearted and playful, with the characters' expressions and body language conveying a sense of joy and
+camaraderie
+Relevance (3): The caption omits key details such as the spiky red hair, Togepi, and the trainer's blue jacket, making it factually incomplete.
+Descriptiveness (4): It mentions two characters and some clothing, but fails to cover the main actions, the Togepi interaction, and the concluding pose.
+Temporal Consistency (2): The caption does not reflect the sequence of multiple frames or the progression of expressions described in the ground truth.
+Fluency (9): The language is clear, grammatically correct, and well-structured.
+DPO
+Prediction: A sequence from the Pokémon anime featuring a character with bright red spiky hair wearing a yellow sleeveless top with red suspenders. The
+character is shown smiling and looking at another character with a white face and blue and red markings. The scene then cuts to a character wearing a red and
+white baseball cap with a black \"P\" logo, a blue and white jacket, and a black shirt. The character appears to be in a contemplative or angry expression, looking
+slightly to the side. The background is a green forest setting with blue sky visible through the trees. The sequence appears to be from a Pokémon episode where
+the character with red hair is interacting with the character with the white face, possibly in a dramatic or emotional moment.
+Relevance (3): The caption misidentifies the second character as a white-faced figure with markings instead of Togepi, adds details like red suspenders and a
+black 'P' logo that are not in the reference, and omits key actions such as the red-haired character leaning toward Togepi.
+Descriptiveness (4): It covers the red-haired character and the trainer with a cap, but fails to mention the multiple frames, expressive facial changes, the
+concluding close-up with Togepi, and the varying expressions of the trainer.
+Temporal Consistency (5): The caption references a sequence and a cut, but does not reflect the multiple frames or the progression of expressions described in
+the ground truth.
+Fluency (9): The language is generally clear and grammatically correct, though some phrasing is awkward and the description of the second character is vague.
+Ranking
+Prediction: A sequence from the Pokémon anime featuring a character with bright red spiky hair wearing a yellow sleeveless top with red suspenders. The
+character is shown smiling and looking at another character with a white face and blue and red markings. The scene then cuts to a character wearing a red and
+white baseball cap with a black "P" logo, a blue and white jacket, and a black shirt. The character appears to be in a contemplative or angry expression, looking
+slightly to the side. The final frame shows the character with red spiky hair again, this time leaning in to kiss the face of a Pokémon with a white face and blue
+and red markings, who is wearing a blue body with white accents. The background appears to be a natural outdoor setting with green foliage.
+Relevance (6): The caption correctly identifies the red-haired character and the trainer with the red and white cap, but incorrectly describes the Pokémon as
+having a blue body and mentions a kiss, which are not in the ground-truth.
+Descriptiveness (7): It covers the main scenes and background, but omits details like the Togepi’s egg shape and the animated facial changes, and adds
+extraneous details such as a black shirt.
+Temporal Consistency (9): The sequence order is maintained and no temporal contradictions are present.
+Fluency (8): The language is generally clear and fluent, with only minor awkward phrasing.
+GT
+Caption: A compilation of scenes from the Pokémon anime featuring two main characters. The first set shows a cheerful character with spiky red hair in a yellow
+outfit animatedly talking to a Togepi, with expressive facial changes through multiple frames. The second set features a trainer wearing the iconic red and white
+cap and blue jacket, shown with varying expressions against a green forest backdrop. The sequence concludes with the red-haired character leaning down close
+to the small egg-shaped Togepi Pokémon. The images capture the characteristic anime art style with bright colors and expressive character reactions typical of
+the Pokémon series.
+Fig. 2: An example of model caption predictions on MSR-VTT with GPT-OSS 20B
+as a judge.
+Appendix
+9
+been shown to be more effective than off-policy DPO, at the cost of regenerating
+data on a per-model basis [7,8]. Adapting our method to modify model-generated
+captions in an on-policy manner constitutes a promising direction for future re-
+search.
+References
+1. Introducing GPT-OSS, https://openai.com/index/introducing-gpt-oss/ 5
+2. Burges, C., Shaked, T., Renshaw, E., Lazier, A., Deeds, M., Hamilton, N., Hul-
+lender, G.: Learning to rank using gradient descent. In: Proceedings of the 22nd
+international conference on Machine learning. pp. 89–96 (2005) 6, 7
+3. Chai, W., Song, E., Du, Y., Meng, C., Madhavan, V., Bar-Tal, O., Hwang, J.N., Xie,
+S., Manning, C.D.: Auroracap: Efficient, performant video detailed captioning and a
+new benchmark. ArXiv abs/2410.03051 (2024), https://api.semanticscholar.
+org/CorpusID:273162259 1
+4. Gu, J., Jiang, X., Shi, Z., Tan, H., Zhai, X., Xu, C., Li, W., Shen, Y., Ma, S., Liu,
+H., et al.: A survey on llm-as-a-judge. The Innovation (2024) 1
+5. Matsuda, K., Wada, Y., Hirano, S., Otsuki, S., Sugiura, K.: Vela: An llm-hybrid-
+as-a-judge approach for evaluating long image captions. ArXiv abs/2509.25818
+(2025), https://api.semanticscholar.org/CorpusID:281681513 1
+6. Rawal, R., Shirkavand, R., Huang, H., Somepalli, G., Goldstein, T.: Argus: Hal-
+lucination and omission evaluation in video-llms. ArXiv abs/2506.07371 (2025),
+https://api.semanticscholar.org/CorpusID:279251247 1
+7. Shenfeld, I., Pari, J., Agrawal, P.: Rl’s razor: Why online reinforcement learning
+forgets less. arXiv preprint arXiv:2509.04259 (2025) 9
+8. Yang, Z., Luo, X., Han, D., Xu, Y., Li, D.: Mitigating hallucinations in large vision-
+language models via dpo: On-policy data hold the key. In: Proceedings of the Com-
+puter Vision and Pattern Recognition Conference. pp. 10610–10620 (2025) 4, 5,
+9
+9. Yu, T., Zhang, H., Li, Q., Xu, Q., Yao, Y., Chen, D., Lu, X., Cui, G., Dang, Y., He,
+T., et al.: Rlaif-v: Open-source ai feedback leads to super gpt-4v trustworthiness.
+In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp.
+19985–19995 (2025) 5
+10
+Fig. 3: Examples from our Long-Form Multiple Choice Question Answering bench-
+mark. Green represents the correct answer.
+Appendix
+11

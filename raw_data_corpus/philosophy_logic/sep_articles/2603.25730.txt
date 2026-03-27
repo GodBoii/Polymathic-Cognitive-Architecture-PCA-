@@ -1,0 +1,1605 @@
+PackForcing: Short Video Training Suffices for Long
+Video Sampling and Long Context Inference
+Xiaofeng Mao1,2,∗,§, Shaohao Rui1,3,∗,§, Kaining Ying1,2, Bo Zheng1, Chuanhao Li1, Mingmin Chi2,†, Kaipeng
+Zhang1,3†
+1Alaya Studio, Shanda AI Research Tokyo 2Fudan University 3Shanghai Innovation Institute
+Autoregressive video diffusion models have demonstrated remarkable progress, yet they remain
+bottlenecked by intractable linear KV-cache growth, temporal repetition, and compounding errors
+during long-video generation. To address these challenges, we present PackForcing, a unified
+framework that efficiently manages the generation history through a novel three-partition KV-cache
+strategy. Specifically, we categorize the historical context into three distinct types: (1) Sink tokens,
+which preserve early anchor frames at full resolution to maintain global semantics; (2) Mid tokens,
+which achieve a massive spatiotemporal compression (∼32× token reduction) via a dual-branch
+network fusing progressive 3D convolutions with low-resolution VAE re-encoding; and (3) Recent
+tokens, kept at full resolution to ensure local temporal coherence. To strictly bound the memory
+footprint without sacrificing quality, we introduce a dynamic top-k context selection mechanism for
+the mid tokens, coupled with a continuous Temporal RoPE Adjustment that seamlessly re-aligns
+position gaps caused by dropped tokens with negligible overhead. Empowered by this principled
+hierarchical context compression, PackForcing can generate coherent 2-minute, 832×480 videos
+at 16 FPS on a single H200 GPU. It achieves a bounded KV cache of just ∼4 GB and enables a
+remarkable 24× temporal extrapolation (5 s →120 s), operating effectively either zero-shot or
+trained on merely 5-second clips. Extensive results on VBench demonstrate state-of-the-art temporal
+consistency (26.07) and dynamic degree (56.25), proving that short-video supervision is sufficient
+for high-quality, long-video synthesis.
+Project page: https://github.com/ShandaAI/PackForcing
+Date: March 27, 2026
+SelfForcing
+Rolling
+Forcing
+CausVid
+LongLive
+Pack
+Forcing
+Prompt: A charming 3D digital render art style image showcasing an adorable and happy otter confidently standing on a surfboard, wearing a bright yellow lifejacket. The otter is 
+depicted with a joyful expression, its fur soft and detailed, and it appears to glide gracefully through turquoise tropical waters…
+t=0s
+t=20s
+t=40s
+t=60s
+t=80s
+t=100s
+t=120s
+Deep
+Forcing
+Figure 1 Our framework enables the generation of high-quality, temporally coherent videos up to 120 seconds.
+§This work was done during Xiaofeng and Shaohao’s internship at Shanda AI Research Tokyo
+*Equal contribution.
+†Corresponding authors: mmchi@fudan.edu.cn; kaipeng.zhang@shanda.com
+1
+arXiv:2603.25730v1  [cs.CV]  26 Mar 2026
+1
+Introduction
+Recent video diffusion models Ho et al. (2022); Blattmann et al. (2023); Polyak et al. (2024); Wan et al.
+(2025); Valevski et al. (2024); Chen et al. (2025, 2024b); Ceylan et al. (2023); Harvey et al. (2022); Wang
+et al. (2024); He et al. (2025, 2024) have demonstrated significant progress in high-fidelity and complex
+motion synthesis for short clips (5–15 s). However, their bidirectional architectures typically require the
+simultaneous processing of all frames within a spatiotemporal volume. This computationally intensive
+paradigm hinders the development of streaming or real-time generation.
+Autoregressive video generation Yin et al. (2025); Huang et al. (2025a); Chen et al. (2024a) addresses this
+limitation by employing a block-by-block generation strategy. Instead of computing the entire sequence
+jointly, these methods sequentially cache key-value (KV) pairs from previously generated blocks to provide
+continuous contextual conditioning. While this approach theoretically mitigates the memory bottlenecks of
+joint processing and enables unbounded-length video generation, its practical application for minute-scale
+generation is limited by two primary challenges:
+(1) Error accumulation. Small prediction errors compound iteratively during the autoregressive denoising
+process, leading to progressive quality degradation and semantic drift. Although Self-Forcing Huang et al.
+(2025a) attempts to mitigate this by training on self-generated historical frames, it still suffers from severe
+error accumulation beyond its training horizon. Consequently, it exhibits a significant decline in text-video
+alignment: within 60 s, the model gradually loses the prompt’s semantics, with its CLIP score dropping
+from 33.89 to 27.12 (Table 2).
+(2) Unbounded memory growth. The KV cache scales linearly with the length of the generated video. For a
+2-minute, 832×480 video at 16 FPS, the full attention context grows to ∼749K tokens, requiring ∼138 GB
+of KV storage across 30 transformer layers, well beyond the memory budget of a single commodity GPU.
+Standard workarounds, such as history truncation Yin et al. (2025) or sliding windows Liu et al. (2025),
+severely compromise long-range coherence. Even recent advanced baselines struggle with this bottleneck.
+For instance, DeepForcing introduces attention sinks and participative compression to retain informative
+tokens based on query importance. However, to prevent unbounded KV cache expansion, it ultimately
+relies on aggressive buffer truncation, leading to the irreversible loss of intermediate historical memory.
+A fundamental dilemma thus emerges in autoregressive video generation: mitigating error accumulation
+requires an extensive contextual history, yet unbounded KV cache growth inevitably forces the discarding
+of critical memory under hardware constraints. Maintaining a large effective context window while strictly
+bounding the KV cache size remains a critical open problem.
+Building upon DeepForcing’s insights, we recognize the effectiveness of its deep sink and participative
+compression mechanisms in identifying and retaining crucial historical context. However, rather than
+irreversibly dropping unselected intermediate tokens to save memory, we propose efficiently compressing
+them. To this end, we introduce PackForcing, a unified framework comprehensively addressing both
+challenges via a principled three-partition KV cache design.
+To this end, we introduce PackForcing, a unified framework that comprehensively addresses both error
+accumulation and memory bottlenecks via a principled three-partition KV cache design. Specifically, our
+framework categorizes the historical context into: (1) Sink tokens, which preserve early anchor frames at
+full resolution to maintain global semantics and prevent drift; (2) Compressed mid tokens, which undergo a
+128× spatiotemporal volume compression (via a dual-branch network) to efficiently retain the bulk of the
+historical memory; and (3) Recent and current tokens, which are kept at full resolution to ensure fine-grained
+local coherence.
+This hierarchical design successfully bounds memory requirements while preserving critical information. To
+strictly limit the capacity of the compressed mid-buffer, we adapt dynamic context selection as an advanced
+top-k selection strategy, retrieving only the most informative mid tokens during generation. To resolve the
+ensuing positional discontinuities caused by managing unselected tokens, we introduce a novel incremental
+RoPE rotation that gracefully corrects temporal positions without requiring a full cache recomputation.
+In a nutshell, our primary contributions are summarized as follows:
+2
+• Three-partition KV cache. We propose PackForcing, which partitions generation history into sink, com-
+pressed, and recent tokens, bounding per-layer attention to ∼27,872 tokens for any video length.
+• Dual-branch compression. We design a hybrid compression layer fusing progressive 3D convolutions with
+low-resolution re-encoding. This achieve a 128× spatiotemporal compression (∼32× token reduction) for
+intermediate history, increasing effective memory capacity by over 27×.
+• Incremental RoPE rotation & Dynamic Context Selection. We introduce a temporal-only RoPE adjustment to
+seamlessly correct position gaps during memory management. Alongside an importance-scored top-k
+token selection strategy, this ensures highly stable generation over extended horizons.
+• 24× temporal extrapolation. Trained exclusively on 5-second clips (or operating zero-shot without any
+training), PackForcing successfully generates coherent 2-minute videos. It achieves state-of-the-art VBench
+scores and demonstrates the most stable CLIP trajectory among all compared methods.
+2
+Related Work
+Video Diffusion Models. Early video models inflated 2D U-Nets with pseudo-3D modules Ho et al. (2020);
+Rombach et al. (2022); Ho et al. (2022); Singer et al. (2022); Blattmann et al. (2023). Recently, Diffusion
+Transformers (DiTs) Peebles & Xie (2023); Brooks et al. (2024) have emerged as the dominant architecture,
+treating videos as spatiotemporal patches to enable scalable 3D attention in state-of-the-art models (e.g.,
+CogVideoX Yang et al. (2024), Movie Gen Polyak et al. (2024), Wan Wan et al. (2025), Open-Sora Zheng et al.
+(2024)). Concurrently, Flow Matching Lipman et al. (2022); Liu et al. (2022) has largely replaced standard
+diffusion to offer faster convergence. Despite these advances, current models primarily generate short clips
+(5–10 s). Joint spatiotemporal modeling for minute-level videos remains computationally intractable, as full
+3D attention incurs a quadratic O((THW)2) memory cost. This bottleneck directly motivates the need for
+memory-efficient, autoregressive long-video generation strategies.
+Autoregressive Video Generation. Autoregressive video generation overcomes the fixed-length limitations of
+joint spatiotemporal modeling by synthesizing frames block-by-block and maintaining historical context
+via key-value (KV) caching. Recent methods have rapidly evolved this paradigm, exploring ODE-based
+initialization Yin et al. (2025), self-generated frame conditioning Huang et al. (2025a), rolling temporal
+windows Liu et al. (2025), long-short context guidance Yang et al. (2025), and enlarged attention sinks Yi
+et al. (2025). Despite these innovations, existing approaches universally lack a mechanism to explicitly
+compress the KV cache. Consequently, they face a rigid trade-off: retaining the full history inevitably causes
+out-of-memory failures for videos exceeding roughly 80 seconds, whereas truncating the context buffer
+results in an irreversible loss of long-range coherence. PackForcing explicitly breaks this memory-coherence
+trade-off by introducing learned spatiotemporal token compression tailored for causal video generation.
+KV Cache Management. KV cache management has been extensively studied in Large Language Models
+(LLMs) to enable long-context understanding. Representative techniques include retaining initial attention
+sinks Xiao et al. (2023), selecting heavy-hitter keys based on attention scores Zhang et al. (2023), and
+extending context via RoPE interpolation Peng et al. (2023). However, these methods primarily focus on
+token selection or eviction rather than explicit compression, as text representations are already highly
+compact. Video tokens, conversely, encode dense spatiotemporal grids characterized by massive inter-frame
+redundancy. Exploiting this unique structural redundancy motivates our learned 128× volume compression,
+achieving a memory reduction far beyond what token selection alone can provide.
+Long Video Generation. Beyond purely autoregressive caching, traditional long video generation strategies
+often rely on modifying the inference noise scheduling Qiu et al. (2023); Ge et al. (2023), designing
+hierarchical planning frameworks Hong et al. (2023), or utilizing complex multi-stage extensions Henschel
+et al. (2025). While effective, these methods typically require multi-stage pipelines or alter the fundamental
+diffusion process. In contrast, PackForcing operates within a unified, single-stage causal framework. By
+managing the historical context through hierarchical compression and position-corrected eviction, our
+method achieves the generation of arbitrarily long videos with strictly bounded memory footprint and
+constant-time attention cost.
+3
+3
+Method
+We first introduce the background on flow matching and causal KV caching (Sec. 3.1), then present the core
+components of PackForcing: the three-partition KV cache (Sec. 3.2), dual-branch compression (Sec. 3.3),
+Dual-Resolution Shifting with incremental RoPE adjustment (Sec. 3.4), and Dynamic Context Selection
+(Sec. 3.5).
+3.1
+Preliminaries
+Flow Matching. Our base model builds upon the flow matching framework Lipman et al. (2022). Given a
+clean video latent x0 and standard Gaussian noise ϵ ∼N (0, I), the noisy latent at noise level σ ∈[0, 1] is
+constructed as:
+xσ = (1 −σ) x0 + σ ϵ .
+(1)
+A neural network fθ is trained to predict the velocity field vθ(xσ, σ) ≈ϵ −x0.
+KV Caching. A video sequence of T latent frames is partitioned into non-overlapping blocks, each containing
+Bf frames. Each block i, denoted as zi ∈RBf ×C×H×W (where C, H, and W represent the channel, height,
+and width dimensions, respectively), is generated autoregressively. After spatial patchification, each block
+yields n=Bf hw tokens, where h and w represent the spatial height and width after patchification.
+During the generation of block i, each transformer layer l attends to the Key-Value (KV) pairs cached from
+all previously generated blocks:
+Cl =
+(Kl
+j, Vl
+j)
+	i−1
+j=1,
+(2)
+where Kl
+j, Vl
+j ∈Rn×Nh×dh, with Nh representing the number of attention heads and dh denoting the head
+dimension.
+The attention operation for the current block i concatenates these historical keys and values with its own:
+Attn(Qi, Cl) = softmax
+Qi K|
+1:i
+√dh
+
+V1:i ,
+(3)
+where Qi is the query matrix for block i, while K1:i and V1:i represent the concatenated keys and values
+from block 1 to i.
+As generation proceeds, the KV cache grows linearly. For a 2-minute, 832×480 video at 16 FPS (h=30, w=52, Bf =4),
+the context size at the final block swells to ∼749K tokens—consuming an intractable amount of GPU memory.
+This fundamental scaling bottleneck directly motivates our three-partition design.
+3.2
+Three-Partition KV Cache
+The core idea of PackForcing is to decouple the monotonically growing generation history into three distinct
+functional partitions. Rather than applying a one-size-fits-all eviction or compression strategy, we apply a
+tailored policy to each partition based on its temporal role and information density (Fig. 2).
+Sink Tokens (Full resolution, never evicted). Inspired by the attention-sink phenomenon in StreamingLLM Xiao
+et al. (2023), we hypothesize that the earliest generated frames serve as critical semantic anchors. Let Nsink
+denote the number of these initial frames, corresponding to the first Nsink/Bf generation blocks. For a
+given transformer layer l, the sink cache is defined as:
+Cl
+sink =
+(Kl
+j, Vl
+j)
+	Nsink/Bf
+j=1
+,
+|Cl
+sink| = Nsink
+Bf
+n ,
+(4)
+where j is the block index, and Kl
+j, Vl
+j are the original, uncompressed key and value. These tokens lock in
+the scene layout, subject identity, and global style. Because they are vital for preventing semantic drift, they
+are never compressed or evicted. We set Nsink=8 (two blocks), which consumes <2% of the total token budget
+for a 2-minute video, yet provides a robust and stable global reference throughout the entire generation
+process.
+4
+Keep Resolution
+Rope Adjustment
+𝑆! 
+...
+𝑆"#$% 
+𝑀! 
+...
+𝑀&#' 
+𝑅!
+...
+𝑅()* 
+𝑅*+( 
+...
+...
+...
+Denoising Context
+Denoising Block
+(a) Three-Partition KV management of PackForcing
+(b) Dual-Branch Compression
+Mid Tokens
+HR: 4-stage 3D 
+CNN
+LR: 
+Pool>VAE>Patch
++
+Compressed Tokens
+Sink Tokens
+Mid Tokens
+Recent and Current Tokens
+(i) Before Dynamic Context Selection
+S0
+p=0
+S1
+p=1
+M2
+p=2
+M3
+p=3
+M4
+p=4
+M5
+p=5
+M6
+p=6
+M7
+p=7
+R
+p=8
+R
+p=9
+(ii) After Select Top-K candidate tokens (position gap!)
+S0
+p=0
+S1
+p=1
+X
+M3
+M4
+p=4
+M5
+p=5
+X
+M7
+p=7
+R
+p=8
+R
+p=9
+(iii) After RoPE Adjustment (continuous)
+S0
+p=2
+S1
+p=3
+M3
+p=4
+M4
+p=5
+M5
+p=6
+M7
+p=7
+R
+p=8
+R
+p=9
+p=3
+(c) Temporal RoPE Adjustment of Historical Contexts
+(d) HR compression layers
+Dual Branch Compression
+Dynamic Context Selection
+Rope Adjustment
+Keep Resolution
+Full<->Reduced 
+Exchange
+Input: 16,T,H,W
+16,T,H,W
+Conv3D 16->32, s=(2,1,1)
+32,T/2,H,W
+Conv3D 32->128, s=(1,2,2)
+128,T/2,H/2,W/2
+Conv3D 128->512, s=(1,2,2)
+512,T/2,H/4,W/4
+Conv3D 512->2048, s=(1,2,2)
+2048,T/2,H/8,W/8
+Conv3D 2048->D, s=(1,1,1)
+D,T/2,H/8,W/8
+Figure 2 Overview of PackForcing. (a) The three-partition KV management organizes the denoising context into sink
+tokens (full resolution), mid tokens (compressed and dynamically selected), and recent/current tokens (full resolution
+with full-to-reduced exchange). (b) & (d) The dual-branch compression module fuses a High-Resolution (HR) branch (a
+progressive 4-stage 3D CNN) with a Low-Resolution (LR) branch (pooling followed by VAE re-encoding) via element-
+wise addition to minimize token count. (c) To efficiently bound the memory footprint, dynamic context selection is
+applied to retain only the top-K informative mid tokens. To resolve the ensuing position gaps caused by dropped tokens,
+a Temporal RoPE Adjustment is utilized to re-align and enforce continuous positional indices across the historical
+contexts.
+Compressed Mid Tokens (∼32× token reduction & dynamically routed). The vast majority of the video history
+falls between the initial sink frames and the most recent window. We define this region as the mid partition.
+Retaining this partition at full resolution is computationally prohibitive and highly redundant. Instead,
+tokens populating this region are represented by highly compressed KV pairs ( ˜Kl
+j, ˜Vl
+j) produced via our
+dual-branch module (Sec. 3.3). Furthermore, as this compressed buffer accumulates over time, we do not
+attend to the entire pool indiscriminately. We employ Dynamic Context Selection (Sec. 3.5) to dynamically
+evaluate query-key affinities, actively routing only the Nmid most informative blocks to form the active set
+Smid for the current computation:
+Cl
+mid =
+( ˜Kl
+j, ˜Vl
+j)
+	
+j∈Smid ,
+|Cl
+mid| ≤Nmid · Nc ,
+(5)
+where the tilde (∼) denotes compressed part and Nmid limits the active computational budget. Nc is the
+token count per compressed block, calculated as Nc = ⌊Bf /2⌋× ⌊h/4⌋× ⌊w/4⌋. Here, the factors 1/2 and
+1/4 correspond to the downsampling strides of the compression module along the temporal and spatial
+dimensions. With default settings (Bf =4, h=30, w=52), each block is compressed to Nc = 182 tokens—a
+dramatic ∼32× reduction from the original n=6,240 tokens.
+Recent & Current Tokens (Dual-resolution shifting). To maintain high-fidelity local temporal dynamics when
+generating new video frames, the most recently generated frames must be kept pristine. Let i denote the
+index of the block currently being generated and Nrecent be the number of preceding recent frames. The
+context for this partition comprises the intact KV pairs from these recent blocks, alongside the current block
+5
+i itself:
+Cl
+rc =
+(Kl
+j, Vl
+j)
+	i
+j=i−Nrecent/Bf ,
+|Cl
+rc| =
+  Nrecent
+Bf
++ 1
+
+n .
+(6)
+Preserving these recent tokens at uncompressed resolution guarantees smooth temporal transitions. Cru-
+cially, to bridge this partition with the mid-buffer without incurring sequential latency, we concurrently
+compute a low-resolution backup for these tokens. As detailed in Sec. 3.4, this dual-resolution shifting
+pipeline perfectly hides the compression overhead and ensures a seamless transition of aging recent tokens
+into long-term mid memory.
+Bounded Attention Context. During the generation of block i, the transformer layer l concatenates the three
+partitions to form the active attention context:
+Cl = Cl
+sink ∥Cl
+mid ∥Cl
+rc ,
+(7)
+which enforces a constant token count for the attention computation: |Cl| = Nsink
+Bf
+n + Nmid · Nc +
+  Nrecent
+Bf
++
+1
+
+n. Crucially, while the entire generation history is persistently maintained within the memory buffers
+(either at full resolution or in a highly compressed state), the actual context input for generating the block i
+is strictly bounded and independent of the total video length T. Rather than attending to the full growing
+sequence, this fixed-size input context is dynamically retrieved from the comprehensive historical partitions,
+ensuring O(1) attention complexity without discarding any past memory.
+3.3
+Dual-Branch HR Compression
+The mid partition requires a massive token reduction (∼32×) while retaining sufficient structural and
+semantic information for coherent attention patterns (see Fig. 3). A single-pathway compressor faces a steep
+trade-off: aggressive spatial downsampling preserves layout but loses texture, whereas semantic pooling
+preserves meaning but destroys spatial structure. To resolve this, we propose a dual-branch compression
+module (Fig. 2(b)) that aggregates fine-grained structure (HR branch) and coarse semantics (LR branch).
+HR Branch: Progressive 3D Convolution. The HR branch operates directly on the VAE latent z ∈RB×C×T×H×W
+to preserve local, fine-grained details. It applies a cascade of strided 3D convolutions with SiLU activations.
+Specifically, it first performs a 2× temporal compression, followed by three stages of 2× spatial compression,
+and a final 1×1×1 projection to the model’s hidden dimension d=1536. This yields a structurally rich
+representation hHR with a total 128× volume reduction (2×8×8) in the latent space.
+LR Branch: Pixel-Space Re-encoding. To capture complementary global context, the LR branch operates via a
+distinct pixel-space pathway. We decode the latent z back into pixel frames, apply a 3D average pooling
+(2× temporally, 4× spatially), and then re-encode the pooled frames back into the latent space using the
+frozen VAE encoder, followed by standard patch embedding to obtain hLR. This decoding-pooling-encoding
+pipeline preserves the perceptual layout far better than direct pooling in the latent space.
+Feature Fusion. The outputs from both branches share the same dimensional space and are fused via
+element-wise addition:
+˜h = hHR + hLR ∈RB×Nc×d ,
+(8)
+where the compressed token count is Nc = ⌊T/2⌋× ⌊H/8⌋× ⌊W/8⌋. Given that the original patch
+embedding already performs a 1×2×2 spatial reduction, our dual-branch module effectively achieves a net
+token reduction of ∼32× per block (e.g., from 6,240 to 182 tokens). This simple yet effective fusion ensures
+comprehensive information retention under extreme compression.
+3.4
+Dual-Resolution Shifting and Incremental RoPE adjustment
+Dual-Resolution Shifting Mechanism. Unlike FIFO methods that permanently discard tokens, we preserve
+long-term memory via a seamless dual-resolution pipeline. During chunk generation, we concurrently
+compute a full-resolution KV cache for immediate prediction and a reduced-resolution backup. Once
+the next chunk is generated, new full-resolution tokens replace the old ones, while the pre-computed
+compressed tokens smoothly slide into the mid partition. This retains comprehensive history while hiding
+compression latency.
+6
+The Position Misalignment Problem. Although this dual-track pipeline efficiently populates the compressed
+mid-buffer, strictly bounding the total memory capacity (Nmid) eventually necessitates evicting the absolute
+oldest compressed blocks from the mid partition. Our backbone uses 3D Rotary Position Embeddings
+(RoPE) Su et al. (2024) with separate temporal, height, and width frequencies θ = [θt, θh, θw], allocated
+as 44 + 42 + 42 = 128 dimensions per head. When a key is cached, it already carries the rotation for its
+absolute position p:
+k(p)
+cached = kraw ⊙ei θp .
+(9)
+After evicting ∆blocks (δ = ∆Bf frames) to maintain the capacity budget, the sink keys still encode positions
+0, . . . , Nsink−1, yet the earliest surviving mid key now encodes position Nsink + δ. The resulting position
+gap breaks the positional continuity that the transformer attention relies on.
+Incremental RoPE adjustment. We exploit two properties to resolve this without a full recomputation: (i) RoPE
+adjustments are multiplicative: eiθp · eiθδ = eiθp+δ; and (ii) eviction shifts only the temporal axis. We therefore
+apply a highly efficient, temporal-only RoPE adjustment to the sink keys:
+k′
+sink = ksink ⊙ei θt(δ), 1h, 1w ,
+(10)
+where 1h, 1w are identity (unit-magnitude) rotations that leave spatial positions unchanged. After adjustment,
+the sink positions become δ, δ+1, . . . , seamlessly preceding the mid positions. This operation is applied
+once per eviction event across all layers, costing <0.1% of total inference time (Table 9 in Appendix).
+3.5
+Dynamic Context Selection
+Treating all compressed blocks equally ignores their varying semantic importance. To prioritize visually
+critical keyframes, we introduce a dynamic context selection mechanism based on query-key affinity. Unlike
+DeepForcing Yi et al. (2025), which permanently prunes unselected tokens, we employ a non-destructive
+soft-selection. We retrieve only the top-K most relevant mid-blocks for attention, keeping unselected tokens
+safely archived for potential future reactivation as the scene evolves. To ensure negligible overhead (<1%),
+affinity scoring occurs only at the first denoising step of each block, caching the indices for subsequent steps.
+We further accelerate this by subsampling query tokens and using half the attention heads. This soft-routing
+improves subject consistency by +0.8 and the CLIP score by +0.12 over strict FIFO eviction (Table 5).
+3.6
+Empirical Analysis of Temporal Attention Patterns
+To motivate our KV cache design, we empirically investigate the attention distribution of the denoising
+network during a 480-frame generation (Fig. 3). Our analysis reveals two critical insights (detailed in the
+Appendix): (1) Attention demand persists across the entire video history, invalidating naive FIFO eviction
+strategies; and (2) Highly attended tokens are sparsely and dynamically distributed, exhibiting a high
+Jaccard distance (0.75) between consecutive selection steps. These observations fundamentally justify our
+three-partition cache architecture (sink, mid, and recent). By aggressively compressing the sporadically
+queried yet globally essential mid-range tokens, we successfully preserve comprehensive spatiotemporal
+context within a strictly bounded memory footprint.
+.
+4
+Experiments
+4.1
+Experimental Settings
+Implementation Details. PackForcing employs the Wan2.1-T2V-1.3B Wan et al. (2025) backbone to generate
+832×480 videos at 16 FPS. Text conditioning relies on the UMT5-XXL encoder, where text key-value pairs
+are computed once and cached globally to reduce overhead. Consistent with recent causal generative
+frameworks Yin et al. (2025); Huang et al. (2025a); Liu et al. (2025); Yi et al. (2025), the causal student is
+initialized via ODE trajectory alignment. Training prompts are sourced from VidProM and augmented
+via large language models following the Self-Forcing paradigm. For the cache partitions, we set Nsink=8,
+7
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Relative Position in KV Cache
+5
+10
+15
+20
+25
+Video Time (s)
+Sink
+Recent
+(a) Block Selection Density
+0.00
+0.02
+0.04
+0.06
+0.08
+0.10
+0.12
+Density
+0
+20
+40
+60
+80
+100
+Block Index (temporal)
+5
+8
+10
+12
+15
+18
+20
+22
+25
+28
+Video Time (s)
+(b) Continuous Importance Scores
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Norm. Importance
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Relative Position (0=earliest, 1=most recent)
+0.35
+0.40
+0.45
+0.50
+0.55
+0.60
+0.65
+0.70
+Normalized Importance Score
+Attention demand persists
+across ALL positions
+ must retain historical tokens
+(c) Importance vs History Position
+(Late generation, frame 
+ 200)
+Mean = 0.499
+5
+10
+15
+20
+25
+30
+Video Time (seconds)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Score
+Scattered, changing selection
+ high redundancy in mid-tokens
+ motivates compression
+(d) Selection Dynamics
+(High = diverse/changing needs)
+Position diversity (window=10)
+Jaccard dist (mean=0.75)
+Attention Pattern Analysis: Why We Need KV Cache Compression
+for Long-form Causal Video Generation
+Figure 3 Attention patterns in causal video generation. (a) Density map shows attention distributed across the entire history.
+(b) Importance scores ϕj = ∑i q⊤
+i kj/
+√
+d reveal sparse information. (c) Near-flat late-stage importance (mean = 0.499)
+rules out FIFO eviction. (d) High Jaccard distance (0.75) and position diversity (> 0.85) show rapid, diverse block
+retrieval, motivating compression.
+Nrecent=4, and Ntop=16. Chunk-wise generation operates with Bf =4 latent frames per block and S=4
+distilled denoising steps. The model is trained for 3,000 iterations with a batch size of 8 on a 20-latent-frame
+temporal window (˜5 seconds). We use AdamW Loshchilov & Hutter (2017) (β1=0, β2=0.999), setting
+learning rates to 2.0×10−6 for the generator Gθ and 1.0×10−6 for the fake score estimator sfake, with a 1:5
+update ratio. During inference, we utilize a classifier-free guidance scale of 3.0 and a timestep shift of 5.0.
+Evaluation Protocols. To rigorously assess long video generation performance, we adopt the evaluation
+setting of VBench-Long Huang et al. (2025b). Specifically, we utilize 128 text prompts sourced from
+MovieGen Polyak et al. (2024), adhering strictly to the prompt selection protocol established in Self-
+Forcing++ Cui et al. (2025). Consistent with the standard Self-Forcing Cui et al. (2025) paradigm, each
+prompt is refined and expanded using Qwen2.5-7B-Instruct Qwen et al. (2025) prior to generation. Under
+this standardized setup, we generate videos at both 60 s and 120 s durations. We quantitatively eval-
+uate the results using seven core metrics from the VBench framework Huang et al. (2024): Dynamic
+Degree (Dyn. Deg.), Motion Smoothness (Mot. Smth.), Overall Consistency (Over. Cons.), Imaging Quality
+(Img. Qual.), Aesthetic Quality (Aest. Qual.), Subject Consistency (Subj. Cons.), and Background Consistency
+(Back. Cons.). Furthermore, to measure the temporal stability of text-video alignment over extended
+durations, we compute and report CLIP scores at 10-second intervals throughout the generated sequences.
+8
+Table 1 Quantitative comparison on 60 s and 120 s benchmarks (7 VBench Huang et al. (2024) metrics). Best results are
+highlighted in bold.
+Method
+Dyn.
+Deg.↑
+Mot.
+Smth.↑
+Over.
+Cons.↑
+Img.
+Qual.↑
+Aest.
+Qual.↑
+Subj.
+Cons.↑
+Back.
+Cons.↑
+60 s generation
+CausVid Yin et al. (2025)
+48.43
+98.04
+23.36
+65.69
+60.63
+84.53
+89.84
+LongLive Yang et al. (2025)
+44.53
+98.70
+25.73
+69.06
+63.30
+92.00
+92.97
+Self-Forcing Huang et al. (2025a)
+35.93
+98.26
+24.92
+66.62
+57.15
+80.41
+86.95
+Rolling Forcing Liu et al. (2025)
+33.59
+98.70
+25.73
+71.06
+61.43
+91.62
+93.00
+Deep Forcing Yi et al. (2025)
+53.67
+98.56
+21.75
+67.75
+58.88
+92.55
+93.80
+PackForcing (ours)
+56.25
+98.29
+26.07
+69.36
+62.56
+90.49
+93.46
+120 s generation
+CausVid Yin et al. (2025)
+50.00
+98.11
+23.13
+65.41
+60.11
+83.24
+87.83
+LongLive Yang et al. (2025)
+44.53
+98.72
+25.95
+69.59
+63.00
+91.54
+93.73
+Self-Forcing Huang et al. (2025a)
+30.46
+98.12
+23.42
+62.49
+51.68
+74.40
+83.57
+Rolling Forcing Liu et al. (2025)
+35.15
+98.65
+25.45
+70.58
+60.62
+90.14
+92.40
+Deep Forcing Yi et al. (2025)
+52.84
+98.22
+21.38
+68.21
+57.96
+91.95
+92.55
+PackForcing (ours)
+54.12
+98.35
+26.05
+69.67
+61.98
+92.84
+91.88
+4.2
+Main Results
+Quantitative Comparison. Table 1 evaluates 60 s and 120 s video generation across seven VBench metrics.
+PackForcing excels in motion synthesis, achieving the highest Dynamic Degree at both durations (56.25
+and 54.12) and outperforming the strongest baseline, CausVid, by +7.82 and +4.12. This confirms that our
+persistent memory mechanism provides reliable temporal grounding, enabling the model to confidently
+synthesize extensive motion. Furthermore, PackForcing demonstrates superior stability over extended
+horizons. While baselines like Self-Forcing degrade significantly from 60 s to 120 s (e.g., Subject Consistency
+drops by 6.01, Aesthetic Quality by 5.47), our performance declines are marginal (-1.01 and -0.49, respec-
+tively). This robustness highlights the effectiveness of sink tokens in anchoring global semantics and the
+dynamically routed mid-buffer in preserving intermediate context. Finally, despite an aggressive ∼32×
+token reduction, PackForcing maintains highly competitive Image and Aesthetic Quality, proving that our
+dual-branch architecture successfully retains perceptually critical spatiotemporal details.
+Long-Range Consistency. Table 2 evaluates the temporal stability of text-video alignment via CLIP scores at
+10-second intervals. PackForcing maintains the highest alignment throughout the 60-second generation, with
+a marginal decline of only 1.14 points (from 34.04 to 32.90). Conversely, baselines suffer from compounding
+errors: Self-Forcing exhibits a severe 6.77-point drop, while CausVid declines by 1.86 points. This sustained
+temporal coherence directly validates our sink token mechanism’s ability to anchor global semantics across
+extended horizons.
+Table 2 CLIP Score comparison on long video generation (60s).
+Method
+0–10 s
+10–20 s
+20–30 s
+30–40 s
+40–50 s
+50–60 s
+Overall
+CausVid Yin et al. (2025)
+32.65
+31.78
+31.47
+31.13
+30.81
+30.79
+31.44
+LongLive Yang et al. (2025)
+33.95
+33.38
+33.14
+33.51
+33.45
+33.36
+33.46
+Self-Forcing Huang et al. (2025a)
+33.89
+33.23
+31.66
+29.99
+28.37
+27.12
+30.71
+Rolling Forcing Liu et al. (2025)
+33.85
+33.39
+32.94
+32.78
+32.49
+32.25
+32.95
+Deep Forcing Yi et al. (2025)
+33.47
+33.29
+32.38
+32.28
+32.26
+32.27
+32.33
+PackForcing (ours)
+34.04
+33.99
+33.70
+33.37
+33.24
+32.90
+33.54
+Qualitative Comparison. Fig. 4 presents sampled frames from a 120-second generation for all methods under
+9
+Self
+Forcing
+Rolling
+Forcing
+CausVid
+LongLive
+Pack
+Forcing
+Prompt: A 3D animation of a small, round, fluffy creature with big, expressive eyes exploring a vibrant, enchanted forest. The creature, a whimsical blend of a rabbit and a squirrel, has 
+soft blue fur and a bushy, striped tail. It hops along a sparkling stream, its eyes wide with wonder…
+t=0s
+t=20s
+t=40s
+t=60s
+t=80s
+t=100s
+t=120s
+Deep
+Forcing
+Figure 4 Qualitative comparison of 120 s generation. Sampled frames across seven timestamps under the same prompt.
+PackForcing consistently maintains strict subject identity and high visual fidelity throughout the entire sequence. In
+contrast, baseline methods suffer from progressive degradation over time: Self-Forcing exhibits color shifts by 60 s and
+eventual collapse, CausVid loses background details, and LongLive generates severely restricted motion. Furthermore,
+Rolling-Forcing struggles with significant subject inconsistencies, while DeepForcing loses the main subject at 100s.
+the same text prompt. At 0 s all methods produce comparable quality. By 60 s, Self-Forcing exhibits visible
+color shift and object duplication; CausVid loses fine details in the background. At 120 s, only PackForcing
+and LongLive maintain coherent subjects, but LongLive shows noticeably less camera and subject motion.
+PackForcing preserves both subject identity and dynamic motion throughout the full two minutes, thanks
+to the persistent sink tokens and compressed history.
+4.3
+Ablation Studies
+We perform systematic ablations on the 60 s benchmark to evaluate each critical component of PackForcing.
+Qualitative comparisons are shown in Fig. 5.
+Table 3 Quantitative ablation results of sink size. We consolidate overall CLIP scores and VBench metrics across varying
+sink sizes. Setting Nsink=8 achieves the optimal balance between dynamic motion and semantic consistency.
+Sink Size
+Overall
+CLIP
+x
+Dyn.
+Deg.
+x
+Mot.
+Smth.
+x
+Over.
+Cons.
+x
+Img.
+Qual.
+x
+Aest.
+Qual.
+x
+Subj.
+Cons.
+x
+Back.
+Cons.
+x
+0
+31.24
+20.31
+98.89
+23.11
+72.87
+59.37
+74.72
+86.37
+2
+34.85
+49.69
+98.57
+26.78
+72.59
+65.85
+91.37
+93.68
+4
+34.85
+50.16
+98.57
+26.99
+72.59
+65.84
+91.37
+93.73
+8
+35.09
+49.84
+98.68
+26.29
+73.18
+66.46
+93.11
+94.53
+16
+35.39
+35.16
+98.82
+26.71
+73.05
+66.34
+93.84
+94.92
+Effect of Sink Tokens. To evaluate the impact of sink size (Nsink) on long-term stability, we conduct an
+ablation study on 60 randomly selected samples (Table 3). Removing attention sinks entirely (Nsink=0)
+causes severe semantic drift, evidenced by sharp drops in the Overall CLIP score (35.09 to 31.24) and
+Subject Consistency (93.11 to 74.72), confirming their role as critical global anchors (Fig. 5). Conversely,
+an excessively large sink (Nsink=16) maximizes consistency but stifles motion, plummeting the Dynamic
+10
+w/o Sink 
+Tokens
+w/o RoPE
+Adjustment
+PackForcing
+(Full)
+w/o Context
+Selection
+Prompt: A 3D animation of a small, round, fluffy creature with big, expressive eyes exploring a vibrant, enchanted forest. The creature, a whimsical blend of a rabbit and a squirrel, has 
+soft blue fur and a bushy, striped tail. It hops along a sparkling stream, its eyes wide with wonder…
+t=0s
+t=10s
+t=20s
+t=30s
+t=40s
+t=50s
+t=60s
+Reset to origin
+Reset to origin
+Figure 5 Qualitative ablation results on 60 s generation. Removing sink tokens leads to progressive semantic drift, whereas
+disabling either the RoPE adjustment or dynamic context selection introduces severe frame reset artifacts.
+Table 4 Ablation on compress. branches.
+Branch
+Img.
+Qual.
+x
+Over.
+Cons.
+x
+CLIP
+x
+60 s
+HR only
+68.12
+25.41
+32.97
+✓
+LR only
+67.45
+25.18
+33.11
+✓
+HR + LR
+69.36
+26.07
+33.54
+✓
+Table 5 Ablation on eviction strategy.
+Strategy
+Subj.
+Cons.
+x
+Over.
+Cons.
+x
+CLIP
+x
+Random
+86.31
+25.42
+33.01
+FIFO
+87.82
+25.91
+33.42
+Dynamic Select
+88.62
+26.07
+33.54
+Degree to 35.16 as the model over-conditions on static early frames. Setting Nsink=8 achieves the optimal
+balance. It preserves dynamic richness (49.84) and yields the best Image (73.18) and Aesthetic (66.46) Quality,
+with Subject Consistency within 1% of the Nsink=16 setting—all while consuming strictly bounded memory
+(<2% of the total token budget). Temporal CLIP details can be found in the Appendix.
+Effect of Compression Branches. Table 4 isolates each compression branch, evaluated at 60 s where all variants
+fit in memory. The HR branch alone provides strong spatial compression but misses coarse semantic cues;
+the LR branch alone preserves semantics but lacks spatial precision.
+FIFO vs. Dynamic Context Selection. Table 5 compares memory management strategies within the compressed
+mid-buffer. Dynamic context selection outperforms standard FIFO, yielding notable improvements in
+Subject Consistency (+0.8) and the overall CLIP score (+0.12). This advantage stems from its affinity-driven
+approach, which prioritizes the retention of highly attended historical blocks rather than relying on a rigid
+chronological eviction.
+4.4
+Discussion
+Generalization from Short-Video Supervision. The remarkable 24× temporal extrapolation capability of
+PackForcing (from 5 s training clips to 120 s generated videos) can be attributed to two primary mechanisms.
+First, the framework enforces context size invariance. By systematically compressing and managing the
+KV cache, the attention context remains strictly bounded (e.g., ∼27,872 tokens) during both training
+and inference. This effectively prevents out-of-distribution sequence length shifts that typically trigger
+error accumulation in standard autoregressive models. Second, the architecture ensures representational
+compatibility. Jointly training the dual-branch compression layer aligns the compressed tokens with the
+full-resolution tokens within the same latent subspace, enabling the transformer to seamlessly attend to the
+highly compressed historical features.
+Motion Richness and Dynamic Degree. As indicated by the VBench evaluations, PackForcing consistently
+achieves superior dynamic degree scores. Existing autoregressive baselines, which often lack persistent
+long-range memory, tend to degenerate into producing low-variance, near-static frames as a conservative
+11
+strategy to avoid compounding temporal errors. In contrast, by preserving the global layout through sink
+tokens and the intermediate motion trajectory through the compressed mid-buffer, our framework provides
+a reliable, uninterrupted spatiotemporal reference. This comprehensive contextual grounding encourages
+the model to confidently synthesize complex, continuous motion without collapsing into static artifacts.
+Limitations and Future Work. While PackForcing excels in generating dynamic content, we observe a nuanced
+trade-off. Baselines such as LongLive achieve marginally higher Subject Consistency (92.00 versus our 90.49)
+at the severe expense of motion richness, yielding a Dynamic Degree of only 44.53 compared to our 56.25.
+Closing this consistency gap by further enhancing strict subject preservation without compromising the
+high dynamic diversity enabled by our compressed history remains a primary direction for future work.
+5
+Conclusion
+In this paper, we introduce PackForcing, a unified framework that fundamentally resolves the dual bot-
+tlenecks of error accumulation and unbounded memory growth in autoregressive video generation. By
+strategically partitioning the KV cache into sink, compressed mid, and recent tokens, our approach strictly
+bounds the memory footprint to ∼4 GB and ensures constant-time attention complexity without discarding
+essential historical context. Empowered by a 128× dual-branch compression module (∼32× token reduc-
+tion), incremental RoPE adjustments, and dynamic context selection, PackForcing achieves a remarkable 24×
+temporal extrapolation (5 s →120 s). This demonstrates that short-video supervision is entirely sufficient
+for high-quality, long-video synthesis. Ultimately, it generates highly coherent 2-minute videos, establishing
+state-of-the-art VBench scores and the most robust text-video alignment among existing baselines, paving
+the way for efficient, unbounded video generation on standard hardware.
+References
+Andreas Blattmann, Robin Rombach, Huan Ling, Tim Dockhorn, Seung Wook Kim, Sanja Fidler, and
+Karsten Kreis. Align your latents: High-resolution video synthesis with latent diffusion models. In
+Proceedings of the IEEE/CVF conference on computer vision and pattern recognition, pp. 22563–22575, 2023.
+Tim Brooks, Bill Peebles, Connor Holmes, Will DePue, Yufei Guo, Li Jing, David Schnurr, Joe Taylor, Troy Luh-
+man, Eric Luhman, Clarence Ng, Ricky Wang, and Aditya Ramesh. Video generation models as world sim-
+ulators. 2024. URL https://openai.com/research/video-generation-models-as-world-simulators.
+Duygu Ceylan, Chun-Hao P Huang, and Niloy J Mitra. Pix2video: Video editing using image diffusion. In
+Proceedings of the IEEE/CVF international conference on computer vision, pp. 23206–23217, 2023.
+Boyuan Chen, Diego Martí Monsó, Yilun Du, Max Simchowitz, Russ Tedrake, and Vincent Sitzmann.
+Diffusion forcing: Next-token prediction meets full-sequence diffusion. Advances in Neural Information
+Processing Systems, 37:24081–24125, 2024a.
+Haoxin Chen, Yong Zhang, Xiaodong Cun, Menghan Xia, Xintao Wang, Chao Weng, and Ying Shan.
+Videocrafter2: Overcoming data limitations for high-quality video diffusion models. In Proceedings of the
+IEEE/CVF conference on computer vision and pattern recognition, pp. 7310–7320, 2024b.
+Junsong Chen, Yuyang Zhao, Jincheng Yu, Ruihang Chu, Junyu Chen, Shuai Yang, Xianbang Wang, Yicheng
+Pan, Daquan Zhou, Huan Ling, et al. Sana-video: Efficient video generation with block linear diffusion
+transformer. arXiv preprint arXiv:2509.24695, 2025.
+Justin Cui, Jie Wu, Ming Li, Tao Yang, Xiaojie Li, Rui Wang, Andrew Bai, Yuanhao Ban, and Cho-Jui Hsieh.
+Self-forcing++: Towards minute-scale high-quality video generation. arXiv preprint arXiv:2510.02283, 2025.
+Songwei Ge, Seungjun Nah, Guilin Liu, Tyler Poon, Andrew Tao, Bryan Catanzaro, David Jacobs, Jia-Bin
+Huang, Ming-Yu Liu, and Yogesh Balaji. Preserve your own correlation: A noise prior for video diffusion
+models. In Proceedings of the IEEE/CVF International Conference on Computer Vision, pp. 22930–22941, 2023.
+William Harvey, Saeid Naderiparizi, Vaden Masrani, Christian Weilbach, and Frank Wood. Flexible diffusion
+modeling of long videos. Advances in neural information processing systems, 35:27953–27965, 2022.
+12
+Hao He, Yinghao Xu, Yuwei Guo, Gordon Wetzstein, Bo Dai, Hongsheng Li, and Ceyuan Yang. CameraCtrl:
+Enabling camera control for text-to-video generation, 2024.
+Hao He, Ceyuan Yang, Shanchuan Lin, Yinghao Xu, Meng Wei, Liangke Gui, Qi Zhao, Gordon Wetzstein,
+Lu Jiang, and Hongsheng Li. Cameractrl ii: Dynamic scene exploration via camera-controlled video
+diffusion models. In Proceedings of the IEEE/CVF International Conference on Computer Vision, pp. 13416–
+13426, 2025.
+Roberto Henschel, Levon Khachatryan, Hayk Poghosyan, Daniil Hayrapetyan, Vahram Tadevosyan,
+Zhangyang Wang, Shant Navasardyan, and Humphrey Shi. Streamingt2v: Consistent, dynamic, and
+extendable long video generation from text. In Proceedings of the Computer Vision and Pattern Recognition
+Conference, pp. 2568–2577, 2025.
+Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. Advances in neural
+information processing systems, 33:6840–6851, 2020.
+Jonathan Ho, Tim Salimans, Alexey Gritsenko, William Chan, Mohammad Norouzi, and David J Fleet.
+Video diffusion models. Advances in neural information processing systems, 35:8633–8646, 2022.
+Susung Hong, Junyoung Seo, Heeseong Shin, Sunghwan Hong, and Seungryong Kim. Large language
+models are frame-level directors for zero-shot text-to-video generation. In First Workshop on Controllable
+Video Generation@ ICML24, 2023.
+Xun Huang, Zhengqi Li, Guande He, Mingyuan Zhou, and Eli Shechtman. Self forcing: Bridging the
+train-test gap in autoregressive video diffusion. arXiv preprint arXiv:2506.08009, 2025a.
+Ziqi Huang, Yinan He, Jiashuo Yu, Fan Zhang, Chenyang Si, Yuming Jiang, Yuanhan Zhang, Tianxing
+Wu, Qingyang Jin, Nattapol Chanpaisit, et al. Vbench: Comprehensive benchmark suite for video
+generative models. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition,
+pp. 21807–21818, 2024.
+Ziqi Huang, Fan Zhang, Xiaojie Xu, Yinan He, Jiashuo Yu, Ziyue Dong, Qianli Ma, Nattapol Chanpaisit,
+Chenyang Si, Yuming Jiang, et al. Vbench++: Comprehensive and versatile benchmark suite for video
+generative models. IEEE Transactions on Pattern Analysis and Machine Intelligence, 2025b.
+Yaron Lipman, Ricky TQ Chen, Heli Ben-Hamu, Maximilian Nickel, and Matt Le. Flow matching for
+generative modeling. arXiv preprint arXiv:2210.02747, 2022.
+Kunhao Liu, Wenbo Hu, Jiale Xu, Ying Shan, and Shijian Lu. Rolling forcing: Autoregressive long video
+diffusion in real time. arXiv preprint arXiv:2509.25161, 2025.
+Xingchao Liu, Chengyue Gong, and Qiang Liu. Flow straight and fast: Learning to generate and transfer
+data with rectified flow. arXiv preprint arXiv:2209.03003, 2022.
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. arXiv preprint arXiv:1711.05101,
+2017.
+William Peebles and Saining Xie. Scalable diffusion models with transformers. In Proceedings of the IEEE/CVF
+international conference on computer vision, pp. 4195–4205, 2023.
+Bowen Peng, Jeffrey Quesnelle, Honglu Fan, and Enrico Shippole. Yarn: Efficient context window extension
+of large language models. arXiv preprint arXiv:2309.00071, 2023.
+Adam Polyak, Amit Zohar, Andrew Brown, Andros Tjandra, Animesh Sinha, Ann Lee, Apoorv Vyas, Bowen
+Shi, Chih-Yao Ma, Ching-Yao Chuang, et al. Movie gen: A cast of media foundation models. arXiv preprint
+arXiv:2410.13720, 2024.
+Haonan Qiu, Menghan Xia, Yong Zhang, Yingqing He, Xintao Wang, Ying Shan, and Ziwei Liu. Freenoise:
+Tuning-free longer video diffusion via noise rescheduling. arXiv preprint arXiv:2310.15169, 2023.
+Qwen, :, An Yang, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chengyuan Li,
+Dayiheng Liu, Fei Huang, Haoran Wei, Huan Lin, Jian Yang, Jianhong Tu, Jianwei Zhang, Jianxin Yang,
+Jiaxi Yang, Jingren Zhou, Junyang Lin, Kai Dang, Keming Lu, Keqin Bao, Kexin Yang, Le Yu, Mei Li,
+13
+Mingfeng Xue, Pei Zhang, Qin Zhu, Rui Men, Runji Lin, Tianhao Li, Tianyi Tang, Tingyu Xia, Xingzhang
+Ren, Xuancheng Ren, Yang Fan, Yang Su, Yichang Zhang, Yu Wan, Yuqiong Liu, Zeyu Cui, Zhenru Zhang,
+and Zihan Qiu. Qwen2.5 technical report, 2025.
+Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Björn Ommer. High-resolution
+image synthesis with latent diffusion models. In Proceedings of the IEEE/CVF conference on computer vision
+and pattern recognition, pp. 10684–10695, 2022.
+Uriel Singer, Adam Polyak, Thomas Hayes, Xi Yin, Jie An, Songyang Zhang, Qiyuan Hu, Harry Yang, Oron
+Ashual, Oran Gafni, et al. Make-a-video: Text-to-video generation without text-video data. arXiv preprint
+arXiv:2209.14792, 2022.
+Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu. Roformer: Enhanced
+transformer with rotary position embedding. Neurocomputing, 568:127063, 2024.
+Dani Valevski, Yaniv Leviathan, Moab Arar, and Shlomi Fruchter. Diffusion models are real-time game
+engines. arXiv preprint arXiv:2408.14837, 2024.
+Team Wan, Ang Wang, Baole Ai, Bin Wen, Chaojie Mao, Chen-Wei Xie, Di Chen, Feiwu Yu, Haiming
+Zhao, Jianxiao Yang, et al. Wan: Open and advanced large-scale video generative models. arXiv preprint
+arXiv:2503.20314, 2025.
+Zhouxia Wang, Ziyang Yuan, Xintao Wang, Yaowei Li, Tianshui Chen, Menghan Xia, Ping Luo, and Ying
+Shan. Motionctrl: A unified and flexible motion controller for video generation. In ACM SIGGRAPH 2024
+Conference Papers, pp. 1–11, 2024.
+Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming language
+models with attention sinks. arXiv preprint arXiv:2309.17453, 2023.
+Shuai Yang, Wei Huang, Ruihang Chu, Yicheng Xiao, Yuyang Zhao, Xianbang Wang, Muyang Li, Enze
+Xie, Yingcong Chen, Yao Lu, et al. Longlive: Real-time interactive long video generation. arXiv preprint
+arXiv:2509.22622, 2025.
+Zhuoyi Yang, Jiayan Teng, Wendi Zheng, Ming Ding, Shiyu Huang, Jiazheng Xu, Yuanming Yang, Wenyi
+Hong, Xiaohan Zhang, Guanyu Feng, et al. Cogvideox: Text-to-video diffusion models with an expert
+transformer. arXiv preprint arXiv:2408.06072, 2024.
+Jung Yi, Wooseok Jang, Paul Hyunbin Cho, Jisu Nam, Heeji Yoon, and Seungryong Kim. Deep forc-
+ing: Training-free long video generation with deep sink and participative compression. arXiv preprint
+arXiv:2512.05081, 2025.
+Tianwei Yin, Qiang Zhang, Richard Zhang, William T Freeman, Fredo Durand, Eli Shechtman, and Xun
+Huang. From slow bidirectional to fast autoregressive video diffusion models. In Proceedings of the
+IEEE/CVF Conference on Computer Vision and Pattern Recognition, pp. 22963–22974, 2025.
+Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong
+Tian, Christopher Ré, Clark Barrett, et al. H2o: Heavy-hitter oracle for efficient generative inference of
+large language models. Advances in Neural Information Processing Systems, 36:34661–34710, 2023.
+Zangwei Zheng, Xiangyu Peng, Tianji Yang, Chenhui Shen, Shenggui Li, Hongxin Liu, Yukun Zhou,
+Tianyi Li, and Yang You. Open-sora: Democratizing efficient video production for all. arXiv preprint
+arXiv:2412.20404, 2024.
+14
+Appendix Contents
+A Extended Discussion on Limitations
+16
+B
+Design Comparison of Causal Video Generation Methods
+16
+C Training Strategy
+16
+D Streaming VAE Decode
+16
+E
+Additional Experimental Results
+17
+E.1
+Detailed Temporal CLIP Scores . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+17
+F
+Inference Algorithm
+17
+G Detailed Mechanism of Dynamic Context Selection
+17
+H Further Analysis
+18
+H.1 Empirical Analysis of Temporal Attention Patterns
+. . . . . . . . . . . . . . . . . . . . . . . .
+18
+H.2 Effect of RoPE Adjustment. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+19
+H.3 Computational Efficiency Analysis . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+19
+I
+More Qualitative Results
+20
+15
+A
+Extended Discussion on Limitations
+Several directions remain open: (i) the fixed compression ratio (128× volume / ∼32× token) could be made
+adaptive to scene complexity; (ii) attention-based importance scoring may not capture all aspects of visual
+saliency—learned importance predictors could help; (iii) scaling to higher resolutions (e.g., 1920×1080)
+requires investigating the interaction between spatial compression and quality. We believe the three-partition
+principle is general and can be applied to other autoregressive domains beyond video.
+B
+Design Comparison of Causal Video Generation Methods
+Table 6 Design comparison of causal video generation methods. PackForcing uniquely integrates learned compression,
+bounded memory, and RoPE adjustment to ensure persistent long-range memory during extended generation.
+Method
+KV
+Compress
+Bounded
+Memory
+RoPE
+Adjustment
+Long-range
+Memory
+CausVid Yin et al. (2025)
+✗
+✗
+—
+✗
+Self-Forcing Huang et al. (2025a)
+✗
+✗
+—
+✗
+Rolling-F. Liu et al. (2025)
+✗
+✓
+✓
+✗
+LongLive Yang et al. (2025)
+✗
+✓
+N/A
+partial
+DeepForcing Yi et al. (2025)
+✗
+✓
+✓
+partial
+PackForcing (Ours)
+✓
+✓
+✓
+✓
+C
+Training Strategy
+Our training procedure closely follows the two-phase Self-forcing paradigm Huang et al. (2025a). First, the
+causal student model Gθ is initialized from a pretrained bidirectional prior (e.g., Wan2.1-T2V-1.3B Wan et al.
+(2025)) via ODE trajectory alignment. Second, the student performs block-wise rollout and is optimized via
+score distillation against a frozen bidirectional teacher.
+Since the overarching loss formulation and gradient normalization techniques remain identical to standard
+self-forcing, we omit the standard score-matching equations for brevity. The critical distinction in our training
+pipeline is the end-to-end optimization of the HR compression layer (Sec. 3.3). During the rollout phase, the
+compression module is integrated directly into the computational graph. This joint optimization ensures
+that the compressed mid tokens are explicitly tailored to preserve essential semantic and structural cues for
+downstream causal attention, rather than merely minimizing a generic pixel-level reconstruction loss.
+Short-to-Long Generalization. Training uses only 20 latent frames (∼5 s after 4× VAE temporal decompres-
+sion), yet the model generalizes to 2-minute generation—a 24× temporal extrapolation. This transfer is
+enabled by the three-partition design: the attention context seen by each transformer layer is bounded
+at ∼27,872 tokens during both training and inference, since compression maintains a constant-size window
+regardless of the actual video length. The model therefore never encounters a context distribution it was
+not trained on.
+D
+Streaming VAE Decode
+To reduce latency, PackForcing supports streaming VAE decoding: each block is decoded incrementally
+as it is generated rather than accumulated for joint decoding. The VAE decoder maintains a temporal
+cache to ensure seamless frame boundaries—the first block produces 13 pixel frames (due to the initial
+receptive field), while subsequent blocks produce 16 each via cache-assisted decoding. This reduces the
+time-to-first-frame and enables progressive display.
+16
+E
+Additional Experimental Results
+E.1
+Detailed Temporal CLIP Scores
+In Table 7, we provide the fine-grained, temporal breakdown of the CLIP scores over 20-second intervals for
+different sink sizes. Consistent with the main text, Nsink=0 exhibits a continuous degradation over time
+(dropping to 28.51 by 120 s), while Nsink ≥8 successfully maintains a stable score trajectory throughout the
+entire minute-scale generation.
+Table 7 Detailed temporal CLIP Score breakdown. Evaluated across 20-second intervals for different sink sizes. Nsink ≥8
+demonstrates robust prevention of temporal degradation.
+Sink Size
+0–20s
+20–40s
+40–60s
+60–80s
+80–100s
+100–120s
+Overall
+0
+34.72
+33.24
+31.51
+30.44
+29.01
+28.51
+31.24
+2
+35.32
+35.45
+34.64
+34.24
+34.63
+34.80
+34.85
+4
+35.33
+35.45
+34.64
+34.24
+34.63
+34.79
+34.85
+8
+35.59
+35.16
+35.04
+35.14
+34.81
+34.81
+35.09
+16
+35.54
+35.34
+35.21
+35.42
+35.40
+35.46
+35.39
+F
+Inference Algorithm
+Algorithm 1 summarizes the complete PackForcing inference procedure. The key operations involve:
+(1) block-wise causal generation with multi-step denoising, (2) KV cache updates after each block, (3)
+periodic dual-branch compression of mid-range frames, and (4) incremental RoPE adjustment for capacity
+management coupled with streaming VAE decoding for immediate frame output.
+G
+Detailed Mechanism of Dynamic Context Selection
+In this section, we provide the detailed formulation and engineering optimizations of the Dynamic Context
+Selection introduced in Sec. 3.5. Our goal is to dynamically identify the top-K most informative compressed
+mid-blocks without introducing noticeable latency to the autoregressive generation pipeline.
+Given the recent and current blocks acting as queries Q ∈RB×Lq×Nh×dh, and the candidate mid-blocks acting
+as keys K ∈RM×B×Lk×Nh×dh (where M is the number of candidate blocks), we compute an aggregated
+importance score sm for each candidate block m ∈{1, . . . , M}.
+To minimize the computational overhead of the dot-product attention, we introduce three structural
+optimizations: (1) Deterministic Query Subsampling: We uniformly sample a subset of query tokens Sq from
+the Lq sequence using a target sampling ratio γ (e.g., yielding max(32, ⌊γLq⌋) tokens), preserving the
+spatial-temporal distribution without evaluating the full grid. (2) Half-Head Evaluation: Since importance is
+highly correlated across attention heads, we compute the affinity using only the first Nopt = Nh/2 heads. (3)
+Step-wise Caching: The affinity distribution shifts minimally within the internal denoising loop of a single
+generated chunk. Therefore, we strictly compute sm only at the first denoising timestep t = T, caching the
+sorted indices for all subsequent t < T. Furthermore, an optional interval hyperparameter allows reusing
+the same indices across multiple adjacent video blocks.
+Formally, the importance score sm for block m is defined as the averaged multi-head affinity over the batch
+and selected heads, summed across the subsampled queries and full block keys:
+sm =
+Lk
+∑
+j=1 ∑
+i∈Sq
+ 
+1
+B · Nopt
+B
+∑
+b=1
+Nopt
+∑
+h=1
+Qb,h,iK⊤
+m,b,h,j
+√dh
+!
+(11)
+Once sm is computed for all M candidates, we select the indices of the top-K scores. To maintain the
+causal temporal structure essential for the Rotary Position Embedding (RoPE) and temporal consistency,
+17
+Algorithm 1: PackForcing Inference
+Input: Noise ϵ, text prompt c, initial frames z0
+Output: Generated video frames V
+1 Initialize KV cache C = {Csink, Cmid, Crecent};
+2 Cache initial frames into Csink;
+3 tgen ←Nsink;
+4 for each block i = 1, . . . , Nblocks do
+5
+zi ←ϵi ;
+// Initialize from noise
+6
+for s = 1, . . . , S do
+;
+// S=4 denoising steps
+7
+if s = 1 then
+8
+Smid ←Affinity_Routing(Cmid, zi, Ntop) ;
+// Dynamic context selection
+9
+Cactive ←{Csink, Cmid[Smid], Crecent} ;
+// Sparse attention context
+10
+v ←fθ(zi, σs, c, Cactive) ;
+// Attend to active partitions
+11
+ˆzi ←zi −σs · v;
+12
+zi ←(1 −σs+1)ˆzi + σs+1ϵ′;
+13
+Update Crecent with denoised zi;
+14
+Vi ←Streaming_VAE_Decode(zi) ;
+// Decode incrementally
+15
+if tgen ≥Nsink + Nmid + Nrc then
+;
+// Context window is full
+16
+˜h ←HR(zi−1) + LR(Vi−1) ;
+// LR uses streaming decoded output
+17
+Append compressed tokens to Cmid;
+18
+if |Cmid| > Nmid then
+19
+Shift Cmid window by ∆blocks ;
+// Maintain capacity budget
+20
+Apply incremental RoPE adjustment (Eq. 10) to Csink;
+21
+tgen ←tgen + Bf ;
+22 return Concatenated frames V
+the selected indices are sorted in ascending order before retrieving the corresponding Key-Value tensors
+from the mid-buffer. The selected compact KV caches are then concatenated with the recent blocks for the
+standard flash-attention forward pass.
+H
+Further Analysis
+H.1
+Empirical Analysis of Temporal Attention Patterns
+A central question in designing KV cache compression for causal video generation is: which historical tokens
+does the denoising network actually attend to? If attention were concentrated on a small, predictable subset of
+the history—say, only the initial frames and the most recent context—a simple sliding-window or FIFO
+eviction policy would suffice. However, our empirical analysis reveals a fundamentally different picture.
+Setup.
+We generate a 30-second video (480 latent frames, decoded at 16 fps) using our causal inference
+pipeline with participatory compression enabled (sink size = 8, budget = 16 mid-blocks, block size = 4
+frames). At each compression step, we record the per-block importance score ϕj = ∑i q⊤
+i kj/
+√
+d, where
+queries qi are drawn from the recent and current blocks and keys kj from each candidate mid-block. We
+also record which blocks are selected (top-k by importance) for retention. Results are visualized in figure 3.
+Observation 1: Attention demand spans the full history.
+figure 3(a) shows the block selection density as a
+function of relative position in the KV cache. If only sink and recent tokens mattered, we would observe
+activity exclusively at the left (position ≈0) and right (position ≈1) edges. Instead, selected blocks are
+distributed across the entire temporal range, with persistent demand in the mid-range (0.2–0.8). This is
+further confirmed by figure 3(c), where the average importance score is plotted against relative position
+18
+Table 8 Ablation on RoPE Corr.
+RoPE
+Corr.
+CLIP
+(0–20 s) ↑
+CLIP
+(40–60 s) ↑
+∆↓
+✗
+33.95
+31.42
+2.53
+✓
+34.02
+33.07
+0.95
+Table 9 Memory and speed for 120 s generation (832×480, 16 FPS, single A100-80GB).
+Method
+KV Cache
+Peak GPU
+Speed
+Full cache
+∼138 GB
+OOM
+—
+Window-only
+3.1 GB
+24 GB
+18 FPS
+PackForcing (FIFO)
+4.0 GB
+26 GB
+16 FPS
+PackForcing (Part.)
+4.2 GB
+27 GB
+15 FPS
+for late-stage generation (frame ≥200). The curve is remarkably flat with a mean of 0.499, indicating
+near-uniform attention demand over all historical positions. This observation rules out FIFO-based eviction,
+which would systematically discard early tokens that remain equally relevant.
+Observation 2: Important tokens are sparsely and unpredictably distributed.
+figure 3(b) displays the continuous
+importance scores for each candidate block across the generation process. High-importance blocks (bright
+spots) appear at scattered, non-contiguous positions rather than forming coherent temporal clusters.
+Moreover, figure 3(d) quantifies the selection dynamics: the Jaccard distance between consecutive selection
+sets averages 0.75, meaning 75% of the retained blocks change at every step. The position diversity metric—
+the fraction of distinct cache positions visited within a sliding window of 10 steps—stabilizes above 0.85,
+confirming that the model rapidly cycles through diverse temporal locations.
+Implications for compression design.
+These two observations jointly motivate our compression strategy. First,
+since attention demand persists across all historical positions, we must retain a representative summary of
+the entire past rather than only recent context—hence the three-region cache structure (sink + mid + recent).
+Second, since individual mid-range tokens are each only sporadically needed while the aggregate demand
+covers the full history, there is high temporal redundancy among mid-tokens. This makes them ideal
+candidates for aggressive compression: a compact representation can preserve the distributed information
+without retaining every individual token. Our dual-shift compression network exploits this redundancy by
+compressing mid-range KV blocks at a high ratio, achieving constant memory usage regardless of video
+length while maintaining generation quality.
+H.2
+Effect of RoPE Adjustment.
+Table 8 isolates the impact of incremental RoPE rotation. Without Adjustment, the CLIP gap between early
+(0–20 s) and late (40–60 s) segments is 2.53—indicating progressive semantic drift after FIFO eviction begins
+around the 20 s mark. With Adjustment, the gap shrinks to 0.95 (a 62% reduction), confirming that position
+continuity is essential for stable long-horizon generation. The cost is negligible: one complex multiplication
+per eviction event, amounting to <0.1% of total FLOPs.
+H.3
+Computational Efficiency Analysis
+Table 9 compares memory footprint and speed for 120 s generation. Without compression, the KV cache
+alone requires ∼138 GB (748,800 × 30 × 2 × 12 × 128 × 2 bytes), exceeding single-GPU capacity. PackForcing
+bounds KV cache memory to ∼4.2 GB regardless of video length, while maintaining competitive speed
+through the reduced attention context.
+19
+SelfForcing
+Rolling
+Forcing
+CausVid
+LongLive
+Pack
+Forcing
+Prompt: A charming 3D digital render art style image showcasing an adorable and happy otter confidently standing on a surfboard, wearing a bright yellow lifejacket. The otter is 
+depicted with a joyful expression, its fur soft and detailed, and it appears to glide gracefully through turquoise tropical waters…
+t=0s
+t=20s
+t=40s
+t=60s
+t=80s
+t=100s
+t=120s
+Deep
+Forcing
+Figure 6 Qualitative Results (1)
+In this section, we present extended 120-second qualitative comparisons to further demonstrate the robust
+long-range consistency and dynamic generation capabilities of PackForcing against state-of-the-art baselines.
+I
+More Qualitative Results
+Analysis for Figure 1:
+Figure 6 illustrates the generation of a highly dynamic scene featuring an "adorable
+and happy otter confidently standing on a surfboard". PackForcing successfully maintains strict subject
+identity, preserving fine details such as the "bright yellow lifejacket" and the "turquoise tropical waters"
+seamlessly across the entire two-minute duration. In stark contrast, baseline methods struggle with error
+accumulation over the extended horizon: Self-Forcing exhibits severe color degradation and visual collapse
+by t = 60s, while CausVid and Rolling Forcing suffer from noticeable background blurring and subject
+inconsistency, respectively.
+Analysis for Figure 2:
+Figure 7 evaluates the models’ ability to maintain complex structural boundaries
+and intricate details, specifically a "glass sphere containing a tranquil Zen garden" and a dwarf holding a
+"bamboo rake". PackForcing consistently preserves the transparent properties of the glass sphere and the
+precise identity of the dwarf throughout the 120-second sequence. Baselines fail to sustain this coherence:
+Self-Forcing completely collapses into dark purple artifacts early in the generation, and DeepForcing
+gradually loses the structural integrity of the rake and the sphere. While LongLive maintains the subject,
+it does so at the cost of freezing the motion, whereas our method sustains continuous, deliberate raking
+movements.
+Analysis for Figure 3:
+Figure 8 tests the generation of vibrant, stylized content with complex, continuous
+motion—a "kangaroo performing a lively disco dance" in a "colorful sequined outfit". PackForcing excels in
+preserving both the high-frequency visual details (the sparkles and vibrant colors) and the highly dynamic
+rhythmic motion over the extended timeframe. Competing methods typically face a trade-off, either
+collapsing under the complexity of the prolonged motion or reverting to near-static frames to avoid drift.
+PackForcing’s three-partition memory efficiently prevents these artifacts, ensuring the character remains
+energetic and visually consistent.
+20
+SelfForcing
+Rolling
+Forcing
+CausVid
+LongLive
+Pack
+Forcing
+Prompt: A close-up view of a glass sphere containing a tranquil Zen garden. Inside, a small Eastern dwarf with weathered skin and a serene expression is raking the sand, meticulously 
+creating intricate patterns with a bamboo rake. His movements are deliberate and meditative, enhancing the peaceful atmosphere of the scene…
+t=0s
+t=20s
+t=40s
+t=60s
+t=80s
+t=100s
+t=120s
+Deep
+Forcing
+Figure 7 Qualitative Results (2)
+SelfForcing
+Rolling
+Forcing
+CausVid
+LongLive
+Pack
+Forcing
+Prompt: A vibrant cartoon-style illustration depicting a kangaroo performing a lively disco dance. The kangaroo has a joyful expression, with large, expressive eyes and a mischievous 
+grin. It wears a colorful sequined outfit with sparkles, including a glittery top and matching pants. Its tail is fluffed out and swaying rhythmically…
+t=0s
+t=20s
+t=40s
+t=60s
+t=80s
+t=100s
+t=120s
+Deep
+Forcing
+Figure 8 Qualitative Results (3)
+21

@@ -1,0 +1,808 @@
+APreQEL: Adaptive Mixed Precision Quantization For Edge LLMs
+Meriem Bouzouad
+Lab-STICC, CNRS UMR 6285 , ENSTA,
+Institut Polytechnique de Paris
+Brest, France
+meriem.bouzouad@ensta.fr
+Yuan-Hao Chang
+National Taiwan University
+Taipei, Taiwan
+johnson@csie.ntu.edu.tw
+Jalil Boukhobza
+Lab-STICC, CNRS UMR 6285 , ENSTA,
+Institut Polytechnique de Paris
+Brest, France
+jalil.boukhobza@ensta.fr
+Abstract
+Today, large language models have demonstrated their strengths in
+various tasks ranging from reasoning, code generation, and com-
+plex problem solving. However, this advancement comes with a
+high computational cost and memory requirements, making it chal-
+lenging to deploy these models on edge devices to ensure real-time
+responses and data privacy. Quantization is one common approach
+to reducing memory use, but most methods apply it uniformly
+across all layers. This does not account for the fact that different
+layers may respond differently to reduced precision. Importantly,
+memory consumption and computational throughput are not nec-
+essarily aligned, further complicating deployment decisions. This
+paper proposes an adaptive mixed precision quantization mecha-
+nism that balances memory, latency, and accuracy in edge deploy-
+ment under user-defined priorities. This is achieved by analyzing
+the layer-wise contribution and by inferring how different quanti-
+zation types behave across the target hardware platform in order
+to assign the most suitable quantization type to each layer. This
+integration ensures that layer importance and the overall perfor-
+mance trade-offs are jointly respected in this design. Our work
+unlocks new configuration designs that uniform quantization can-
+not achieve, expanding the solution space to efficiently deploy the
+LLMs on resource-constrained devices.
+Keywords
+LLM, memory optimization, embedded systems, edge intelligence,
+MCDA.
+1
+Introduction
+The enhancement of reasoning capabilities in large language mod-
+els (LLMs) is mainly associated with the growth in their number of
+parameters. Thus, enabling those models to capture complex rela-
+tionships and dependencies from data [12]. However, such scale-up
+necessitates substantial computational power and significant mem-
+ory capacity, often requiring deployment on resource-rich cloud
+platforms for inference requests, especially to ensure scalability
+and assure quality of service for the users. This shift raises various
+security concerns, as well as a communication overhead, particu-
+larly due to internet connection and availability issues in certain
+regions.
+With the advent of edge intelligence and real-time processing of
+data, deploying LLM models on the edge has gained much interest
+in research areas [11], especially with advancements in hardware
+accelerators in edge devices, such as integrated GPU, NPU, and
+powerful CPUs. However, the memory bandwidth does not scale
+with the compute speed, which hinders the overall performance of
+systems, particularly for LLMs, which require a significant amount
+of memory to load the weight matrices and context requests. Indeed,
+deploying LLMs on the edge requires having a reasonable Quality
+of Service metrics in terms of memory footprint while ensuring
+good accuracy with limited latency.
+One of the most adopted strategies to deploy those models ef-
+ficiently is quantization, which reduces the precision of weights,
+generally from 16-bit to 8-bit or even 2-bit. This has allowed those
+large models to run on GPU consumer hardware or even on CPU;
+however, the hardware support for operations under 8-bits is lim-
+ited to a few types of AI accelerators, which are rarely present
+in edge devices. As a result, the acceleration is not always reach-
+able, since the de-quantization overhead can offset the theoretical
+speedup expected from memory footprint reduction.
+Many quantization schemes have appeared in recent years such
+as GPTQ [6], AWQ [9], SmoothQuant[13], K-quant types from
+llama.cpp1 library, which algorithm is formulated in [5]. Some re-
+cent work, such as ShortGPT[10], have exploited the similarity
+between layers to prune the layers judged unimportant, while oth-
+ers [4] assign variable quantization depending on the importance
+of the layers; however, in addition to being limited to one QoS met-
+ric objective (memory footprint), their experiments are limited to
+2-bit and 4-bit quantization. In addition, except for [4], all the tech-
+niques cited above follow a uniform quantization scheme, which
+treats all layers in an LLM equally. However, not every layer af-
+fects accuracy in the same way. Some layers are critical and require
+higher precision, while others can tolerate lower precision without
+significant loss of accuracy [4]; uniform quantization ignores this
+difference, often causing unnecessary reductions in accuracy or
+missing opportunities for more efficient compression[14].
+Moreover, uniform quantization may lead to a degraded QoS,
+in terms of inference latency and memory if hardware-specific
+characteristics are ignored. This is because different quantization
+methods introduce varying, often uncorrelated impacts on latency
+and memory depending on the model architecture, as reported in
+the motivation Section (2.3), largely due to de-quantization over-
+head. As a result, model compression may fail to translate into
+actual efficiency gains on a given target hardware.
+To the best of our knowledge, previous studies did not explore
+the trade-offs achievable through mixed quantization schemes, par-
+ticularly when latency is included. This limitation is particularly
+problematic in edge environments, where resource availability of-
+ten fluctuates more than in the cloud, requiring designs that are
+both adaptable and efficient to meet shifting requirements.
+In this paper, we propose APreQEL, a flexible solution for layer-
+wise quantization in LLMs, which adapts to diverse deployment
+scenarios by incorporating user-driven QoS requirements. APreQEL
+1https://github.com/ggml-org/llama.cpp
+arXiv:2603.23575v1  [cs.LG]  24 Mar 2026
+Figure 1: Cosine similarity distribution for Llama-3.13 includ-
+ing Attention and FFN layers.
+makes it possible for users to make a trade-off between QoS metrics
+(memory footprint, model accuracy, and latency).
+To this end, our approach (1) ranks layers depending on their
+contribution to the change of information; (2) determines the best
+distribution of quantization types, accounting for their distinct QoS
+metrics; (3) combines the ranking from step (1) with the distribution
+from step (2) to assign the most suitable quantization type to each
+layer.
+Our findings demonstrate that APreQEL systematically guaran-
+tees that the generated solutions are spread over the Pareto-front,
+under any priority set by the user, enabling either focused opti-
+mization on a single metric, joint optimization of two metrics, or
+balanced trade-offs across memory footprint, accuracy, and latency.
+Notably, APreQEL achieves ∼9% increase in the hypervolume indi-
+cator on average over the uniform baseline set, reflecting a broader
+Pareto front while considering only a small set of 28 configurations.
+2
+Background and Motivation
+2.1
+Background
+LLMs are built on top of a decoder-only transformer architecture
+[2]. The natural language prompt is converted to tokens, which
+are mapped to high-dimensional vectors called embeddings to cap-
+ture their semantic content. Those embeddings are then passed
+through 𝑁decoding blocks, each containing a self-attention layer
+and a feedforward network (FNN) layer, to capture the contextual
+relationship between the different embeddings. Finally, LM_head
+module predicts the next token.
+2.2
+Motivation1: Layers contribute differently
+In this part, we examine how the intermediate representation (em-
+beddings) evolves across transformer layers to assess whether layers
+contribute differently, suggesting that distinct layers may benefit
+from different quantization strategies. To conduct this observation,
+we used the Llama3.1 model, where token-level cosine similarity is
+computed using 70 prompts from the huggingface WebInstructSub-
+prometheus dataset 2 and the transformers library of python, with
+32bit precision.
+2https://huggingface.co/datasets/chargoddard/WebInstructSub-prometheus
+3https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
+Figure 1 illustrates the cosine similarity of hidden embeddings
+across consecutive layers, accounting for both the attention (blue)
+and the feed-forward network (grey). We observe different trends;
+sometimes attention layers are closer to 1 (highly similar), and
+sometimes the feed-forward network layer is, depending on their
+position; This leads us to score them separately, which provides a
+better choice for quantization, unlike [4] that collapsed them inside
+the decoder block.
+2.3
+Motivation 2: Unpredictable Inference
+Latency across quantization types
+We have examined how latency varies depending on both the type
+of quantization and the specific model architecture. We used the
+popular K-types supported by llama.cpp for 3, 4, 5, and 6-bit quan-
+tization, and q8_0 for 8-bit; We employed the llama-bench tool
+to measure the time required to generate a single token over the
+hardware setup in Section 4.1.3, with the GPU enabled.
+2
+3
+4
+0
+50
+100
+150
+3-bit
+4-bit 5-bit
+6-bit
+8-bit
+Model size (GB) (Phi3.5)
+Latency (ms)
+4
+6
+8
+0
+100
+200
+3-bit
+4-bit
+5-bit
+6-bit
+8-bit
+Model size (GB) (Llama3.1)
+Figure 2: Inference Latency by model size for Phi3.5 model
+(left) and Llama3.1 model (right) according to the quantiza-
+tion levels
+Figure 2 illustrates the (stable) average time required to generate
+one token over 5 runs for different quantization types in llama.cpp
+during the text generation phase, revealing the lack of a clear cor-
+relation between model size and inference time. For example, we
+see that 5-bit quantization is faster than 8-bit for the Phi3.5 model,
+contrary to the Llama3.1 model. Our main hypothesis is that this
+behavior stems from de-quantization overhead, which occurs when
+converting the quantized weights to the original float format for
+the computational operations. This is due to the lack of hardware
+support, the algorithm used for de-quantization, and the model
+architecture. This suggests that aggressive quantization techniques,
+while effective in reducing model size, can lead to either gains or
+losses in inference latency, depending heavily on both the model
+architecture and the underlying hardware.
+Our objective, therefore, is to explore mixed-quantization strate-
+gies that can leverage the strengths of each uniform type in order
+to adapt to diverse deployment needs in terms of accuracy, latency,
+and memory.
+3
+Contribution
+We propose an adaptive mixed precision quantization solution
+based on three main modules: (1) Layer-wise contribution mod-
+ule that calculates a score per layer according to its importance
+(2.b) Mixed-precision QoS
+metrics estimation
+2. Quantization Types Distribution 
+1. Layer-wise contribution  
+Token input
+ 
+  ....
+(1.a) compute
+cosine similarity 
+LLM
+layers
+(1.b) calculate
+  contribution 
+ 
+{mem,lat,ppl}
+ 
+{mem,lat,ppl}
+ 
+{mem,lat,ppl}
+(2.a) Uniform
+quantization metrics
+Best
+distribution
+(2.c) Multi-criteria analysis
+over X
+Apply weights
+criteria weights
+Ranking Layers
+3. Allocation of quantization types over layers.
+    
+ 
+Attribute 
+    
+ 
+Output
+Allocate 
+ to
+Layer 
+ordering
+Allocation Solution
+Figure 3: Contribution Overview
+in the inference process (Fig 3.1). Specifically, it uses cosine simi-
+larity to measure how much the layer modifies the intermediate
+representation (i.e., hidden embedding). Layers that cause larger
+changes receive higher scores. (2) Quantization types distribu-
+tion module: The objective of this module is to evaluate how many
+layers should be assigned a given quantization level by considering
+user preferences in terms of QoS metrics (provided as weights). It
+outputs the best distribution of quantization levels across the layers.
+To do so, we first need to explore all feasible solutions (Fig. 3.(2.b)),
+i.e., all possible ways to distribute the number of layers across quan-
+tization types based on uniform quantization measures (Fig. 3.(2.a)).
+Then the solutions are ranked using the TOPSIS multi-criteria anal-
+ysis method (Fig. 3.(2.c)). (3) Layer-wise quantization allocation:
+this module maps a quantization level to each layer according to
+the scores of module (1) and respecting the quantization types dis-
+tribution from module (2). This way, this module builds a mixed
+layer-wise quantization that takes into consideration the layer’s
+importance along with the trade-offs between the three QoS metrics
+according to user preferences (Fig. 3.3).
+3.1
+Layer-wise contribution module (Fig 3.1)
+The core idea behind this module is to calculate a score per layer
+depending on its contribution, as in LLMs, the embeddings are
+progressively transformed as they pass through the model’s layers.
+Some layers introduce substantial changes to the hidden embed-
+dings and are more likely to play a critical role in the output.
+To quantify these changes, we measured the cosine similarity
+between the hidden states of successive layers across a diverse set of
+prompts. The cosine similarity of the hidden embeddings of layers
+𝑖and 𝑖+ 1 is given as follows:
+𝑑𝑖𝑠𝑡(𝑖,𝑖+ 1) =
+h𝑖· h𝑖+1
+∥h(𝑖) ∥∥h(𝑖+1) ∥
+We propose a Reward-Penalty approach that uses layer-wise
+statistics in order to estimate the layer’s contribution. Each layer 𝑖
+is evaluated by comparing its output to the next layer 𝑖+ 1; if the
+distance is lower than a fixed threshold 𝛾, we increase its reward 𝑅𝑖,
+reflecting an information gain; otherwise, a penalty 𝑃𝑖is increased.
+The value of 𝛾was set to 0.9 as a heuristic balance, high enough
+to capture meaningful differences, yet not so low that most layers
+are uniformly penalized. The score is computed as the difference
+between its reward and penalty (𝑠𝑐𝑜𝑟𝑒𝑖= 𝑅𝑖−𝑃𝑖) to enable a
+fair comparison between layers. Finally, the layers are ordered
+depending on their contribution score.
+3.2
+Quantization types distribution (Fig 3.2)
+This module determines the number of layers associated with each
+quantization type. A key consideration here is that each uniform
+quantization type has distinct QoS metrics in terms of memory,
+accuracy, and latency (see Section 2.3). This module exploits the
+complementary strengths of mixed quantization. To this goal, dif-
+ferent layers in a model can benefit from different quantization
+types. Indeed, assigning a quantization type that offers low latency
+to more layers will reduce the overall inference latency; the same
+applies to the other metrics.
+This module is built upon two parts. The first one devises a
+method to estimate the QoS metrics of all the feasible solutions of
+mixed quantizations, ie, distributions of layers across quantization
+types. Then, in a second part, we apply multi-criteria analysis to
+rank candidates and identify the best configuration.
+3.2.1
+Mixed-precision QoS metrics estimation. In order to evaluate
+the performance of a given mixed quantization solution, the ideal
+approach is to evaluate its QoS metrics through real measurements.
+For instance, for the Llama3.1 model, this would require measuring
+over 814385 models when using 5 types of quantization levels and
+64 layers (that would take ∼42 years on a 30mn per model basis).
+Because of this combinatorial search space explosion, we relied on
+estimation rather than measurements. We used the QoS metric val-
+ues associated with uniform quantization types as building blocks
+to derive the QoS metrics of a mixed solution.
+Formally, let I be the set of 𝑀different uniform quantization
+types 𝐼= {𝑞𝑖,𝑖∈{1, ., 𝑀}}.
+A candidate solution 𝑘is one way of dividing the 𝐿layers among
+the 𝑀quantization types, represented by a vector𝑍𝑘= (𝑧𝑘1, . . . ,𝑧𝑘𝑀),
+where𝑧𝑘𝑖denotes the number of layers using type𝑞𝑖; with Í𝑀
+𝑖=1 𝑧𝑘𝑖=
+𝐿.
+As stated above, evaluating all possible solutions by directly
+measuring their QoS metric (e.g., memory or latency) is infeasible;
+therefore, we approximate those solution utilizing the measure-
+ments of QoS metrics of uniform quantization in order to compare
+them. To this end, we put forth the simplified hypothesis that each
+layer of the model affects the 𝐽QoS metrics (memory, latency, ac-
+curacy) in the same way. For example, if we have 10 layers and
+the total latency is 100ms, each layer is assumed to contribute by
+10ms. Based on this assumption, for every quantization type 𝑞𝑖in 𝐼,
+we record a set of 𝐽metric values (latency, memory footprint, and
+accuracy in our case), let 𝑐𝑖𝑗be the value of 𝑗𝑡ℎmetric for the quan-
+tization type 𝑞𝑖. Thus, the set of measurements can be expressed
+by matrix 𝐶∈R𝑀×𝐽.
+The metric vector 𝑋𝑘= (𝑥𝑘1, . . . ,𝑥𝑘𝐽) of each candidate solution
+𝑍𝑘is approximated by a weighted combination of the uniform-type
+QoS metrics (𝐶∈R𝑀×𝐽), with weights given by the assignment
+proportions 𝑧𝑘𝑖
+𝐿:
+𝑥𝑘𝑗=
+𝐼∑︁
+𝑖=1
+𝑧𝑘𝑖
+𝐿· 𝑐𝑖𝑗
+Here, 𝑥𝑘𝑗is the estimated value of the QoS metric 𝑗for solution
+𝑘, reflecting the mixture of quantization types according to their
+layer proportions. The output of this part is the estimation of 𝐾
+distribution solutions (𝑍) over the 𝐽metrics, which we denote by
+𝑋∈R𝐾×𝐽.
+3.2.2
+Multi-criteria Analysis . The approximated QoS metrics vec-
+tors of the candidate solutions (𝑋𝑘∈R𝐽), are then compared
+through a multi-criteria analysis4, which take into account the
+weight attributed to each metric𝑤𝑗∈[0, 1] ,𝑊= {𝑤𝑗, 𝑗∈{1, .., 𝐽}}.
+For our contribution, J=3, with 𝑤1, 𝑤2, 𝑤3 denoting the memory,
+latency, and accuracy QoS metrics, respectively.
+These weights let the user emphasize different goals depending
+on the scenario, such as prioritizing latency in real-time applications
+or memory in resource-constrained devices. For example, if latency
+is prioritized, the weight vectors can be {𝑤1=0.1,𝑤2=0.8,𝑤3=0.1}.
+We then apply the TOPSIS method, which is highly regarded for
+solving the multiple attribute decision making [1]. TOPSIS assumes
+that the best option is the one nearest to the ideal solution and
+farthest from the worst solution.
+Firstly, the metric values 𝑋𝑘of the solution 𝑘are normalized by
+the Euclidean norm following this equation:
+𝑦𝑘𝑗=
+𝑥𝑘𝑗
+√︃Í𝐾
+𝑘=1 𝑥2
+𝑘𝑗
+Secondly, the importance of each metric is incorporated by mul-
+tiplying the normalized value 𝑦𝑘𝑗by the weight value related to
+that metric 𝑤𝑗, therefore 𝑎𝑘𝑗= 𝑦𝑘𝑗· 𝑤𝑗. We denote 𝐴𝑘as the nor-
+malized weighted metric vector of solution 𝑘. Next, the ideal and
+negative-ideal solutions are defined. The ideal solution𝐴∗= {𝑎∗
+𝑗}𝐽
+𝑗=1
+corresponds to the best attainable values across the 𝐽QoS metrics,
+while the negative-ideal solution 𝐴−= {𝑎−
+𝑗}𝐽
+𝑗=1 corresponds to the
+worst values.
+Finally, the ranking score of solution 𝑘is computed by
+𝑟𝑎𝑛𝑘𝑖𝑛𝑔_𝑠𝑐𝑜𝑟𝑒𝑘=
+√︃Í𝐽
+𝑗=1 (𝑎𝑘𝑗−𝑎−
+𝑗)2
+√︃Í𝐽
+𝑗=1 (𝑎𝑘𝑗−𝑎−
+𝑗)2+
+√︃Í𝐽
+𝑗−1 (𝑎𝑘𝑗−𝑎∗
+𝑗)2
+The highest ranking score indicates the best alternative solution;
+therefore, we get the best candidate solution for the distribution of
+quantization types.
+Note that APreQEL does not exclude uniform solutions; if a
+uniform configuration is optimal under the specified weighting of
+QoS metrics, it will be selected. APreQEL goes further by integrating
+user-defined priorities and supporting mixed quantization schemes.
+3.3
+Layer-wise quantization allocation (Fig 3.3)
+In this part, the most contributing layers are mapped to the least
+aggressive quantization types, while less critical layers are progres-
+sively assigned more aggressive ones. This is done by combining
+the ranking of layers using the contribution score (Section 3.1 ) with
+the distribution strategy (Section 3.2) to assign the most suitable
+quantization type to each layer.
+The Algorithm 1 sorts quantization types from least to most
+aggressive and ranks layers by their contribution scores, from the
+4In multi-criteria analysis (MCDA), metrics are typically referred to as criteria
+most important to the least important (line 5). It iterates over the
+ordered quantization set 𝐼, then uses the best distribution 𝑍𝑏𝑒𝑠𝑡to
+determine the number of layers to associate with each quantization
+type (inner for loop)(lines 6-9). The algorithm maps higher-ranked
+layers to less aggressive quantization and lower-ranked layers to
+more aggressive ones, yielding the final allocation A (lines 10–14).
+This integration ensures that layer contributions and the overall
+performance trade-offs according to the user’s priorities are jointly
+respected in the quantization design.
+Algorithm 1 Layer-wise Quantization Allocation
+1: Inputs: layer’s contribution scores vector 𝑆𝑐𝑜𝑟𝑒𝑠= {𝑠𝑐𝑜𝑟𝑒1, . . . ,𝑠𝑐𝑜𝑟𝑒𝐿};
+2: Best distribution Zbest = (𝑧1, . . . ,𝑧𝑀)
+3: Quantization types 𝐼= {𝑞1, . . . ,𝑞𝑀}
+⊲ordered from least to most aggressive
+4: Output: Allocation A = {v1, . . . , v𝐿}
+5: 𝑜𝑟𝑑𝑒𝑟←indices of 𝑆𝑐𝑜𝑟𝑒𝑠sorted in descending order
+6: 𝑝←0
+7: for 𝑖= 1 to 𝑀do
+⊲iterate over quantization types
+8:
+for 𝑗= 1 to 𝑧𝑖do
+⊲assign 𝑧𝑖layers to type 𝑞𝑖
+9:
+ℓ←𝑜𝑟𝑑𝑒𝑟[𝑝]
+⊲layer index with 𝑝-th largest score
+10:
+A[ℓ] ←𝑞𝑖
+11:
+𝑝←𝑝+ 1
+12:
+end for
+13: end for
+14: return A
+4
+Evaluation and Discussion
+4.1
+Experimental Methodology
+We evaluate APreQEL across three different model architectures
+(Phi3.5, Llama3.1 and Qwen3-4B) against the uniform quantization
+types. In effect, it was not feasible to compare with past work, as
+none considers all three metrics jointly. Specifically, we aim to
+demonstrate that by leveraging mixed quantization, APreQEL can
+adjust to varied QoS metrics weightings while ensuring that the
+resulting models lie on the Pareto front.
+4.1.1
+Experimental setup . We used the K-type quantization types
+of llama.cpp for 3-, 4-, 5-, and 6-bit precision, and q8_0 for 8-bit, for
+the uniform baseline model (except for Qwen3-4B where the 8-bit
+precision was skipped as it was dominated by the 6-bit one).
+To evaluate APreQEL, we generated a set of 28 models. To do so,
+we have tuned the weights assigned to the three QoS metrics (mem-
+ory, perplexity, and latency) in a way to span a large configuration
+space, as described below.
+We divided the set of generated models into four categories:
+APreQEL-Fairness, where weights were distributed evenly across
+two or three metrics among 4 models {( 1
+3, 1
+3, 1
+3), (0.5,0.5,0), (0.5,0,0.5),
+(0,0.5,0.5)}; APreQEL-Latency category, where latency is priori-
+tized; and likewise for APreQEL-Accuracy and APreQEL-Memory.
+The three latter APreQEL-categories prioritize a single metric
+across two scenarios. The first spans from moderately to highly
+skewed or dominant preferences across the three metrics; the prior-
+itized one is given weights of 0.7, 0.8, and 0.9 (giving 3 models per
+category, totaling 9), while the other two metrics share the residual
+weight equally (e.g., (0.8, 0.1, 0.1)), and dominant where only one
+metric matters (e.g,(1, 0, 0)), giving 3 additional models. The second
+emphasizes only two metrics, using skewed pairwise weights of
+0.75 (e.g., (0.75, 0.25, 0), giving 6 models), and 0.9 (e.g.(0.1, 0.9, 0),
+resulting in 6 models).
+Figure 4: Hypervolume indicator[3]
+To evaluate the resulting models, we measured the perplexity us-
+ing the wiki-test-2 dataset, and the benchmarking tool of llama.cpp
+with GPU execution enabled for the execution time. We also modi-
+fied the llama.cpp library to generate the mixed precision models.
+4.1.2
+Evaluation metrics. We used the following metrics:
+(1) Inference latency: time to generate one token (ms/token).
+(2) Memory footprint of the model: measured by the memory
+space occupied by the model parameters.
+(3) Perplexity: assess the model’s ability to generate cohesive and
+fluent sentences; lower perplexity corresponds to better predictive
+ability. It serves as an accuracy proxy for quantized LLMs [8], as it
+is negatively correlated with accuracy.
+(4) Hypervolume gain: To compare our solution set with the base-
+line uniform set across the three objectives, we relied on the hyper-
+volume (HV) indicator, a set-quality indicator over multi-objective
+optimizations, which evaluates the quality of a set of solution [7].
+It measures the portion of the objective space dominated by the
+solutions relative to a reference point.
+Figure 4 illustrates how the hypervolume is calculated using
+the two objectives; it highlights the region that the solutions cover
+between the reference point and the optimal Pareto front (optimal
+line in red in the Figure). The closer the uncovered Pareto front is
+to the optimal one, the largest 𝐻𝑉is. The green Pareto front has a
+higher 𝐻𝑉as it covers more space closer to the optimal line, while
+the space between the green and the blue front represents the gain
+of the former over the latter.
+We note the 𝐻𝑉𝑢𝑛𝑖as the hypervolume of the uniform set and
+𝐻𝑉𝐴𝑃𝑟𝑒𝑄𝐸𝐿as the hypervolume associated with our APreQEL solu-
+tions, we define the gain as follows: 𝐻𝑉𝑔𝑎𝑖𝑛=
+𝐻𝑉𝐴𝑃𝑟𝑒𝑄𝐸𝐿−𝐻𝑉𝑢𝑛𝑖
+𝐻𝑉𝑢𝑛𝑖
+4.1.3
+Hardware setup. We used the Jetson Orin-AGX embedded
+board, a 12-core Arm® v8.2 CPU, NVIDIA Ampere GPU architec-
+ture, and 64 GB LPDDR5 memory.
+4.2
+Discussion
+We first discuss how APreQEL performs better than uniform quan-
+tization. Then, we evaluate how APreQEL generated models are
+effectively driven by users’ predefined weights. Finally, we explore
+the effective choice made by APreQEL in terms of hybrid quantiza-
+tion levels.
+APreQEL Vs uniform Trade-offs: To explore how APreQEL
+provides superior trade-offs, we compared the HV of the 28 mod-
+els produced over the different weight configurations mentioned
+above (Section 4.1.1), with the uniform quantization baseline set
+across the three evaluation metrics. As usually done in multi-objective
+optimization, the HV values were computed5 with respect to the
+worst metric values observed under the uniform quantization base-
+line, which served as the reference point.
+Model
+𝐻𝑉𝑢𝑛𝑖
+𝐻𝑉𝐴𝑃𝑟𝑒𝑄𝐸𝐿
+𝐻𝑉𝑔𝑎𝑖𝑛
+Llama3.1
+0.681
+0.738
+8.43%
+Phi3.5
+0.247
+0.270
+9.07%
+Qwen3-4B
+0.163
+0.178
+9.31%
+Table 1: Comparison of Uniform and Our Method with HV
+gains for Llama3.1, Phi3.5 and Qwen3-4B
+Table 1 reports the HV values for Llama3.1, Phi3.5, and Qwen3-
+4B for the uniform quantization baseline set 𝐻𝑉𝑢𝑛𝑖and the APreQEL
+resulting models set 𝐻𝑉𝐴𝑃𝑟𝑒𝑄𝐸𝐿.
+APreQEL yields an 𝐻𝑉𝑔𝑎𝑖𝑛of (8.43%), (9.07%), and (9.31%) for the
+Llama3.1, Phi3.5, and Qwen3-4B models, respectively. Note that
+adding more configurations to APreQEL could further improve
+the hypervolume. These improvements show that applying mixed
+quantization with respect to user-defined QoS priorities uncovers
+new trade-offs that uniform quantization types cannot provide.
+A higher HV, as obtained by APreQEL, reflects two aspects:
+(i) more solutions extend the Pareto front outward, meaning that
+the solution pushes at least one of the three metrics toward a better
+value. (ii) solutions achieve broader coverage across the QoS metrics,
+capturing a wider variety of trade-offs as compared to uniform
+quantization types. APreQEL guaranties flexibility by offering a
+larger number of configurations and ensuring that every solution
+remains competitive (non-dominated) in at least one objective.
+Model
+Category
+Mem (GB)↓
+Lat (ms)↓
+PPL↓
+Phi3.5
+APreQEL-Fairness
+0.573
+1.952
+0.493
+APreQEL-Latency
+0.487
+0.413
+0.556
+APreQEL-Memory
+0.170
+36.705
+2.122
+APreQEL-Accuracy
+1.143
+14.130
+0.099
+Llama3.1
+APreQEL-Fairness
+1.897
+3.728
+0.348
+APreQEL-Latency
+1.255
+1.232
+0.416
+APreQEL-Memory
+0.385
+66.345
+1.163
+APreQEL-Accuracy
+3.298
+23.462
+0.052
+Qwen3-4B
+APreQEL-Fairness
+0.610
+2.270
+0.740
+APreQEL-Latency
+1.255
+0.520
+0.416
+APreQEL-Memory
+0.100
+51.070
+2.890
+APreQEL-Accuracy
+1.240
+23.070
+0.148
+Table 2: Category-average difference to best metrics (lower
+is better) for Phi-3.5, LLaMA-3.1, and Qwen-3-4B.
+APreQEL’s Robustness
+In this part, we investigate APreQEL’s ability to meet user QoS
+demands (fixed through weights). For instance, we want to ensure
+that if the user requests a model with a low memory footprint (with
+a weight higher than the others), the generated model effectively
+decreases this metric. To put it concisely, each model category
+should demonstrate the best results according to the emphasized
+metric. To do so, we have measured how far each category is from
+a given metric’s best model. Also, for a given QoS metric, the best
+model should be one of the categories dedicated to that metric (that
+5emoa R package https://cran.r-project.org/web/packages/emoa/index.html
+is, the best model for latency should be a model for which the user
+has given a higher weight for that metric). The latter condition was
+satisfied in all our tests; that is, the best model for each QoS metric
+was one for which a high weight was given.
+Table 2 reports the difference between each APreQEL category’s
+average and the best value of the corresponding QoS metric for
+Phi3.5, Llama3.1 and Qwen3-4B models. APreQEL-Memory achieves
+the closest results to the minimal memory footprint, with small
+differences (in green) of 0.17 (Phi-3.5), 0.385 (Llama-3.1), and 0.1
+(Qwen3-4B). Similarly, APreQEL-Latency and APreQEL-Accuracy
+excel at minimizing the differences to best latency and best per-
+plexity, respectively, for the three evaluated models. We also note
+that, while APreQEL-Memory effectively reduces memory use, it
+exhibits higher perplexity, whereas APreQEL-Fairness maintains
+a more balanced trade-off across the three QoS metrics and never
+yields the worst deviation for any metric.
+Moreover, APreQEL may use solely one quantization type for
+all layers to achieve the exact minimal value for the prioritized
+metric or combine multiple quantization types to balance several
+QoS objectives, depending on how the metrics are weighted.
+These findings demonstrate APreQEL’s robustness in meeting
+specific QoS goals and generalizing across different model archi-
+tectures. This behavior fits the needs of edge deployment, since
+operational stability depends on selecting the configuration that
+meets the practical requirements; shrinking the memory footprint
+for resource-limited devices, reducing latency for real-time applica-
+tions, focusing on accuracy for critical tasks, or achieving a balanced
+QoS over the system.
+Figure 5: Average bit-width for APreQEL-categories for the
+three models
+APreQEL’s adaptibility In this part, we evaluate how APreQEL
+adapts the distribution of quantization types in response to different
+QoS priorities and model architectures. To capture this, we report,
+in Figure 5, the average bit-width of the models produced for the
+APreQEL categories, across the three models’ architectures, along
+with the variability of these bit-widths within each category. The
+dashed red markers identify the fixed bit-widths of the uniform
+quantization baselines (q3_K,..,q8_0).
+We note that the effective bit-widths used by the uniform quanti-
+zation exceed the nominal precision. This is because the parameters
+of the model are partitioned into groups, and each group is quan-
+tized with a scaling factor. This is why, for example, the q3_K
+quantization has a bit-width of 3.44 instead of 3.
+APreQEL is not constrained to a fixed bit-width; depending on
+the weight configuration, it can result in a uniform assignment or
+generate mixed-precision that allocates different quantization types
+to layers. This flexibility enables finer control over quantization
+behavior. Across all three models, the configurations line up in a con-
+sistent pattern: APreQEL-Memory settings always attribute the low-
+est bit-widths, between 3 and 4-bit precisions; APreQEL-Accuracy
+uses higher precision to preserve model quality, while APreQEL-
+Latency assigns 4-bit precision to most layers, as it performs best
+on latency among the three models (see Fig1). APReQEL-Fairness
+produces a moderate bit-width pattern, aiming to balance the com-
+peting objectives. The exact magnitudes and spreads, however, vary
+by model, indicating that each model architecture translates these
+optimization priorities into distinct distributions.
+For example, under the weight setting (0.7, 0.1, 0.1), which places
+the highest emphasis on memory, APreQEL assigns 72.2% of Qwen3-
+4B’s 72 layers to q3_K and 27.7% to q4_K. In contrast, for Phi-3.5 (64
+layers), 39% of layers are mapped to q3_K and 60.9% to q4_K, while
+for Llama-3.1 (64 layers), 42.18% are assigned to q3_K and 57.8% to
+q4_K, showing that the mixed-precision pattern is not constant but
+model-dependent.
+Indeed, APReQEL explicitly accounts for the model-specific
+differences in QoS behavior across uniform quantization types
+(overview (Fig3.(2.a)), allowing it to enable a systematic way to ob-
+tain, under weighting configuration, the best distribution of quanti-
+zation types across different models. To the best of our knowledge,
+this aspect has not been studied in any prior work. Consequently,
+APreQEL adapts the quantization types not only to the chosen op-
+timization priorities but also to the characteristics of each model
+architecture.
+5
+Conclusion and Perspectives
+In conclusion, we introduced APreQEL, a novel framework that
+leverages mixed quantization to enable efficient LLM inference on
+resource-constrained edge devices by uncovering a large set of
+configurations optimized according to three QoS metrics; latency,
+memory footprint and accuracy. APreQEL systematically assigns
+the most suitable quantization types to the appropriate layers un-
+der user-defined prioritization. This design makes it robust and
+adaptable to fluctuating edge environments.
+For future work, we intend to extend APreQEL to include other
+metrics (e.g., energy, carbon footprint), support different hardware
+(e.g., TPUs, NPUs), and mix quantization types from different li-
+braries, provided they are compatible, as quantization algorithms
+often vary and may exhibit distinct trade-off.
+References
+[1] Subrata Chakraborty. 2022. TOPSIS and Modified TOPSIS: A comparative analysis.
+Decision Analytics Journal 2 (2022), 100021.
+[2] Yuxuan Chen, Guangsheng Ou, Mingwei Liu, Yanlin Wang, and Zibin Zheng.
+2024. Are Decoder-Only Large Language Models the Silver Bullet for Code
+Search? arXiv preprint arXiv:2410.22240 (2024).
+[3] İbrahım Demır, Fatma Corut Ergın, and Berna Kıraz. 2019. A New Model for the
+Multi-Objective Multiple Allocation Hub Network Design and Routing Problem.
+IEEE Access 7 (2019), 90678–90689. doi:10.1109/ACCESS.2019.2927418
+[4] Razvan-Gabriel Dumitru, Vikas Yadav, Rishabh Maheshwary, Paul Ioan Clotan,
+Sathwik Tejaswi Madhusudhan, and Mihai Surdeanu. 2025. Variable Layerwise
+Quantization: A Simple and Effective Approach to Quantize LLMs. In Findings of
+the Association for Computational Linguistics: ACL 2025, Wanxiang Che, Joyce
+Nabende, Ekaterina Shutova, and Mohammad Taher Pilehvar (Eds.). Association
+for Computational Linguistics, Vienna, Austria, 534–550. doi:10.18653/v1/2025.
+findings-acl.29
+[5] Kazuki Egashira, Robin Staab, Mark Vero, Jingxuan He, and Martin Vechev.
+2025. Mind the Gap: A Practical Attack on GGUF Quantization. In Forty-second
+International Conference on Machine Learning. https://openreview.net/forum?
+id=TV17MLZGuA
+[6] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. 2022. Gptq:
+Accurate post-training quantization for generative pre-trained transformers.
+arXiv preprint arXiv:2210.17323 (2022).
+[7] Andreia P. Guerreiro, Carlos M. Fonseca, and Luís Paquete. 2021. The Hypervol-
+ume Indicator: Computational Problems and Algorithms. ACM Comput. Surv. 54,
+6, Article 119 (July 2021), 42 pages. doi:10.1145/3453474
+[8] Renren Jin, Jiangcun Du, Wuwei Huang, Wei Liu, Jian Luan, Bin Wang, and Deyi
+Xiong. 2024. A comprehensive evaluation of quantization strategies for large
+language models. In Findings of the Association for Computational Linguistics ACL
+2024. 12186–12215.
+[9] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen
+Wang, Guangxuan Xiao, Xingyu Dang, Chuang Gan, and Song Han. 2024. Awq:
+Activation-aware weight quantization for on-device llm compression and accel-
+eration. Proceedings of machine learning and systems 6 (2024), 87–100.
+[10] Xin Men, Mingyu Xu, Qingyu Zhang, Qianhao Yuan, Bingning Wang, Hongyu
+Lin, Yaojie Lu, Xianpei Han, and Weipeng Chen. 2025. ShortGPT: Layers in
+Large Language Models are More Redundant Than You Expect. In Findings of
+the Association for Computational Linguistics: ACL 2025, Wanxiang Che, Joyce
+Nabende, Ekaterina Shutova, and Mohammad Taher Pilehvar (Eds.). Association
+for Computational Linguistics, Vienna, Austria, 20192–20204. doi:10.18653/v1/
+2025.findings-acl.1035
+[11] Rui Wang, Zhiyong Gao, Liuyang Zhang, Shuaibing Yue, and Ziyi Gao. 2025.
+Empowering large language models to edge intelligence: A survey of edge
+efficient LLMs and techniques.
+Computer Science Review 57 (2025), 100755.
+doi:10.1016/j.cosrev.2025.100755
+[12] Jason Wei, Yi Tay, Rishi Bommasani, Colin Raffel, Barret Zoph, Sebastian
+Borgeaud, Dani Yogatama, Maarten Bosma, Denny Zhou, Donald Metzler, et al.
+2022. Emergent abilities of large language models. arXiv preprint arXiv:2206.07682
+(2022).
+[13] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song
+Han. 2023. SmoothQuant: Accurate and Efficient Post-Training Quantization for
+Large Language Models. In Proceedings of the 40th International Conference on
+Machine Learning (Proceedings of Machine Learning Research, Vol. 202), Andreas
+Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato,
+and Jonathan Scarlett (Eds.). PMLR, 38087–38099. https://proceedings.mlr.press/
+v202/xiao23c.html
+[14] Zhongzhi Yu, Zheng Wang, Yuhan Li, Ruijie Gao, Xiaoya Zhou, Sreenidhi Reddy
+Bommu, Yang (Katie) Zhao, and Yingyan (Celine) Lin. 2024. EDGE-LLM: En-
+abling Efficient Large Language Model Adaptation on Edge Devices via Unified
+Compression and Adaptive Layer Voting. In Proceedings of the 61st ACM/IEEE
+Design Automation Conference (San Francisco, CA, USA) (DAC ’24). Associ-
+ation for Computing Machinery, New York, NY, USA, Article 327, 6 pages.
+doi:10.1145/3649329.3658473

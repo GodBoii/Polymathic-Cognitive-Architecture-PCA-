@@ -1,0 +1,1950 @@
+WRITEBACK-RAG: Training the Knowledge Base through Evidence
+Distillation and Write-Back Enrichment
+Yuxing Lu♠♡, Xukai Zhao♣, Wei Wu♠, Jinzhuo Wang *♠
+♠Peking University
+♡Georgia Institute of Technology
+♣Tsinghua University
+Abstract
+The knowledge base in a retrieval-augmented
+generation (RAG) system is typically assem-
+bled once and never revised, even though the
+facts a query requires are often fragmented
+across documents and buried in irrelevant con-
+tent. We argue that the knowledge base should
+be treated as a trainable component and pro-
+pose WRITEBACK-RAG, a framework that
+uses labeled examples to identify where re-
+trieval succeeds, isolate the relevant documents,
+and distill them into compact knowledge units
+that are indexed alongside the original corpus.
+Because the method modifies only the corpus,
+it can be applied once as an offline preprocess-
+ing step and combined with any RAG pipeline.
+Across four RAG methods, six benchmarks,
+and two LLM backbones, WRITEBACK-RAG
+improves every evaluated setting, with gains av-
+eraging +2.14%. Cross-method transfer experi-
+ments further show that the distilled knowledge
+benefits RAG pipelines other than the one used
+to produce it, confirming that the improvement
+resides in the corpus itself.
+1
+Introduction
+Retrieval-augmented generation (RAG) systems
+consist of three core components: a retriever, a
+generator, and a knowledge base (KB) (Hu and Lu,
+2024; Fan et al., 2024). Modern RAG research has
+devoted substantial effort to optimizing the first
+two: training better retrievers (Shi et al., 2024),
+teaching generators when and how to use retrieved
+evidence (Asai et al., 2023; Jiang et al., 2023b),
+and designing tighter retriever-generator integra-
+tion (Izacard et al., 2023). The knowledge base,
+by contrast, is treated as a fixed input: assembled
+once from raw document collections like Wikipedia
+dumps, textbooks, or web crawls, and never up-
+dated in response to downstream task signals.
+Knowledge bases are composed of raw docu-
+ments, so the granularity at which knowledge is
+* Corresponding author.
+✘
+✔
+Standard RAG
+Generator
+Gate
+Distill
+Write-Back
+KB Training
+WriteBack-RAG
+Q
++
+Generator
+Q
+Figure 1: Standard RAG retrieves fragmented evidence
+from raw documents. WRITEBACK-RAG distills use-
+ful evidence into compact write-back documents that
+improve future retrieval and generation.
+stored is dictated by document boundaries. How-
+ever, the knowledge a query requires rarely aligns
+with these boundaries: the relevant facts are typi-
+cally distributed across multiple documents (frag-
+mentation), while each document contains substan-
+tial content irrelevant to the query (noise). As a
+result, the retriever surfaces partially relevant doc-
+uments, but the context the generator receives is
+both incomplete and diluted. By observing how a
+RAG system interacts with the corpus on labeled
+data, which samples benefit from retrieval, and
+which documents contribute to the generation, we
+can identify where knowledge is fragmented and
+should be rewritten and fused. This provides a
+natural supervision signal for optimizing the KB.
+This observation motivates a new concept we
+call knowledge base training: optimizing the KB
+itself using supervision from labeled examples,
+analogous to how model parameters are updated
+through training data (Appendix A). We instantiate
+this idea in WRITEBACK-RAG, a framework that
+learns from retrieval patterns on training data to
+improve the knowledge base. Concretely, a two-
+stage gating mechanism analyzes retrieval behavior
+to identify which training samples benefit from re-
+trieval and which retrieved documents contribute
+1
+arXiv:2603.25737v1  [cs.AI]  26 Mar 2026
+to better generation. An LLM-based distiller then
+fuses and compresses the selected evidence into
+compact, self-contained knowledge units that are
+permanently indexed alongside the original cor-
+pus. Because WRITEBACK-RAG augments only
+the KB, not the retriever or generator, it enhances
+any RAG pipeline as an orthogonal optimization
+step, with a one-time offline cost and no additional
+inference-time overhead.
+Our contributions are:
+1. We propose treating the knowledge base as a
+trainable component of RAG systems and in-
+troduce WRITEBACK-RAG, a framework that
+learns from retrieval patterns on labeled data
+to restructure and enrich the KB through gated
+evidence distillation and persistent write-back.
+2. We provide extensive empirical validation
+across four RAG methods (Naive Retrieval, Re-
+Plug, Self-RAG, Flare), six benchmarks (NQ,
+BoolQ, FEVER, zsRE, HotpotQA, SQuAD),
+and two LLM backbones (Llama-3.1-8B,
+Gemma-3-12B), showing consistent improve-
+ments in all settings.
+3. We present detailed analyses of write-back
+knowledge properties, including compression
+statistics, retrieval dynamics, and generalization
+behavior, providing insight into when and why
+WRITEBACK-RAG improves performance.
+2
+Related Works
+Retrieval and Generation Strategies.
+The stan-
+dard RAG pipeline retrieves top-K documents and
+conditions generation on them (Lu et al., 2025;
+Guu et al., 2020; Borgeaud et al., 2022). A large
+body of work has improved this pipeline from
+both sides. On the retrieval side, REPLUG (Shi
+et al., 2024) ensembles generation probabilities
+over documents for better passage weighting, and
+HyDE (Gao et al., 2023) generates hypothetical
+documents to improve query representations. On
+the generation side, SELF-RAG (Asai et al., 2023)
+introduces reflection tokens for adaptive retrieval
+decisions, FLARE (Jiang et al., 2023b) triggers re-
+trieval when generation confidence drops, and At-
+las (Izacard et al., 2023) jointly trains the retriever
+and generator. These methods share a common
+assumption: the knowledge base is a fixed input.
+They optimize how to search it and how to consume
+its outputs, but the content and organization of the
+KB itself is never modified. WRITEBACK-RAG
+addresses this independent dimension.
+Improving Retrieved Context at Inference Time.
+A separate line of work aims to improve the
+quality of the context the generator sees, rather
+than the retrieval or generation mechanism. RE-
+COMP (Xu et al., 2023) trains extractive and ab-
+stractive compressors to shorten retrieved docu-
+ments. FILCO (Wang et al., 2023) learns to select
+useful spans within documents. LLMLingua (Jiang
+et al., 2023a) uses perplexity-based token pruning
+to compress prompts. GenRead (Yu et al., 2022)
+bypasses retrieval entirely, prompting the LLM to
+generate its own context. RAGate (Wang et al.,
+2025) gates external retrieval according to whether
+the required knowledge is already available within
+the model. All of these operate per query at infer-
+ence time: they produce ephemeral, compressed or
+generated context that is consumed once and dis-
+carded. This means the cost scales linearly with the
+number of test queries, and knowledge gained from
+one query never benefits another. WRITEBACK-
+RAG inverts this paradigm: it distills and fuses
+evidence once during an offline phase, producing
+persistent knowledge units that benefit all future
+queries at zero inference-time cost.
+Knowledge Base Optimization.
+The idea of di-
+rectly modifying the knowledge source to improve
+downstream performance has been explored in
+two distinct settings, neither of which addresses
+the RAG corpus. In traditional NLP, knowledge
+base construction methods extract structured triples
+from text (Dong et al., 2015; Martinez-Rodriguez
+et al., 2018), but these produce symbolic KBs rather
+than retrieval-ready documents. In the model edit-
+ing literature, methods like ROME (Meng et al.,
+2022a) and MEMIT (Meng et al., 2022b) update
+factual associations by modifying model parame-
+ters, effectively “editing the KB” that lives inside
+the network weights. However, these parametric
+edits are brittle at scale and entangled with the
+model’s other capabilities. WRITEBACK-RAG
+pursues a non-parametric alternative: rather than
+editing model weights, it edits the external corpus
+that the model retrieves from. This is more modu-
+lar (the enriched KB works with any retriever and
+generator), more interpretable (write-back units are
+readable text), and more scalable (adding docu-
+ments does not risk degrading the model). To our
+knowledge, WRITEBACK-RAG is the first frame-
+work to treat the RAG knowledge base as a train-
+able component that is systematically optimized
+using downstream task signals.
+2
+Training Phase
+Test Phase
+Generator
+Knowledge Base
+Labeled Dataset
+Stage ①
+Retriever
+Retriever
+Generator
+    docs 
+from KB
+Yes
+    docs 
+from KB
+correct
+answer
+No-retrieval
+Utility Gate
+<
+Stage ②
+Document Gate
+Stage ③
+>
+Generator
+…
+Distillation
+LLM Distiller
+Index separately
+Which documents contribute?
+Compress and fuse
+Does retrieval help this sample?
+Write-Back
+Score with
+metrics
+-
+>
+>
+Retriever and Generator are 
+unchanged, only augment KB
+Compatiable with any 
+RAG method, no 
+additional overhead
+✔
+✔
+✔
+✘
+>
+✔
+>
+✔
+=
+✘
+Dtrain
+Dtest
+Dtest
+Stage ④
+Figure 2: The WRITEBACK-RAG pipeline. During training (top), a two-stage gating mechanism identifies
+examples where retrieval helps and selects contributing documents. An LLM distiller fuses the selected evidence
+into a compact knowledge unit, which is indexed into a separate write-back corpus. During testing (bottom), the
+retriever searches combined knowledge source with no changes to the retriever or generator.
+3
+Problem Formulation
+A RAG system consists of three components: a
+retriever R, a generator G, and a knowledge base
+K = {d1, d2, . . . , d∣K∣} containing ∣K∣documents.
+Given a query q, the retriever returns a set of top-K
+documents:
+Dq = R(q, K) = {d(1), d(2), . . . , d(K)}
+(1)
+and the generator produces an answer conditioned
+on both the query and retrieved documents:
+ˆa = G(q, Dq)
+(2)
+The quality of the answer is measured by a task-
+specific metric M(q, a ∣G, Dq), where a is the
+reference answer.
+Existing work optimizes R and G while treating
+K as fixed. We instead propose to optimize K while
+keeping R and G unchanged. Given a set of labeled
+training examples Dtrain = {(qi, ai)}N
+i=1, the KB
+training objective is to find a write-back corpus
+Kwb such that the augmented KB K′ = K ∪Kwb
+maximizes downstream performance:
+K
+∗
+wb = arg max
+Kwb
+∑
+Dtest
+M(q, a ∣G, R(q, K ∪Kwb))
+(3)
+At test time, retrieval operates over the combined
+index:
+D
+′
+q = R(q, K
+′) = Top-K(R(q, K) ∪R(q, Kwb))
+(4)
+4
+Methods
+4.1
+Overview
+WRITEBACK-RAG instantiates the KB training
+objective (Eq. 3) by learning from how a RAG
+system interacts with the corpus on labeled data.
+The key insight is that retrieval patterns on train-
+ing examples reveal where the KB’s knowledge
+organization is deficient, where relevant facts are
+fragmented across documents or buried in noise,
+and this signal can be used to systematically re-
+structure the KB.
+As shown in Figure 2, WRITEBACK-RAG oper-
+ates in two phases. During the training phase, a
+two-stage gating mechanism first selects training
+examples where retrieval genuinely helps (utility
+gate, §4.2) and then identifies which retrieved doc-
+uments carry useful knowledge (document gate,
+§4.3). The selected evidence is fused and com-
+pressed into a single knowledge unit via LLM-
+based distillation (§4.4) and indexed into a sep-
+arate write-back corpus (§4.5). During the test
+3
+Algorithm 1 WRITEBACK-RAG KB Training
+Require: Dtrain, R, G, K, M, τδ, τs, τdoc
+Ensure: Trained KB K′ = K ∪Kwb
+1: Kwb ←∅
+2: for each (qi, ai) ∈Dtrain do
+3:
+snr
+i ←M(qi, ai ∣G)
+4:
+Di ←R(qi, K); s
+rag
+i
+←M(qi, ai ∣G, Di)
+5:
+δi ←s
+rag
+i
+−snr
+i
+6:
+if δi > τδ and s
+rag
+i
+> τs then
+7:
+// Utility Gate passed
+8:
+D∗
+i ←∅
+9:
+for each dj ∈Di do
+10:
+si,j ←M(qi, ai ∣G, dj)
+11:
+if si,j −snr
+i > τdoc then
+12:
+D∗
+i ←D∗
+i ∪{dj} // Document Gate
+13:
+end if
+14:
+end for
+15:
+if D∗
+i = ∅then
+16:
+D∗
+i ←Top-nmin(Di)
+17:
+end if
+18:
+ki ←F(qi, D∗
+i ) // Distillation
+19:
+Kwb ←Kwb ∪{ki} // Write-Back
+20:
+end if
+21: end for
+22: Index Kwb; set K′ ←K ∪Kwb
+phase, the retriever searches the combined knowl-
+edge source K′ = K ∪Kwb with no changes to the
+retriever or generator. The full pipeline is given in
+Algorithm 1.
+Both gating stages rely on two reference scores
+computed for each training example (qi, ai). The
+no-retrieval score measures what the generator can
+answer from parametric knowledge alone:
+snr
+i = M(qi, ai ∣G)
+(5)
+The RAG score measures performance with re-
+trieval from the original KB:
+srag
+i
+= M(qi, ai ∣G, R(qi, K))
+(6)
+The gap δi = s
+rag
+i
+−snr
+i quantifies the retrieval bene-
+fit for each example and drives all gating decisions.
+The backbone RAG method (e.g., Naive Retrieval,
+RePlug, Self-RAG, FLARE) is used consistently
+for computing these scores, for distillation, and for
+final evaluation. WRITEBACK-RAG is an orthog-
+onal optimization step that works on top of any
+backbone without modifying it.
+4.2
+Utility Gate
+The utility gate operates at the sample level, select-
+ing training examples where retrieved knowledge
+makes a genuine difference. If the generator can
+already answer correctly without retrieval, or if re-
+trieval does not improve the answer, there is no
+useful signal for KB training.
+WRITEBACK-RAG retains a training example
+(qi, ai) if and only if:
+δi > τδ
+and
+srag
+i
+> τs
+(7)
+The margin threshold τδ ensures retrieval provides
+non-negligible improvement, and the quality thresh-
+old τs ensures the retrieval-augmented answer is
+actually correct. Their conjunction guards against
+two failure modes: high gain but low absolute qual-
+ity (retrieval improves a wrong answer to a slightly
+less wrong one), or high quality already achievable
+without retrieval. We denote the set of examples
+passing the utility gate as Dutil ⊆Dtrain.
+4.3
+Document Gate
+The document gate operates at the document level
+within each utility-approved example. Among the
+K retrieved documents, not all carry useful knowl-
+edge, some are noisy, tangential, or distracting. The
+document gate isolates the specific documents that
+contribute to the improved answer.
+For each retrieved document dj, WRITEBACK-
+RAG measures its standalone contribution:
+sdoc
+i,j = M(qi, ai ∣G, dj)
+(8)
+A document passes if it provides information be-
+yond the generator’s parametric knowledge:
+D
+∗
+i = {dj ∈Di ∣sdoc
+i,j −snr
+i > τdoc}
+(9)
+If no documents pass (D∗
+i = ∅), we retain the
+top-nmin by retrieval rank as a fallback. Removing
+weak evidence before distillation ensures the result-
+ing knowledge units are focused and more likely to
+generalize beyond the original training query.
+4.4
+Distillation
+Given a training query qi and its gated evidence
+D∗
+i , an LLM-based distiller F synthesizes a single
+knowledge unit:
+ki = F(qi, D
+∗
+i )
+(10)
+The distiller takes multiple gated documents as in-
+put and produces a single compact passage as out-
+put. Its core operation is fusion: merging correlated
+knowledge that is scattered across separate docu-
+ments, i.e., information that is related but separated
+by document boundaries in the original KB, into
+one coherent unit. At the same time, it compresses
+away redundant or tangential content within each
+source document, producing a denser passage. The
+4
+training query qi serves only as a locator that identi-
+fies which documents should be fused; the resulting
+knowledge unit is written in a topic-level, encyclo-
+pedic style so that it can be retrieved by diverse
+future queries, not just the original one (full prompt
+in Appendix G). The goal is that a single distilled
+unit is at least as useful as the full multi-document
+evidence it was derived from:
+M(q, a ∣G, ki) ≥M(q, a ∣G, D
+∗
+i )
+(11)
+4.5
+Write-Back
+The distilled knowledge units are collected into a
+separate write-back corpus:
+Kwb = {ki ∣(qi, ai) ∈Dutil}
+(12)
+A retrieval index is built for Kwb using the same
+retriever encoder. At inference time, the retriever
+searches K and Kwb independently and merges the
+results into a single top-K set (Eq. 4). The trained
+knowledge base is K′ = K ∪Kwb.
+We store write-back knowledge in a separate in-
+dex rather than merging it into the original KB for
+three reasons: (1) the original corpus is kept clean
+and unmodified, avoiding any risk of corrupting
+existing retrieval quality; (2) the write-back index
+can be updated, replaced, or rolled back indepen-
+dently without rebuilding the base index; and (3) it
+introduces no additional storage overhead beyond
+the distilled documents themselves.
+Because WRITEBACK-RAG augments only the
+KB, not the retriever or generator, it enhances any
+RAG pipeline as an orthogonal optimization step
+(see Appendix C for a detailed discussion).
+5
+Experiments
+5.1
+Datasets
+We evaluate on six benchmarks from the FlashRAG
+collection (Jin et al., 2025): Natural Questions
+(NQ) (Kwiatkowski et al., 2019), BoolQ (Clark
+et al., 2019), FEVER (Thorne et al., 2018),
+zsRE (Levy et al., 2017), HotpotQA (Yang et al.,
+2018), and SQuAD (Rajpurkar et al., 2016). We
+use the preprocessed benchmark releases provided
+by FlashRAG (Jin et al., 2025) and adopt the
+FlashRAG-provided Wikipedia corpus as the exter-
+nal knowledge source for retrieval.
+These datasets cover a diverse set of knowledge-
+intensive tasks. NQ evaluates open-domain ques-
+tion answering over Wikipedia; BoolQ evaluates
+naturally occurring yes/no question answering;
+Dataset
+Task
+Metric
+Train
+Test
+NQ
+Open-domain QA
+Acc
+79,168
+3,610
+BoolQ
+Yes/No QA
+Acc
+9,427
+3,270
+FEVER
+Fact verification
+F1
+104,966 10,444
+zsRE
+Slot filling
+Acc
+147,909
+3,724
+HotpotQA Multi-hop QA
+Acc
+90,447
+7,405
+SQuAD
+Extractive QA
+EM
+87,599
+10,570
+Table 1: Main evaluation datasets. Detailed descriptions
+and split statistics are given in Appendix Table 5.
+FEVER evaluates evidence-based fact verification;
+zsRE evaluates slot filling / relation extraction for-
+mulated as question answering; HotpotQA eval-
+uates multi-hop question answering that requires
+aggregating evidence across multiple documents;
+and SQuAD evaluates extractive question answer-
+ing. Table 1 summarizes the datasets and evaluation
+metrics used in the main paper, while Appendix Ta-
+ble 5 provides detailed task descriptions and split
+statistics. Following our evaluation setup, we report
+Accuracy on NQ, BoolQ, zsRE, and HotpotQA; F1
+on FEVER, and Exact Match (EM) on SQuAD.
+5.2
+Implementation Details
+We use E5-base-v2 (Wang et al., 2022) as the re-
+triever with K=5 documents; the same encoder
+is used to index both K and Kwb.
+The same
+LLM (Llama-3.1-8B (Grattafiori et al., 2024) and
+Gemma-3-12B (Team et al., 2024)) serves as both
+the generator G and the distiller F; the distiller
+operates only during the training phase with a task-
+specific prompt (Appendix G).
+For gating, we set τs = 0.1 and τδ = 0.01 (any
+strict improvement suffices, i.e., δi > 0). The docu-
+ment gate uses τdoc = 0.01 with nmin = 2 fallback
+documents. Threshold sensitivity is analyzed in
+Section 6.5. Notably, the distiller does not receive
+the gold answer, so there is no direct answer leak-
+age into the write-back corpus (Appendix B). Kwb
+is stored as a separate FAISS index (Douze et al.,
+2025); at inference time, both indices are searched
+independently and results are merged into a sin-
+gle top-K set. Full hyperparameters are given in
+Appendix Table 6.
+The training phase has three cost components:
+baseline scoring (2N generator calls), document
+gating (up to ∣Dutil∣× K calls), and distillation
+(∣Dutil∣calls). For NQ (N=79,168, ∣Dutil∣=12,295,
+K=5), this totals approximately 220K generator
+calls, completing in 0.5 hours on two H200 GPUs.
+This is a one-time offline cost; at inference time,
+write-back adds zero overhead beyond a marginally
+5
+Table 2: Main results across six benchmarks, four RAG methods, and two LLMs. +WB denotes WRITEBACK-RAG
+using write-back RAG. Numbers in parentheses show absolute gains over the corresponding retrieval baseline.
+LLM
+Method
+NQ
+BoolQ
+FEVER
+zsRE
+Hotpot
+SQuAD
+Acc
+Acc
+F1
+Acc
+Acc
+EM
+Gemma-3-12B
+No Retrieval
+30.61
+63.39
+34.24
+17.29
+24.28
+54.36
+Naive RAG
+31.44
+80.85
+32.77
+22.34
+41.13
+60.89
++ WB
+34.82 (+3.38)
+83.12 (+2.27)
+37.89 (+5.12)
+22.82 (+0.48)
+41.99 (+0.86)
+61.24 (+0.35)
+RePlug
+31.39
+80.92
+32.73
+22.34
+41.13
+60.25
++ WB
+34.63 (+3.24)
+83.52 (+2.60)
+37.92 (+5.19)
+22.77 (+0.43)
+41.97 (+0.84)
+61.39 (+1.14)
+Self-RAG
+34.77
+77.25
+29.61
+19.68
+27.49
+61.73
++ WB
+36.53 (+1.76)
+79.81 (+2.56)
+32.08 (+2.47)
+20.03 (+0.35)
+28.73 (+1.24)
+63.22 (+1.49)
+FLARE
+38.50
+84.22
+46.25
+21.18
+29.82
+60.55
++ WB
+41.23 (+2.73)
+84.73 (+0.51)
+51.31 (+5.06)
+21.64 (+0.46)
+30.18 (+0.36)
+61.78 (+1.23)
+Llama-3.1-8B
+No Retrieval
+29.17
+64.82
+33.13
+16.43
+23.90
+55.18
+Naive RAG
+32.15
+82.43
+34.08
+21.80
+42.33
+62.14
++ WB
+35.84 (+3.69)
+84.95 (+2.52)
+39.89 (+5.81)
+22.49 (+0.69)
+43.56 (+1.23)
+63.23 (+1.09)
+RePlug
+31.92
+82.51
+33.96
+21.78
+42.12
+61.83
++ WB
+35.53 (+3.61)
+85.45 (+2.94)
+39.60 (+5.64)
+22.37 (+0.59)
+43.12 (+1.00)
+63.42 (+1.59)
+Self-RAG
+35.18
+79.20
+31.45
+19.94
+29.33
+63.58
++ WB
+37.48 (+2.30)
+82.13 (+2.93)
+34.77 (+3.32)
+20.69 (+0.75)
+31.04 (+1.71)
+65.45 (+1.87)
+FLARE
+39.42
+85.61
+48.18
+21.50
+31.25
+62.29
++ WB
+42.83 (+3.41)
+86.45 (+0.84)
+53.90 (+5.72)
+22.27 (+0.77)
+32.12 (+0.87)
+64.16 (+1.87)
+larger retrieval index.
+6
+Results
+We organize the analysis around five research ques-
+tions: whether KB training improves downstream
+accuracy (RQ1), what the write-back corpus looks
+like in practice (RQ2), where the retained evidence
+sits in the retrieval ranking (RQ3), whether write-
+back knowledge transfers across RAG methods
+(RQ4), and how sensitive the pipeline is to its main
+hyperparameters (RQ5).
+6.1
+RQ1: Overall Performance
+Table 2 reports results for all 48 settings (4 RAG
+methods × 6 datasets × 2 LLMs). WRITEBACK-
+RAG shows improvement on every single setting,
+with an average gain of +2.14% (Prompts and Ex-
+amples can be found in Appendix G and H). The
+effect is not driven by any particular backbone or
+model scale: averaged over datasets and LLMs,
+Naive RAG gains +2.29%, RePlug +2.40%, Self-
+RAG +1.90%, and FLARE +1.99%; averaged over
+methods and datasets, Gemma-3-12B gains +1.92%
+and Llama-3.1-8B gains +2.36%.
+The size of the improvement varies across tasks
+in a way that aligns with the nature of the knowl-
+edge demand. FEVER (+4.79%) and NQ (+3.01%)
+benefit most, as both require locating specific
+factual evidence that is often scattered across
+Wikipedia passages, exactly the scenario where fus-
+ing and compressing evidence should help. BoolQ
+(+2.15%) also sees clear gains despite its short-
+answer format. Improvements on zsRE (+0.56%),
+HotpotQA (+1.01%), and SQuAD (+1.33%) are
+smaller but uniformly positive. We note that even
+the smallest gains are achieved at zero inference-
+time cost: the only change is a slightly larger re-
+trieval index.
+Two observations deserve emphasis. First, the
+gains on Self-RAG and FLARE show that KB train-
+ing is complementary to adaptive retrieval strate-
+gies, not redundant with them, these methods al-
+ready decide when and whether to retrieve, yet still
+benefit from a better-organized corpus. Second,
+write-back helps even when retrieval itself hurts: on
+FEVER, Naive RAG (32.77%) underperforms the
+no-retrieval baseline (34.24%), yet adding write-
+back raises F1 to 37.89%, well above both. This
+suggests that distilled documents can partially com-
+pensate for noisy retrieval by placing more focused
+evidence within reach of the retriever.
+6.2
+RQ2: Selection and Compression
+Table 3 shows the write-back construction process
+under Gemma-3-12B + Naive RAG (we use Naive
+RAG as the reference setting throughout the analy-
+sis to isolate the effect of write-back from retrieval
+6
+Table 3: Training-time write-back construction statistics. Selected Rate is the fraction of training examples
+written back to the KB. Retained Docs is the average number of retained documents after document filtering.
+Source Tokens and Distilled Tokens denote the average source and distilled token counts for selected examples.
+Compression is computed as source tokens divided by distilled tokens. Fallback Rate is the fraction of selected
+examples for which no document passed the document gate and the top-nmin fallback was used.
+Dataset
+Selected Rate
+Retained Docs
+Source Tokens
+Distilled Tokens
+Compression
+Fallback Rate
+NQ
+14.0%
+1.77
+183.4
+87.0
+2.15×
+5.9%
+BoolQ
+6.3%
+2.79
+288.2
+92.7
+3.21×
+29.2%
+FEVER
+9.1%
+2.37
+243.0
+85.6
+2.88×
+13.5%
+zsRE
+11.6%
+2.11
+216.0
+71.6
+3.51×
+5.3%
+HotpotQA
+49.3%
+4.76
+489.2
+79.8
+6.79×
+1.2%
+SQuAD
+48.1%
+1.97
+203.2
+87.9
+2.55×
+96.2%
+strategy differences; see Appendix I).
+The utility gate selects vastly different fractions
+of training data depending on the task: only 6-14%
+for NQ, BoolQ, FEVER, and zsRE, but nearly half
+for HotpotQA (49.3%) and SQuAD (48.1%). The
+gap reflects how much each task depends on re-
+trieval beyond the model’s parametric knowledge.
+HotpotQA, by design, requires cross-document rea-
+soning that the generator cannot perform alone, so
+a large share of examples exhibit a positive retrieval
+benefit. SQuAD’s high selection rate has a differ-
+ent explanation: its fallback rate of 96.2% indicates
+that for extractive QA, where the answer typically
+resides in a single passage, individual documents
+rarely surpass the no-retrieval baseline on their own.
+In such cases the fallback mechanism ensures that
+distillation still receives a compact evidence bun-
+dle, and the downstream gains on SQuAD (+0.35%
+to +1.87% across settings) confirm that write-back
+remains effective even when the document gate
+defers to fallback.
+After document filtering, the evidence bundles
+are compact: roughly 2 documents on average for
+most tasks, and 4.76 for HotpotQA. The distiller
+compresses these bundles by 2.15-6.79×, produc-
+ing write-back units of 72-93 tokens. The strongest
+compression occurs on HotpotQA, where multi-
+document bundles averaging 489 tokens are re-
+duced to 80-token units. Appendix Figure 5 and
+Appendix F confirm this pattern: across all tasks,
+the majority of points fall below the identity line.
+The spread within each panel indicates that the
+distiller adapts its compression to the input length
+rather than producing fixed-length outputs.
+6.3
+RQ3: Evidence Rank Distribution
+To further understand how the document gate se-
+lects useful evidence, we analyze the retrieval-rank
+distribution of retained documents. Figure 3 shows,
+1
+2
+3
+4
+5
+0.0
+0.2
+0.4
+NQ
+1
+2
+3
+4
+5
+BoolQ
+1
+2
+3
+4
+5
+FEVER
+1
+2
+3
+4
+5
+0.0
+0.2
+0.4
+zsRE
+1
+2
+3
+4
+5
+HotpotQA
+1
+2
+3
+4
+5
+SQuAD
+Retrieval rank
+Fraction of retained documents
+Figure 3: Retrieval-rank distribution of retained docu-
+ments. Each panel shows the fraction of retained docu-
+ments among the retrieved documents.
+for each dataset, the fraction of retained documents
+originating from each rank among the top-5 re-
+trieved results. For NQ, BoolQ, FEVER, and zsRE,
+the distribution is clearly top-heavy: rank-1 and
+rank-2 documents account for the largest share,
+with a steady decline toward rank-5. This indicates
+that the retriever already places useful evidence
+near the top for these tasks; the document gate’s
+primary role is to filter out the lower-ranked noise
+rather than to rescue useful documents from deep
+in the list.
+HotpotQA and SQuAD illustrate two different
+non-standard patterns. HotpotQA is nearly flat
+across ranks 1 to 5, indicating that useful evidence
+is distributed broadly across the retrieved set rather
+than concentrated in the top few documents, which
+is consistent with its multi-hop nature, answering
+requires combining facts from multiple passages
+regardless of their retrieval score. SQuAD is al-
+most entirely concentrated on ranks 1 and 2, which
+directly reflects its high fallback rate (96.2%, Ta-
+ble 3): the fallback mechanism defaults to the top-
+nmin documents, so the rank profile here illustrates
+fallback behavior rather than document-gate selec-
+tivity.
+7
+Naive RAG
+RePlug RAG
+30
+32
+34
+36
++3.38
++3.24
++3.82
++3.49
+=+0.44
+=+0.25
+NQ
+Naive RAG
+RePlug RAG
+80
+81
+82
+83
+84
++2.26
++2.60
++2.38
++2.57
+=+0.12
+=-0.03
+BoolQ
+Evaluation method
+Accuracy (%)
+Same-WB
+Cross-WB
+No WB (retrieval-only)
+Figure 4: Cross-writeback robustness. Same-WB
+uses write-back knowledge from the same RAG method,
+while Cross-WB uses write-back knowledge from the
+other method. Numbers above the bars denote absolute
+gains over the No-WB baseline.
+6.4
+RQ4: Transfer and Reuse
+A key question is whether write-back knowledge
+is specific to the RAG method that produced it, or
+whether it behaves as a reusable improvement to
+the knowledge source itself. Figure 4 addresses
+this with a cross-writeback experiment between
+Naive RAG and RePlug. Same-WB evaluates a
+method using its own write-back corpus; Cross-
+WB evaluates it using the corpus distilled by the
+other method.
+Across all four evaluation settings, both Same-
+WB and Cross-WB outperform the corresponding
+no-write-back baseline. Same-WB yields gains of
++2.26% to +3.38%, while Cross-WB yields +2.38%
+to +3.82%. The gap between the two never exceeds
+0.44% in either direction, and in three of four cases
+Cross-WB is marginally better. If the distilled doc-
+uments were encoding artifacts of a specific de-
+coding policy rather than genuine improvements to
+the knowledge source, performance should degrade
+noticeably under cross-method reuse. Instead, the
+write-back corpus produced by one method is es-
+sentially interchangeable with that of another, indi-
+cating that WRITEBACK-RAG improves the cor-
+pus itself rather than fitting to a particular pipeline.
+6.5
+RQ5: Component Ablations
+Table 4 ablates three controls of the write-back
+pipeline on NQ (Naive RAG baseline: 31.44%
+Acc). Every write-back configuration outperforms
+this baseline, with gains ranging from +1.75 to
++3.45 points, so the method does not depend on
+precise hyperparameter tuning.
+The utility gate is the least sensitive: varying
+τs from 0 to 0.20 changes accuracy by only 0.16
+points (34.66%-34.82%), indicating that its role is
+simply to exclude clearly uninformative examples.
+Table 4: Ablation study on the utility gate threshold τs,
+document gate threshold τdoc, and fallback size nmin. †
+marks the default configuration in the main experiments.
+No-WB retrieval baseline on NQ: 31.44 Acc
+Utility gate τs
+0
+0.05
+0.10†
+0.15
+0.20
+NQ Acc
+34.78 34.76 34.82 34.71 34.66
+Document gate τdoc
+0
+0.01†
+0.03
+0.05
+0.10
+NQ Acc
+34.89 34.82 34.79 33.85 33.76
+Fallback nmin
+1
+2†
+3
+4
+5
+NQ Acc
+33.19 34.82 34.71 33.60 34.28
+The document gate has a larger effect. Light filter-
+ing performs best, τdoc=0 yields 34.89% and the
+default τdoc=0.01 yields 34.82%, but raising the
+threshold to 0.05 or 0.10 drops accuracy to 33.85
+and 33.76, suggesting that aggressive standalone
+contribution tests discard documents that are indi-
+vidually weak but become useful after fusion, con-
+sistent with the evidence patterns observed in RQ2
+and RQ3. The fallback size nmin has the strongest
+effect. A single fallback document (33.19%) is in-
+sufficient since one passage rarely provides enough
+material for a good rewrite. Performance peaks at
+the default nmin=2 (34.82%) and declines for both
+smaller and larger bundles, suggesting a trade-off
+between having enough material for distillation and
+avoiding the reintroduction of noise. Larger fall-
+back sizes also increase the offline distillation cost,
+as the distiller must process more source tokens per
+example, making nmin=2 a practical choice that
+balances accuracy and efficiency.
+7
+Conclusion
+We proposed WRITEBACK-RAG, a framework
+that treats the knowledge base as a trainable compo-
+nent of RAG systems. By observing which training
+examples benefit from retrieval and which docu-
+ments contribute, WRITEBACK-RAG distills scat-
+tered evidence into compact knowledge units that
+are indexed alongside the original corpus. The
+approach modifies only the KB and is therefore
+compatible with any retriever and generator. Exper-
+iments across four RAG methods, six benchmarks,
+and two LLM backbones show that write-back con-
+sistently improves downstream performance, with
+an average gain of +2.14%. Cross-method transfer
+experiments confirm that the distilled knowledge
+is a property of the corpus, not of the pipeline that
+produced it. These results establish WRITEBACK-
+RAG as a viable method for improving RAG, com-
+plementary to advances in retrieval and generation.
+8
+Limitations
+WRITEBACK-RAG has several limitations. It re-
+lies on labeled training examples, so its effective-
+ness in low-label or unsupervised settings remains
+unclear (though can be replaced by LLM-as-a-
+Judge). The quality of the auxiliary corpus also
+depends on the quality of the underlying LLM: un-
+supported abstractions or hallucinated details may
+be written back and later retrieved. In addition, our
+experiments are limited to public Wikipedia-based
+benchmarks, leaving domain transfer, multilingual
+settings, and continuously updated corpora for fu-
+ture work. Finally, WRITEBACK-RAG introduces
+a nontrivial offline cost and currently studies only
+additive write-back, without deletion, deduplica-
+tion, or contradiction resolution.
+Ethical Consideration
+Because
+WRITEBACK-RAG
+writes
+distilled
+knowledge back into a retrievable corpus, errors or
+biases in the distillation process may persist and
+affect future queries. We mitigate direct answer
+leakage by not exposing the gold answer during
+distillation, and we store write-back knowledge in
+a separate index to support inspection and rollback.
+However, the method still inherits biases from both
+the source corpus and the LLM used for distilla-
+tion. Our experiments use public benchmark re-
+leases and a public Wikipedia corpus, but applying
+the method to proprietary or user-generated data
+would require additional safeguards for privacy, ac-
+cess control, and sensitive-content filtering. The
+method also incurs additional offline computation,
+which should be weighed against its downstream
+benefits.
+References
+Akari Asai, Zeqiu Wu, Yizhong Wang, Avirup Sil, and
+Hannaneh Hajishirzi. 2023. Self-rag: Learning to
+retrieve, generate, and critique through self-reflection.
+In The Twelfth International Conference on Learning
+Representations.
+Sebastian Borgeaud, Arthur Mensch, Jordan Hoff-
+mann, Trevor Cai, Eliza Rutherford, Katie Milli-
+can, George Bm Van Den Driessche, Jean-Baptiste
+Lespiau, Bogdan Damoc, Aidan Clark, and 1 others.
+2022. Improving language models by retrieving from
+trillions of tokens. In International conference on
+machine learning, pages 2206–2240. PMLR.
+Christopher Clark, Kenton Lee, Ming-Wei Chang,
+Tom Kwiatkowski, Michael Collins, and Kristina
+Toutanova. 2019. Boolq: Exploring the surprising
+difficulty of natural yes/no questions. In Proceedings
+of the 2019 conference of the north American chap-
+ter of the association for computational linguistics:
+Human language technologies, volume 1 (long and
+short papers), pages 2924–2936.
+Xin Luna Dong, Evgeniy Gabrilovich, Kevin Murphy,
+Van Dang, Wilko Horn, Camillo Lugaresi, Shaohua
+Sun, and Wei Zhang. 2015. Knowledge-based trust:
+Estimating the trustworthiness of web sources. arXiv
+preprint arXiv:1502.03519.
+Matthijs Douze, Alexandr Guzhva, Chengqi Deng, Jeff
+Johnson, Gergely Szilvasy, Pierre-Emmanuel Mazaré,
+Maria Lomeli, Lucas Hosseini, and Hervé Jégou.
+2025. The faiss library. IEEE Transactions on Big
+Data.
+Wenqi Fan, Yujuan Ding, Liangbo Ning, Shijie Wang,
+Hengyun Li, Dawei Yin, Tat-Seng Chua, and Qing
+Li. 2024. A survey on rag meeting llms: Towards
+retrieval-augmented large language models. In Pro-
+ceedings of the 30th ACM SIGKDD conference on
+knowledge discovery and data mining, pages 6491–
+6501.
+Luyu Gao, Xueguang Ma, Jimmy Lin, and Jamie Callan.
+2023. Precise zero-shot dense retrieval without rel-
+evance labels. In Proceedings of the 61st Annual
+Meeting of the Association for Computational Lin-
+guistics (Volume 1: Long Papers), pages 1762–1777.
+Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri,
+Abhinav Pandey, Abhishek Kadian, Ahmad Al-
+Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten,
+Alex Vaughan, and 1 others. 2024. The llama 3 herd
+of models. arXiv preprint arXiv:2407.21783.
+Kelvin Guu, Kenton Lee, Zora Tung, Panupong Pasu-
+pat, and Mingwei Chang. 2020. Retrieval augmented
+language model pre-training. In International confer-
+ence on machine learning, pages 3929–3938. PMLR.
+Yucheng Hu and Yuxing Lu. 2024.
+Rag and rau:
+A survey on retrieval-augmented language model
+in natural language processing.
+arXiv preprint
+arXiv:2404.19543.
+Gautier Izacard, Patrick Lewis, Maria Lomeli, Lucas
+Hosseini, Fabio Petroni, Timo Schick, Jane Dwivedi-
+Yu, Armand Joulin, Sebastian Riedel, and Edouard
+Grave. 2023. Atlas: Few-shot learning with retrieval
+augmented language models. Journal of Machine
+Learning Research, 24(251):1–43.
+Huiqiang Jiang, Qianhui Wu, Chin-Yew Lin, Yuqing
+Yang, and Lili Qiu. 2023a. Llmlingua: Compressing
+prompts for accelerated inference of large language
+models. In Proceedings of the 2023 conference on
+empirical methods in natural language processing,
+pages 13358–13376.
+Zhengbao Jiang, Frank F Xu, Luyu Gao, Zhiqing Sun,
+Qian Liu, Jane Dwivedi-Yu, Yiming Yang, Jamie
+Callan, and Graham Neubig. 2023b. Active retrieval
+9
+augmented generation. In Proceedings of the 2023
+conference on empirical methods in natural language
+processing, pages 7969–7992.
+Jiajie Jin, Yutao Zhu, Zhicheng Dou, Guanting Dong,
+Xinyu Yang, Chenghao Zhang, Tong Zhao, Zhao
+Yang, and Ji-Rong Wen. 2025. Flashrag: A modular
+toolkit for efficient retrieval-augmented generation
+research. In Companion Proceedings of the ACM on
+Web Conference 2025, pages 737–740.
+Tom Kwiatkowski, Jennimaria Palomaki, Olivia Red-
+field, Michael Collins, Ankur Parikh, Chris Alberti,
+Danielle Epstein, Illia Polosukhin, Jacob Devlin, Ken-
+ton Lee, and 1 others. 2019. Natural questions: a
+benchmark for question answering research. Trans-
+actions of the Association for Computational Linguis-
+tics, 7:453–466.
+Omer Levy, Minjoon Seo, Eunsol Choi, and Luke Zettle-
+moyer. 2017. Zero-shot relation extraction via read-
+ing comprehension. In Proceedings of the 21st Con-
+ference on Computational Natural Language Learn-
+ing (CoNLL 2017), pages 333–342.
+Yuxing Lu, Gecheng Fu, Wei Wu, Xukai Zhao, Goi Sin
+Yee, and Jinzhuo Wang. 2025. Towards doctor-like
+reasoning: Medical rag fusing knowledge with pa-
+tient analogy through textual gradients. In The Thirty-
+ninth Annual Conference on Neural Information Pro-
+cessing Systems.
+Jose L Martinez-Rodriguez, Ivan López-Arévalo, and
+Ana B Rios-Alvarado. 2018. Openie-based approach
+for knowledge graph construction from text. Expert
+Systems with Applications, 113:339–355.
+Kevin Meng, David Bau, Alex Andonian, and Yonatan
+Belinkov. 2022a. Locating and editing factual as-
+sociations in gpt. Advances in neural information
+processing systems, 35:17359–17372.
+Kevin Meng, Arnab Sen Sharma, Alex Andonian,
+Yonatan Belinkov, and David Bau. 2022b. Mass-
+editing memory in a transformer.
+arXiv preprint
+arXiv:2210.07229.
+Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and
+Percy Liang. 2016. Squad: 100,000+ questions for
+machine comprehension of text. In Proceedings of
+the 2016 conference on empirical methods in natural
+language processing, pages 2383–2392.
+Weijia Shi, Sewon Min, Michihiro Yasunaga, Min-
+joon Seo, Richard James, Mike Lewis, Luke Zettle-
+moyer, and Wen-tau Yih. 2024. Replug: Retrieval-
+augmented black-box language models. In Proceed-
+ings of the 2024 Conference of the North American
+Chapter of the Association for Computational Lin-
+guistics: Human Language Technologies (Volume 1:
+Long Papers), pages 8371–8384.
+Gemma Team, Thomas Mesnard, Cassidy Hardin,
+Robert Dadashi, Surya Bhupatiraju, Shreya Pathak,
+Laurent Sifre, Morgane Rivière, Mihir Sanjay Kale,
+Juliette Love, and 1 others. 2024. Gemma: Open
+models based on gemini research and technology.
+arXiv preprint arXiv:2403.08295.
+James
+Thorne,
+Andreas
+Vlachos,
+Christos
+Christodoulopoulos,
+and
+Arpit
+Mittal.
+2018.
+Fever: a large-scale dataset for fact extraction and
+verification. In Proceedings of the 2018 Conference
+of the North American Chapter of the Association
+for Computational Linguistics: Human Language
+Technologies, Volume 1 (Long Papers), pages
+809–819.
+Liang Wang, Nan Yang, Xiaolong Huang, Binxing
+Jiao, Linjun Yang, Daxin Jiang, Rangan Majumder,
+and Furu Wei. 2022. Text embeddings by weakly-
+supervised contrastive pre-training. arXiv preprint
+arXiv:2212.03533.
+Xi Wang, Procheta Sen, Ruizhe Li, and Emine Yilmaz.
+2025. Adaptive retrieval-augmented generation for
+conversational systems. In Findings of the Associ-
+ation for Computational Linguistics: NAACL 2025,
+pages 491–503.
+Zhiruo Wang, Jun Araki, Zhengbao Jiang, Md Rizwan
+Parvez, and Graham Neubig. 2023. Learning to filter
+context for retrieval-augmented generation. arXiv
+preprint arXiv:2311.08377.
+Fangyuan Xu, Weijia Shi, and Eunsol Choi. 2023. Re-
+comp: Improving retrieval-augmented lms with con-
+text compression and selective augmentation. In The
+Twelfth International Conference on Learning Repre-
+sentations.
+Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio,
+William Cohen, Ruslan Salakhutdinov, and Christo-
+pher D Manning. 2018. Hotpotqa: A dataset for
+diverse, explainable multi-hop question answering.
+In Proceedings of the 2018 conference on empiri-
+cal methods in natural language processing, pages
+2369–2380.
+Wenhao Yu, Dan Iter, Shuohang Wang, Yichong
+Xu, Mingxuan Ju, Soumya Sanyal, Chenguang
+Zhu, Michael Zeng, and Meng Jiang. 2022. Gen-
+erate rather than retrieve:
+Large language mod-
+els are strong context generators.
+arXiv preprint
+arXiv:2209.10063.
+10
+A
+On the Use of “KB Training”
+The implementation of WRITEBACK-RAG is a
+corpus augmentation and distillation pipeline, not
+gradient-based optimization over KB parameters.
+We adopt the term “training” because the process
+is supervised (driven by labeled examples), task-
+informed (guided by downstream retrieval perfor-
+mance signals), and persistent (the KB is modified
+once and benefits all future queries). In this sense
+the KB undergoes a transformation analogous to
+how model parameters are shaped by training data,
+even though the mechanism is distillation rather
+than gradient descent.
+More concretely, the analogy rests on three struc-
+tural parallels. First, training data acts as supervi-
+sion: just as labeled examples define a loss signal
+for model parameters, the labeled set Dtrain pro-
+vides the signal that drives the utility gate and doc-
+ument gate. Second, the process is iterative over
+data: the pipeline loops over training examples,
+accumulating write-back knowledge one unit at a
+time, analogous to how parameter updates accumu-
+late over mini-batches. Third, the result is a persis-
+tent artifact: the enriched KB K′ is produced once
+and reused for all future inference, just as trained
+model weights are. We acknowledge that no gradi-
+ent computation is involved, and the term “training”
+is used in this broader, process-level sense rather
+than in the narrow sense of stochastic optimization.
+B
+WRITEBACK-RAG Prevents Answer
+Leakage
+Although the distiller never receives the gold an-
+swer ai, the utility gate selects examples where
+retrieval produces a correct answer, and the doc-
+ument gate retains documents that contributed to
+that answer. The distiller therefore receives an evi-
+dence bundle implicitly conditioned on correctness,
+raising the question of whether the method simply
+smuggles answers into the corpus. We argue that it
+does not. The selected documents D∗
+i are passages
+already present in the original KB—the distiller
+has no access to information beyond what the re-
+triever already surfaces, and its prompt instructs it
+to produce a general-purpose encyclopedic passage
+rather than to answer the question (Appendix G).
+Any answer-relevant content in a write-back doc-
+ument was already retrievable from the original
+corpus; the distiller merely reorganizes it into a
+more compact and retrieval-friendly format.
+More fundamentally, the improvement must gen-
+eralize to unseen queries to affect test-time per-
+formance, because write-back documents compete
+with the entire original corpus and are ranked solely
+by embedding similarity to the test query. A docu-
+ment narrowly tailored to a single training question
+would not rank highly for semantically different
+test queries and would simply be ignored by the
+retriever. The cross-writeback experiment (RQ4,
+Figure 4) provides direct evidence of this general-
+ization: write-back corpora produced by one RAG
+method transfer to another with negligible perfor-
+mance difference, ruling out pipeline-specific ar-
+tifacts or memorized answer patterns. Together
+with the consistent gains across all 48 settings in
+Table 2, these results indicate that the benefit stems
+from improved knowledge organization rather than
+indirect answer leakage.
+C
+WRITEBACK-RAG as a General
+Method for RAG
+A natural question is why WRITEBACK-RAG can
+improve RAG methods with very different retrieval
+and generation strategies without any method-
+specific modification.
+The four RAG backbones we evaluate differ
+substantially in how they use retrieved documents.
+Naive RAG concatenates the top-K passages into a
+single prompt. RePlug ensembles generation prob-
+abilities across documents, weighting each passage
+by its retrieval score. Self-RAG introduces reflec-
+tion tokens that let the generator decide, per step,
+whether to retrieve and which passages to trust.
+FLARE monitors generation confidence token-by-
+token and triggers retrieval only when uncertainty
+exceeds a threshold. Despite these differences, all
+four methods share a common dependency: the
+quality of the documents present in the retrieval
+index. A document that is more focused, less noisy,
+and better aligned with the knowledge a query re-
+quires will be ranked higher by the retriever and
+will be more useful to the generator, regardless of
+how the generator consumes it.
+WRITEBACK-RAG operates entirely at this
+shared layer. It does not modify the retrieval al-
+gorithm, the generation prompt, or the decoding
+strategy. It adds distilled documents to the index,
+and the existing retriever decides whether to surface
+them. If a write-back document is more relevant
+than the original passages it was derived from, it
+will naturally rise in the ranking; if not, it will be
+ignored (Figure 1). This means the method can-
+11
+Dataset
+Task
+Description
+Train
+Test
+Metric
+NQ
+Open-domain QA
+Real user questions answered using retrieved Wikipedia evi-
+dence.
+79,168
+3,610
+Acc
+BoolQ
+Yes or No QA
+Naturally occurring Yes or No questions paired with supporting
+documents.
+9,427
+3,270
+Acc
+FEVER
+Fact verification
+Claim verification against Wikipedia evidence with SUPPORTS,
+REFUTES, and NOT ENOUGH INFO labels.
+104,966 10,444
+F1
+zsRE
+Slot filling
+Relation extraction framed as answering natural-language rela-
+tion queries over factual knowledge.
+147,909
+3,724
+Acc
+HotpotQA
+Multi-hop QA
+Question answering that requires aggregating evidence across
+multiple Wikipedia documents.
+90,447
+7,405
+Acc
+SQuAD
+Extractive QA
+Reading comprehension where the answer is extracted as a text
+span from the provided passage.
+87,599
+10,570
+EM
+Table 5: Detailed dataset statistics used in our experiments, following the FlashRAG benchmark release (Jin et al.,
+2025). All datasets use the FlashRAG-provided Wikipedia corpus (wiki18_100w) as external knowledge.
+not degrade retrieval quality for queries unrelated
+to the training set, because irrelevant write-back
+documents simply remain unretrieved.
+The empirical results in Table 2 confirm this
+reasoning. The gains are positive across all four
+backbones, and the cross-writeback experiment
+(Figure 4) shows that write-back corpora are in-
+terchangeable across methods. Together, these ob-
+servations support treating WRITEBACK-RAG as a
+corpus-level preprocessing step that is independent
+of the choice of RAG pipeline: it can be applied
+once and reused with any downstream method.
+D
+Datasets
+We evaluate on six benchmarks from the FlashRAG
+collection (Jin et al., 2025) and use the FlashRAG-
+provided Wikipedia corpus (wiki18_100w) as the
+external knowledge source for retrieval in all ex-
+periments. These datasets span open-domain ques-
+tion answering, fact verification, slot filling, multi-
+hop reasoning, and extractive question answering.
+This breadth is important for our study because
+WRITEBACK-RAG is designed to improve the
+knowledge base itself rather than a single task-
+specific generation strategy.
+Table 5 reports the task type, a short description,
+the train and test split sizes, and the evaluation
+metric used in our experiments. We follow the
+FlashRAG benchmark release for preprocessing
+and split construction.
+E
+Hyperparameters
+Our implementation uses one shared retriever en-
+coder for both the original corpus and the write-
+back corpus, and uses the same backbone LLM as
+both the generator and the distiller. The key de-
+sign choices are therefore concentrated in retrieval
+depth, gating thresholds, and distillation settings.
+Table 6 summarizes the full configuration used in
+the main experiments.
+Hyperparameter
+Value
+Retrieval
+Retriever
+E5-base-v2
+Retrieval top-K
+5
+Write-back retrieval top-K
+5
+Merged retrieval top-K
+5
+Gating
+Utility gate threshold τs
+0.10
+Utility gate margin τδ
+0.01
+Document gate margin τdoc
+0.01
+Document gate fallback nmin
+2
+Distillation
+Distiller model
+Same as generator
+Use gold answer in distillation
+No
+Extractive pre-selection
+Enabled
+Max selected evidence sentences
+8
+Fallback selected sentences
+6
+Max new tokens
+128
+Temperature
+0.0
+Indexing
+Write-back storage mode
+Separate FAISS index
+Incremental indexing
+Enabled
+Table 6: Full hyperparameter settings used in the main
+experiments.
+The utility gate uses a minimum absolute re-
+trieval score threshold τs together with a positive
+improvement margin τδ so that write-back is trig-
+gered only when retrieval is both useful and suf-
+ficiently correct. The document gate uses a small
+positive margin τdoc and a fallback mechanism with
+nmin = 2 so that distillation still receives a com-
+pact evidence bundle even when no single retrieved
+document is individually strong enough under the
+standalone contribution test.
+12
+0
+100
+200
+300
+NQ
+BoolQ
+FEVER
+0
+100
+200
+300
+0
+100
+200
+300
+zsRE
+0
+100
+200
+300
+HotpotQA
+0
+100
+200
+300
+SQuAD
+Source evidence tokens
+Distilled knowledge tokens
+Figure 5: Source evidence length versus distilled write-
+back knowledge length for six benchmarks.
+F
+Knowledge Distillation Analysis
+Figure 5 visualizes the relationship between ex-
+tracted source evidence length and distilled write-
+back knowledge length across six datasets. Over-
+all, most points fall below the identity line, show-
+ing that the write-back module usually produces a
+shorter distilled note than the source evidence from
+which it is derived. This trend is consistent across
+all datasets, confirming that the module generally
+performs compression rather than direct copying.
+The figure specifically reflects compression
+from retrieved evidence into write-back knowledge,
+rather than general prompt shortening. The broad
+spread within each panel also indicates that the
+rewrite module performs adaptive compression,
+producing shorter or longer notes depending on
+the amount and structure of the available evidence.
+G
+Prompt Templates
+We use task-specific prompts for retrieval-based
+inference. For no-retrieval baselines, we derive
+matched prompts by removing the document block
+from the corresponding retrieval prompt and re-
+moving evidence-dependent wording to preserve
+prompt parity as closely as possible.
+Below we show representative task prompts to-
+gether with the extractive evidence prompt and the
+rewrite prompt used in the write-back pipeline.
+BoolQ task prompt
+Decide whether the answer to the question is
+true or false using the provided
+evidence. Output exactly one word: True or
+False. Do not output yes or no,
+labels, or any explanation.
+The following are given documents.
+{reference}
+HotpotQA task prompt
+Answer the multi-hop question using the
+provided evidence. Output only the final
+answer. If the question is yes or no, output
+exactly yes or no in lowercase.
+Otherwise output only the shortest answer
+phrase.
+The following are given documents.
+{reference}
+Representative no-retrieval task prompt
+Answer the factoid question from your own
+knowledge. Output only the short final
+answer phrase or entity name. Do not output a
+sentence or explanation.
+The next two prompts correspond to the write-
+back stage. The first extracts answer-relevant evi-
+dence sentences from retrieved passages, and the
+second rewrites the selected evidence into a com-
+pact retrieval-oriented document that is later in-
+dexed into the auxiliary write-back corpus. Be-
+cause the distilled document must remain reusable
+for future queries, the rewrite stage is conditioned
+on the question and supporting evidence only and
+does not expose the gold answer.
+Extractive evidence prompt
+System:
+Extract only answer-relevant evidence
+sentences from retrieved passages.
+Do not paraphrase. Keep exact sentence text.
+User:
+Question: {question}
+Retrieved passages:
+{formatted_reference}
+Select up to {extractive_max_sentences}
+evidence sentences.
+Output one sentence per line using this
+format only:
+[Doc <index>] <sentence>
+where Doc index starts from 1.
+Rewrite prompt
+System:
+You are writing a high-utility retrieval
+document for future QA. Use only facts
+supported by the provided knowledge.
+User:
+Question: {question}
+Supporting knowledge:
+{evidence_text}
+Write one merged document in the same style
+as the original evidence corpus.
+13
+Quality requirements:
+1) Add concise supporting facts that improve
+retrieval recall: key entities,
+aliases, dates, numbers, and locations when
+supported.
+2) Reuse important terms from the question
+and evidence; include alternative
+names only if supported.
+3) Keep it factual and compact; do not add
+unsupported claims.
+Output format (exactly two parts, no labels):
+<title line>
+<knowledge paragraph(s)>
+Do not output prefixes like ‘Title:‘ or ‘
+Knowledge:‘.
+H
+Representative Write-Back Examples
+We next present representative training instances
+that were rewritten and added to the write-back cor-
+pus. Each example includes the original question,
+the model outputs with and without retrieval, the
+utility signal used for selection, the extracted evi-
+dence sentences, and the final distilled document
+written back to the auxiliary corpus. For clarity, we
+report the reference answer in the qualitative exam-
+ples below as part of analysis, but the distillation
+prompt itself does not receive the gold answer.
+To keep the appendix readable in ACL double-
+column format, each example is displayed in a
+single breakable outer box, while the evidence and
+distilled text are shown as compact monospaced
+blocks inside the same box.
+Binary verification example.
+This example
+shows a case where retrieval supplies historical and
+geopolitical context that is not reliably recovered
+in the no-retrieval setting.
+Example 1: BoolQ
+Question: do iran and afghanistan speak the same
+language
+Gold answer: ["True"]
+Original RAG prediction: True
+No-retrieval prediction: False
+Utility scores: srag = 1.0, snr = 0.0, ∆= 1.0
+Retained document indices: [3]
+Extractive evidence.
+[Doc 1] Afghanistan-Iran relations
+Afghanistan-Iran relations were
+established in 1935 during King Zahir
+Shah’s reign and the Pahlavi dynasty of
+Persia.
+[Doc 1] Mujahideen, Afghan refugees, and
+Taliban), as well as Iran’s water dispute
+, the growing influence of the United
+States in Afghanistan.
+[Doc 1] Afghanistan and Iran share the same
+underlying language, Persian, but speak
+different dialects.
+[Doc 1] When the Safavid dynasty was founded
+in Persia, part of what is now
+Afghanistan was ruled by the Khanate of
+Bukhara and Babur from Kabulistan.
+[Doc 1] They have been negatively affected by
+the 1979 Iranian Revolution and issues
+related to the 1978-present Afghan
+conflicts.
+Distilled knowledge.
+Afghanistan-Iran relations Afghanistan-Iran
+relations were established in 1935 during
+King Zahir Shah’s reign and the Pahlavi
+dynasty of Persia. Afghanistan shares a
+relatively long history with Iran (called
+Persia in the West before 1935). When
+the Safavid dynasty was founded in Persia
+, part of what is now Afghanistan was
+ruled by the Khanate of Bukhara and Babur
+from Kabulistan. They have been
+negatively affected by the 1979 Iranian
+Revolution and issues related to the
+1978-present Afghan conflicts (i.e.
+Mujahideen, Afghan refugees, ...
+Multi-hop QA example.
+This case illustrates
+how the extracted evidence brings together lexi-
+cal cues and supporting chemical context that help
+recover the correct answer.
+Example 2: HotpotQA
+Question: Cadmium Chloride is slightly soluble
+in this chemical, it is also called what?
+Gold answer: ["alcohol"]
+Original RAG prediction: alcohol
+No-retrieval prediction: water
+Utility scores: srag = 1.0, snr = 0.0, ∆= 1.0
+Retained document indices: [0, 1, 2, 3, 4]
+Extractive evidence.
+[Doc 2] It is a hygroscopic solid that is
+highly soluble in water and slightly
+soluble in alcohol.
+[Doc 1] Cadmium tetrafluoroborate may be
+prepared from the reaction between an
+aqueous solution of fluoroboric acid and
+cadmium carbonate or cadmium oxide: It is
+also possible to prepare Cadmium
+tetrafluoroborate through an oxidation
+reduction reaction implementing nitrosyl
+tetrafluoroborate: Cadmium
+tetrafluoroborate is an ionic compound
+formed from the two, ionic species Cd and
+BF.
+[Doc 3] Cadmium hydride Cadmium hydride (
+systematically named cadmium dihydride)
+is an inorganic compound with the
+chemical formula.
+[Doc 5] It forms by treating cadmium oxide
+with acetic acid: Cadmium acetate is used
+for glazing ceramics and pottery; in
+electroplating baths, in dyeing and
+printing textiles; and as an analytic
+reagent for sulfur, selenium and
+tellurium.
+[Doc 1] At room temperature it forms
+colorless, odorless crystals which are
+14
+soluble in polar solvents such as water
+or ethanol.
+[Doc 2] Cadmium chloride Cadmium chloride is
+a white crystalline compound of cadmium
+and chlorine, with the formula CdCl.
+[Doc 2] The crystal structure of cadmium
+chloride (described below), composed of
+two dimensional layers of ions, is a
+reference for describing other crystal
+structures.
+[Doc 4] Operation LAC (Large Area Coverage)
+was a United States Army Chemical Corps
+operation in 1957 and 1958 which
+dispersed microscopic zinc cadmium
+sulfide (ZnCdS) particles over much of
+the United States.
+Distilled knowledge.
+Cadmium Chloride Cadmium chloride is a white
+crystalline compound of cadmium and
+chlorine, with the formula CdCl. It is a
+hygroscopic solid that is highly soluble
+in water and slightly soluble in alcohol.
+The crystal structure of cadmium
+chloride, composed of two dimensional
+layers of ions, is a reference for
+describing other crystal structures. At
+room temperature it forms colorless,
+odorless crystals which are soluble in
+polar solvents such as water or ethanol.
+Cadmium tetrafluoroborate may be prepared
+from the reaction between an aqueous
+solution of fluoroboric acid and cadmium
+carbonate or cadmium oxide. It is also
+possible to prepare Cadmium
+tetrafluoroborate ...
+Short answer factoid QA example.
+This exam-
+ple shows a case where the rewritten document
+consolidates salient series-level facts into a com-
+pact document that is easy to retrieve later.
+Example 3: NQ
+Question: big little lies season 2 how many
+episodes
+Gold answer: ["seven"]
+Original RAG prediction: seven
+No-retrieval prediction: NAN
+Utility scores: srag = 1.0, snr = 0.0, ∆= 1.0
+Retained document indices: [0, 2]
+Extractive evidence.
+[Doc 1] All seven episodes are being written
+by Kelley
+[Doc 2] Kelley, the series’ seven episode
+first season was directed by Jean Marc
+Vallee.
+[Doc 2] Big Little Lies (TV series) Big
+Little Lies is an American drama
+television series, based on the novel of the
+same name by Liane Moriarty, that
+premiered on February 19, 2017, on HBO.
+[Doc 2] ""Big Little Lies"" stars Nicole
+Kidman, Reese Witherspoon and Shailene
+Woodley and tells the story of three
+emotionally
+[Doc 1] Despite originally being billed as a
+miniseries, HBO renewed the series for a
+second season.
+[Doc 1] Production on the second season began
+in March 2018 and is set to premiere in
+2019.
+[Doc 2] The first season was released on Blu
+ray and DVD on August 1, 2017.
+Distilled knowledge.
+Big Little Lies (TV series) Big Little Lies
+is an American drama television series,
+based on the novel of the same name by
+Liane Moriarty, that premiered on
+February 19, 2017, on HBO. ""Big Little
+Lies"" stars Nicole Kidman, Reese
+Witherspoon and Shailene Woodley and
+tells the story of three emotionally
+complex women. The first season,
+consisting of seven episodes, was
+directed by Jean Marc Vallee and released
+on Blu ray and DVD on August 1, 2017.
+Despite originally being billed as a
+miniseries, HBO renewed the series for a
+second ...
+I
+Rationale for using Naive RAG for
+Analysis
+We mainly adopt naive RAG as the reference base-
+line during analysis because it offers the most con-
+trolled setting for identifying the source of im-
+provement. The central question of WRITEBACK-
+RAG is not whether a more sophisticated retrieval
+pipeline can improve results, but whether our write-
+back mechanism can provide additional gains by
+distilling retrieved evidence into reusable knowl-
+edge. Using naive RAG as the primary compari-
+son point reduces confounding factors and makes
+attribution clearer: performance differences can
+be interpreted more directly as arising from our
+method, rather than from auxiliary changes in re-
+trieval, reranking, or prompt engineering. In con-
+trast, if the main comparison were conducted only
+against stronger RAG variants, it would be diffi-
+cult to disentangle whether the improvement came
+from the RAG system itself or from the proposed
+method layered on top of it. For this reason, naive
+RAG serves as the fairest baseline for measuring
+the incremental value of our approach.
+15

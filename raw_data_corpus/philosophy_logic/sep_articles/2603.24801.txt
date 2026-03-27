@@ -1,0 +1,1113 @@
+Dissecting Model Failures in Abdominal Aortic Aneurysm Segmentation through
+Explainability-Driven Analysis
+Abu Noman Md Sakib1,∗
+Merjulah Roby1,∗
+Zijie Zhang1
+Satish Muluk2
+Mark K. Eskandari3
+Ender A. Finol1
+1University of Texas at San Antonio 2Drexel University 3Northwestern University
+Abstract
+Computed tomography image segmentation of complex ab-
+dominal aortic aneurysms (AAA) often fails because the
+models assign internal focus to irrelevant structures or do
+not focus on thin, low-contrast targets. Where the model
+looks is the primary training signal, and thus we propose
+an Explainable AI (XAI) guided encoder shaping frame-
+work.
+Our method computes a dense, attribution-based
+encoder focus map (”XAI field”) from the final encoder
+block and uses it in two complementary ways: (i) we align
+the predicted probability mass to the XAI field to promote
+agreement between focus and output; and (ii) we route the
+field into a lightweight refinement pathway and a confi-
+dence prior that modulates logits at inference, suppressing
+distractors while preserving subtle structures. The objec-
+tive terms serve only as control signals; the contribution is
+the integration of attribution guidance into representation
+and decoding. We evaluate clinically validated challeng-
+ing cases curated for failure-prone scenarios. Compared
+to a base SAM setup, our implementation yields substantial
+improvements. The observed gains suggest that explicitly
+optimizing encoder focus via XAI guidance is a practical
+and effective principle for reliable segmentation in complex
+scenarios.
+1. Introduction
+Abdominal aortic aneurysm (AAA) is a life-threatening
+vascular disease in which local dilation of the abdominal
+aorta can progress silently and culminate in catastrophic
+rupture. Accurate segmentation of AAA structures from
+medical images is critical for risk assessment, surgical
+planning, and longitudinal monitoring [1, 10].
+In clini-
+cal practice and research pipelines, two masks are typi-
+cally of interest: the outer aneurysm wall and the lumen
+[25].
+Although modern deep segmentation architectures
+including U-Net variants [15, 26, 39, 40] and, more re-
+*These authors contributed equally to this work.
+Figure 1. Performance comparison in complex outer wall AAA
+segmentation cases. Our XAI-SAM method significantly outper-
+forms U-Net, U-Net++, MedSAM, and SAM measured by Dice
+score and HD95.
+cently, Segment Anything Model (SAM) style large vision
+encoders have achieved strong performance on relatively
+clean cases, their predictions often break down in the com-
+plex, failure-prone scenarios that are most clinically conse-
+quential [11, 12, 17, 20, 24, 31].
+In challenging AAA cases, segmenters frequently allo-
+cate the probability mass to the wrong anatomical struc-
+tures (e.g., nearby vessels or soft tissue) or leak into regions
+that should not be segmented. These errors are exacerbated
+when the aneurysm wall is thin, has low contrast against
+the surrounding tissue, or exhibits irregular morphology.
+Conventional training objectives such as Dice loss or cross-
+entropy treat these failures implicitly through pixel-wise er-
+rors, but they do not directly reason about where the model
+is focusing internally when it makes these mistakes. As a
+result, the learned encoder representation may remain mis-
+aligned with the clinically relevant structures even when the
+mask losses are minimized.
+In this work, we treat the internal focus of the encoder
+as the primary objective of optimization rather than as a by-
+product. We propose an explainability-guided framework
+that uses attribution maps derived from the final encoder
+block as an explicit training signal. We compute a dense,
+1
+arXiv:2603.24801v1  [cs.CV]  25 Mar 2026
+gradient-based attribution field, which we term an Explain-
+able AI (XAI) field, and integrate it into both representation
+learning and decoding. First, we encourage alignment be-
+tween the predicted segmentation probability mass and the
+XAI field. This strategy highlights the agreement between
+where the model looks and where it predicts. Second, we
+route the XAI field into a lightweight refinement pathway
+and a confidence prior that modulate logits, suppressing dis-
+tractors while preserving subtle structures. In parallel, we
+introduce a pairwise consistency regularizer based on a clas-
+sifier trained on consecutive mask pairs, which discourages
+anatomically implausible transitions across slices.
+We evaluated our method on a clinically curated AAA
+dataset that explicitly includes complex, failure-prone cases
+for both outer wall and lumen segmentation. Across the
+general test set, our approach substantially outperforms
+strong baselines, including U-Net [26], U-Net++ [39], Med-
+SAM [17], and a SAM-based [12] segmentation baseline.
+In the subset of complex cases, the gains are even greater,
+with our XAI-guided SAM model (XAI-SAM) closing the
+majority of the failure modes observed in the baselines (Fig.
+1). Beyond aggregate metrics, qualitative case studies show
+that our method refines internal focus away from irrele-
+vant structures and towards thin aneurysm walls and lumen
+boundaries. Our main contributions are to
+• Propose an XAI-guided encoder shaping framework that
+treats encoder attribution maps as a first-class training sig-
+nal for AAA segmentation.
+• Introduce a focus alignment loss that enforces agree-
+ment between segmentation probability mass and an
+attribution-based XAI field, and we couple this with a
+refinement pathway and confidence prior that modulate
+logits.
+• Incorporate a pairwise consistency classifier trained in
+consecutive ground-truth masks and use it as a regularizer
+to penalize anatomically inconsistent predictions across
+slices.
+• Conduct a detailed empirical study of outer wall and lu-
+men masks in both general and complex AAA cases,
+which shows consistent and substantial improvements
+over U-Net, U-Net++, MedSAM, and SAM baselines, ac-
+companied by qualitative and explainability-driven anal-
+yses of model failures and corrections.
+2. Related Work
+2.1. AAA Segmentation and Vascular Imaging
+Automated segmentation of AAA structures has been ex-
+plored using classical image processing pipelines, active
+contour models, and, more recently, convolutional neural
+networks [16, 34]. Early approaches often relied on inten-
+sity thresholds, region growing, or hand-crafted features tai-
+lored to contrast-enhanced CT or MR data. These methods
+are sensitive to noise, calcifications, and irregular aneurysm
+morphology, and typically struggle in difficult cases [21].
+With the advent of deep learning, U-Net and its variants
+have become the standard for medical image segmentation,
+including vascular and aneurysm tasks [23]. However, even
+these architectures can fail on thin, low-contrast aneurysm
+walls or in the presence of adjacent vessels with similar in-
+tensity profiles.
+2.2. Deep Segmentation Architectures
+Encoder–decoder architectures such as U-Net, U-Net++,
+and related designs have achieved state-of-the-art perfor-
+mance in many medical segmentation benchmarks by com-
+bining multi-scale feature extraction with skip connections
+[3, 6, 8, 26, 32, 39].
+Extensions incorporate attention
+modules, residual blocks, or multi-branch decoders to bet-
+ter capture context and fine structures [7, 27, 37].
+Al-
+though self-configuring frameworks such as nnU-Net pro-
+vide a robust benchmark for medical tasks, they rely pri-
+marily on standard volumetric losses [8]. In parallel, large-
+scale vision models, such as the Segment Anything Model
+(SAM), have demonstrated strong zero-shot and prompt-
+driven segmentation abilities in natural images [12–14, 36].
+MedSAM-style adaptations have begun to transfer this ca-
+pability to medical imaging domains, providing powerful
+encoders and flexible prompt-aware decoders [17, 22]. De-
+spite their capacity, these models are typically optimized
+using standard region-based losses and are not explicitly
+encouraged to focus on clinically relevant structures.
+In
+failure-prone AAA cases, they may assign high probabil-
+ity to distractor regions even when global metrics remain
+acceptable on easier slices.
+2.3. Explainability and XAI-guided Learning
+Explainability methods such as Grad-CAM [4, 28], inte-
+grated gradients [9], and related attribution techniques have
+been widely used to visualize how models make decisions
+[35]. In segmentation, attribution maps can reveal whether
+the internal focus of a model aligns with the target structure
+or is driven by spurious cues. Although most work uses ex-
+plainability for post-hoc analysis, recent studies have begun
+to incorporate attribution into training objectives, for exam-
+ple by penalizing attention on known confounders or en-
+couraging focus on salient regions [2, 29, 30, 33]. However,
+such approaches are still relatively rare in medical imaging,
+and few works integrate attribution signals directly into the
+encoder representation and decoder logits in a unified way.
+2.4. Shape and Consistency Constraints
+Several works have explored shape priors, topology-aware
+losses, and consistency constraints to encourage anatomi-
+cally plausible segmentation. Skeleton-based losses (e.g.,
+clDice) and edge-aware losses (e.g., Sobel-based boundary
+2
+Figure 2. Overview of the proposed XAI-SAM framework. The left module introduces the pairwise consistency mechanism. The central
+module shows the SAM-based segmentation pipeline enhanced with pairwise consistency, probability-focus alignment, and anatomy-aware
+loss. The right module illustrates the XAI component.
+Dice) have been proposed to better preserve thin structures
+and connectivity [5, 19]. Temporal or slice-wise consis-
+tency has also been studied, where predictions across neigh-
+boring frames or slices are regularized to align with motion
+or anatomical continuity [18]. Our method is inspired by
+this line of work but takes a different route: instead of hand-
+crafting pairwise penalties, we train a small classifier on
+pairs of ground-truth masks to learn what “realistic” slice-
+to-slice consistency looks like, and then use this classifier
+as a learned regularizer during segmentation training.
+3. Methods
+3.1. Problem Setup and Backbone
+Let x ∈R3×H0×W0 denote an input AAA image slice,
+rescaled to H0 = W0 = 1024. Each slice has two bi-
+nary masks: one for the outer aneurysm wall and one for
+the lumen. For simplicity, we describe the method for a sin-
+gle binary target y ∈{0, 1}1×H×W . The base architecture
+is based on an SAM-style encoder–decoder. Although the
+framework is backbone-agnostic, we focus on SAM-based
+models due to their tendency toward diffuse attention in
+medical images. A shallow pre-encoder M maps the input
+to a normalized representation, x′ = M(x) ∈R3×H×W .
+A Vision Transformer (ViT)-based [38] image encoder
+Enc processes the normalized input x′ and produces feature
+maps E = Enc(x′) ∈RC×He×We, where C = 256 repre-
+sents the number of channels. These feature maps are fur-
+ther refined by applying a channel-wise MLP with residual
+connections: E′ = F(E) = E + MLP(E). Next, we em-
+ploy a projection head P to predict a bounding box prompt
+b = P(E) ∈R4, which is subsequently fed into the SAM
+prompt encoder and mask decoder to generate segmentation
+logits. The logits are then passed through a sigmoid func-
+tion, yielding segmentation probabilities p = σ(s), where
+s = Dec(E, b) ∈R1×H×W represents the final segmenta-
+tion logits.
+In parallel, an auxiliary decoder G is attached to the
+shaped features E′, producing auxiliary probabilities a =
+G(E′) ∈R1×H×W .
+These auxiliary probabilities are
+passed through a sigmoid activation to obtain paux = σ(a).
+A confidence head A takes paux as input and maps it to a
+refinement prior mc = A(paux) ∈[0, 1]1×H×W . In in-
+ference, this confidence prior is used to modulate the fi-
+nal logits, thereby suppressing distractor regions while re-
+inforcing confident predictions. Fig. 2 provides a detailed
+illustration of our architecture, integrating pairwise consis-
+tency, anatomy-aware learning, and explainability-guided
+optimization to enhance both segmentation accuracy and in-
+terpretability.
+3.2. Failure Analysis of Baseline
+Despite strong aggregate scores on easy slices, SAM-style
+baselines exhibit systematic errors on AAA: (i) probability
+mass concentrates on distractors (adjacent vessels, calcifi-
+cations), (ii) over-segmentation into background or lumen,
+and (iii) abrupt, anatomically implausible changes across
+consecutive slices (Fig. 3). We hypothesize that these be-
+haviors correlate with encoder focus misalignment, i.e., in-
+ternal attribution peaks do not coincide with clinically rel-
+3
+evant structures. We therefore instrument the encoder with
+explainability probes and derive quantitative failure indices.
+Figure 3. Visualization of model performance on abdominal CT
+slices. From left to right: Ground Truth segmentation, Model Pre-
+diction, Attention Map highlighting regions of model focus, and
+Error Map indicating mismatched regions (red box) between Pre-
+diction and Ground Truth.
+For the attribution probe, let ϕ ∈R1×H×W denote a
+gradient-weighted attribution map obtained from the last
+encoder block (as in §3.4.1, using activations A and gra-
+dients G with channel weights wc = (HeWe)−1 P
+i,j Gc,i,j
+and ϕlow = ReLU(P
+c wcAc), upsampled to (H, W) and
+ℓ1-normalized to ˜ϕ).
+Let the baseline posterior be p =
+σ(s) ∈[0, 1]H×W and the ground-truth mask be y ∈
+{0, 1}H×W . We measure how the distribution of predicted
+probability ˜p .= p/ P p deviates from the normalized attri-
+bution ˜ϕ using a symmetrized KL divergence:
+JSD(˜p, ˜ϕ) =
+1
+2 KL
+
+˜p
+ ˜p+˜ϕ
+2
+
++
+1
+2 KL
+
+˜ϕ
+ ˜p+˜ϕ
+2
+
+(1)
+Large JSD indicates scattered or off-target focus even when
+region losses are small. We define a focus overlap index and
+its complement:
+FOI =
+P
+i,j ϕi,j yi,j
+P
+i,j ϕi,j + ϵ,
+FMI = 1 −FOI
+(2)
+Here, FMI signals that the encoder attends outside the
+aneurysm region. To expose over-segmentation, we quan-
+tify attribution mass on the complement of the mask:
+Leakϕ =
+P ϕ (1 −y)
+P ϕ + ϵ
+,
+Leakp =
+P p (1 −y)
+P p + ϵ
+(3)
+To test sensitivity to thin walls, let ∂y be a (one-pixel) mor-
+phological boundary of y and Br(∂y) its r-dilation; the
+boundary coverage is
+BCovr =
+P
+(i,j)∈Br(∂y) ϕi,j
+P ϕ + ϵ
+,
+(4)
+with low BCovr indicating failure to concentrate on the true
+wall boundary. Given consecutive predictions ˆyi = ⊮[pi >
+0.5] and ˆyi+1, we compute a boundary-based chamfer dis-
+tance dch(∂ˆyi, ∂ˆyi+1) and define
+Econs =
+1
+|N|
+X
+i∈N
+dch(∂ˆyi, ∂ˆyi+1)
+(5)
+where N indexes valid slice pairs. A high Econs reflects
+anatomically implausible jumps along the stack. In failure-
+prone slices, we observe (i) elevated JSD(˜p, ˜ϕ) and FMI,
+(ii) high Leakϕ/Leakp together with low BCovr, and (iii)
+spikes in Econs.
+In addition, the Spearman correlations
+ρ(JSD, 1−IoU) and ρ(FMI, 1−Dice) are strongly posi-
+tive, indicating that focus misalignment predicts segmenta-
+tion error. Visual overlays of ϕ on the baseline SAM predic-
+tions confirm attention concentrated on distractors precisely
+where IoU collapses.
+This analysis motivates two principles substantiated in
+XAI-SAM: (i) focus alignment: explicitly shape the en-
+coder so that predicted probability mass agrees with attri-
+bution (reducing JSD (1), and FMI (2)); and (ii) anatomy
+and temporal regularization:
+bias focus toward bound-
+ary neighborhoods (raising BCovr (4)) and suppress over-
+segmentation (lower Leakϕ/Leakp (3)), while enforcing
+slice-to-slice plausibility (lower Econs (5)). The subsequent
+subsections operationalize these principles via our align-
+ment losses, confidence prior, and learned regularizer.
+3.3. Pairwise Consistency Classifier
+We first address failures where the model segments the
+wrong region or exhibits inconsistent masks across consec-
+utive slices. To mitigate failures, we introduce a learned
+slice–pair consistency module. The idea is to constrain pre-
+dicted masks to lie on a manifold of realistic anatomical
+transitions observed in ground-truth 3D volumes.
+Given a stack of binary masks {yi}N
+i=1 for a training
+volume, we construct positive examples using consecutive
+pairs (yi, yi+1) and negative examples by sampling non-
+consecutive pairs (yi, yj) with |i −j| > 1. Each pair is
+represented as a two-channel tensor z = stack(yi, yj) ∈
+{0, 1}2×H×W with an associated binary label c ∈{0, 1} in-
+dicating whether it forms a true anatomical progression. A
+lightweight CNN classifier C maps z to a consistency score
+C(z) ∈(0, 1) and is trained using the binary cross-entropy
+objective
+Lcls = −E(z,c)[c log C(z) + (1 −c) log(1 −C(z))] (6)
+During segmentation training, the classifier acts as a
+learned anatomical prior. For each minibatch {(xi, yi)}B
+i=1,
+predicted masks are first computed as pi = σ(si) and
+then binarized as ˆyi = ⊮[pi > 0.5]. Forward and back-
+ward inter-slice penalties are evaluated by feeding pairs
+such as (ˆyi, yi+1) or (yi−1, ˆyi) through C(·) and accu-
+mulating penalties of the form 1 −C(·).
+If ℓdenotes
+4
+any such per-pair penalty and Npairs the number of valid
+neighboring slice pairs in the minibatch, we compute the
+slice-consistency energy simply as the average penalty, i.e.,
+Lcons = N −1
+pairs
+P ℓ.
+This quantity is then scaled by a
+weighting coefficient λc to obtain the final consistency reg-
+ularizer, expressed compactly as Lpair = λc Lcons.
+If the classifier C has learned to assign high scores only
+to anatomically realistic consecutive pairs, minimizing 1 −
+C(·) encourages the predicted masks ˆyi to lie on a manifold
+of plausible slice-to-slice shapes. This reduces gross mis-
+localization and discontinuities that often occur in difficult
+AAA cases.
+3.4. XAI Field and Focus Alignment
+3.4.1. Gradient-based XAI Field
+To extract a spatial attribution field that reveals the in-
+ternal focus of the encoder, we attach forward and back-
+ward hooks to the final transformer block.
+Let A ∈
+RB×C×He×We denote the block activations and G
+∈
+RB×C×He×We their gradients with respect to a scalar sur-
+rogate objective ssur. From these gradients, we compute
+channel coefficients wc by spatially averaging each gradi-
+ent map, i.e., wc = (HeWe)−1 P
+i,j Gc,i,j. Using these co-
+efficients, we form a coarse attribution map by aggregating
+activation channels via a positively truncated linear opera-
+tor,
+Φlow = Ω
+ X
+c
+wc Ac
+!
+∈R1×He×We
+(7)
+where Ω(·) denotes a one-sided gating transformation
+applied elementwise. Subsequently, this attribution map is
+lifted to the resolution of the segmentation using a spatial
+lifting operator U, giving Φ = U(Φcoarse) ∈R1×H×W . To
+obtain a probability-like focus distribution, we normalize by
+its global mass,
+˜ϕi,j =
+ϕi,j
+P
+u,v ϕu,v + ϵ.
+(8)
+where ε ensures numerical stability.
+The resulting ˜Φ
+functions as a dense, attribution-based focus map that sum-
+marizes where the encoder concentrates its attention, driven
+by the current loss.
+3.4.2. Probability Focus Alignment
+We treat both the segmentation probabilities and the XAI
+field as spatial distributions to enforce agreement between
+the predictive field of the model and the attribution map.
+p = σ(s),
+˜pi,j =
+pi,j
+P
+u,v pu,v + ϵ.
+(9)
+The raw probability surface is obtained by applying a non-
+linear squashing operator to the logits p, and subsequently
+transformed into a mass–normalized density through ˜pi,j.
+We impose the alignment through two complementary in-
+teraction terms. First, a mass-overlap functional compares
+p with the unnormalized attribution Φ by evaluating an over-
+lap ratio of their pointwise products.
+Lovlp = 1 −
+2 P
+i,j pi,jϕi,j + ϵ
+P
+i,j pi,j + P
+i,j ϕi,j + ϵ.
+(10)
+Second, a distributional divergence penalizes discrepan-
+cies between the normalized fields ˜p and ˜Φ by contrasting
+their local log-masses.
+The divergence term is the only
+component maintained in explicit form.
+Ldiv = Ei,j
+
+˜pi,j log(˜pi,j + ϵ) −˜pi,j log(˜ϕi,j + ϵ)
+
+(11)
+By aligning focus mass distributional divergence (Ldiv),
+the model learns a robust attention manifold that suppresses
+false distractors. The final alignment objective couples the
+overlap term and the divergence through a tunable coef-
+ficient λdiv, yielding Lalign = Lovlp + λdiv Jdiv.
+This
+composite penalty encourages the segmentation probability
+mass to concentrate on regions that the encoder itself iden-
+tifies as important, thereby discouraging scattered or mis-
+aligned focus. Practically, the attribution field Φ is obtained
+by differentiating the surrogate scalar ssur with respect to
+the encoder representation and applying the above defini-
+tion of normalization.
+3.5. Anatomy-aware and Confidence Prior
+To further protect thin aneurysm walls and lumen bound-
+aries, we incorporate the learning signal with structure-
+sensitive penalties derived from differential operators. Let
+Dx and Dy denote first-order image differential operators
+implemented via discrete convolution kernels, and let p∗=
+Ψ(s) denote the nonlinear squashing of the logits. Applying
+(Dx, Dy) to both p∗and y yields two gradient-magnitude
+fields,
+Gp =
+ (Dxp∗)2 + (Dyp∗)2 + ε
+1/2
+(12)
+Gy =
+ (Dxy)2 + (Dyy)2 + ε
+1/2
+(13)
+whose spatial alignment is measured using a normalized
+inner-product ratio embedded directly into the penalty term.
+Ledge = 1 −
+2 P
+i,j Gp,i,jGy,i,j + ϵ
+P
+i,j Gp,i,j + P
+i,j Gy,i,j + ϵ
+(14)
+Alongside this differential alignment, we impose a
+topology-sensitive component based on a differentiable
+medial-axis surrogate. We adopt a differentiable approx-
+imation of skeletonization to obtain centerlines S(p) and
+5
+S(y), and compute
+Lcline = 1 −
+2 P
+i,j S(p)i,jS(y)i,j + ϵ
+P
+i,j S(p)i,j + P
+i,j S(y)i,j + ϵ
+(15)
+The combination of these differential and topological
+terms produces an anatomy-regularizing functional,
+Lanat = 1
+2 Ledge + 1
+2 Lcline,
+(16)
+where each constituent term highlights the normalized
+correlation structure described above. These components
+ensure that the model respects both the thickness and the
+medial topology of the aneurysm region rather than relying
+solely on regional-level overlap.
+In parallel, the auxiliary branch provides a spatial prior
+mc that reflects the model’s internal confidence. This prior
+is trained to match the base probability field through a dis-
+crepancy functional Lconf, obtained by applying a mono-
+tone contrast operator between mc and p∗. The geometric
+box signal, predicted via the projection head, is penalized
+through an ℓ1 deviation between the predicted and ground-
+truth bounding vectors. Thus, giving rise to an additional
+geometric term Lbox.
+The complete optimization strategy proceeds as a cur-
+riculum in which all loss components coexist within a sin-
+gle unified objective, but are emphasized differently across
+training stages. Let
+Lseg = Λmain(s, y) + γaux Λaux(a, y)
+(17)
+denote the region-matching component that acts on both
+primary and auxiliary decoding paths, where each Λ sub-
+sumes both volumetric and overlap-based discrepancies.
+The structural regularizer Lanat, the confidence coher-
+ence term Lconf, the geometric deviation penalty Lbox,
+and the encoder–attribution alignment functional Ldiv to-
+gether form a pool of auxiliary constraints.
+During the
+early phase, optimization prioritizes inter-slice plausibility
+through a weighted consistency energy Lpair, producing a
+stage-weighted objective
+Jearly = Lseg + α1 Lconf + α2 Lpair
+(18)
+which stabilizes volumetric coherence and suppresses
+abrupt spatial discontinuities. Once stable, the emphasis
+is progressively shifted towards attribution-probability and
+anatomical faithfulness through
+Jlate = Lseg + β1 Lanat + β2 Lconf + β3 Ldiv
+(19)
+Both stages operate on the same level, and the transition
+corresponds solely to a shift in emphasis over the same set
+of losses. This unified formulation ensures that global con-
+sistency, boundary geometry, encoder focus alignment, and
+region-level accuracy are optimized jointly in a compatible
+and mutually reinforcing manner.
+4. Experimental Results
+4.1. Dataset and Evaluation Protocol
+We retrospectively collected 147 contrast-enhanced CTA
+examinations from Allegheny Health Network and North-
+western Memorial Hospital. All scans had slice thicknesses
+between 1 and 3 mm and a resolution of 512 x 512. The
+study was approved by the Institutional Review Boards of
+the participating institutions. Since this was a retrospec-
+tive study using de-identified data, informed consent was
+waived by both IRBs. The data set includes 9,037 axial
+CTA images used as ground truth, with an 80/20 patient-
+level split for training and testing.
+We evaluated our method on the clinically validated
+AAA data set that contains two masks per slice: an outer
+aneurysm wall mask and a lumen mask. The data set was
+divided into training and test sets, with the test set further
+divided into two parts. One part is the general test set that
+contains a wide range of cases, while the second part is
+a curated complex subset that consists of slices where the
+baseline models are prone to failure. We report results sep-
+arately for outer wall and lumen segmentation. For evalua-
+tion, we compute the following metrics: Intersection-over-
+Union (IoU), Dice coefficient, and the 95th percentile Haus-
+dorff distance (HD95). All metrics are reported as mean
+values across test slices.
+4.2. Baselines and Implementation Details
+All models are implemented in PyTorch and trained on eight
+NVIDIA H200 GPUs for 200 epochs using a batch size of
+12 volumes. Training XAI-SAM on 8 NVIDIA H200 GPUs
+took ∼14 hours. At inference, the overhead is negligible
+(∼12ms per slice) as the gradient hooks are only active dur-
+ing training. We compared against the following baselines:
+U-Net, U-Net++, nnU-Net, MedSAM, and SAM trained on
+the AAA data set. The MedSAM fine-tuned model and the
+SAM-based baseline use the same ViT-B encoder and de-
+coder architecture as our method but without XAI guidance,
+auxiliary decoder, or pairwise consistency. For the XAI-
+guided model, we use λkl = 0.2 and a gradient-clipping
+threshold to stabilize training.
+4.3. General Test Set Performance
+In the general test set, as seen in Table 1, our XAI-SAM
+substantially outperforms all baselines for both the outer
+wall and lumen segmentation. For the outer wall, the SAM
+baseline achieves an IoU of approximately 82% and a Dice
+of around 89%, while XAI-SAM reaches an IoU of approx-
+imately 96% and a Dice of 98%, with corresponding im-
+provements in HD95. For the lumen, the gains are similarly
+pronounced: IoU improves from roughly 86% (SAM base-
+line) to 96% (XAI-SAM), and Dice increases from about
+92% to 98%. U-Net and U-Net++ show noticeably lower
+6
+Figure 4. Visualization of model performance on abdominal CT slices. U-Net and U-Net++ frequently mis-localize or leak into adjacent
+vessels; MedSAM and SAM produce diffuse, unstable masks across slices; XAI-SAM accurately captures thin boundaries and maintains
+anatomical consistency across the full axial sequence (Red: Lumen. Green: Outer wall).
+Table 1. General test set results. IoU and Dice are reported in
+percentages (↑higher is better); HD95 in millimeters (↓lower is
+better). Best results are in bold, second best are underlined.
+Model
+IoU (%)↑
+Dice (%)↑
+HD95 (mm)↓
+Outer Wall
+U–Net [26]
+68.81
+77.21
+14.98
+U–Net++ [39]
+68.23
+78.13
+22.15
+MedSAM [17]
+77.97
+85.58
+6.30
+nnU-Net [8]
+80.26
+86.62
+6.87
+SAM baseline [12]
+81.53
+88.99
+4.09
+XAI–SAM
+96.08
+97.93
+0.19
+Lumen
+U–Net [26]
+81.05
+87.61
+10.93
+U–Net++ [39]
+71.22
+81.45
+30.31
+MedSAM [17]
+76.83
+84.67
+7.67
+nnU-Net [8]
+80.42
+87.80
+12.14
+SAM baseline [12]
+85.83
+91.86
+1.97
+XAI–SAM
+95.56
+97.67
+0.26
+and more variable performance, particularly on outer wall
+segmentation, where their IoU and Dice have higher stan-
+dard deviations and much larger HD95 values. The Med-
+SAM fine-tuned model improves over the U-Net variants,
+but still falls short of the SAM baseline and significantly
+behind XAI-SAM. Overall, the results of the general test
+set demonstrate that integrating the alignment of the XAI
+field, anatomy-aware losses, and confidence priors into the
+SAM backbone yields a consistent boost across all metrics
+for both the outer wall and lumen regions.
+Table 2. Complex test set results. IoU and Dice are reported in
+percentages (↑higher is better); HD95 in millimeters (↓lower is
+better). Best results are in bold, second best are underlined.
+Model
+IoU (%)↑
+Dice (%)↑
+HD95 (mm)↓
+Outer Wall
+U–Net [26]
+65.14
+74.15
+17.98
+U–Net++ [39]
+65.58
+76.20
+23.74
+MedSAM [17]
+69.82
+79.73
+9.72
+nnU-Net [8]
+76.53
+84.22
+10.05
+SAM baseline [12]
+78.43
+86.83
+5.49
+XAI–SAM
+94.95
+97.30
+0.31
+Lumen
+U–Net [26]
+76.52
+84.33
+13.39
+U–Net++ [39]
+66.96
+78.50
+31.39
+MedSAM [17]
+70.09
+79.57
+10.89
+nnU-Net [8]
+75.51
+84.17
+18.07
+SAM baseline [12]
+82.11
+89.57
+2.59
+XAI–SAM
+94.55
+97.11
+0.49
+4.4. Complex Case Performance
+In Table 2, for the complex subset, the benefits of our
+method become even more apparent. For outer wall seg-
+mentation, the SAM baseline achieves an IoU of approxi-
+mately 78% and a Dice of 87%, while XAI-SAM improves
+these to approximately 95% and 97%, respectively. HD95 is
+reduced by a large margin, reflecting more accurate bound-
+ary alignment in difficult cases. Similar trends hold for lu-
+men segmentation, where XAI-SAM improves both overlap
+measures and reduces boundary errors.
+7
+Importantly, U-Net and U-Net++ exhibit a large perfor-
+mance degradation and variance in this subset, with IoU
+dropping into the 65%-75% range and HD95 values some-
+times exceeding 30-50 millimeters (mm). MedSAM per-
+forms better but still suffers from over-segmentation and
+leakage in failure-prone slices.
+By contrast, XAI-SAM
+maintains high overlap and low HD95, indicating that the
+model not only generalizes well but is particularly robust
+where other models fail.
+4.5. Ablation Study
+To isolate the impact of individual components, we present
+an ablation study on the complex test set. S: Segmentation
+Refinement, X: XAI-Field Guidance, A: Anatomy-Aware
+Loss.
+Table 3 reports a component-wise ablation in the
+complex test set. The results confirm that, while Anatomy
+(A) provides a strong prior, full XAI-SAM integration is
+required to achieve peak precision and robustness against
+distractors.
+Table 3. Ablation study on the complex test set.
+Comp.
+Outer Wall
+Lumen
+S
+X
+A
+IoU
+Dice
+HD95
+IoU
+Dice
+HD95
+×
+×
+×
+78.4
+86.8
+5.4
+82.1
+89.6
+2.6
+×
+✓
+✓
+92.9
+96.2
+0.4
+91.3
+95.4
+0.6
+✓
+×
+✓
+93.3
+96.4
+0.6
+90.0
+94.6
+1.0
+✓
+✓
+×
+94.7
+97.1
+0.2
+93.8
+96.7
+0.6
+✓
+✓
+✓
+95.0
+97.3
+0.3
+94.6
+97.1
+0.5
+4.6. Qualitative Case Studies and XAI Analysis
+To better understand why XAI-SAM improves perfor-
+mance, we conducted detailed qualitative case studies
+on challenging abdominal CT slices, including complex
+aneurysm morphology, thin and irregular walls, and the
+presence of adjacent vessels with similar intensity patterns
+(Fig. 4).
+In many cases, U-Net and U-Net++ focus on
+adjacent vessels or wall-like structures, leading to mis-
+localization. These confusions are expected, as these ar-
+chitectures rely heavily on local texture cues and lack ex-
+plicit mechanisms for regulating focus. MedSAM and the
+standard SAM baseline exhibit a different failure profile.
+Although they often identify a coarse region of interest, in-
+ternal attention tends to be diffuse, with large portions of
+the probability mass spreading into surrounding tissue. This
+diffuse focus manifests itself in predictions that leak beyond
+the aneurysm wall or collapse inward near thin boundary
+segments. In contrast, XAI-SAM’s XAI field is strongly
+concentrated on the true aneurysm wall and lumen bound-
+aries. The aligned focus is reflected in the predicted masks,
+which follow the thin wall more closely and avoid leak-
+age. For volumes in which pairwise consistency was ap-
+plied, we observe that the slice-to-slice masks remain more
+stable and anatomically coherent. Abrupt changes in seg-
+mentation, such as sudden disappearance or expansion of
+the aneurysm region, are substantially reduced compared to
+baselines. Together, these qualitative findings support our
+claim that treating encoder focus as a training signal helps
+correct specific classes of model failures that are not fully
+addressed by standard region-based losses.
+5. Discussion
+Our experiments show that explicitly optimizing the en-
+coder’s internal focus via an XAI field and integrating this
+signal into both representation and decoding leads to more
+reliable AAA segmentation, especially in complex cases.
+The improvements are not limited to global metrics; they
+also manifest as better preservation of thin aneurysm walls,
+reduced over-segmentation, and more consistent behavior
+across slices. From a methodological standpoint, our ap-
+proach bridges post-hoc explainability and training-time su-
+pervision.
+Instead of using attribution solely to analyze
+models after training, we use it proactively to shape the
+learned representation. The XAI alignment loss encourages
+the model to look where it predicts, and anatomy-aware
+losses ensure that this focus remains faithful to clinically
+meaningful structures. The pairwise consistency classifier
+complements this by enforcing a learned notion of slice-to-
+slice plausibility, helping to suppress anatomically implau-
+sible transitions. There are several limitations and avenues
+for future work. First, our XAI field is based on attribu-
+tion, which may not capture all aspects of the encoder’s de-
+cision process. Exploring alternative attribution methods
+or learned attention maps as the basis for the XAI field is
+an interesting direction. Second, we currently train sepa-
+rate models for outer wall and lumen masks; a multi-task
+formulation that jointly models both regions and their rela-
+tionships could further improve performance. Third, while
+our experiments focus on AAA, the proposed framework
+is generic and could be applied to other vascular or organ
+segmentation tasks where model failures are tied to mis-
+allocated attention. In summary, our results suggest that
+explainability-driven analysis can be elevated from a diag-
+nostic tool to a guiding principle for training segmentation
+models. By dissecting how and where models fail and then
+explicitly encoding this knowledge into the learning objec-
+tive, we can obtain segmentation systems that are not only
+more accurate but also more aligned with clinical intuition
+in the scenarios that matter most.
+Acknowledgement
+This work was funded by the National Institutes of Health
+(Grant No. R01HL159300).
+8
+References
+[1] A Anjum, R Von Allmen, R Greenhalgh, and JT Powell.
+Explaining the decrease in mortality from abdominal aortic
+aneurysm rupture. Journal of British Surgery, 99(5):637–
+645, 2012. 1
+[2] Sebastian Bach et al. On pixel-wise explanations for non-
+linear classifier decisions by layer-wise relevance propaga-
+tion. PloS One, 10(7):e0130140, 2015. 2
+[3] Hu Cao, Yueyue Wang, Joy Chen, Dongsheng Jiang, Xi-
+aopeng Zhang, Qi Tian, and Manning Wang.
+Swin-unet:
+Unet-like pure transformer for medical image segmentation.
+In European conference on computer vision, pages 205–218.
+Springer, 2022. 2
+[4] Aditya Chattopadhay, Anirban Sarkar, Prantik Howlader,
+and Vineeth N Balasubramanian.
+Grad-cam++: General-
+ized gradient-based visual explanations for deep convolu-
+tional networks. In 2018 IEEE winter conference on appli-
+cations of computer vision (WACV), pages 839–847. IEEE,
+2018. 2
+[5] Du Chen and Geoffrey A Chua.
+Differentially private
+stochastic convex optimization under a quantile loss func-
+tion.
+In International Conference on Machine Learning,
+pages 4435–4461. PMLR, 2023. 3
+[6] Shuaipeng Ding, Mingyong Li, and Chao Wang. Mg-unet:
+A memory-guided unet for lesion segmentation in chest im-
+ages. In International Conference on Medical Image Com-
+puting and Computer-Assisted Intervention, pages 355–365.
+Springer, 2025. 2
+[7] Nabil Ibtehaz and Daisuke Kihara. Acc-unet: A completely
+convolutional unet model for the 2020s.
+In International
+conference on medical image computing and computer-
+assisted intervention, pages 692–702. Springer, 2023. 2
+[8] Fabian Isensee, Paul F Jaeger, Simon AA Kohl, Jens Pe-
+tersen, and Klaus H Maier-Hein. nnu-net: a self-configuring
+method for deep learning-based biomedical image segmen-
+tation. Nature methods, 18(2):203–211, 2021. 2, 7
+[9] Andrei Kapishnikov, Subhashini Venugopalan, Besim Avci,
+Ben Wedin, Michael Terry, and Tolga Bolukbasi. Guided
+integrated gradients: An adaptive path method for remov-
+ing noise. In Proceedings of the IEEE/CVF conference on
+computer vision and pattern recognition, pages 5050–5058,
+2021. 2
+[10] Alan Karthikesalingam, Peter J Holt, Alberto Vidal-Diez,
+Baris A Ozdemir, Jan D Poloniecki, Robert J Hinchliffe, and
+Matthew M Thompson.
+Mortality from ruptured abdomi-
+nal aortic aneurysms: clinical lessons from a comparison of
+outcomes in england and the usa. The Lancet, 383(9921):
+963–969, 2014. 1
+[11] Lei Ke, Mingqiao Ye, Martin Danelljan, Yu-Wing Tai, Chi-
+Keung Tang, Fisher Yu, et al. Segment anything in high qual-
+ity. Advances in Neural Information Processing Systems, 36:
+29914–29934, 2023. 1
+[12] Alexander Kirillov, Eric Mintun, Nikhila Ravi, Hanzi Mao,
+Chloe Rolland, Laura Gustafson, Tete Xiao, Spencer White-
+head, Alexander C Berg, Wan-Yen Lo, et al. Segment any-
+thing. In ICCV, pages 4015–4026, 2023. 1, 2, 7
+[13] Hyeokjun Kweon and Kuk-Jin Yoon. From sam to cams: Ex-
+ploring segment anything model for weakly supervised se-
+mantic segmentation. In Proceedings of the IEEE/CVF Con-
+ference on Computer Vision and Pattern Recognition, pages
+19499–19509, 2024.
+[14] Feng Li, Hao Zhang, Peize Sun, Xueyan Zou, Shilong Liu,
+Chunyuan Li, Jianwei Yang, Lei Zhang, and Jianfeng Gao.
+Segment and recognize anything at any granularity. In Eu-
+ropean Conference on Computer Vision, pages 467–484.
+Springer, 2024. 2
+[15] Lin Li, Dong Tang, Xiaowen Chu, Xiaofei Yang, and Fei Yu.
+Reseg-unet: A reconstruction-guided optimization frame-
+work for enhanced medical image segmentation.
+In In-
+ternational Conference on Medical Image Computing and
+Computer-Assisted Intervention, pages 544–554. Springer,
+2025. 1
+[16] Zonghan Lyu, Nan Mu, Mostafa Rezaeitaleshmahalleh, Xi-
+aoming Zhang, Robert McBane, and Jingfeng Jiang. Auto-
+matic segmentation of intraluminal thrombosis of abdominal
+aortic aneurysms from ct angiography using a mixed-scale-
+driven multiview perception network (m2net) model. Com-
+puters in Biology and Medicine, 179:108838, 2024. 2
+[17] Jun Ma, Yuting He, Feifei Li, Lin Han, Chenyu You, and
+Bo Wang.
+Segment anything in medical images.
+Nature
+Communications, 15(1):654, 2024. 1, 2, 7
+[18] Anqi Mao, Mehryar Mohri, and Yutao Zhong. Cross-entropy
+loss functions: Theoretical analysis and applications. In In-
+ternational conference on Machine learning, pages 23803–
+23828. pmlr, 2023. 3
+[19] Anqi Mao, Mehryar Mohri, and Yutao Zhong. Realizable h-
+consistent and bayes-consistent loss functions for learning to
+defer. Advances in neural information processing systems,
+37:73638–73671, 2024. 3
+[20] Maciej A Mazurowski, Haoyu Dong, Hanxue Gu, Jichen
+Yang, Nicholas Konz, and Yixin Zhang. Segment anything
+model for medical image analysis: an experimental study.
+Medical Image Analysis, 89:102918, 2023. 1
+[21] Nan Mu, Zonghan Lyu, Mostafa Rezaeitaleshmahalleh, Xi-
+aoming Zhang, Todd Rasmussen, Robert McBane, and
+Jingfeng Jiang. Automatic segmentation of abdominal aor-
+tic aneurysms from ct angiography using a context-aware
+cascaded u-net. Computers in biology and medicine, 158:
+106569, 2023. 2
+[22] Sumit Pandey, Kuan-Fu Chen, and Erik B Dam. Comprehen-
+sive multimodal segmentation in medical imaging: Combin-
+ing yolov8 with sam and hq-sam models. In Proceedings of
+the IEEE/CVF international conference on computer vision,
+pages 2592–2598, 2023. 2
+[23] Erin Rainville, Amirhossein Rasoulian, Hassan Rivaz, and
+Yiming Xiao. Weakly supervised intracranial aneurysm de-
+tection and segmentation in mr angiography via multi-task
+unet with vesselness prior. In Proceedings of the IEEE/CVF
+International Conference on Computer Vision, pages 938–
+947, 2025. 2
+[24] Simiao Ren, Francesco Luzi, Saad Lahrichi, Kaleb Kas-
+saw, Leslie M Collins, Kyle Bradbury, and Jordan M Malof.
+Segment anything, from space?
+In Proceedings of the
+9
+IEEE/CVF Winter Conference on Applications of Computer
+Vision, pages 8355–8365, 2024. 1
+[25] Merjulah Roby, Abu Noman Md Sakib, Zijie Zhang,
+Satish C Muluk, Mark K Eskandari, and Ender A Finol.
+Automatic explainable segmentation of abdominal aortic
+aneurysm from computed tomography angiography. IEEE
+access, 2025. 1
+[26] Olaf Ronneberger, Philipp Fischer, and Thomas Brox. U-
+net: Convolutional networks for biomedical image segmen-
+tation. In International Conference on Medical image com-
+puting and computer-assisted intervention, pages 234–241.
+Springer, 2015. 1, 2, 7
+[27] Jiacheng Ruan, Mingye Xie, Jingsheng Gao, Ting Liu, and
+Yuzhuo Fu. Ege-unet: an efficient group enhanced unet for
+skin lesion segmentation.
+In International conference on
+medical image computing and computer-assisted interven-
+tion, pages 481–490. Springer, 2023. 2
+[28] Ramprasaath R Selvaraju, Michael Cogswell, Abhishek Das,
+Ramakrishna Vedantam, Devi Parikh, and Dhruv Batra.
+Grad-cam:
+Visual explanations from deep networks via
+gradient-based localization. In Proceedings of the IEEE in-
+ternational conference on computer vision, pages 618–626,
+2017. 2
+[29] Daniel Smilkov, Nikhil Thorat, Been Kim, Fernanda Vi´egas,
+and Martin Wattenberg.
+Smoothgrad: removing noise by
+adding noise. arXiv preprint arXiv:1706.03825, 2017. 2
+[30] Mukund Sundararajan et al. Axiomatic attribution for deep
+networks. Proceedings of the 34th International Conference
+on Machine Learning, pages 3319–3328, 2017. 2
+[31] Wei-En Tai, Yu-Lin Shih, Cheng Sun, Yu-Chiang Frank
+Wang, and Hwann-Tzong Chen. Segment anything, even oc-
+cluded. In Proceedings of the Computer Vision and Pattern
+Recognition Conference, pages 29385–29394, 2025. 1
+[32] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszko-
+reit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia
+Polosukhin. Attention is all you need. Advances in neural
+information processing systems, 30, 2017. 2
+[33] Kira Vinogradova, Alexandr Dibrov, and Gene Myers. To-
+wards interpretable semantic segmentation via gradient-
+weighted class activation mapping (student abstract). In Pro-
+ceedings of the AAAI conference on artificial intelligence,
+pages 13943–13944, 2020. 2
+[34] Mingyu Wan, Jing Zhu, Yue Che, Xiran Cao, Xiao Han, Xin-
+hui Si, Wei Wang, Chang Shu, Mingyao Luo, and Xuelan
+Zhang. Bif-net: Boundary information fusion network for
+abdominal aortic aneurysm segmentation. Computers in Bi-
+ology and Medicine, 183:109191, 2024. 2
+[35] Haofan Wang, Zifan Wang, Mengnan Du, Fan Yang, Zijian
+Zhang, Sirui Ding, Piotr Mardziel, and Xia Hu. Score-cam:
+Score-weighted visual explanations for convolutional neural
+networks. In Proceedings of the IEEE/CVF conference on
+computer vision and pattern recognition workshops, pages
+24–25, 2020. 2
+[36] XuDong Wang, Jingfeng Yang, and Trevor Darrell. Segment
+anything without supervision. Advances in Neural Informa-
+tion Processing Systems, 37:138731–138755, 2024. 2
+[37] Jiahao Xu and Lyuyang Tong.
+Lb-unet: A lightweight
+boundary-assisted unet for skin lesion segmentation. In In-
+ternational Conference on Medical Image Computing and
+Computer-Assisted Intervention, pages 361–371. Springer,
+2024. 2
+[38] Hongxu Yin, Arash Vahdat, Jose M Alvarez, Arun Mallya,
+Jan Kautz, and Pavlo Molchanov.
+A-vit:
+Adaptive to-
+kens for efficient vision transformer.
+In Proceedings of
+the IEEE/CVF conference on computer vision and pattern
+recognition, pages 10809–10818, 2022. 3
+[39] Zongwei Zhou, Md Mahfuzur Rahman Siddiquee, Nima
+Tajbakhsh, and Jianming Liang. Unet++: A nested u-net ar-
+chitecture for medical image segmentation. In International
+workshop on deep learning in medical image analysis, pages
+3–11. Springer, 2018. 1, 2, 7
+[40] Zongwei Zhou, Md Mahfuzur Rahman Siddiquee, Nima
+Tajbakhsh, and Jianming Liang. Unet++: Redesigning skip
+connections to exploit multiscale features in image segmen-
+tation. IEEE transactions on medical imaging, 39(6):1856–
+1867, 2019. 1
+10

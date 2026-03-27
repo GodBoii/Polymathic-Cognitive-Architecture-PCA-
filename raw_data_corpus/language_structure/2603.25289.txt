@@ -1,0 +1,1534 @@
+Revealing the influence of participant failures on model quality
+in cross-silo Federated Learning
+Fabian Stricker – fabian.stricker@h-ka.de
+David Bermbach – db@3s.tu-berlin.de
+Christian Zirpins – christian.zirpins@h-ka.de
+Abstract
+Federated Learning (FL) is a paradigm for training machine learning (ML) models in collabo-
+rative settings while preserving participants’ privacy by keeping raw data local. A key requirement
+for the use of FL in production is reliability, as insufficient reliability can compromise the validity,
+stability, and reproducibility of learning outcomes. FL inherently operates as a distributed sys-
+tem and is therefore susceptible to crash failures, network partitioning, and other fault scenarios.
+Despite this, the impact of such failures on FL outcomes has not yet been studied systematically.
+In this paper, we address this gap by investigating the impact of missing participants in FL. To
+this end, we conduct extensive experiments on image, tabular, and time-series data and analyze
+how the absence of participants affects model performance, taking into account influencing factors
+such as data skewness, different availability patterns, and model architectures. Furthermore, we
+examine scenario-specific aspects, including the utility of the global model for missing participants.
+Our experiments provide detailed insights into the effects of various influencing factors. In par-
+ticular, we show that data skewness has a strong impact, often leading to overly optimistic model
+evaluations and, in some cases, even altering the effects of other influencing factors.
+1
+Introduction
+Today, many companies employ machine learning (ML) models in their digital products, services,
+or processes. The quality of these models, however, strongly depends on the availability of suitable
+training data, including data covering rare edge cases. In practice, such data are often confined to
+isolated silos and cannot be shared due to corporate policies or privacy regulations [19].
+This problem is addressed through federated learning (FL), in which ML models are trained col-
+laboratively without exchanging raw data [17]. To this end, multiple participants each train on local
+data and send the resulting ML model to a coordinator. The coordinator then aggregates the partial
+models, e.g., based on weighted averaging of their parameters (FedAvg [17]), and returns the resulting
+global model to all participants. This is repeated over multiple rounds with evaluation and additional
+training until partial and global models converge [17, 25].
+As an FL deployment is inherently a distributed system, it is exposed to the full spectrum of
+failures typical of such systems. Among others, FL deployments often have to deal with participants
+dropping out either temporarily or permanently.
+In cross-device FL with many participants, e.g.,
+based on mobile phones, this is the default state but can be addressed: Due to the large number
+of participants, cross-device FL relies on participant selection methods and can easily fall back to
+alternative candidates [7, 21, 27].
+In contrast, cross-silo FL includes just a few participants, each
+contributing a large share of the overall data [12, p.4-16]. Participants in cross-silo FL might drop out
+through various kinds of failures, e.g., Internet problems, software bugs, or energy outages. In such
+cases, a failed participant cannot be replaced by another due to their small number and the likelihood
+of unique individual training data that is non-independent non-identically distributed (non-IID) [24].
+While there is work on fault tolerance in cross-device FL, e.g., [21, 23, 11], this topic has received little
+attention in cross-silo FL with non-IID data [32].
+In this paper, we further address this gap by extending our previous work [24], which explored the
+impact of participant failures in cross-silo FL on the training and evaluation of convolutional neural
+networks (CNNs) with image data, considering different influential factors. In addition, we analyzed
+1
+arXiv:2603.25289v1  [cs.DC]  26 Mar 2026
+how the performance deteriorates for the missing participant and the use of Shapley values (SVs) for
+impact detection.
+This paper considerably extends our former work by considering important additional data modal-
+ities such as tabular and time-series data that exhibit unique properties and structure and are often
+used in organizational contexts. We also add a crash-recovery scenario to understand the impact of
+a participant failing and recovering near the end of the training process. To further understand the
+limits of the influential factors, we simulated skew situations to consider highly unique heterogeneous
+data silos. Lastly, we analyze the impact of different model architectures for image and time-series
+data to support architectural design choices.
+Overall, this extended paper provides the following contributions:
+• We systematically analyze the problem of participant failures in cross-silo FL and derive failure-
+impact modifiers that are essential to understand the impact of failures. Furthermore, we provide
+a terminology of failure-impact modifiers (Section 3).
+• We conduct a comprehensive study across time-series, image, and tabular datasets while con-
+sidering different non-IID data skews and additional failure-impact modifiers, while providing
+insights into the effect of different failure-impact modifiers on the training, evaluation, and the
+utility of the model for the missing participant. We make all data publicly available (Section 4).
+• We discuss the findings and provide guidance for assessing the impact of participant failures
+(Section 5).
+2
+Background & Related Work
+In this section, we explain the concepts of FL including the structure of a FL system, characteristics
+of the participants, and data heterogeneity. Furthermore, we provide an overview of the related work.
+2.1
+Concepts of Federated Learning
+Since FL is a new technology, there is not yet a common conceptual framework; instead, FL offers
+various patterns that fit diverse application contexts.
+The first aspect to consider is the structure of the FL system, which can range from centralized to
+fully decentralized. In centralized FL, there is only one coordinator instance that handles all partici-
+pants and aggregates the weights. This approach is often used because of the centralized orchestration
+of the process, but it is susceptible to single points of failure and may lead to a bottleneck. In decen-
+tralized FL, the coordinator role is handled by all participants individually, i.e., each participant also
+aggregates the models [12, p.11-13]. In between are different architectures such as multiple aggregation
+layers to handle large numbers of participants or multiple coordinators to improve robustness [4]. Next,
+the data structure is important as it leads to different training processes. In particular, data can be
+partitioned horizontally or vertically. If data are horizontally partitioned (HFL), then all participants
+have the same features for a sample and can train on their datasets. Contrary, in vertical FL (VFL),
+a single participant does not have all features for a sample and therefore requires communication with
+the other participants for training [16]. The next aspect concerns aggregation methods, as they define
+how the model weights of each participant are combined and hence influence the learned patterns. The
+most common method is FedAvg [17], but many new and modified algorithms emerged to improve
+different aspects such as robustness, privacy, or quality [5, 15]. The last aspect addresses the charac-
+teristics of the FL participants, which are commonly distinguished into two settings. The first setting
+is called cross-device FL and consists of many participants that are mostly mobile devices, which are
+constrained by limited internet connectivity, battery capacity, and usually have little data samples [4].
+In contrast, the second setting is called cross-silo FL and consists of a few participants, where each
+participant has substantial resources and large datasets.
+In real-world FL systems, data skewness is a common issue that negatively impacts the quality
+of the model and can manifest in different, potentially overlapping types [32]. The most common is
+quantity skew, where participants have different numbers of data samples. In label skew, the label
+distribution differs across participants. Finally, with attribute skew (full feature overlap), participants
+share the same feature space, but the feature distributions differ [33]. Depending on the data modality,
+2
+other skews can occur. For example, Nachtigall et al. [18] reported new skews for time-series datasets
+such as seasonality skew, and McMahan et al. [17] found that non-IID data may cause model divergence
+leading to unstable convergence.
+In the following, we focus on cross-silo FL, where the number of participants is small, and each
+participant holds a significant portion of the overall data. In such settings, participant failures can
+have a substantial impact on the training process and the resulting model quality. Therefore, we next
+review related work that addresses participant failures in FL.
+2.2
+Related Work
+In existing research, the impact of participant failures in cross-silo FL is often overlooked, and com-
+prehensive analyses are missing. On the contrary, research on missing participants in cross-device FL
+is more mature, as participants not being able to participate are common due to their sheer number.
+For the discussion of related work, we start with existing work on missing participants in cross-device
+FL. Here, one approach to mitigate the issue of a missing or unavailable participant is to use modified
+participant selection methods. Sousa et al. [23] propose an extension for selection strategies that, in
+case of a failure, selects a different participant from a predefined reserve pool of substitute participants
+to ensure convergence of the global model. However, using a reserve pool only is applicable if there are
+sufficient participants. Another aspect is the bias caused by participants with higher availability. Here,
+Ribero et al. [21] proposed an unbiased selection strategy that includes the availability of participants
+to prevent bias. Besides participant selection strategies, there are also substitution and augmentation
+strategies to tackle convergence issues [30]. Wang and Xu [27] use the data distribution to identify
+similar participants. In case of a failure, the model update of the similar participant is used as a sub-
+stitute to reduce the impact. Their approach is based on similarity and clustering, which is difficult to
+achieve with few participants and skewed data. Instead of using a similar participant as a substitute,
+Sun et al. [26] modify model updates with a correction value to mitigate convergence issues in mobile
+edge networks. Besides mitigating the issues, there are also works that focus on system threats like
+dropout attacks causing system disruptions. Qian et al. [20] propose an attack under constraints such
+as low bandwidth and unstable network connection. They found that attacking a high value participant
+slows down convergence and has more influence in a non-IID setting. Following this work, assessing
+the contribution of participants could help in detecting the impact if specific participants crash.
+Although focusing on cross-device instead of cross-silo FL, some existing studies share closer simi-
+larities with our work. Huang et al. [9] analyze the impact of unreliable devices in a rural environment
+and consider non-IID data in combination with different participation rates. Their results indicate that
+FedAvg is robust against unreliable participants; however, their data contain only minor skews and few
+classes. Ruan et al. [22] analyze flexible device participation, where participants can send incomplete
+updates, join or leave the process. They focus on reducing the bias of incomplete updates as well as
+how new participants may accelerate the training. While they consider a cross-device scenario, they
+provide an analysis on how dynamic participation influences the convergence. So far, aspects such
+as convergence, bias, and the availability of participants are considered, but mostly for cross-device
+scenarios and the training process. To the best of our knowledge, a detailed analysis for cross-silo
+FL that also includes a range of additional factors such as the model architecture, complexity of the
+dataset, impact on the evaluation, and different number of participants is still missing. In our former
+work [24] we have provided first insights into the effects of participant failures in cross-silo FL for
+different factors while focusing on image datasets with CNN models. In particular, we have focused
+on analyzing the impact on the evaluation, the performance difference of the quality for the missing
+participants against the other participants, and the use of SVs to predict the impact.
+In this paper, we analyze new aspects that were not addressed yet. First, we study different data
+modalities, such as tabular data, which are commonly used in organizational settings as well as different
+model architectures. We also analyze the impact of unique heterogeneous silos, which represent an
+extremely skewed distribution, to show the limitations of the influential factors. In addition, we discuss
+crash-recovery behavior to analyze the influence of a participant rejoining the process.
+3
+3
+Participant Failures and Impact Modifiers
+In this section, we give an overview of participants failures in cross-silo FL and analyze which potential
+factors can alter the impact on the performance of the model.
+3.1
+Participant failures in FL systems
+In FL, failures can occur on the side of the coordinators (i.e., crashing coordinator, wrong FL con-
+figuration) or on the side of the participants. Here, we focus on the participant-related failures. To
+categorize the failures, we use their natural characteristics. These include the duration of the failure,
+the timing of the failure, the failure type, and the cause of the failure. Usually the duration is measured
+in time; however, in some FL phases (i.e., training, evaluation), the rounds can be used as a measure.
+For the timing, we can use the FL phases, such as training and evaluation, to indicate when the failure
+occurs. Last, for failure types, we consider the common failures such as crash, communication, or
+timing failures.
+In FL, the most commonly reported failures are participant crashes, network failures, participants
+that require significantly more time for computationally expensive tasks (i.e., model training), and
+Byzantine failures sorted by their detectability [28, 1]. Participant crashes can occur during any phase
+of the FL process and can be caused by software bugs or human-made mistakes. Here, the failure type
+is a crash failure. The duration depends on the cause and the recovery, as a software bug could lead to
+another crash after recovery. A participant crash can influence the assessment and the quality of the
+model, as the participant’s data are missing during the training or evaluation phase. As a consequence,
+unique data can be missing, which limits the patterns learned by the model.
+A similar behavior can occur with network failure, such as an external link failure that persists for
+a longer period. In this case, the participant cannot reach the coordinator and, therefore, is unable
+to send results to the server. Here the duration depends on the infrastructure, short interrupts can
+be resolved with reliable communication, while longer interruptions can lead to missing updates for
+multiple rounds. An important difference is that the participant can still perform operations.
+The next failure is slow participants that send the results of expensive operations after a deadline
+is met, which is a timing failure. In cross-silo FL, some participants can have more data than others,
+which can lead to larger differences between the individual training times. Here, the issue only occurs
+during computationally expensive operations such as the training. Furthermore, the impact on the
+FL system is limited as it depends on the aggregation method. Some systems would wait until the
+participant is finished, while others define a deadline, which would lead to missing updates.
+The last failure is a Byzantine failure, where the participant could send wrong information, such
+as wrong training or evaluation results. Here, communication issues, software bugs, or wrong config-
+uration of the system could lead to a different training configuration than the one provided by the
+coordinator. Depending on the cause, the failure can persist for a longer duration or happen once for a
+shorter period. For example, the participant could calculate the accuracy, but precision was supposed
+to be calculated. In FL, this issue can lead to confusing and wrong results or even to a malfunction of
+the process.
+For the remainder of this work, we define a missing participant as a participant who, during a
+failure period, is unable to execute any task given by the coordinator. Here, we consider participant
+crashes and link failures with a long duration that occur during the training and evaluation phase.
+For brevity, we use failure to denote participant failure. Next, we will analyze impact modifiers that
+increase the impact on the FL system.
+3.2
+Failure-impact modifiers
+In recent work on missing participants, the aggregation method, availability, and non-IID data have
+been mentioned as factors that influence the impact of a failure [20, 26, 9]. Here, each of them modifies
+either the behavior or the results of the participant. The first modifier, the aggregation method, defines
+how the results are combined and the participant use that result for the next training. The aggregation
+method is part of the FL process design. Next, the availability is connected to the characteristics of
+failures and describes when data are available. The last modifier influences the data distribution across
+the participants, which can lead to silos that contain unique information. Consequently, the modifier
+influences the result of the participant and the overall data distribution if a participant crashes.
+4
+Following these aspects, we analyze the overall FL process that includes the role of data, the design
+of the process, and the role of the participants, as well as the characteristics of the failure to identify ad-
+ditional aspects that influence the impact of a missing participant. We call these aspects failure-impact
+modifiers (FIM) and categorize them into data-specific, design-specific, and coordination-specific. An
+overview of all FIMs that are used in the experiments is provided in Table 2. In the following, we
+discuss the modifiers in each category:
+Data-specific Modifiers The data-specific modifiers include all aspects that manipulate the data
+of the participant. Here, the identified modifiers in the FL process include the data skewness, dataset
+complexity, data modalities, and data-record partitioning. The first modifier is the data modalities
+(DMod), which can lead to dependencies between features or samples such as in tabular or time-
+series data.
+Furthermore, it indirectly influences the selection of the model architecture, training
+hyperparameters (i.e, loss, evaluation metrics) and data skewness. Second, the data skewness (DSkew)
+is a failure-modifier, as a higher skew (both quantity and label skew) can lead to participants with
+unique data. Hence, specific data are only contributed by single silos, which, in the case of a dropout,
+would lead to their missing (i.e., unique classes or edge cases) [12, p.18-20].
+The dataset complexity (DComp) indicates how difficult it is for a model to extract meaningful
+patterns from the data. This can change due to factors such as the number of unique classes, feature
+dimensionality, and quality of the data (e.g., meaningful features, missing values, reflection of real-
+world population). For example, high complexity requires more samples to extract and learn complex
+patterns. If a participant crashes and recovers later, then a lower complexity can yield a faster recovery
+of the model performance. The last modifier is the data-record partition (DPartition) which refers to
+VFL and HFL. The impact of this factor follows the different available features across the participants.
+In VFL, the impact is higher, as a missing participant would lead to being able to train the model or
+make predictions [16]. In contrast, in HFL a missing participant in the FL process can still continue
+as each participant has the full features for a sample.
+Design-specific Modifiers The design-specific modifiers are related to the design of the FL
+process and consider aspects that modify the behavior of the participants. First, the model architecture
+(MArch) can influence the impact of a failure through different complexities of the model as well as
+different kinds of layers as they influence how the model learns patterns. For example, if the model
+consists of many generalization layers, then it tries to generalize rather than focusing on the specific
+data of the participants. Next, the training hyperparameters (HParams) (i.e., learning rate, optimizer)
+can influence the impact of a missing participant because they define how the model learns.
+For
+example, a higher learning rate leads to large steps and can lead to faster forgetting of information after
+a failure. The next modifier is the aggregation method (Amethod). Similar to the hyperparameters,
+the aggregation method influences the weights, but through the aggregation of the updates on the
+coordinator side. If a participant fails, then, depending on the aggregation method, the participants
+could have different weights assigned, which leads to a different influence on the global model. The last
+modifier is the number of participants (NParti). The number of participants can influence the impact
+of a missing participant, as usually more data means more different distributions, which can lead to
+better generalization. Hence, more participants could lead to less impact, while fewer participants
+can lead to a higher impact because less data are available and the impact of a participant is more
+significant on the data.
+Coordination-specific Modifiers This category covers coordination-related aspects of the FL
+system, including tasks that are delegated to the participants and failure characteristics that affect
+coordination. The first modifier is the participant task (PTask). In general, the task influences the
+impact, as in FL the different tasks lead to different results. These tasks include the data preprocess-
+ing (PTask.DPrep), training (PTask.Train) or evaluation (PTask.Eval). If a participant fails during
+training or evaluation, then the result will be missing, which can lead to a different resulting global
+model or to different evaluation results. The last modifiers based on the failure characteristics are the
+duration (FChar.Dur) and the timing, which lead to different availability phases for the missing par-
+ticipant (FChar.Ti). If a participant crashes, the duration is relevant because, depending on it, more
+updates can be missing, which leads to a larger shift in the global model. Next, failures can occur in
+random patterns, leading to different availability phases during which a participant’s data are included
+in the process. If the participant contributes early but crashes, his information can be forgotten over
+the training process. In contrast, a recovery and participation in the later rounds can refresh the
+information. Based on the derived failure-impact modifiers, we will next define the experiment plan
+5
+and the research goals to analyze the impact.
+4
+Experiment Plan
+In this section, we formulate the research goals and research questions of the experimentation study.
+Furthermore, we describe the setup of the experiments and how they are conducted.
+4.1
+Experimentation Goals and Research Questions
+The purpose of this study is to explore the effects of the FIMs in the failure scenario discussed in
+Section 3 on the quality of the model in cross-silo FL scenarios with few participants. Covering all
+modifiers in this study is not feasible due to the vast number of experiments; hence, we will explore
+a subset of modifiers. Furthermore, analyzing the influence of the modifier alone is not possible, as
+they need to be connected to a task such as evaluation or training where the impact can be measured.
+Besides the modifiers, we also analyze scenario-relevant influences, as these help in understanding the
+consequences for cross-silo FL. Here, one important aspect is fairness across the participants; hence,
+the influence on the usability of the model for the missing participants needs to considered. Based on
+the modifiers and the scenario, we formulate the following research questions:
+RQ1 (Related to FIMs: DMod, DSkew, DComp, MArch, PTask.Eval) Can a missing participant
+influence the model evaluation and, therefore, lead to wrong assumptions about the model quality? The
+evaluation is essential to measure the model quality and make deployment decisions. Here, we aim
+to understand if a missing participant during the evaluation phase can influence the result (i.e., the
+metrics) and whether a resulting difference is significant enough to lead to a biased evaluation. In
+this case, we consider the modifiers DMod, DSkew, DComp and MArch because they influence the
+properties of the data as well as the model, which are essential for making predictions.
+RQ2 (Related to FIMs: DMod, DSkew, DComp, MArch, FChar.Ti, PTask.Train) How does a missing
+participant affect the training of the model and, therefore, the resulting quality? The goal of FL is to
+train a high-quality model; however, a missing participant leads to missing data, which is essential
+for training. Here, the goal is to understand how a missing participant influences the quality. In
+FL, the model is dependent on the previous training rounds. Therefore, the timing of a failure can
+influence the behavior of the model. Furthermore, the data-specific modifiers and the modifier MArch
+are important as they influence the learning of patterns.
+RQ3 (Related to FIMs: DMod, DSkew, DIM.DC, NParti) How does a participant failure affect the
+usability of the trained model for the missing participant?
+In our setting, each organization should
+benefit from the process for them to keep participating. If the participant crashes and the model
+cannot be applied for a participant, then this influences the fairness of the process. Therefore, the goal
+is to analyze the change in model performance for the learning task of the missing participant while
+considering the modifiers NParti, DMod, DSkew and DComp as they influence the data distribution
+and the overall available data.
+RQ4 (Contribution measures) Do participant contribution measures reflect the impact of a missing
+participant on the training task? In FL, participant contribution measures are often used as indicators
+for the importance of a participant. If the impact of a missing participant can be predicted based on
+the importance, then this can help in designing intelligent fault-tolerant mechanisms. The goal is to
+understand if the contribution measure reflects the impact of a failure on the training.
+4.2
+Experiment Design
+In the experimentation goals (Section 4.1), we defined a set of research questions concerning different
+failure-impact modifiers. To analyze the influence of each modifier, we define a base configuration
+(Table 1) that describes the default experiment setup for all datasets. Further, we define the possible
+values a modifier can take in Table 2. We aim to isolate individual modifiers to analyze their effects
+without other influences. Therefore, we will only change one modifier at a time. However, there are still
+dependencies between these factors that cannot be resolved completely, e.g., the model architecture
+depends on the structure of the dataset. For each research question, we will conduct a set of experiments
+based on the base configuration and the possible values of the modifiers to analyze the influence of
+each related modifier. For RQ1, we modify DMod, DComp, DSkew, and MArch, which results in a
+6
+Table 1: Base configuration for all datasets
+Parameter
+Value
+Local Rounds, Global Rounds
+5 Rounds, 30 Rounds
+Aggregation Strategy, Optimizer (Learning rate)
+FedAvg, Adam (0.0001)
+Availability Timing, Available Rounds
+Start, 2
+Metrics (Classification, Forecasting)
+Macro F1-score, R2-score
+Table 2: Overview of all modifiers used in the experiments with description and possible values. Default
+values are shown in bold
+Modifiers
+Description
+Range of values
+DSkew
+Data Skew
+Base Skew, High Skew, Manual Skew
+NParti
+Number of Participants
+4, 6, 8
+FChar.Ti
+Participant Availability
+Start, Middle, End, StartEnd
+DMod
+Data Modality
+Image, Tabular, Time-series
+MArch (Image)
+Model Architecture
+CNN, ResNet50
+MArch (GermanSolarFarm)
+LSTM, 1D-CNN
+DComp (Image)
+Dataset Complexity
+CIFAR10, CIFAR100
+DComp (Tabular)
+Adult, Covertype
+DComp (Time-series)
+PVOD, GermanSolarFarm
+PTask
+Participant Task
+Training, Evaluation
+set of experiment configurations that analyze the influence of the participant included and excluded
+from the evaluation. Similarly, for RQ2, our objective is to understand the impact of the FIMs on
+the quality. However, some FIMs such as FChar.Ti are essential and cannot be removed, as their
+combination leads to the influence on the model quality. Therefore, we analyze the impact of DMod,
+DComp, DSkew, and MArch while considering the FChar.Ti. Next for RQ3, we iterate over values
+of the modifiers DMod, DComp, DSkew, and NParti to analyze their impact on the usability of the
+global model for the missing participant. Last, for RQ4, we only consider the image datasets across
+the base skew and high skew for DSkew. Since SV computation requires a server-side dataset, the
+distributions for both datasets are reduced by a fixed quantity per class. In the following, we describe
+the experiment components in detail.
+4.2.1
+Datasets and Partitioning
+For the experiments, we use CIFAR10 [13] and CIFAR100 [13] as image datasets for classification.
+The datasets have a similar structure but vary in the number of classes, which leads to a complexity
+difference that we can leverage. Each dataset consists of 60,000 data samples that are split equally
+across the number of classes. As tabular datasets, we use Adult [2] and Covertype [3] because they
+contain class imbalance and differ in complexity. Adult consists of 48,842 data samples with 14 features
+and two classes. In comparison, Covertype consists of 581,012 data samples with 54 features and seven
+classes. Last, PVOD [31] and GermanSolarFarm [6] are time-series datasets for regression.
+Both
+consist of multiple datasets collected by photovoltaic (PV) stations with different locations.
+The
+PVOD dataset has 14 features with 15-min resolution. For the experiments, stations act as one FL
+participant each and are selected by the station number. In comparison, GermanSolarFarm consists of
+50 features with a resolution of three hours. For the experiments, we assign the stations non-uniformly
+to participants to simulate utility companies of different sizes (few vs. many PV sites). We partition the
+datasets into non-IID datasets by using the Dirichlet distribution [14]. Here, we sample the quantity
+for eight participants and afterward calculate the label distribution bounded to the quantity skew to
+ensure that no data record is duplicated. For the experiments, we create the following skews:
+• Base skew (BS) consists of a quantity skew alpha of 1.5 and an alpha value of 0.8 for the label
+skew.
+• High skew (HS) consists of a quantity skew alpha of 1.2 and an alpha value of 0.6 for the label
+7
+skew, which aims to provide more insights into the impact of the distribution.
+• Manual Skew (MS) consists of data partitions in which participants share some classes while
+retaining unique ones to simulate organizations with partially overlapping distributions and dis-
+tinct edge cases.
+4.2.2
+Model Architecture
+For both image datasets, we use CNNs because they achieve good performance while the training
+duration is short. In addition, we also use ResNet50 [8], a widely used deep residual CNN architecture,
+to analyze whether the model architecture influences the impact of a failure. In the case of the tabular
+datasets, we use a TabTransformer [10] because it achieves high performance. For PVOD, we use a
+1D-CNN which is efficient while also achieving good performance. For the GermanSolarFarm dataset,
+we use a long short-term memory (LSTM) model and a 1D-CNN with increased dilation for analyzing
+the impact of different architectures. For the training of the models, we use a train-test split with a
+ratio of 70/30. The implementation of the models is publicly available1.
+4.2.3
+Contribution Measurement
+For quantifying the contribution of a participant, we use Shapley-based methods because they are
+accurate. However, they also cause high computational overhead [29]. In the experiments, we use the
+RoundSVEstimation method based on permutation sampling proposed by Wang et al. [29]. While the
+method requires a coordinator-side dataset, it mitigates the high computational overhead. Further-
+more, the method estimates the contribution at each round; hence, it is suited to make conclusions in
+a round before the failure happens.
+4.2.4
+Simulating Participant Failures
+To simulate a missing participant, we decide, based on the availability phase, that a single participant is
+unable to perform training or evaluation tasks. We assume that participant 0 fails and will participate
+only during the availability phases. As availability timing options, we consider the start of the process
+(i.e, the first two rounds), the middle of the process, or the end (i.e., the last two rounds). For the
+timing startEnd (failure with crash-recovery), the participant will participate in the first two rounds
+and then rejoin in the last two rounds. This way we can analyze the timing effects of a participant
+leaving and optionally rejoining.
+4.2.5
+Performance Evaluation
+To assess the model performance, we leverage the participants test datasets and aggregate their eval-
+uation results. For classification tasks, we send the confusion matrix to the coordinator and calculate
+the metrics based on combined confusion matrix. In our scenario, the unique classes of participants
+are important and should be learned by the model to improve the overall quality. Therefore, we use
+the macro F1-score as it represents the behavior and can handle class imbalance. For the time-series
+datasets, we use R2-score which represents the ability of the model to explain the variability in the
+data.
+5
+Results
+This section presents the experimental results and provides a structured overview of the findings for
+each research question.
+5.1
+RQ1: Can a missing participant influence the model evaluation and,
+therefore, lead to wrong assumptions about the model quality?
+1Code available at: https://github.com/HKA-IDSS/Supplement-Revealing-the-influence
+8
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+BS-Excluding MP
+BS-Including MP
+MS-Excluding MP
+MS-Including MP
+Rounds
+Macro F1-Score
+(a) CIFAR10
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+BS-Excluding MP
+BS-Including MP
+MS-Excluding MP
+MS-Including MP
+Rounds
+Macro F1-Score
+(b) CIFAR100
+Figure 1: Image Datasets: Comparison of the evaluation with and without the failed participant across
+base skew (BS) and manual skew (MS)
+Experiments: We compare the difference between evaluation including and excluding the missing
+participant to understand the impact of the missing information while considering DMod, DSkew,
+DComp, and MArch.
+Finding: A participant missing during evaluation leads to an overly optimistic evaluation across
+different data modalities. Here, modifier DSkew influences the impact strongly, while a higher skew
+leads to a higher impact on the evaluation. Furthermore, the label skew shows more influence
+than the quantity skew. For modifier DComp, a low complexity leads to a reduced impact. The
+highest impact was for datasets that have many samples and many classes that enable a more
+skewed distribution. Regarding MArch, we could observe that some architectures are more robust
+than others depending on the generalization layers as well as how information is retained.
+We start with analyzing CIFAR10 in Fig. 1a and can identify that an evaluation excluding the missing
+participant leads to a higher F1-score than using all participants for both skews. In the case of the
+manual skew, where the samples are equally distributed, but each silo contains a unique class, we can
+identify a higher impact. Here, the label skew has a higher relevance than the quantity skew. The
+CIFAR100 dataset with different skews in Fig. 1b shows that the effect is less pronounced compared
+to CIFAR10. We assume that the key factor is the DComp as the high number of classes and the
+rather few samples per class in combination with the skew make it difficult to learn the patterns for
+all classes. Furthermore, the CIFAR100 model includes multiple generalization layers. Therefore, the
+impact of the quantity per class can be lower as the model tries to generalize over all classes. Hence,
+a large quantity of a specific class is less important. Next, the manual skew in Fig. 1b shows a strong
+change, which supports the assumption that DSkew has a high influence on the impact. To understand
+how modifier FMI.DM affects the influence of a missing participant, we analyze the tabular datasets
+in Fig. 2. For both datasets, we can make the same observations as the image datasets for the modifier
+FMI.DS. Contrary to the image datasets, the more complex dataset has a higher difference than the
+less complex dataset. Here, Adult has only two classes; hence, having a high label skew is difficult,
+which is why the impact can be lower and other participants may supplement the information. Instead,
+Covertype has more classes and can have a stronger skew. Following, the FMI.DC shows high impact
+that is also connected to modifier FMI.DS.
+The last data modality are the time-series datasets with regression tasks. The GermanSolarFarm
+shows the same behavior with a stronger effect in Fig. 3a that seems to increase over time. We will
+omit the visualization for the PVOD dataset, as it shows similar results with a lower impact. To
+exclude the possibility that the states within the LSTM model could be the issue, we analyze the
+different model architectures in Fig. 3b. We can observe the same behavior in both cases, while the
+LSTM appears to be more robust as the impact does not cause fluctuations in the quality compared
+to the 1D-CNN. Following the experiments, the shift in test data, which excludes specific classes
+completely or reduces them to a bare minimum, can lead to a deviation between the testing goals.
+In our scenario, this behavior is not wanted, as all companies should be able to use the model for
+their services. The answer to this research question is important, as there are many methods that
+9
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+BS-Excluding MP
+BS-Including MP
+MS-Excluding MP
+MS-Including MP
+Rounds
+Macro F1-Score
+(a) Adult
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+BS-Excluding MP
+BS-Including MP
+MS-Excluding MP
+MS-Including MP
+Rounds
+Macro F1-Score
+(b) Covertype
+Figure 2: Tabular Datasets: Comparison of the evaluation with and without the failed participant for
+the BS and MS
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Including MP
+Excluding MP
+Rounds
+R2-Score
+(a) LSTM
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Including MP
+Excluding MP
+Rounds
+R2-Score
+(b) 1D-CNN
+Figure 3: GermanSolarFarm: Comparison of the evaluation with and without the missing participant
+across different models
+build upon utility measurements (e.g., early stopping) and hence, if a failure occurs, this can lead to
+unexpected behavior, which affects the reliability of a system.
+5.2
+RQ2: How does a missing participant affect the training of the model
+and, therefore, the resulting quality?
+Experiment: We compare the performance of the different availability timings against the base-
+line without failures, while considering DMod, DSkew, DComp, MArch, and FChar.Ti.
+Finding: A missing participant can lead to a decrease in model quality across different data
+modalities for scenarios with high skew. Here, it is important to understand that the modifiers
+also influence each other, which leads to the quality loss. Across the experiments, we observed
+that FChar.Ti can affect the quality if the scenario does not consist of silos with extremely skewed
+classes. In case of tabular datasets, the combination of DComp and DSkew influences the modifier
+FChar.Ti and can confuse model, which can degrade the performance. In addition, DSkew has a
+high impact, especially for the manual skew with unique silos, where the influence of FChar.Ti is
+reduced. Overall, a higher DSkew can lead to a higher performance loss across different DMods.
+The MArch can influence the performance as the LSTMs show more robustness about the loss of
+quality over time. The ResNet architecture showed similar behavior to the CNN architectures,
+while the overall training process fluctuated more.
+To deduce this finding, we start by comparing the base skew and the high label skew for CIFAR10 in
+Fig. 4, which shows that in each availability phase, the performance spikes. Here, the availability at
+10
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+Macro F1-Score
+(a) Base Skew
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+Macro F1-Score
+(b) High Skew
+Figure 4: CIFAR10 CNN: Different availability phases for the missing participant across different
+skews. The baseline represents the absence of the failure
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+Macro F1-Score
+(a) CIFAR10: ResNet
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+Macro F1-Score
+(b) CIFAR100: ResNet
+Figure 5: Influence of the ResNet architecture on the availability phases for image datasets with BS.
+The baseline represents the absence of the failure
+the end of the training shows a performance recovery. If we combine it with availability at the start,
+then the recovery improves. However, it does not match the baseline. We assume that during the
+availability phases, the model has learned new patterns, improving the quality of the global model. It
+is also possible that new samples were added that can be predicted by the model very well; however,
+the F1-score should limit this behavior as it treats all classes equally. For CIFAR100, we can observe
+similar results.
+Furthermore, we analyze the impact of the ResNet architecture in Fig. 5.
+While
+the overall performance is fluctuating, we can identify that the model architecture does not change
+the effect of different availability. Here, the performance spikes for the timing in the middle, which
+corresponds to rounds 14 and 15. Next, we analyze the tabular datasets. Here, for the Adult dataset,
+Fig. 6 shows the results for the high and manual skew.
+For the manual skew of Adult, which does
+not consist of unique silos as there are only two classes in total, we can observe the timing shows
+high importance. In contrast, the high skew only shows an improvement at the beginning, but in the
+later rounds the timing leads to a performance reduction. We explain this behavior by considering
+that the participant with the most data fails, which will also have the highest impact when rejoining.
+Here, the quantity difference is important. Furthermore, if we focus on comparing the impact on the
+quality, we can identify that for the start timing, a higher skew leads to lower performance. Second,
+the combination of quantity and labels skew for two classes can lead to participants that have many
+samples of one class and less for the other class. In the label distribution, the first participant has
+mostly labels for the first class, while the other three participants combined have fewer samples for
+the first class and more for the second one.
+Hence, the rejoining can lead to a confusion for the
+model, which impacts the quality. In the case of Covertype in Fig. 7, the high skew configuration
+11
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+Macro F1-Score
+(a) High Skew
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+Macro F1-Score
+(b) Manual Skew
+Figure 6: Adult: Availability phases of the missing participant across HS and MS. The baseline
+represents the absence of the failure
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+Macro F1-Score
+(a) Base Skew
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+Macro F1-Score
+(b) High Skew
+Figure 7: Covertype: Availability phases for the missing participant across the BS and HS. The baseline
+represents the absence of the failure
+shows a similar impact for timing as in the case of the image datasets. Contrarily, in the base skew,
+the availability phases barely influence the quality. We assume that the unbalanced datasets and,
+hence, the data distribution affect possible timing effects. To further analyze the impact of DSkew,
+we compare the manual skew for CIFAR10, and Covertype in Fig. 8. Here, we can identify that once
+a class belongs solely to a specific silo and, hence, the overall distribution is extremely skewed, it can
+lead to a behavior where the timing is not relevant anymore. Next, we analyze the time-series datasets.
+In the case of the GermanSolarFarm in Fig. 9, the effect is similar to that for the image datasets.
+In addition, we compare the LSTM and the 1-D CNN. Similar to previous observations, the LSTM
+is less fluctuating and seems more robust. We assume that this is due to LSTMs being designed for
+remembering long-term dependencies by maintaining states. For the PVOD datasets, we make the
+same observation, but the differences are small, as the overall performance loss is small.
+Besides the model architecture, we assume that the impact of forgetting is higher in FL as compared
+to centralized ML, i.e., beyond the number of local training rounds and learning rate, because the
+aggregation method (e.g., FedAvg) strongly influences the change of model weights.
+The findings
+show that under consideration of the data distribution and potential recovery of a participant, the
+quality of the model can recover from the impact if the participant rejoins and contributes. Therefore,
+this information can help ML engineers to make better decisions on how to handle participant recovery.
+Furthermore, it indicates that a missing participant in a skewed setting can lead to a reduced quality.
+12
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+Macro F1-Score
+(a) CIFAR10
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+Macro F1-Score
+(b) Covertype
+Figure 8: Manuel Skew: Different availability phases for the missing participant across CIFAR10 and
+Covertype. The baseline represents the absence of the failure
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+R2-Score
+(a) LSTM
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Baseline
+End
+Middle
+Start
+Start_End
+Rounds
+R2-Score
+(b) 1D-CNN
+Figure 9: GermanSolarFarm: Different availability phases for missing participants across different
+model architectures, where the baseline represents the absence of the failure
+5.3
+RQ3: How does a participant failure affect the usability of the trained
+model for the missing participant?
+Experiments: We examine the performance change for the missing participants by comparing a
+no-failure against rejoining post-training scenario, while considering the modifiers DSkew, DComp,
+and NParti.
+Finding: The failed participant can use the global model with decreased performance. Additional
+participants with similar data improve usability, while those with new, unique data lead to a
+decrease. Here, the modifiers DSkew, DComp, and NParti have a strong influence on the model
+performance for the missing participant as they define the data distributions.
+In the skewed
+settings, additional participants that do not provide similar information can lead to a significant
+performance drop. While similar information can compensate for the loss of information across
+all data modalities.
+We start by analyzing Fig. 10 and 11. Here, we can see that the performance of the global model
+for the missing participant drops significantly. In addition, we can also observe that the usability of
+the model increases with more participants.
+In Fig. 12, we can identify that for GermanSolarFarm,
+the applicability of the global model improves with additional participants. We can make the same
+observation for PVOD. To further understand how additional participants affect the performance, we
+analyze DSkew. For CIFAR10 in Fig. 13a, we can identify that unique data cause a reduction in the
+quality, with additional participants not providing new information but introducing new unique classes
+to the process. We can observe the same behavior for Covertype in Fig. 13b. Here, the increase in
+13
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+4P Baseline
+4P Failure
+8P Baseline
+8P Failure
+Rounds
+Macro F1-Score
+(a) CIFAR10
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+4P Baseline
+4P Failure
+8P Baseline
+8P Failure
+Rounds
+Macro F1-Score
+(b) CIFAR100
+Figure 10: Image BS: Comparison of the model performance for the missing participant during failure
+and participation (baseline) across different numbers of participants
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+4P Baseline
+4P Failure
+8P Baseline
+8P Failure
+Rounds
+Macro F1-Score
+(a) Adult
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+4P Baseline
+4P Failure
+8P Baseline
+8P Failure
+Rounds
+Macro F1-Score
+(b) Covertype
+Figure 11: Tabular BS: Comparison of the model performance for the missing participant during failure
+and participation (baseline) across different numbers of participants
+performance with more participants is small compared to the behavior of the high skew in Fig. 11b.
+Hence, highly skewed and new unique classes introduced by participants can negatively affect the
+performance. When introducing similar information already in the training process, the usability of
+the model for the missing participant can be improved. The Adult dataset with fewer classes shows
+in Fig. 11a that additional participants can improve the usability of the global model for the missing
+participant. Here, also the modifier DComp influences the skew. As consequence, it is important to
+analyze the currently available information as well as new information introduced to the FL process
+by additional participants to understand how the quality is influenced.
+5.4
+RQ4:
+Do participant contribution measures reflect the impact of a
+missing participant on the training task?
+Experiments: To analyze the applicability of contribution measures as predictor for the impact,
+we compare the SVs of a participant with the impact if it is missing.
+Finding: Participant contribution metrics can detect participants with a very different data dis-
+tribution compared to the other participants.
+To deduce this answer, we analyze the experiments and the resulting SVs in Table 3. In combination
+with the data distribution in Fig. 14a, we can identify that participant 2 is vastly different from the
+other participants and also has the lowest SVs. If we compare the SVs with the effect of different
+participants dropping out in Fig. 15a, we can identify, that this correlates with the SVs: in the case
+that participant 2 is missing, the model has the best quality. For the other participants, it is difficult
+14
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+4P Baseline
+4P Failure
+8P Baseline
+8P Failure
+Rounds
+R2-Score
+(a) PVOD
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+4P Baseline
+4P Failure
+8P Baseline
+8P Failure
+Rounds
+R2-Score
+(b) GermanSolarFarm
+Figure 12: Time-series: Comparison of the model performance for the missing participant during
+failure and participation (baseline) across different numbers of participants
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+4P Baseline
+4P Failure
+8P Baseline
+8P Failure
+Rounds
+Macro F1-Score
+(a) CIFAR10
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+4P Baseline
+4P Failure
+8P Baseline
+8P Failure
+Rounds
+Macro F1-Score
+(b) Covertype
+Figure 13: MS: Comparison of the global model performance for the missing participant during failure
+and participation (baseline) across different numbers of participants
+Table 3: CIFAR10: SVs for base skew (BS) and high skew (HS) for the first rounds until failure
+Round
+P0-SV
+P1-SV
+P2-SV
+P3-SV
+0-BS
+-0.014305
+0.039144
+-0.036371
+0.018734
+1-BS
+-0.004299
+0.014654
+-0.036120
+0.031978
+0-HS
+0.045645
+-0.013814
+0.000002
+-0.025670
+1-HS
+0.027890
+-0.036587
+-0.032981
+0.049456
+to make reliable assumptions, as the order of the SVs does not directly represent the order of the
+impact. Next, we compare the CIFAR10 high skew. The distribution in Fig. 14b shows that both
+participants 1 and 2 have few samples, while participants 0 and 3 have many samples. The SVs show
+that participants 1 and 2 are less important than 0 and 3. In Fig. 15b, we can see that the behavior
+aligns with the SVs. Despite that, the SVs cannot tell whether participant 3 is more important than
+participant 0.
+We make similar observations for CIFAR100.
+In summary, this allows ML engineers to determine the relevance of outlier participants with a
+different data distribution than the other participants. Hence, it can help in filtering out participants
+that are unique and important or have less impact on the quality of the global model.
+15
+0
+1
+2
+3
+0
+2k
+4k
+6k
+8k
+10k
+12k
+Participant ID
+Number of samples
+(a) Base Skew
+0
+1
+2
+3
+0
+2k
+4k
+6k
+8k
+10k
+12k
+14k
+Participant ID
+Number of samples
+(b) High Skew
+Figure 14: CIFAR10: Quantity distribution per participant across different skews
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Client 0
+Client 1
+Client 2
+Client 3
+Rounds
+F1-Score
+(a) Base Skew
+0
+2
+4
+6
+8
+10 12 14 16 18 20 22 24 26 28 30
+0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1
+Client 0
+Client 1
+Client 2
+Client 3
+Rounds
+F1-Score
+(b) High Skew
+Figure 15: CIFAR10: Impact of different participants dropping out of the process
+6
+Discussion
+In this section, we discuss aspects that influence the validity of our findings. First, for predicting the
+impact of a missing participant, we used SVs to validate whether an assessment is possible. However,
+to calculate the SVs, a server-side dataset is required. In many real-world cases, sending a part of the
+participants data or using a public dataset is not feasible. Here, a suitable measurement is necessary
+that is precise and does not require server-side data. Second, the extended study considered that a
+single participant crashes during an FL round, which makes analyzing the impact feasible as the change
+in the data distribution and the impact are easier to trace. Despite that, in a real-world setting, it is
+possible that multiple participants can crash at the same time due to network failures. We assume that
+for all dataset types the impact will only increase as more missing participants result in more missing
+data in the process. Third, analyzing the failure-impact modifiers in complete isolation is not feasible,
+as each factor (e.g., model architecture, dataset, hyperparameters, aggregation methods) is present
+while training a model. Hence, a certain combination of multiple factors is always involved. Therefore,
+it is not possible to exclude whether some connections between these factors are causing additional
+influence. Here, it is necessary to define scenarios with base configuration. Last, the experiments
+for some modifiers are based on exemplary cases such as the datasets and the model architectures.
+Transferring the results directly onto other cases is difficult, as they may contain unique properties
+that were not represented in these cases. Here, future work should consider additional datasets and
+architectures to validate the generalizability of the results.
+16
+7
+Conclusion
+In this paper, we conducted an extended study on the impact of participant failures on the model
+performance in cross-silo FL. In detail, we systematically derived failure-impact modifiers, including
+model architecture, dataset types, availability timings, and an increasing number of participants.
+We showed that for all dataset types, a missing participant can lead to an optimistic evaluation,
+which can result in wrong decisions regarding the deployment or retraining of the model. Similarly,
+mechanisms that are executed based on performance thresholds can lead to wrong execution, which
+influences the reliability of the system. Furthermore, we provided additional insights on the timing and
+demonstrated the limitations for highly unique silos. We showed that the usability of the global model
+for the missing participant is dependent on the other participants and can be influenced positively or
+negatively based on dynamic changes in the available data. In addition, we demonstrated that the
+model architecture can impact the influence of a failure through different kinds of layers in the model
+architecture, such as regularization and LSTMs; however, here additional modifiers are relevant to
+consider. Overall, the impact of a missing participant is dependent on multiple modifiers that need to
+be considered jointly in order to obtain a detailed understanding of the failure situation in cross-silo
+FL.
+These insights are essential to understand the impact of missing participants in cross-silo FL. They
+demonstrate that, besides the training also the evaluation must be reliable as they are connected in
+deployment decisions. The derived modifiers and their influence can help in designing new cost-effective
+fault-tolerance methods that adapt to different environments of cross-silo FL systems by analyzing the
+failure-impact modifiers and adapting accordingly. By leveraging these insights, the robustness and
+fault-tolerance of FL Systems can be improved, which supports the adoption in real-world challenges.
+As future work, we plan to design fault-tolerance methods that use these insights to increase the
+dependability of FL systems.
+References
+[1] Youssef Allouah, Sadegh Farhadkhani, Rachid Guerraoui, Nirupam Gupta, Rafael Pinot, Geovani
+Rizk, and Sasha Voitovych. Byzantine-Robust Federated Learning: Impact of Client Subsampling
+and Local Updates. In Proceedings of the 41st International Conference on Machine Learning.
+PMLR, July 2024.
+[2] Barry Becker and Ronny Kohavi. Adult, 1996.
+[3] Jock Blackard. Covertype, 1998.
+[4] Keith Bonawitz, Hubert Eichner, Wolfgang Grieskamp, Dzmitry Huba, Alex Ingerman, Vladimir
+Ivanov,
+Chlo´e Kiddon,
+Jakub Koneˇcn´y,
+Stefano Mazzocchi,
+Brendan McMahan,
+Timon
+Van Overveldt, David Petrou, Daniel Ramage, and Jason Roselander. Towards Federated Learning
+at Scale: System Design. Proc. of Machine Learning and Systems, April 2019.
+[5] Dhruv Garg, Debopam Sanyal, Myungjin Lee, Alexey Tumanov, and Ada Gavrilovska. Client
+Availability in Federated Learning: It Matters! In Proc. of the 5th Workshop on Machine Learning
+and Systems, EuroMLSys ’25. ACM, 2025.
+[6] Andr´e Gensler, Janosch Henze, Nils Raabe, and Vitali Pankraz.
+GermanSolarFarm data
+set.
+https://www.uni-kassel.de/eecs/en/sections/intelligent-embedded-systems/downloads.html,
+2016.
+[7] Andrew Hard, Kanishka Rao, Rajiv Mathews, Swaroop Ramaswamy, Fran¸coise Beaufays, Sean
+Augenstein, Hubert Eichner, Chlo´e Kiddon, and Daniel Ramage. Federated Learning for Mobile
+Keyboard Prediction, 2019.
+[8] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep Residual Learning for Image
+Recognition. In 2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR),
+June 2016.
+17
+[9] Victoria Huang, Shaleeza Sohail, Michael Mayo, Tania Lorido Botran, Mark Rodrigues, Chris
+Anderson, and Melanie Ooi. Keep It Simple: Fault Tolerance Evaluation of Federated Learning
+with Unreliable Clients. In 2023 IEEE 16th Int. Conf. on Cloud Computing, July 2023.
+[10] Xin Huang, Ashish Khetan, Milan Cvitkovic, and Zohar Karnin. TabTransformer: Tabular Data
+Modeling Using Contextual Embeddings, 2020.
+[11] Ahmed Imteaj, Urmish Thakker, Shiqiang Wang, Jian Li, and M. Hadi Amini. A Survey on
+Federated Learning for Resource-Constrained IoT Devices.
+IEEE Internet of Things Journal,
+January 2022.
+[12] Peter Kairouz, H Brendan McMahan, Brendan Avent, Aur´elien Bellet, Mehdi Bennis, Arjun Nitin
+Bhagoji, Kallista Bonawitz, Zachary Charles, Graham Cormode, Rachel Cummings, et al. Ad-
+vances and open problems in federated learning. Foundations and trends® in machine learning,
+2021.
+[13] Alex Krizhevsky.
+Learning Multiple Layers of Features from Tiny Images.
+Technical report,
+University of Toronto, 2009.
+[14] Tao Lin, Lingjing Kong, Sebastian U Stich, and Martin Jaggi. Ensemble Distillation for Robust
+Model Fusion in Federated Learning. In Advances in Neural Information Processing Systems.
+Curran Associates, Inc., 2020.
+[15] Ziyao Liu, Jiale Guo, Wenzhuo Yang, Jiani Fan, Kwok-Yan Lam, and Jun Zhao.
+Privacy-
+Preserving Aggregation in Federated Learning: A Survey. IEEE Trans. on Big Data, 2022.
+[16] Heiko Ludwig and Nathalie Baracaldo.
+Introduction to federated learning.
+In Heiko Ludwig
+and Nathalie Baracaldo, editors, Federated Learning: A Comprehensive Overview of Methods and
+Applications. Springer, 2022.
+[17] Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, and Blaise Aguera y Arcas.
+Communication-Efficient Learning of Deep Networks from Decentralized Data. In Proc. of the
+20th Int. Conf. on Artificial Intelligence and Statistics, pages 1273–1282. PMLR, April 2017.
+[18] Robin Nachtigall, Marc Leon Haller, Andreas Wagner, and Viktor Walter. Revealing the Effects
+of Data Heterogeneity in Federated Learning Regression Models for Short-Term Solar Power
+Forecasting. IEEE Access, 2024.
+[19] Frank Pallas, Philip Raschke, and David Bermbach. Fog computing as privacy enabler. In Internet
+Computing. IEEE, 2020.
+[20] Wenjun Qian, Qingni Shen, Haoran Xu, Xi Huang, and Zhonghai Wu. DROPFL: Client Dropout
+Attacks Against Federated Learning Under Communication Constraints. In 2024 IEEE Int. Conf.
+on Acoustics, Speech and Signal Processing (ICASSP), April 2024.
+[21] Monica Ribero, Haris Vikalo, and Gustavo De Veciana. Federated Learning Under Intermittent
+Client Availability and Time-Varying Communication Constraints.
+IEEE Journal of Selected
+Topics in Signal Processing, January 2023.
+[22] Yichen Ruan, Xiaoxi Zhang, Shu-Che Liang, and Carlee Joe-Wong.
+Towards Flexible Device
+Participation in Federated Learning.
+In Proceedings of The 24th International Conference on
+Artificial Intelligence and Statistics. PMLR, March 2021.
+[23] John Sousa, Eduardo Ribeiro, Romulo Bustincio, Lucas Bastos, Renan Morais, Eduardo
+Cerqueira, and Denis Ros´ario.
+Enhancing robustness in federated learning using minimal re-
+pair and dynamic adaptation in a scenario with client failures. Annals of Telecommunications,
+February 2025.
+[24] Fabian Stricker, David Bermbach, and Christian Zirpins. Analyzing the Impact of Participant
+Failures in Cross-Silo Federated Learning, November 2025.
+18
+[25] Fabian Stricker, Jos´e Antonio Peregrina, David Bermbach, and Christian Zirpins. FL-APU: A
+Software Architecture to Ease Practical Implementation of Cross-Silo Federated Learning. In 2nd
+Int. Conf. on Federated Learning Technologies and Applications (FLTA), September 2024.
+[26] Yuchang Sun, Yuyi Mao, and Jun Zhang.
+MimiC: Combating Client Dropouts in Federated
+Learning by Mimicking Central Updates. IEEE Trans. on Mobile Computing, 2024.
+[27] Heqiang Wang and Jie Xu. Friends to Help: Saving Federated Learning from Client Dropout. In
+2024 IEEE Int. Conf. on Acoustics, Speech and Signal Processing (ICASSP), April 2024.
+[28] Irene Wang, Prashant Nair, and Divya Mahajan.
+FLuID: Mitigating Stragglers in Federated
+Learning using Invariant Dropout. Advances in Neural Information Processing Systems, December
+2023.
+[29] Tianhao Wang, Johannes Rausch, Ce Zhang, Ruoxi Jia, and Dawn Song. A principled approach
+to data valuation for federated learning. In Federated Learning: Privacy and Incentive. Springer,
+2020.
+[30] Jian Xu, Meilin Yang, Wenbo Ding, and Shao-Lun Huang. Stabilizing and improving federated
+learning with highly non-iid data and client dropout. Applied Intelligence, December 2024.
+[31] Tiechui Yao, Jue Wang, Haoyan Wu, Pei Zhang, Shigang Li, Yangang Wang, Xuebin Chi, and
+Min Shi. PVOD v1.0 : A photovoltaic power output dataset, 2021.
+[32] Yue Zhao, Meng Li, Liangzhen Lai, Naveen Suda, Damon Civin, and Vikas Chandra. Federated
+Learning with Non-IID Data, 2018.
+[33] Hangyu Zhu, Jinjin Xu, Shiqing Liu, and Yaochu Jin. Federated learning on non-IID data: A
+survey. Neurocomputing, November 2021.
+19

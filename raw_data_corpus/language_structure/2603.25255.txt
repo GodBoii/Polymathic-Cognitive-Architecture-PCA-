@@ -1,0 +1,1444 @@
+Hyperspectral Trajectory Image for Multi-Month
+Trajectory Anomaly Detection
+Md Awsafur Rahman, Chandrakanth Gudavalli,
+Hardik Prajapati, and B. S. Manjunath
+UC Santa Barbara, USA
+{awsaf, chandrakanth, hardik, manj}@ucsb.edu
+Abstract. Trajectory anomaly detection underpins applications from
+fraud detection to urban mobility analysis. Dense GPS methods preserve
+fine-grained evidence such as abnormal speeds and short-duration events,
+but their quadratic cost makes multi-month analysis intractable; conse-
+quently, no existing approach detects anomalies over multi-month dense
+GPS trajectories. The field instead relies on scalable sparse stay-point
+methods that discard this evidence, forcing separate architectures for
+each regime and preventing knowledge transfer. We argue this bottleneck
+is unnecessary: human trajectories, dense or sparse, share a natural two-
+dimensional cyclic structure along within-day and across-day axes. We
+therefore propose TITAnD (Trajectory Image Transformer for Anomaly
+Detection), which reformulates trajectory anomaly detection as a vision
+problem by representing trajectories as a Hyperspectral Trajectory Image
+(HTI): a day × time-of-day grid whose channels encode spatial, seman-
+tic, temporal, and kinematic information from either modality, unifying
+both under a single representation. Under this formulation, agent-level
+detection reduces to image classification and temporal localization to
+semantic segmentation. To model this representation, we introduce the
+Cyclic Factorized Transformer (CFT), which factorizes attention along
+the two temporal axes, encoding the cyclic inductive bias of human rou-
+tines, while reducing attention cost by orders of magnitude and enabling
+dense multi-month anomaly detection for the first time. Empirically, TI-
+TAnD achieves the best AUC-PR across sparse and dense benchmarks,
+surpassing vision models like UNet while being 11–75× faster than the
+Transformer with comparable memory, demonstrating that vision refor-
+mulation and structure-aware modeling are jointly essential. Code will
+be made public soon.
+Keywords: Trajectory · Anomaly Detection · Segmentation
+1
+Introduction
+Trajectory anomaly detection underpins applications from fraud detection and
+public safety to urban mobility analysis, where the goal is to identify rare or
+suspicious behaviors in an individual’s movement history and localize when
+they occur [1, 10]. Existing methods fall into two largely disconnected regimes.
+arXiv:2603.25255v1  [cs.CV]  26 Mar 2026
+2
+M. A. Rahman et al.
+Fig. 1: Overview of our TITAnD framework. Dense GPS streams or sparse stay-points
+are encoded into a unified day × time-of-day hyperspectral trajectory image (HTI),
+where each pixel represents spatio-semantic, temporal, and kinematic information.
+Sparse approaches compress dense GPS streams into event sequences such as
+stay-points or visits [1, 9, 26, 29], enabling long-horizon modeling but discard-
+ing short-duration activities and in-motion behaviors such as detours, abnormal
+speed profiles, and atypical routes [10,18]. Dense approaches preserve this fine-
+grained evidence but face a long-context bottleneck: even after discretization,
+multi-month trajectories yield thousands of time steps, and Transformers scale
+quadratically with sequence length [12, 22]. Consequently, no existing method
+performs anomaly detection over multi-month dense GPS trajectories. Recent
+trajectory foundation models improve scalability through adaptive resampling or
+efficient encoders [30], yet they still operate on flat one-dimensional sequences
+and do not target anomaly detection. Thus no method bridges both regimes
+within a single framework, and most existing approaches remain self-supervised,
+relying on reconstruction or next-event prediction as proxy objectives [1, 26].
+When labeled anomaly data is available, as in recent simulation benchmarks [20],
+supervised detection remains largely unexplored.
+Beyond the tension between observability and scalability, both paradigms
+share a deeper limitation: trajectories are modeled as flat one-dimensional se-
+quences, ignoring the cyclic temporal structure governing human mobility [17].
+Within a day, movement unfolds as coherent episodes such as commutes, errands,
+or leisure, each characterized by consistent motion patterns and stop-and-go dy-
+namics. Across days, behavior at the same time-of-day tends to follow stable
+routines, such as recurring morning commutes or evening gym visits [7,17]. Col-
+lapsing these temporal axes into a single dimension obscures this structure and
+forces models to rediscover periodicity from raw positional tokens.
+This cyclic structure suggests a different formulation. If human mobility or-
+ganizes along within-day and across-day axes, then trajectories over weeks or
+months naturally form an image: a day × time-of-day grid where each pixel
+encodes behavior within a fixed time window (Fig. 1). Under this formulation,
+agent-level anomaly detection reduces to image classification and temporal local-
+ization to semantic segmentation. Both dense GPS streams and sparse stay-point
+logs can be projected into the same image space through data-specific encoders
+that aggregate irregular observations into per-pixel embeddings, revealing that
+Hyperspectral Trajectory Image
+3
+dense and sparse trajectory anomaly detection are instances of the same vision
+task. We instantiate this idea in TITAnD (Trajectory Image Transformer for
+Anomaly Detection), an end-to-end supervised framework. Our contributions
+are as follows:
+– We present TITAnD, to our knowledge the first framework to perform anomaly
+detection over multi-month dense GPS trajectories. This is enabled by two
+complementary ideas: a Hyperspectral Trajectory Image (HTI) that com-
+presses GPS observations into a structured 2D representation, and a Cyclic
+Factorized Transformer (CFT) that processes it efficiently.
+– We unify dense and sparse trajectory data under a single architecture by
+reformulating anomaly detection as a vision problem with the HTI repre-
+sentation: a day × time-of-day grid whose channels encode spatial, seman-
+tic, temporal, and kinematic information aggregated from either dense GPS
+streams or sparse stay-points through modality-specific encoders.
+– We introduce the Cyclic Factorized Transformer (CFT), which factorizes
+attention along the within-day and across-day axes of the HTI to exploit the
+cyclic pattern of human routines while reducing the cost significantly.
+– Extensive experiments across dense and sparse benchmarks show that tra-
+jectory images alone do not guarantee improved performance: gains arise
+when the backbone explicitly exploits their cyclic structure.
+2
+Related Work
+2.1
+Trajectory Anomaly Detection
+Trajectory anomaly detection seeks to identify rare or suspicious behaviors in
+an individual’s movement history. Existing approaches fall into two largely dis-
+connected regimes depending on how trajectories are represented.
+A common strategy is to compress dense GPS streams into event sequences
+such as visits or stay-points [29]. These representations scale well but discard
+short-duration activities and in-motion behaviors before learning begins. Recent
+methods operate on such sequences using self-supervised objectives. ICAD de-
+tects anomalies through autoregressive prediction over visit sequences [1], while
+USTAD models stay-point events with a dual Transformer trained via masked
+reconstruction [26]. Other work summarizes mobility into calendar-style rep-
+resentations derived from routine patterns and detects deviations within that
+structured space [9]. Across these approaches, anomaly detection is typically for-
+mulated through reconstruction or next-event prediction. In contrast, we take
+supervised approach, asking how to best exploit labeled trajectories when they
+exist.
+When operating directly on dense GPS coordinates, existing work focuses on
+short horizons such as individual trips. FOTraj [18] detects route anomalies in
+taxi trajectories using a spatio-temporal graph, while earlier methods such as
+iBAT [28] identify deviations within individual rides. More broadly, recent trajec-
+tory architectures remain limited to short sequences: TrajFormer [12] compresses
+4
+M. A. Rahman et al.
+attention for trip-level classification, TrajMamba [13] applies linear-time state-
+space models to vehicle trips, and UniTraj [30] pre-trains across large datasets
+but processes each trajectory as a flat one-dimensional sequence. Scaling these
+models to months-long histories would incur prohibitive quadratic cost or require
+local attention strategies that sacrifice cross-day context. Consequently, anomaly
+detection over dense, multi-month trajectories remains an open problem.
+2.2
+From Cyclic Mobility Structure to Image Representations
+Human mobility exhibits strong regularity along two temporal dimensions. Within
+a day, movement follows circadian patterns with predictable episodes such as
+commutes, errands, and leisure [7,19]. Across days, individuals repeatedly visit
+a small set of locations and follow stable routines over months [5,17]. These reg-
+ularities naturally define a two-dimensional temporal structure with days and
+time-of-day as separate axes, suggesting that long-horizon trajectories can be
+organized as a day × time-of-day grid rather than a flat sequence.
+The idea of converting temporal signals into images has been explored in
+time-series analysis. Classical transforms such as Gramian Angular Fields, re-
+currence plots, and Markov transition fields encode temporal relationships as im-
+ages for CNN-based classification [4,6,25]. Other approaches render time series
+as visual representations processed by vision transformers [11]. These methods
+treat the image primarily as a visualization of a one-dimensional signal rather
+than a structured representation with semantically meaningful axes. Closer to
+our setting, TimeMixer++ [24] reshapes time series into two-dimensional images
+based on dominant periods discovered through signal autocorrelation. However,
+it discovers periodicity from the signal itself and does not incorporate domain
+structure or support multi-modal trajectory features. Despite this rich literature,
+no prior work connects the well-established cyclic structure of human mobility
+with an image representation designed for trajectory anomaly detection.
+3
+Method
+3.1
+Overview and Task Definition
+TITAnD accepts two input modalities. A dense trajectory is a time-ordered
+GPS stream Rdense = {(latn, lonn, tn)}N
+n=1 sampled at approximately 10-second
+resolution. A sparse trajectory is a sequence of stay-point events Rsparse =
+{(tstart
+k
+, tend
+k
+, latk, lonk)}K
+k=1, each recording the arrival time, departure time, and
+location of a stationary episode. Both modalities cover multi-month observation
+windows with a known past/future split: the first half serves as a normal-behavior
+baseline, while anomalies, if present, occur in the latter half.
+A data-specific encoder (Sec. 3.2) projects either input into a Hyperspectral
+Trajectory Image (HTI), a D × S × C tensor where D is the number of days,
+S=288 is the number of 5-minute time-of-day slots, and C is the number of
+learned feature channels that encode temporal, spatial, semantic and kinemat-
+ics information. Under this image formulation, agent-level anomaly detection
+Hyperspectral Trajectory Image
+5
+reduces to image classification (ˆyagent = maxd,s ˆyd,s) and temporal localization
+reduces to semantic segmentation (predicting ˆyd,s per pixel).
+Slot-level ground truth yd,s ∈{0, 1} is constructed from whichever label
+granularity is available. For dense trajectories with per-point annotations ˜yn:
+yd,s = I
+h
+max
+n∈Rdense
+d,s
+˜yn = 1
+i
+.
+(1)
+For sparse trajectories with per-stop labels ˜yk:
+yd,s = I
+h
+∃k : ˜yk=1 ∧[tstart
+k
+, tend
+k
+) ∩slot(d, s) ̸= ∅
+i
+.
+(2)
+Both constructions produce the same binary label grid Y ∈{0, 1}D×S, enabling
+a unified loss regardless of input modality.
+3.2
+Trajectory Encoders
+TITAnD provides two data-specific encoders—DenseTrajEmbed for dense GPS
+streams and SparseTrajEmbed for sparse stay-point logs—that each produce
+an HTI X ∈RD×S×C, where C denotes the number of channels (C=256 in
+our experiments). Both encoders share three feature groups—spatio-semantic,
+temporal, and kinematic—but instantiate them differently for their respective
+input modality. The resulting HTI is consumed identically by CFT (Sec. 3.3)
+regardless of data source.
+Shared Components.
+Spatio-semantic cell embedding. We first project GPS coordinates to a planar
+system (UTM) and assign each location to a grid cell. We use an adaptive
+QuadTree [16] discretization that refines regions with high POI density, im-
+proving robustness to GPS jitter while keeping the vocabulary compact. Each
+location is mapped to a cell id c and a discrete grid coordinate (i, j).
+To inject lightweight semantics, each cell c is associated with a set of nearby
+POIs P(c) (e.g. restaurant, office). It is capped to a fixed maximum per cell, 125
+for our dataset. For POI q ∈P(c), we embed its category and relative position
+within the cell:
+hc,q = fpoi
+ catc,q, ∆xc,q, ∆yc,q
+
+∈R64.
+(3)
+We aggregate POIs into a compact cell summary via attention,
+sc =
+X
+q∈P(c)
+αc,qhc,q,
+αc,q = softmax
+ w⊤hc,q
+
+,
+(4)
+so the model can emphasize functionally informative POIs when forming the cell
+semantics. We combine the cell semantics with a coarse absolute location code
+via sinusoidal positional encoding PE(i, j) ∈R128:
+ecell
+c
+= MLPsp
+ [sc; PE(ic, jc)]
+
+∈R128.
+(5)
+6
+M. A. Rahman et al.
+Fig. 2: TITAnD’s two data-specific encoders. (a) DenseTrajEmbed reshapes a raw
+GPS stream into a (D, S, P, 3) tensor, extracts per-slot spatio-semantic (SpE), tem-
+poral (TmE), and kinematic (KnE) features, and fuses them via an MLP into an
+HTI X ∈RD×S×256. (b) SparseTrajEmbed encodes stay-point logs into an inter-
+leaved stop–trip sequence and uses dedicated Stop and Trip Encoders sharing the
+same SpE/TmE/KnE structure before a Seq2Image module maps each event onto its
+occupied (d, s) grid cells. Both encoders produce HTI consumed by CFT.
+This cell embedding module is shared by both dense and sparse encoders. Im-
+plementation details of QuadTree construction and POI buffering are deferred
+to supplementary material.
+Temporal encoder. Human mobility is highly periodic, so the same movement
+pattern can be typical or suspicious depending on when it occurs. We attach
+a single calendar embedding to each slot (d, s) that captures daily, weekly,
+and longer-term context. Specifically, we encode a set of calendar attributes
+{ϕk(d, s)}k∈Ktime and concatenate their encodings:
+etm
+d,s = Concat
+
+{Enck(ϕk(d, s))}k∈Ktime
+
+∈R66,
+(6)
+where Ktime includes hour-of-day, day-of-week, day-of-month, part-of-day (coarse
+bins), week-of-month, and month-of-year. This module is shared across Dense-
+TrajEmbed, SparseTrajEmbed stops, and SparseTrajEmbed trips.
+DenseTrajEmbed. DenseTrajEmbed (Fig. 2) converts a dense GPS stream
+into an HTI X ∈RD×S×C. The raw GPS stream is discretized into D days and
+S=288 slots per day (5-minute slots; D=66 days in our experiments). Each slot
+is resampled to a fixed number of points P = 30 using interpolation, with zero
+Hyperspectral Trajectory Image
+7
+padding applied at the end if necessary. This yields a regular tensor of shape
+(D, S, P, 3) together with a validity mask md,s,p ∈{0, 1} for real values.
+Spatio-semantic pooling. Each of the P points in slot (d, s) is mapped to a cell
+embedding ecell
+cd,s,p via Eq. 5. We pool the P point embeddings into a slot-level
+spatial token using learned attention pooling:
+βd,s,p = softmax
+
+v⊤
+pool tanh(Wpoolecell
+cd,s,p)
+
+,
+(7)
+˜xsp
+d,s =
+P
+X
+p=1
+βd,s,pecell
+cd,s,p ∈R128.
+(8)
+This produces one 128-d spatial token per slot, with the pooling weights allow-
+ing the model to emphasize informative points (e.g., transitions and turns) and
+downweight redundant samples.
+Kinematic encoder. Many anomalies are expressed in motion rather than in end-
+points, such as unusual speed profiles, abrupt accelerations, or atypical turning
+behavior. For each slot (d, s), we summarize within-slot dynamics into a com-
+pact normalized descriptor vector gd,s ∈R11 computed from consecutive GPS
+points inside the slot. It captures velocity and speed statistics, directionality
+(via sin / cos of bearing), turning variability, acceleration, and extreme statistics
+(min/max speed and acceleration). We then map this descriptor to a compact
+slot-level embedding:
+ekn
+d,s = Enckn(gd,s) ∈R32.
+(9)
+Slot fusion. The final slot token is obtained by fusing the pooled spatial token
+with slot-level temporal and kinematic context:
+xd,s = MLPfuse
+
+[˜xsp
+d,s; etm
+d,s; ekn
+d,s]
+
+∈RC.
+(10)
+Stacking all slots yields the HTI X ∈RD×S×C.
+SparseTrajEmbed. SparseTrajEmbed converts sparse stay-point logs into the
+same D ×S ×C HTI consumed by CFT. Instead of dense GPS points, the input
+consists of an interleaved sequence of stop and trip events: S1, T1→2, S2, T2→3, . . .,
+where each stop Si records a location and dwell time, and each trip Ti→i+1
+records travel between consecutive stops.
+Event-to-grid mapping. Each event spans a contiguous range of days and slots in
+the D × 288 grid, determined by its start and end timestamps. Multi-slot events
+repeat their features across all occupied slots. When a stop and trip share the
+same 5-minute boundary slot, a stop fraction f ∈[0, 1] records the proportion
+of the slot occupied by the stop, enabling smooth blending rather than a hard
+boundary.
+8
+M. A. Rahman et al.
+Three feature groups. SparseTrajEmbed computes the same three feature groups
+as DenseTrajEmbed, instantiated differently for stops and trips. The spatio-
+semantic feature for stops is the cell embedding (Eq. 5) of the stop location; for
+trips, we use a delta cell embedding ∆ecell = ecell
+cdest−ecell
+corig ∈R128, encoding travel
+direction in the learned embedding space. Combined with RoPE [21] applied
+independently on the slot and day axes and intra-day attention to adjacent stop
+slots, this allows the model to infer full spatial context—origin, destination, and
+direction—without storing explicit coordinates. The temporal encoder is shared
+with DenseTrajEmbed (Eq. 6).
+The kinematic features differ by event type:
+gstop = [log(dur+1), 0, 0, 0, 0],
+(11)
+gtrip = [log(dur+1), log(dist+1), log(vel+1), sin θ, cos θ],
+(12)
+where gstop encodes only dwell duration (zeros signal a stationary event) and
+gtrip captures duration, distance, average velocity, and bearing. Both are pro-
+jected through a shared Enc′
+kn to R32, analogous to Enckn (Eq. 9) but with a
+5-dimensional input suited to event-level kinematics rather than per-slot GPS
+statistics.
+Boundary blending. For boundary slots where a stop and trip overlap (stop
+fraction f), all features blend smoothly:
+esp = f · esp
+stop + (1−f) · esp
+trip,
+ekn = Enc′
+kn(f · gstop + (1−f) · gtrip).
+(13)
+This ensures smooth gradients through stop-to-trip transitions, avoiding hard
+boundaries within a single 5-minute slot.
+Slot fusion and type embedding. The three feature groups are fused via an MLP
+identical in structure to the dense encoder:
+xd,s = MLPfuse
+ [esp
+d,s; etm
+d,s; ekn
+d,s]
+
+∈RC.
+(14)
+A learned type embedding is then added to distinguish stops from trips:
+xd,s ←xd,s + f · estop + (1−f) · etrip,
+(15)
+where estop, etrip ∈RC are learned embeddings and f is the stop fraction (1 for
+pure stops, 0 for pure trips). The number of days D is fixed at 66 for the dense
+encoder but varies across agents in the sparse setting and is padded to the batch
+maximum.
+3.3
+Cyclic Factorized Transformer (CFT)
+Given the HTI X ∈RD×S×C produced by either encoder, a naive approach is to
+flatten it into a length-DS sequence and apply a standard Transformer. This is
+very expensive for multi-month horizons and, more importantly, it discards the
+Hyperspectral Trajectory Image
+9
+Fig. 3: Cyclic Factorized Transformer (CFT) factorizes attention by interleaving intra-
+day and inter-day attentions. Each intra-day attention captures within-day patterns,
+while each inter-day attention captures cross-day routine patterns.
+temporal structure present in human mobility data. Specifically, human move-
+ment exhibits two complementary temporal structures: within-day episodes (e.g.,
+detours, stop-and-go transitions, prolonged dwells during a trip) and across-day
+routines (e.g., recurring morning coffee, commute timing, regular gym visits). To
+preserve this cyclic day×time-of-day structure while scaling to long horizons, we
+introduce the Cyclic Factorized Transformer (CFT). As shown in Fig. 3, CFT
+factorizes attention along the two axes of the HTI X, performing intra-day at-
+tention over the slot axis (S) to model daily episodes and inter-day attention
+over the day axis (D) to model routine consistency at the same time-of-day.
+This factorization reduces attention cost from O(D2S2C) to O((DS2+SD2)C),
+a
+DS
+D+S ≈85× reduction for D=120, S=288.
+It is noteworthy that CFT is conceptually related to the axial attention
+mechanism of Axial-DeepLab [8,23], which factorizes attention along spatial di-
+mensions for efficiency and applies a single shared positional encoding across
+symmetric image axes. However, our setting differs in two key ways. First, our
+primary motivation is not efficiency alone but modeling two semantically distinct
+te mporal patterns: within-day episodes along the slot axis and across-day rou-
+tines along the day axis. Because these axes carry different temporal semantics,
+we apply positional encoding independently along each axis using RoPE [21]
+before attention, giving the model axis-aware temporal structure that a shared
+encoding would conflate. Second, to our knowledge, this is the first work to apply
+axial-style attention to trajectory anomaly detection.
+Intra-Day Attention. Each intra-day layer applies multi-head self-attention
+over all S slots within a single day, modeling short-horizon episode structure such
+as prolonged stays and unusual speeding. For a fixed day d, the row Xd,: ∈RS×C
+is treated as a length-S sequence; collecting all days gives output in RD×S×C.
+Inter-Day Attention. Each inter-day layer mirrors the intra-day design
+but attends over the D days at a fixed time-of-day slot s, capturing routine
+consistency and deviations across days such as changes in habitual commute or
+activity timing. The column X:,s ∈RD×C is treated as a length-D sequence;
+stacking across all slots yields output in RD×S×C.
+Interleaved Blocks. CFT stacks L = 4 interleaved blocks (Fig. 3), each
+applying IntraAttn →FFN →InterAttn →FFN with Pre-LN residual con-
+nections. This interleaving allows information to flow between the two tempo-
+ral scales at every layer, so that intra-day patterns can inform inter-day com-
+parisons and vice versa across the full network depth. The final representation
+10
+M. A. Rahman et al.
+Z = X(L) ∈RD×S×C jointly encodes within-day structure and across-day pat-
+terns.
+3.4
+Prediction Head
+A two-layer MLP produces per-slot anomaly logits from the final representation:
+ˆyd,s = σ(MLPclf(Zd,s)), yielding a segmentation map ˆY ∈[0, 1]D×S. Tempo-
+ral localization reads directly from this map, while agent-level detection takes
+ˆyagent = maxd,s ˆyd,s, reducing classification to the maximum over the segmenta-
+tion output.
+4
+Experiments
+4.1
+Experimental Setup
+Datasets. We evaluate TITAnD across three benchmarks spanning both data
+types (full statistics in Supple). For sparse trajectories, we adopt Sparse (NumoSim-
+LA) [20], a publicly available stay-point dataset from Los Angeles (∼80K agents,
+55 days). No public dense trajectory anomaly benchmark exists, so we use Dense
+(Tokyo), a private GPS dataset (∼18K agents, 66 days at 10 s resolution) gen-
+erated by an independent third party with undisclosed anomaly injection; our
+model has no prior knowledge of anomaly definitions. To bridge both modalities,
+Dense2Sparse (Tokyo) is drawn from the same private data source as Dense but
+comprises a larger, distinct cohort converted to stay-points (∼80K agents, 120
+days); comparing the two quantifies the representational gap between dense GPS
+and stay-point modalities under matched geographic and collection conditions.
+All benchmarks follow a past/future protocol and use agent-disjoint train/vali-
+dation splits.
+Evaluation and Metrics. We report the area under the Precision–Recall
+curve (AUC-PR) as the primary ranking metric and mean Intersection-over-
+Union (mIoU) as the primary localization metric at the optimal threshold. We
+evaluate at two granularities: temporal (per-slot anomaly localization) and agent
+(per-agent anomaly detection). Sparse baselines (USTAD, ICAD) are originally
+self-supervised; for fair comparison we retain their architecture but train them
+under the same supervised protocol as our HTI methods, using the same data,
+labels, and evaluation.
+Training Details. All models are trained under a unified supervised proto-
+col: BCE + Dice loss with a positive class weight of 50 to handle class imbalance,
+AdamW optimizer (lr is tuned for different experiments) for 20 epochs, and a
+batch size of 32 agents. Sparse baselines (USTAD, ICAD) retain their published
+encoder architectures and are fine-tuned end-to-end under the same protocol
+with a linear classification head; no self-supervised auxiliary loss is used during
+supervised training. Training is performed with mixed precision on two NVIDIA
+H200 GPUs. Additional details are provided in the supplementary material.
+Hyperspectral Trajectory Image
+11
+4.2
+Comparison to Prior Methods
+Accuracy. Table 1 compares TITAnD to prior approaches under a unified super-
+vised protocol, reporting AUC and mIoU across three benchmarks at both tem-
+poral and agent granularity. We group methods by representation type: Sparse
+approaches operate on stop or stay-point event sequences, while HTI methods
+all operate on both sparse and dense data type via the same Hyperspectral
+Trajectory Image representation with different models—Transformer [22] (flat
+1D attention), U-Net [15] (encoder-decoder CNN), SegFormer [27] (hierarchical
+segmentation Transformer), and our CFT (cyclic factorized attention).
+Sparse methods such as USTAD [26] and ICAD [1] rely on stop-level repre-
+sentations. On the NumoSim-LA benchmark, USTAD achieves 0.53 agent AUC
+and 0.70 mIoU, while ICAD reaches 0.30 AUC and 0.62 mIoU. At the temporal
+level, both methods degrade further, with USTAD at 0.46 AUC and ICAD at 0.23
+AUC, reflecting a fundamental limitation of event compression: motion within
+stops is discarded, short-duration events are lost, and heterogeneous movement
+patterns are collapsed into a single event, impeding proper temporal localization.
+Among HTI methods, we compare four models on the same trajectory images.
+Transformer [22] flattens the D×S image into a 1D sequence of pixels/patches
+similar to ViT [3], then it treats it as standard image pixel classification. U-
+Net [15] uses an encoder-decoder architecture with ConvNeXt [14] as backbone
+along with skip connections, capturing multi-scale features but limited by local
+receptive fields. SegFormer [27], designed for dense prediction, combines hier-
+archical attention with a lightweight MLP decoder. CFT factorizes attention
+along the day and slot axes, encoding the cyclic inductive bias directly. On the
+Dense Tokyo benchmark, TITAnD with CFT achieves 0.84 temporal AUC, a
+40% relative gain over the Transformer, without increasing model capacity. On
+NumoSim-LA, TITAnD reaches 0.63 agent AUC and 0.74 mIoU, improving over
+the Transformer from 0.16 to 0.63 agent AUC. On Dense2Sparse Tokyo, CFT
+achieves 0.78 agent AUC and 0.80 mIoU, substantially outperforming U-Net
+(0.60 AUC) and SegFormer (0.52 AUC); notably, CFT on sparse input still out-
+performs purpose-built sparse methods (USTAD 0.41, ICAD 0.36 agent AUC),
+showing the HTI formulation is more expressive than event-sequence modeling
+even after sparsification. Since all HTI methods share the same encoder, these
+gains are entirely attributable to the backbone’s inductive bias. The Transformer
+is the worst HTI backbone despite having the most expensive O(N 2) attention:
+we hypothesize that it needs to discover the cyclic day×slot structure entirely
+from 1D sequence of many pixels, which exhibits the standard data-hungry prob-
+lem [3] in standard Transformer. CNN-based backbones, on the other hand, ex-
+ploit inductive bias and perform decently, but their limited receptive fields miss
+global inter-day dependencies (e.g., comparing a Monday to all previous Mon-
+days). Notably, on Dense Tokyo agent-level detection, U-Net approaches CFT
+(0.95 vs. 0.98 AUC): agent detection is a coarser binary task where local 2D
+features are sufficient, and CFT’s inductive bias provides its largest margin on
+the harder temporal localization task (0.84 vs. 0.50 AUC).
+12
+M. A. Rahman et al.
+Fig. 4: Scaling with time horizon (2–12 months) across HTI backbones: (a) inference
+latency on log scale, (b) peak GPU memory, and (c) model size.
+Table 1: Comparison across dense and sparse trajectory benchmarks. Sparse method
+operates on stop/stay-point sequences; proposed HTI operates on both spare and
+dense. “—” indicates the method cannot process that input data type.
+Sparse (NumoSim-LA)
+Dense2Sparse (Tokyo)
+Dense (Tokyo)
+Temporal
+Agent
+Temporal
+Agent
+Temporal
+Agent
+Type
+Backbone
+AUC
+mIoU
+AUC
+mIoU
+AUC
+mIoU
+AUC
+mIoU
+AUC
+mIoU
+AUC
+mIoU
+Sparse
+USTAD [26]
+0.46
+0.67
+0.53
+0.70
+0.03
+0.52
+0.41
+0.66
+—
+—
+—
+—
+ICAD [1]
+0.23
+0.59
+0.30
+0.62
+0.01
+0.51
+0.36
+0.65
+—
+—
+—
+—
+HTI
+Transformer [22]
+0.06
+0.56
+0.16
+0.57
+0.01
+0.52
+0.24
+0.60
+0.60
+0.70
+0.84
+0.84
+Unet [15]
+0.29
+0.63
+0.57
+0.75
+0.03
+0.52
+0.60
+0.72
+0.50
+0.67
+0.95
+0.77
+SegFormer [27]
+0.33
+0.66
+0.62
+0.76
+0.03
+0.53
+0.52
+0.70
+0.21
+0.59
+0.95
+0.91
+CFT (ours)
+0.54
+0.71
+0.63
+0.74
+0.20
+0.58
+0.78
+0.80
+0.84
+0.84
+0.98
+0.97
+Efficiency. CFT is the smallest model (6.5M parameters versus 19–26M for
+CNN-based methods) and scales favorably with the observation horizon (Fig. 4).
+At 2 months it is already 11× faster than the Transformer (54 ms vs. 610 ms); at
+12 months factorized attention grows linearly while flat attention grows quadrat-
+ically, widening the gap to 75× (234 ms vs. 17.5 s). Memory usage is comparable
+across all backbones (∼7–10 GB) thanks to flash-attention [2], so the primary
+differentiators are latency and model size, both of which favor CFT.
+4.3
+Ablations
+We ablate both encoder features and attention axes while keeping the other
+component fixed (Table 2).
+Encoder features. Temporal features alone are insufficient for both modali-
+ties (≤4% of full AUC). Adding spatial features yields the largest jump: 0.03→0.62
+for Dense and 0.001→0.52 for Sparse, confirming that location context is the
+dominant signal. Kinematic features (speed, bearing, distance) provide a further
+gain, substantial for Dense (0.62→0.84) and modest for Sparse (0.52→0.54), re-
+flecting that dense GPS retains richer motion dynamics than sparse stay-points.
+Attention axes. On Dense Tokyo, intra-day attention alone achieves 62%
+of full AUC, indicating most anomaly in the dataset arises from within-day de-
+viations. Inter-day attention alone captures only 35%, reflecting that cross-day
+comparison provides weaker signal when anomalies are locally coherent within
+Hyperspectral Trajectory Image
+13
+Table 2: Ablation of encoder features and attention axes with Temporal AUC-PR.
+Encoder features
+Attention axes
+Temporal
+Spatial + Temporal
+Intra-day
+Inter-day
+Full (CFT)
+Dense (Tokyo)
+0.03
+0.62
+0.52
+0.29
+0.84
+Sparse (LA)
+0.001
+0.52
+0.09
+0.07
+0.54
+individual days. On Sparse NumoSim-LA, both axes contribute modestly in iso-
+lation (17% and 13%), but their combination recovers full performance : neither
+axis independently carries sufficient anomaly signal on sparse stay-point data,
+yet their factorized combination does, showing that cyclic factorized attention
+is necessary for sparse trajectories rather than merely beneficial—a finding that
+directly validates the architectural design. Across both benchmarks, full inter-
+leaved attention is strictly best. The Full (CFT) entries in both subtables of
+Table 2 correspond to the same model architecture, confirming cross-consistency
+of the 0.84 (Dense) and 0.54 (Sparse) values.
+4.4
+Qualitative Analysis
+We qualitatively analyze TITAnD on dense dataset by visualizing inter-day and
+intra-day attention maps along with prediction produced by CFT in Fig. 5. At-
+tention is computed via attention rollout across layers and averaged over heads;
+inter-day attention is further averaged over anomalous time slots, while intra-
+day attention is averaged over anomalous days. Across agents, inter-day atten-
+tion concentrates on a small set of anomalous days, whereas intra-day atten-
+tion highlights the specific within-day slots, matching CFT’s decomposition into
+routine-level change (inter-day) and within-day irregularity (intra-day).
+Fig. 5: Qualitative analysis. Rows show (top-bottom) ground-truth (gray: missing),
+model predictions, inter-day, and intra-day attention.
+Agent 1. During the baseline (past half) period, this agent follows a compact
+routine with limited variation. On Day 41 evening, the behavior shifts abruptly:
+14
+M. A. Rahman et al.
+the agent traverses a substantially wider region and exhibits markedly different
+stop-and-go dynamics within a 4-hour window. Inter-day attention shows a sharp
+peak on Day 41, while intra-day attention concentrates on the evening slots
+corresponding to the anomaly interval (18:00–22:00). Notably, the anomalous
+window contains a surge in distinct visited locations and extended stationary
+periods at atypical areas, which together drive high-confidence detection and
+precise temporal localization.
+Agent 3. This case illustrates that anomalies need not be dominated by
+large spatial displacement. On Day 37 morning, the agent becomes stationary
+for most of the 4-hour interval and exhibits repeated prolonged dwells, deviat-
+ing from their baseline weekday morning pattern of regular movement and brief
+stops. Inter-day attention again isolates the anomalous day (Day 37), and intra-
+day attention concentrates tightly on the morning slots (09:00–13:00), match-
+ing the ground-truth window. This example highlights the benefit of modeling
+within-day structure: even when the overall region visited remains similar, fine-
+grained temporal dynamics (prolonged inactivity and abnormal dwell structure)
+are sufficient for detection.
+5
+Limitations
+Our evaluation relies on synthetically injected anomalies because large-scale
+datasets with verified real-world mobility anomaly labels are currently unavail-
+able. Constructing such labels requires access to sensitive mobility traces and
+ground-truth incident verification, which makes large public benchmarks diffi-
+cult to obtain. Synthetic anomaly injection therefore provides a controlled way
+to benchmark detection performance across diverse anomaly types. For dense
+trajectories, experiments were conducted on private data since no public dataset
+currently provides multi-month dense GPS traces with anomaly annotations.
+Consequently, two of our three benchmarks share the same private Tokyo data
+source, which limits the geographic and demographic diversity of our evaluation;
+results on additional independent real-world datasets would further strengthen
+the generalization claims. To support reproducibility, we will release the full
+implementation of HTI and CFT, along with preprocessing pipelines, training
+scripts, and trained model weights so that future work can reproduce our re-
+sults on comparable datasets. Finally, several prior methods (e.g., USTAD and
+ICAD) were originally designed for self-supervised anomaly detection. To enable
+comparison in the supervised setting studied here, we retain their encoders and
+train them with a supervised objective. While this protocol does not fully reflect
+their original design goals, it allows us to compare representations under the
+same labeled evaluation setting.
+6
+Conclusion
+We showed that sparse and dense trajectory anomaly detection are instances of
+the same vision problem. Through hyperspectral trajectory images and structure-
+aware attention along the cyclic axes of human mobility, TITAnD makes multi-
+month dense anomaly detection feasible for the first time while matching or
+surpassing specialized baselines for both data regimes, at 6.5M parameters and
+Hyperspectral Trajectory Image
+15
+up to 75× lower latency than a flat Transformer at 12 months. Our ablations
+confirm that the vision reformulation and the factorized architecture are jointly
+necessary: on sparse trajectories, neither attention axis alone carries the anomaly
+signal, yet their factorized combination does.
+Acknowledgements
+This work is supported by the Intelligence Advanced Research Projects Activ-
+ity (IARPA) via Department of Interior/ Interior Business Center (DOI/IBC)
+contract number 140D0423C0057. The U.S. Government is authorized to repro-
+duce and distribute reprints for Governmental purposes notwithstanding any
+copyright annotation thereon. Disclaimer: The views and conclusions contained
+herein are those of the authors and should not be interpreted as necessarily rep-
+resenting the official policies or endorsements, either expressed or implied, of
+IARPA, DOI/IBC, or the U.S. Government.
+References
+1. Azarijoo, B., Siampou, M.D., Krumm, J., Shahabi, C.: ICAD: A self-supervised
+autoregressive approach for multi-context anomaly detection in human mobility
+data. In: Proceedings of the 33rd ACM International Conference on Advances in
+Geographic Information Systems (SIGSPATIAL ’25). pp. 595–606 (2025). https:
+//doi.org/10.1145/3748636.3762774
+2. Dao, T., Fu, D., Ermon, S., Rudra, A., Ré, C.: Flashattention: Fast and memory-
+efficient exact attention with io-awareness. Advances in neural information pro-
+cessing systems 35, 16344–16359 (2022)
+3. Dosovitskiy, A., Beyer, L., Kolesnikov, A., Weissenborn, D., Zhai, X., Unterthiner,
+T., Dehghani, M., Minderer, M., Heigold, G., Gelly, S., et al.: An image is
+worth 16x16 words: Transformers for image recognition at scale. arXiv preprint
+arXiv:2010.11929 (2020)
+4. Eckmann, J.P., Kamphorst, S.O., Ruelle, D.: Recurrence plots of dynamical sys-
+tems. Europhysics Letters 4(9), 973–977 (1987)
+5. González, M.C., Hidalgo, C.A., Barabási, A.L.: Understanding individual human
+mobility patterns. Nature 453(7196), 779–782 (2008)
+6. Hatami, N., Gavet, Y., Debayle, J.: Classification of time-series images using deep
+convolutional neural networks. In: Tenth International Conference on Machine Vi-
+sion (ICMV 2017). vol. 10696, p. 106960Y. SPIE (2018)
+7. Herder, E., Siehndel, P.: Daily and weekly patterns in human mobility. In: UMAP
+Workshops. pp. 338–340 (2012)
+8. Ho, J., Kalchbrenner, N., Weissenborn, D., Salimans, T.: Axial attention in multi-
+dimensional transformers. arXiv preprint arXiv:1912.12180 (2019)
+9. Hosseini Sereshgi, E., Uppalapati, M., Liu, Y., Kennedy, L., Züfle, A., Wenk, C.:
+Semantic anomaly detection in human trajectories: Preserving behavioral patterns
+through calendar representations. In: Proceedings of the 2nd ACM SIGSPATIAL
+International Workshop on Geospatial Anomaly Detection. pp. 33–42 (2025)
+10. Kennedy, L., Züfle, A.: Kinematic detection of anomalies in human trajectory
+data. In: Proceedings of the 1st ACM SIGSPATIAL International Workshop on
+Geospatial Anomaly Detection. pp. 94–97 (2024)
+16
+M. A. Rahman et al.
+11. Li, Z., Li, S., Yan, X.: Time series as images: Vision transformer for irregularly sam-
+pled time series. Advances in Neural Information Processing Systems 36, 49187–
+49204 (2023)
+12. Liang, Y., Ouyang, K., Wang, Y., Liu, X., Chen, H., Zhang, J., Zheng, Y., Zim-
+mermann, R.: Trajformer: Efficient trajectory classification with transformers. In:
+Proceedings of the 31st ACM International Conference on Information & Knowl-
+edge Management. pp. 1229–1237 (2022)
+13. Liu, Y., Lin, Y., Guo, S., Zhou, Z., Lin, Y., Wan, H.: TrajMamba: An ef-
+ficient and semantic-rich vehicle trajectory pre-training model. arXiv preprint
+arXiv:2510.17545 (2025)
+14. Liu, Z., Mao, H., Wu, C.Y., Feichtenhofer, C., Darrell, T., Xie, S.: A convnet for
+the 2020s. In: Proceedings of the IEEE/CVF conference on computer vision and
+pattern recognition. pp. 11976–11986 (2022)
+15. Ronneberger, O., Fischer, P., Brox, T.: U-net: Convolutional networks for biomedi-
+cal image segmentation. In: International Conference on Medical image computing
+and computer-assisted intervention. pp. 234–241. Springer (2015)
+16. Samet, H.: The quadtree and related hierarchical data structures. ACM Computing
+Surveys (CSUR) 16(2), 187–260 (1984)
+17. Schneider, C.M., Belik, V., Couronné, T., Smoreda, Z., González, M.C.: Unravel-
+ling daily human mobility motifs. Journal of The Royal Society Interface 10(84),
+20130246 (2013)
+18. Shao, W., Fang, Z., Chen, L., Gao, Y.: Towards trajectory anomaly detection:
+a fine-grained and noise-resilient framework. In: Proceedings of the 31st ACM
+SIGKDD Conference on Knowledge Discovery and Data Mining V. 2. pp. 2490–
+2501 (2025)
+19. Song, C., Qu, Z., Blumm, N., Barabási, A.L.: Limits of predictability in human
+mobility. Science 327(5968), 1018–1021 (2010)
+20. Stanford, C., Adari, S., Liao, X., He, Y., Jiang, Q., Kuai, C., Ma, J., Tung, E.,
+Qian, Y., Zhao, L., et al.: Numosim: A synthetic mobility dataset with anomaly
+detection benchmarks. In: Proceedings of the 1st ACM SIGSPATIAL International
+Workshop on Geospatial Anomaly Detection. pp. 68–78 (2024)
+21. Su, J., Lu, Y., Pan, S., Murtadha, A., Wen, B., Liu, Y.: RoFormer: Enhanced
+transformer with rotary position embedding. Neurocomputing 568, 127063 (2024)
+22. Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A.N., Kaiser,
+Ł., Polosukhin, I.: Attention is all you need. In: Advances in Neural Information
+Processing Systems. pp. 5998–6008 (2017)
+23. Wang, H., Zhu, Y., Green, B., Adam, H., Yuille, A., Chen, L.C.: Axial-deeplab:
+Stand-alone axial-attention for panoptic segmentation. In: European conference on
+computer vision. pp. 108–126. Springer (2020)
+24. Wang, S., Li, J., Shi, X., Ye, Z., Mo, B., Lin, W., Ju, S., Chu, Z., Jin, M.:
+Timemixer++: A general time series pattern machine for universal predictive anal-
+ysis. arXiv preprint arXiv:2410.16032 (2024)
+25. Wang, Z., Oates, T.: Imaging time-series to improve classification and imputation.
+In: Proceedings of the 24th International Joint Conference on Artificial Intelligence
+(IJCAI). pp. 3939–3945 (2015)
+26. Wen, H., Cao, S., Rasheed, Z., Shafique, K.H., Akoglu, L.: Uncertainty-aware hu-
+man mobility modeling and anomaly detection. arXiv preprint arXiv:2410.01281
+(2024)
+27. Xie, E., Wang, W., Yu, Z., Anandkumar, A., Alvarez, J.M., Luo, P.: Segformer:
+Simple and efficient design for semantic segmentation with transformers. Advances
+in neural information processing systems 34, 12077–12090 (2021)
+Hyperspectral Trajectory Image
+17
+28. Zhang, D., Li, N., Zhou, Z.H., Chen, C., Sun, L., Li, S.: ibat: detecting anoma-
+lous taxi trajectories from gps traces. In: Proceedings of the 13th international
+conference on Ubiquitous computing. pp. 99–108 (2011)
+29. Zheng, Y., Zhang, L., Xie, X., Ma, W.Y.: Mining interesting locations and travel
+sequences from GPS trajectories. In: Proceedings of the 18th International Confer-
+ence on World Wide Web (WWW ’09). pp. 791–800. Association for Computing
+Machinery (2009). https://doi.org/10.1145/1526709.1526816
+30. Zhu, Y., Yu, J.J., Zhao, X., Zhou, X., Han, L., Wei, X., Liang, Y.: Unitraj: Learning
+a universal trajectory foundation model from billion-scale worldwide traces. arXiv
+preprint arXiv:2411.03859 (2024)
+18
+M. A. Rahman et al.
+This document provides supplementary details for the main paper. We in-
+clude dataset statistics (Sec. A), pseudocode for TITAnD, CFT, and QuadTree
+(Sec. B), encoder implementation details (Sec. C), per-benchmark training hy-
+perparameters (Sec. D), extended qualitative analysis (Sec. E), and full efficiency
+benchmarks (Sec. F).
+A
+Dataset Details
+Table 3: Dataset statistics across three benchmarks.
+Scale
+Splits
+Anomaly Prevalence
+Benchmark
+Modality
+Agents
+Duration
+Train
+Val
+Slots/Agent
+Slot Rate
+Agent Rate
+Sparse (NumoSim-LA)
+Stay-points
+80,381
+55 days
+50,238
+30,143
+15,840
+0.024%
+0.47%
+Dense (Tokyo)
+GPS (10 s)
+18,469
+66 days
+14,772
+3,697
+19,008
+0.20%
+46.4%
+Dense2Sparse (Tokyo)
+Stay-points
+80,463
+120 days
+50,416
+30,047
+34,272
+0.009%
+0.57%
+Sparse (NumoSim-LA). NumoSim [20] provides natively sparse stay-point
+trajectories from the Los Angeles region. Each event records arrival time, depar-
+ture time, and a POI location; no dense GPS is available. Trajectories span ∼55
+days (28 past + 27 future). Anomaly labels are aggregated to 5-minute slots via
+the sparse labeling rule (Eq. 2 in the main paper).
+Dense (Tokyo). A private dense GPS dataset from the Tokyo metropolitan
+region sampled at ∼10-second resolution. Each agent spans 66 days (33 past +
+33 future), yielding ∼570K GPS points per agent. Anomaly labels are provided
+at per-point granularity and aggregated to 5-minute slots via OR aggregation
+(Eq. 1 in the main paper).
+Dense2Sparse (Tokyo). The same Tokyo agents preprocessed into stay-
+point sequences spanning 120 days. Because dense ground-truth labels are also
+available, this benchmark enables a controlled comparison that isolates the in-
+formation loss from sparsification.
+B
+Pseudocode
+B.1
+TITAnD: End-to-End Forward Pass
+Listing 1.1 shows the high-level three-stage pipeline. Encoder internals (spatial
+blending, temporal calendar encoding, kinematic features) are detailed in Sec. 3.2
+of the main paper; the pseudocode focuses on inter-stage data flow.
+Listing 1.1: TITAnD forward pass.
+1 def
+titand_forward(batch):
+2
+B, D, S = batch.mask.shape
+3
+4
+# Stage 1: Modality -specific
+encoder
+5
+# ( DenseTrajEmbed or SparseTrajEmbed )
+6
+sp = encode_spatial (batch)
+# [B,D,S ,128]
+Hyperspectral Trajectory Image
+19
+7
+tm = encode_temporal (batch)
+# [B,D,S ,66]
+8
+kn = encode_kinematic (batch)
+# [B,D,S ,32]
+9
+x = mlp_fuse(cat(sp , tm , kn)) # [B,D,S,C]
+10
+x += type_emb(batch.stop_frac)
+11
+12
+# Stage 2: CFT
+13
+x = cft(x, mask=batch.day_mask)
+14
+15
+# Stage 3: Prediction
+head
+16
+y = mlp_clf(x).squeeze (-1)
+# [B,D,S]
+17
+y_agent = y.max(dim=(1, 2))
+# [B]
+18
+return y, y_agent
+B.2
+Cyclic Factorized Transformer (CFT)
+Listing 1.2 details the interleaved block structure described in Sec. 3.3. Each
+block applies intra-day attention (over S slots within each day) followed by inter-
+day attention (over D days at the same time-of-day), both with LayerNorm and
+residual connections.
+Listing 1.2: CFT forward pass.
+1 def
+cft_forward(x, day_mask=None):
+2
+B, D, S, C = x.shape
+3
+rope_s = build_rope(S) # slot
+positions
+4
+rope_d = build_rope(D) # day
+positions
+5
+6
+for i in range(L):
+7
+# Intra -day: self -attn over S per day
+8
+x = x + intra_attention [i](
+9
+layer_norm(x), rope=rope_s)
+10
+x = x + ffn_intra[i]( layer_norm(x))
+11
+12
+# Inter -day: self -attn over D per slot
+13
+x = x + inter_attention [i](
+14
+layer_norm(x), rope=rope_d ,
+15
+mask=day_mask)
+16
+x = x + ffn_inter[i]( layer_norm(x))
+17
+return x # [B, D, S, C]
+B.3
+QuadTree Spatial Discretization
+Listing 1.3 shows the adaptive grid construction referenced in Sec. 3.2 of the
+main paper. Cells with more than cap POIs are recursively split into quadrants
+until reaching the minimum resolution.
+Listing 1.3: QuadTree construction.
+20
+M. A. Rahman et al.
+1 def
+build_quadtree(bounds , pois ,
+2
+base =200, cap=50, min_sz =25):
+3
+# base: cell size (m)
+4
+# cap: POI split
+threshold
+5
+# min_sz: smallest
+cell (m)
+6
+root = Node(bounds)
+7
+queue = [(root , all_pois)]
+8
+leaves = []
+9
+10
+while
+queue:
+11
+node , idx = queue.popleft ()
+12
+half = min(node.w, node.h) / 2
+13
+14
+if len(idx) > cap and half
+>= min_sz:
+15
+for c in split_quadrants (node):
+16
+c_idx = idx[in_bounds(pois , c)]
+17
+queue.append ((c, c_idx))
+18
+else:
+19
+leaves.append(node)
+20
+21
+for i, leaf in enumerate(leaves):
+22
+leaf.cell_id = i
+23
+lut = build_lookup(leaves , res =10)
+24
+return leaves , lut
+B.4
+Spatio-Semantic Cell Embedding (Encsp)
+Listing 1.4 shows the shared cell_embed core (GPS →QuadTree →128-d). The
+dense encoder pools P=30 cell embeddings per slot via learned attention. The
+sparse encoder distinguishes stops (cell embedding at location) from trips (delta
+embedding ∆e = edest −eorig, encoding travel direction in the learned space).
+Listing 1.4: Spatio-semantic cell embedding.
+1 def
+cell_embed(cell_id , i, j):
+2
+# Semantic: attention -pool POIs in cell
+3
+h = poi_mlp(cat(cat_emb(cell_id),
+4
+pos_mlp(dxy[cell_id ]))) # [N ,64]
+5
+alpha = softmax(w_sem @ h, poi_mask)
+6
+s = dot(alpha , h)
+# [64]
+7
+# Spatial: sinusoidal
+grid PE
+8
+pe = sinusoidal_pe (i, j)
+# [128]
+9
+return
+mlp_sp(cat(s, pe)) # [128]
+10
+11 # Dense: pool P cell
+embeddings
+per slot
+12 def
+enc_sp_dense(gps):
+# [P, 2]
+13
+cells , ij = quadtree(gps)
+14
+e = vmap(cell_embed)(cells , ij) # [P, 128]
+15
+beta = softmax(w_pool @ e, valid)
+Hyperspectral Trajectory Image
+21
+16
+return dot(beta , e)
+# [128]
+17
+18 # Sparse
+stop: cell
+embedding at location
+19 def
+enc_sp_stop(stop):
+20
+cell , ij = quadtree(stop.gps)
+21
+return
+cell_embed(cell , *ij)
+# [128]
+22
+23 # Sparse
+trip: delta
+embedding (direction)
+24 def
+enc_sp_trip(trip):
+25
+e_o = cell_embed (* quadtree(trip.gps_orig))
+26
+e_d = cell_embed (* quadtree(trip.gps_dest))
+27
+return e_d - e_o
+# [128]
+B.5
+Temporal Encoder (Enct)
+Listing 1.5 shows the shared temporal encoder used identically for both dense
+and sparse encoders. Six calendar attributes are embedded independently and
+concatenated to a 66-d vector.
+Listing 1.5: Temporal encoder.
+1 def
+enc_temporal(t):
+2
+# 6 calendar
+attributes
+→
+66-d total
+3
+h = cat(
+4
+emb_hour(t.hour),
+# 8-d
+5
+emb_dow(t.day_of_week),
+# 6-d
+6
+emb_dom(t.day_of_month ),
+# 8-d
+7
+emb_pod(t.part_of_day),
+# 16-d
+8
+emb_wom(t.week_of_month ), # 8-d
+9
+emb_mon(t.month),
+# 20-d
+10
+)
+11
+return h
+# [66]
+B.6
+Kinematic Encoders (Enckn)
+Listing 1.6 shows both variants. The dense encoder derives an 11-d descriptor
+from raw GPS within a 5-minute slot. The sparse encoder uses a shared 5-d input
+for stops and trips: stops set distance, velocity, and bearing to zero (signalling
+a stationary event), while trips carry the full kinematic descriptor. Both share
+the same KinMLP.
+Listing 1.6: Kinematic encoders (dense and sparse).
+1 # Dense: 11-d from ~30 GPS points per slot
+2 def
+enc_kn_dense(gps):
+# [P, 2]
+3
+v = diff(gps) / dt
+# [P-1, 2]
+4
+spd = norm(v, dim=-1)
+# [P-1]
+5
+brg = atan2(v[:,1], v[: ,0]) # [P-1]
+22
+M. A. Rahman et al.
+6
+acc = diff(spd) / dt
+# [P-2]
+7
+f = cat([v.mean (0),
+8
+sin(brg).mean (), cos(brg).mean (),
+9
+spd.mean (), bearing_var(brg),
+10
+acc.mean (), spd.min(), spd.max(),
+11
+acc.min(), acc.max()]) # 11-d
+12
+return
+linear_kn(f)
+# [32]
+13
+14 # Sparse
+stop: duration only , rest = 0
+15 def
+enc_kn_stop(stop):
+16
+f = [log1p(stop.dur), 0, 0, 0, 0] # 5-d
+17
+return
+gelu(linear_kn(f))
+# [32]
+18
+19 # Sparse
+trip: full 5-d kinematic
+20 def
+enc_kn_trip(trip):
+21
+f = [log1p(trip.dur),
+22
+log1p(trip.dist),
+23
+log1p(trip.vel),
+24
+sin(trip.bearing),
+25
+cos(trip.bearing)]
+# 5-d
+26
+return
+gelu(linear_kn(f))
+# [32]
+27 # linear_kn
+shared
+across
+stops and trips
+C
+Encoder Implementation Details
+C.1
+QuadTree Grid Statistics
+The QuadTree starts from the full AOI bounding box and recursively splits any
+cell containing more than 50 POIs into four quadrants, stopping when children
+would be smaller than 25 m. This yields fine resolution in dense commercial
+districts and coarse cells in sparse residential areas.
+Property
+Value
+Total leaf cells
+∼78,000
+Split threshold
+50 POIs
+Minimum cell size
+25 m
+Lookup resolution
+10 m (for O(1) vectorized queries)
+C.2
+POI Categories
+We use 45 semantic POI categories grouped from raw OpenStreetMap tags:
+C.3
+Feature Dimensions
+Spatio-semantic cell embedding. Each POI is encoded by its category em-
+bedding (32-d) concatenated with a relative position MLP (32-d), yielding a
+Hyperspectral Trajectory Image
+23
+Category group
+Examples
+Residential (6)
+apartment, house, dormitory, . . .
+Commercial (8)
+store, mall, supermarket, . . .
+Food & Drink (5)
+restaurant, cafe, bar, . . .
+Office (4)
+office building, coworking, . . .
+Healthcare (4)
+hospital, clinic, pharmacy, . . .
+Education (5)
+school, university, library, . . .
+Transportation (4)
+station, parking, bus stop, . . .
+Recreation (5)
+park, gym, cinema, . . .
+Other (4)
+religious, industrial, . . .
+64-d POI feature. Attention pooling over all POIs in a cell produces a 64-d cell
+summary, which is concatenated with a 128-d sinusoidal grid position encoding
+PE(i, j) and projected via MLPsp to a 128-d cell embedding. For the dense en-
+coder, learned attention pooling over P=30 cell embeddings per slot produces a
+128-d spatial token.
+Temporal encoder. Six calendar attributes are independently encoded and
+concatenated: hour-of-day (8-d), day-of-week (6-d), day-of-month (8-d), part-of-
+day with 4 bins (16-d), week-of-month (8-d), and month-of-year (20-d), totaling
+66 dimensions.
+Kinematic encoder. For the dense encoder, Enckn takes an 11-d descriptor
+(velocity components, direction, speed, turning variability, acceleration, min/-
+max speed and acceleration) and projects it to 32 dimensions. For the sparse
+encoder, Enc′
+kn takes a 5-d input (log-duration, log-distance, log-velocity, sin θ,
+cos θ) and projects it to 32 dimensions.
+Slot fusion. The three feature groups are concatenated (128+66+32 = 226
+dimensions) and projected to C=256 via MLPfuse.
+C.4
+Dense Encoder: Attention Pooling
+For each slot (d, s) with P = 30 resampled GPS points, we compute attention
+weights:
+βd,s,p = softmax
+ v⊤
+pool tanh(Wpool ecell
+d,s,p)
+
+· md,s,p,
+(16)
+where md,s,p ∈{0, 1} is the validity mask (0 for padded points). The pooled
+spatial token is ˜xsp
+d,s = P
+p βd,s,p ecell
+d,s,p ∈R128. This allows the model to empha-
+size informative points (transitions, turns) and downweight redundant stationary
+samples.
+D
+Training Details
+All benchmarks share a unified training protocol: BCE + Dice loss with posi-
+tive class weight 50, AdamW optimizer with cosine annealing schedule, gradient
+clipping at 1.0, mixed precision training, and SpecAugment data augmentation
+(probability 0.5, 1 frequency mask up to 1 day, 2 time masks up to 3 slots).
+Table 4 lists the per-benchmark hyperparameters.
+24
+M. A. Rahman et al.
+Table 4: Per-benchmark training hyperparameters.
+Hyperparameter
+Dense (Tokyo)
+Sparse (NumoSim-LA)
+Dense2Sparse (Tokyo)
+Learning rate
+5×10−3
+7×10−5
+7×10−5
+LR warmup epochs
+10
+10
+10
+Epochs
+20
+20
+20
+Batch size (agents)
+32
+32
+32
+Weight decay
+0.1
+0.01
+0.01
+E
+Extended Qualitative Analysis
+The main paper presents qualitative analysis for Agents 1 and 3. Here we provide
+two additional case studies from the Dense (Tokyo) benchmark. For each agent,
+we compare the anomaly period against the established pattern of life during the
+33-day baseline (Days 0–32). Throughout this analysis, unique locations refers to
+distinct grid cells visited; novel locations are cells not visited during the baseline;
+POI enrichment is the ratio of POI category exposure during anomaly versus
+baseline; and velocity is normalized per agent using min-max scaling.
+E.1
+Agent 2 (Days 40–41, 00:00–23:45)
+This agent exhibited the longest anomaly in our evaluation: 24 continuous hours.
+During baseline, the agent frequented only 37 unique locations with strong res-
+idential preference (66%) and essentially zero engagement with entertainment
+venues (<0.5%). Starting midnight on Day 40, the agent visited 86 locations
+(83% novel) with a dramatic semantic shift: 6.4× enrichment in night club prox-
+imity and 2.4× enrichment near theaters—POI categories absent from their
+pattern of life. Between 21:15–22:30 on Day 40, the agent made five consec-
+utive 15-minute stops in unpopulated areas, behavior inconsistent with normal
+evening activity. The 24-hour duration, spatial novelty, and entertainment venue
+engagement collectively constitute a comprehensive behavioral discontinuity.
+E.2
+Agent 4 (Day 50, 06:00–10:00)
+This case presents the most geographically dramatic anomaly. Baseline morning
+activity showed a consistent 5 km commute with 2–3 brief stops. On Day 50,
+the agent traversed a 31×14 km area—spanning the metropolitan region north-
+to-south—visiting 267 locations (81% novel). The trajectory formed an approx-
+imately linear path, suggesting deliberate transit rather than exploration. Most
+notably, the five longest dwells (15 minutes each, 07:00–08:15) occurred at educa-
+tion and religious facilities—institutional POI categories with negligible baseline
+presence. Despite covering 6× normal distance, velocity decreased 81%, indi-
+cating methodical movement with frequent stops. This combination of extreme
+spatial displacement, institutional engagement, and paradoxically reduced speed
+triggered high-confidence detection.
+Hyperspectral Trajectory Image
+25
+F
+Efficiency Benchmarks
+F.1
+Single-Point Comparison (2 Months)
+Table 5 reports model size, FLOPs, inference latency, and peak GPU memory
+at the 2-month horizon (the Dense Tokyo setting).
+Table 5: Efficiency comparison at 2-month horizon. Latency measured on a single
+NVIDIA H200 GPU with batch size 4.
+Model
+Parameters
+FLOPs
+Latency (ms)
+Memory (GB)
+CFT (ours)
+6.5M
+170B
+54
+7.5
+Transformer
+6.7M
+1,636B
+610
+7.5
+SegFormer
+25.7M
+39B
+24
+7.5
+U-Net
+19.1M
+39B
+20
+7.5

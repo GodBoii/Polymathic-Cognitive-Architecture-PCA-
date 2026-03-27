@@ -1,0 +1,1396 @@
+DVM: Real-Time Kernel Generation for Dynamic AI Models
+Jingzhi Fang∗
+Huawei, China
+fangjingzhi@huawei.com
+Xiong Gao*
+Huawei, China
+xiong.gao@huawei.com
+Renwei Zhang
+Huawei, China
+zhangrenwei1@huawei.com
+Zichun Ye
+Huawei, China
+zichun.ye@huawei.com
+Lei Chen
+HKUST, HKUST(GZ)
+leichen@cse.ust.hk
+Jie Zhao
+Hunan University
+jiezhao@hnu.edu.cn
+Chengnuo Huang
+Huawei, China
+huangchengnuo1@huawei.com
+Hui Xu
+Huawei, China
+xuhui78@huawei.com
+Xuefeng Jin
+Huawei, China
+jinxuefeng@huawei.com
+Abstract
+Dynamism is common in AI computation, e.g., the dynamic
+tensor shapes and the dynamic control flows in models. Due
+to the long compilation time, existing runtime compilation
+damages the model efficiency, while the offline compilers
+either suffer from the long compilation time and device mem-
+ory footprint to cover all the possible execution instances of
+a dynamic model, or sacrifice optimization opportunities for
+usability. In this paper, we rethink the feasibility of runtime
+compilation for dynamic models and identify that the key for
+it to work is to speed up the compilation or hide the compi-
+lation overhead. To do this, we propose a real-time compiler,
+DVM. In DVM, we design a runtime operator compiler based
+on a bytecode virtual machine to perform effective and effi-
+cient compilation for each dynamic operator instance given
+its input. Specifically, instead of compiling programs into ma-
+chine code, we encode the operator program into bytecode
+on the CPU and decode the bytecode into virtual instructions
+for direct execution on the NPU. Based on the runtime op-
+erator compiler, we further propose an operator fuser, which
+performs symbol-deduction-based fusion on static graphs
+and runtime fusion on dynamic graphs. Both pattern- and
+stacking-based fusion are supported to increase fusion op-
+portunities. Evaluation on operators, subgraphs, and models
+shows that, compared with TorchInductor, PyTorch-eager and
+MindSpore-graph-O0, we are up to 11.77× better in terms of
+the operator/model efficiency and up to 5 orders of magnitude
+faster in terms of the maximum compilation time.
+1
+Introduction
+Nowadays, dynamism is common in AI computation. For
+example, the input sequence lengths of large language mod-
+els (LLMs) can vary at runtime, making the tensor shapes
+of operators dynamic, and the control flow in a model also
+makes the computation graph structure dynamic. Supporting
+the dynamic models with dynamic tensor shapes and dynamic
+∗These authors contributed equally to this work.
+topological structures is of significant importance for AI com-
+pilers to achieve high model efficiency.
+Due to the long compilation time (e.g., according to our
+experiments, TorchInductor [6] can take tens of seconds to
+compile an operator instance with given input tensors, which
+can be more than 105× of the operator running time), most of
+the existing compilers for dynamic models depend on offline
+compilation. However, pre-compiled kernels either require
+a significant overhead of compilation time and device mem-
+ory footprint to cover all the possible execution instances of
+a dynamic model in practice, which can often be unaccept-
+able, or sacrifice optimization opportunities for usability. We
+elaborate this argument below from two aspects: operator
+optimization and operator fusion in dynamic models.
+Operator optimization challenges. The naive way to sup-
+port dynamic operator shapes is to generate kernels for each
+possible shape, which is impractical when there are a large
+number of possible tensor shapes, e.g., for the batch inference
+tasks of LLMs, there can be tens of thousands of possible
+input shapes [batch size,sequence length]. Considering that
+some operator tensor shapes may be more popular than others,
+just-in-time compilation with caching can be used, but there
+will be frequent jitter of service time in case of many unseen
+shapes, and the memory footprint issue remains.
+To avoid compiling an operator for every possible shape
+separately, two types of methods have been developed: (1)
+bucketing and (2) micro-kernels. Bucketing [15] splits the
+given possible shape range into several buckets and pads each
+dimension to the maximum in each range, so that it only needs
+to generate kernels for the maximum shapes in each range.
+Micro-kernels [20–22] are unit computation blocks that can
+be replicated to constitute a complete operator kernel, i.e.,
+for any operator shape, the complete kernel is determined by
+the micro-kernel, and different operator shapes can share the
+same micro-kernel. Micro-kernels (and the corresponding ker-
+nels) are usually prepared at compile-time, and the best one is
+selected for the specific shape at runtime. To obtain the micro-
+kernel set, some works [20, 21] require the possible tensor
+shape range to define the micro-kernel search space and select
+1
+arXiv:2603.24239v1  [cs.PL]  25 Mar 2026
+a subset of micro-kernels from it based on their performance
+on the possible shapes. When the shape space is large (e.g, an
+operator has multiple dynamic shape dimensions), it can be
+hard to search for high-performance micro-kernels efficiently.
+Both bucketing and micro-kernels trade off the number of
+kernels (i.e., the overhead of compilation and memory foot-
+print) against the operator efficiency, and they can fail when
+the possible shape space is unknown in practice. Helix [22]
+recently constructs micro-kernels offline tailored to the archi-
+tectural hierarchy directly, requiring no input shape ranges.
+However, Helix still suffers from higher operator dynamism,
+which is the limitation of all the pre-compilation methods.
+For example, for the operators with dynamic numbers of di-
+mensions and implicit input broadcast, or the flexibly fused
+operators (e.g., computation-intensive operators can be fused
+with element-wise consumers with various operator type com-
+binations), as a kernel cannot be reused among operators with
+different computation expressions except for different input
+shapes, it is necessary to prepare a large number of kernels to
+cover all the possible cases.
+Operator fusion challenges. When fusing dynamic shape
+operators, existing works rely on symbolic shape equivalence
+checking [21]. However, when the operator shape equiva-
+lence cannot be determined before execution, some fusion
+opportunities may be missed. For example, given two oper-
+ators A + B,A +C, supposing the respective shapes of the
+tensors A,B,C are [1,20],[b,20],[c,20], the two operators can
+be fused only when b = c (by fusion, A only needs to be
+loaded once). If we cannot determine this equality condi-
+tion beforehand (e.g., the concrete shape is determined by a
+data-dependent operation like nonzero), the fusion will not
+be made, even if b = c for some model instances.
+The dynamic computation graph structure makes the oper-
+ator fusion even more challenging. Existing works [2,11,19]
+consider three types of control flows in models, i.e., loop,
+branch, and recursion. These works either transform the con-
+trol flow into the data flow (e.g., writing the loops in the ker-
+nels or via lifting) or extract sub-graphs without control flows
+from the computation graph to compile. However, fusion on
+complex dynamic topologies has not been well supported
+yet. For example, for the potential fusions across multiple
+branches, existing works may conservatively not fuse any op-
+erators, or we may have to enumerate all the possible operator
+fusions and prepare respective kernels. Lazy Tensors [12]
+defers operation execution to accumulate a graph and com-
+piles it with the XLA compiler [14], so that the actual exe-
+cution paths and operator shapes can be utilized. However,
+the accumulated graph has to be hashed to avoid unnecessary
+recompilation, incurring extra overhead. In PyTorch 2 [1], in-
+stead of capturing all the branches of a conditional like a fully
+symbolic system, it always picks one branch based on shape
+reasoning given model input and specializes its trace under
+the assumption that this trace will only be reused when the
+assumptions hold. Both Lazy Tensors and PyTorch 2 suffer
+from the time-consuming just-in-time recompilation.
+Our solution. In this paper, we try to solve the problem of
+dynamic model compilation for better model efficiency and
+focus on the Ascend NPU architecture. Since all of the pre-
+compilation methods cannot handle the general dynamism
+by nature, we rethink the feasibility of runtime compilation
+for dynamic models. Previous runtime compilation methods
+cannot work well because we need to (1) either wait for the
+long compilation to finish before we can run the kernel on
+the device, (2) or continuously cache the kernels while still
+suffering from the long compilation when a new operator
+instance appears. Therefore, the key for runtime compilation
+to work is to speed up the compilation or hide the compilation
+overhead.
+To do this, instead of compiling programs to machine code,
+we turn to a bytecode virtual machine. Specifically, we en-
+code a program into bytecode on the CPU and decode the
+bytecode into virtual instructions for direct execution on the
+NPU. In this way, we significantly shorten the compilation
+process compared with the traditional process that generates
+machine code. We further speed up the bytecode generation
+by defining a high-level bytecode per operator type, with each
+bytecode representing a tile of operator computation (instead
+of a scalar operation); at runtime, for each fused set of opera-
+tors, given the exact operator shapes, we use an architecture-
+guided light-weight shape tiling algorithm to efficiently tile
+the operator iteration space and generate the corresponding
+bytecode program. Each operation bytecode corresponds to a
+virtual instruction. A virtual instruction is executed by calling
+the corresponding virtual instruction function. When running
+a model, thanks to the hardware features of Ascend NPU that
+(1) different types of computation flows (scalar/vector/matrix
+computation) run in parallel and (2) the bytecode decoding
+(requiring scalar computation) is generally much faster than
+the instruction execution, we can hide the bytecode decoding
+overhead within the model computation latency.
+Based on the runtime operator compiler, we further pro-
+pose an operator fuser for computation graphs with static or
+dynamic graph structures. Two categories of operator fusion,
+pattern-based fusion and stacking-based fusion, are supported
+to make the fusion flexible and increase the fusion opportuni-
+ties. For static graphs, we check the fusion conditions based
+on symbol deduction. For dynamic graphs, we use an operator
+buffer to make operator execution lazy and perform streaming
+operator fusion at runtime based on the actual operator shapes
+and execution paths, enabling more fusion opportunities than
+the existing methods.
+Building on the above ideas, we propose a dynamism-
+native compiler, DVM, for dynamic models, which consists of
+a runtime operator compiler and an operator fuser (Figure 1).
+The whole design has 3 advantages. (1) Dynamism-native:
+the runtime operator compilation is flexible enough to support
+various operator shapes and operator fusion. (2) Light-weight:
+we do not need to enumerate all the possible fused operator
+2
+Figure 1: DVM Overview.
+Figure 2: Hardware architecture abstraction (the example AI
+Core abstraction is about A2/A3 Ascend NPU) [5].
+kernels before execution, avoiding the high compilation over-
+head and large memory footprint; the compilation is efficient.
+(3) More optimization opportunities: the runtime model infor-
+mation enables more optimization opportunities that are hard
+to utilize when the operator shape and the execution path are
+uncertain. Although DVM is implemented for Ascend NPU,
+its design (specifically, the bytecode virtual machine) can be
+adapted to other accelerators that enable parallel computation
+flows of different types.
+By comparing DVM with the available Ascend NPU com-
+pilers, TorchInductor [6] (adapting TorchInductor in PyTorch
+2 [1] to Ascend NPU), PyTorch-eager [6] (adapting PyTorch
+eager to Ascend NPU), and MindSpore-graph-O0 [8] (the O0
+graph mode of MindSpore) on different operators, subgraphs,
+and models, we show that DVM is up to 11.77× better than
+the baselines in terms of the operator/model efficiency, with
+the runtime compilation overhead of DVM counted. In terms
+of compilation time, we are up to 5 orders of magnitude faster
+than the baselines, which shows our significant superiority in
+rapid model development and deployment.
+The contributions of this paper are summarized below.
+1. We design a runtime operator compiler based on a byte-
+code virtual machine to achieve both high optimization
+effectiveness and high compilation efficiency.
+2. We propose an operator fuser based on the runtime opera-
+tor compiler for both static and dynamic graphs. Particu-
+larly, the operator fusion on dynamic graphs is performed
+at runtime to enable more optimizations. Both pattern-
+and stacking-based fusion are supported to increase fu-
+sion opportunities.
+Figure 3: The asynchronous computation flows in an AI Core.
+Figure 4: Traditional compilation VS virtual machine.
+3. Comparison with the available Ascend NPU compilers,
+TorchInductor [6], PyTorch-eager [6], and MindSpore-
+graph-O0 [8] on different operators, subgraphs, and mod-
+els shows that we are up to 11.77× better than the base-
+lines in terms of the operator/model efficiency and 5
+orders of magnitude faster in terms of the compilation
+time.
+2
+Background
+In this section, we introduce the Ascend NPU architecture
+and the bytecode virtual machine, respectively.
+2.1
+Ascend NPU
+Each Ascend NPU has multiple AI Cores, which can work in
+parallel. Figure 2 shows the hardware architecture abstraction
+of an Ascend NPU [5]. Each AI core has its computation units,
+local memory, and the Direct Memory Access (DMA) unit.
+There are three types of computation units: (1) the Scalar unit
+conducts scalar computation and dispatches the instructions
+it receives to the corresponding units (the blue arrows in Fig-
+ure 2); (2) the Vector unit conducts vector computation; (3)
+the Cube unit conducts matrix computation. The DMA unit
+is responsible for the data transfer between different memory
+layers. The Vector, Cube, and DMA units all have their own
+instruction queue, so they can run in parallel. Since there
+can be dependency between instructions in different queues,
+the Scalar unit will launch synchronization instructions to
+the corresponding units when necessary (the orange arrows
+in Figure 2). A typical dataflow in an AI Core is that DMA
+first loads data from Global Memory to Local Memory, and
+3
+Figure 5: The workflow of the operator compiler.
+then the Vector/Cube unit conducts computation and stores
+the result in Local Memory for DMA to further move it to
+Glocal Memory (the purple arrows in Figure 2). Figure 3
+illustrates the asynchronous computation flows of the Ascend
+NPU.
+Ascend NPU conducts computation in an SPMD (Single-
+Program Multiple-Data) way, i.e., the parallel AI Cores will
+run the same program on different data, each with one thread.
+When calling a function on the Host side (the CPU side), the
+corresponding task, with the number of AI Cores required
+and the task type specified, will be loaded by the Device and
+scheduled to the idle AI Cores, and those AI Cores will run
+the corresponding kernel function [7].
+2.2
+Bytecode and Virtual Machine
+Unlike compiling a program into machine code to run, a pro-
+gram can also be encoded into a bytecode program, so that a
+virtual machine can execute it efficiently by decoding it into
+virtual instructions and directly executing the instructions,
+one at a time (i.e., performing bytecode interpretation). There
+are bytecode virtual machines for programming languages
+such as Java [16] and Python [17], etc. With bytecode, we do
+not need to generate or load any file, or compile the program
+to machine code before execution, i.e., the program execu-
+tion process (hence the compilation overhead) is significantly
+shortened compared with the traditional compile-then-execute
+way (Figure 4). Furthermore, since the bytecode is interpreted
+one at a time, we can pipeline the bytecode decoding and
+instruction execution to hide the decoding overhead.
+3
+DVM Overview
+We propose DVM, a real-time compiler, which consists of an
+operator compiler and an operator fuser (Figure 1). The oper-
+ator compiler compiles each (fused) operator instance at run-
+time, based on bytecode and a virtual machine. The operator
+fuser works on both static and dynamic graphs; for dynamic
+graphs, fusion is based on the actual execution paths and
+shapes. Besides, since the dynamic graph structures and the
+dynamic operator shapes are dealt with at runtime, DVM does
+not cache the fusion decisions or the operator kernels, making
+it memory-efficient.
+Operator Compiler. Figure 5 shows the workflow of our
+operator compiler. Like other compilers [1], the operators in
+DVM are decomposed into basic operators for easier handling,
+e.g., addmm is decomposed into matmul and add. Given a
+computation graph of a set of basic operators to fuse, the byte-
+code compiler of DVM first performs shape tiling to partition
+the iteration space and then encodes the tiled computation
+graph into bytecode. The load/store operations are responsi-
+ble for the address transformation between the global com-
+putation space and the local computation space, so that the
+diversity of the data layouts in the global computation space
+is transparent to the tiled computation operations, reducing
+the complexity of computation operations. Given the gen-
+erated bytecode program, the required number of AI Cores
+for the program will be activated, the computation tiles will
+be assigned to the AI Cores evenly, and the virtual machine
+on each AI Core will decode the bytecode program into the
+corresponding sequence of virtual instructions. Each virtual
+instruction is executed by calling a pre-compiled kernel func-
+tion.
+We further improve the efficiency of the operator compiler
+by (1) using a hardware-aligned shape tiling algorithm with-
+out real hardware measurement, (2) using tile-level bytecode
+and virtual instructions to reduce the encoding/interpretation
+complexity, and (3) pipelining the bytecode generation and
+interpretation of different fused operators, as well as pipelin-
+ing the bytecode decoding and instruction execution, to hide
+the compilation overhead.
+Operator Fuser. The operator fuser groups the operators
+of the given model to fuse, which will be sent to the operator
+compiler to compile. For static graphs with fixed graph struc-
+tures, we check the fusion conditions, e.g., whether the shapes
+of two operators can be fused, based on symbol deduction.
+For dynamic graphs whose graph structures are uncertain, we
+perform streaming fusion, so the fusion decisions do not need
+to be cached, reducing the memory pressure.
+4
+4
+Operator Compiler
+Given an operator (or a set of operators), the bytecode
+compiler encodes it into bytecode on the host, and the virtual
+machine interprets the bytecode on the device to perform
+the actual computation. In this section, we first introduce the
+virtual instructions used by DVM, and then present the details
+of the bytecode compiler and the virtual machine, respectively.
+4.1
+Virtual Instruction
+Each virtual instruction in DVM corresponds to a kernel func-
+tion on the device that performs a tile of a certain computation.
+For example, Add(xd,xm,xn,size) computes the addition of
+two input tensors A[size],B[size] with addresses xm,xn and
+stores the results in memory with the address xd. Compared
+with the traditional scalar virtual instructions, such tile-level
+virtual instructions have two advantages: (1) fewer instruc-
+tions are required for the same program, so the time of byte-
+code encoding and decoding can be shorter; (2) the compu-
+tation tiles are aligned with the SIMD (Single-Instruction
+Multiple-Data) architecture of the Ascend NPU, so the com-
+putation resources can be fully utilized and the running effi-
+ciency can be higher.
+Table 1 lists the virtual instructions used by DVM. Specif-
+ically, we split the virtual instructions into two categories:
+memory-related (load and store) and computation-related vir-
+tual instructions. In DVM, we ensure that the data layout in the
+local memory is the same as the computation-related virtual
+instructions expect, so the memory-related virtual instructions
+will automatically transform the data layout when moving
+data between the global and the local memory. In this way,
+we do not need to design different computation-related virtual
+instructions for different data layouts, which simplifies the
+implementation and reduces the size of the virtual instruction
+set.
+4.2
+Bytecode Compiler
+The computation graph is compiled into bytecode via two
+steps: shape tiling and bytecode encoding.
+Shape tiling. We partition the iteration space into multiple
+tiles to align with the hardware architecture. The main idea
+of our tiling algorithm is that we design dedicated tiling tem-
+plates for different types of (fused) operators and prune the
+tiling solutions with the hardware resource constraints and a
+lightweight cost model. Specifically, as there are vector units
+and matrix units, we divide the computation operations into
+vector operations accordingly (e.g., add) and matrix opera-
+tions (e.g., matmul).
+Algorithm 1 describes the detailed tiling algorithm for vec-
+tor operations. Given a computation graph G consisting of
+vector operations, we first identify the dominant shape Sd of
+Algorithm 1: Shape Tiling
+Input: Basic operator computation graph G, the local
+memory size M
+Output: Tiled basic operator computation graph G′
+1 Sd ←the dominant shape of G;
+2 nmax ←the peak number of live operators in G;
+3 L ←the total size of Sd;
+4 Tmax ←M/nmax; // the tile size limit
+5 i ←the outermost dimension of Sd;
+6 G′ ←G;
+7 while L > Tmax do
+8
+ℓ←Sd[i];
+9
+if L/ℓ> Tmax then
+10
+t ←1;
+11
+L ←L/ℓ;
+12
+else
+13
+L′ ←L/ℓ;
+14
+t ←hardware_align_div(Tmax,L′);
+15
+L ←t ∗L′;
+16
+for op ∈G′ do
+17
+// skip broadcasting or reduction dimensions
+18
+if op.shape[dim] ̸= 1 then
+19
+op.shape[dim] = t;
+20
+i ←the next inner dimension of Sd;
+21 return G′;
+G, i.e., the maximum number of dimensions and the maxi-
+mum dimension sizes to cover the spatial dimensions of the
+operations in G (line 1). The tiling starts from the maximum
+tile size, L, i.e., the size of Sd, and then tries to decrease the tile
+size (line 11,15) by tiling Sd from outer to inner (line 5,20).
+The maximum tile size limit Tmax is computed by dividing
+the local memory size by the peak number of live operators in
+G (line 4). Once we reach a dimension such that there can be
+possible tile sizes within the limit Tmax (line 12), we select the
+best tile size from them using hardware_align_div based on a
+lightweight cost model considering the hardware alignment
+(line 14). Specifically, the cost of a tiling solution is measured
+by ⌈#tiles/N⌉∗(˜L+2), where #tiles is the number of tiles, ˜L
+is the corresponding tile size, and 2 is used for the extra cost
+of computing a tile (e.g., decoding bytecode), so this formula
+models the bottleneck workload of all AI Cores. After getting
+the minimum-cost tile size, hardware_align_div rounds it up
+to align with the hardware instruction width while respecting
+the Tmax limit. The remaining non-dominant operations are
+tiled accordingly (line 16-19).
+For matrix operations, the output shape of each tile is 2-
+dimensional to align with the cube unit intrinsics; after tiling,
+we need to select the best swizzle strategy for the operations.
+For the case where we fuse a matrix operation with multiple
+vector operations after it, we tile the iteration space of the
+5
+Table 1: Tile-level Virtual Instructions
+Category
+Instruction
+Semantics
+Memory
+Load (dst, src, tile_stride, tile_size)
+Load a continuous tile from global memory to local memory
+ViewLoad(dst, src, tile_stride[], tile_size[], tile_dims)
+Load a non-contiguous tile from global memory to local memory
+Store(dst, src, tile_stride, tile_size)
+Store a tile from local memory to continuous global memory
+ViewStore(dst, src, tile_stride[], tile_size[], tile_dims)
+Store a tile from local memory to non-continuous global memory
+Computation
+Copy(xd, xn, size)
+Copy size bytes data from xn to xd in local memory
+Broadcast(xd, xn, M, size, N)
+Broadcast xn of shape [M,1,N] to xd of shape [M, size, N]
+Sqrt(xd, xn, size)
+xd[i] = sqrt(xn[i]) for i in [0, size)
+Abs(xd, xn, size)
+xd[i] = abs(xn[i]) for i in [0, size)
+Log(xd, xn, size)
+xd[i] = log(xn[i]) for i in [0, size)
+Exp(xd, xn, size)
+xd[i] = exp(xn[i]) for i in [0, size)
+Pow(xd, xm, xn, size)
+xd[i] = xm[i]xn[i] for i in [0, size)
+Round(xd, xn, size)
+xd[i] = round(xn[i]) for i in [0, size)
+Floor(xd, xn, size)
+xd[i] = floor(xn[i]) for i in [0, size)
+IsFinite(xd, xn, size)
+Check finiteness of each xn[i], store to xd[i], for i in [0, size)
+Adds(xd, scalar, size)
+xd[i] = xd[i] + scalar for i in [0, size)
+Muls(xd, scalar, size)
+xd[i] = xd[i] * scalar for i in [0, size)
+Add(xd, xm, xn, size)
+xd[i] = xm[i] + xn[i] for i in [0, size)
+Sub(xd, xm, xn, size)
+xd[i] = xm[i] - xn[i] for i in [0, size)
+Mul(xd, xm, xn, size)
+xd[i] = xm[i] * xn[i] for i in [0, size)
+Div(xd, xm, xn, size)
+xd[i] = xm[i] / xn[i] for i in [0, size)
+Min(xd, xm, xn, size)
+xd[i] = min(xm[i], xn[i]) for i in [0, size)
+Max(xd, xm, xn, size)
+xd[i] = max(xm[i], xn[i]) for i in [0, size)
+Cmp(xd, xm, xn, size, cmp_type)
+xd[i] = (xm[i] <cmp_type> xn[i]) ? 1 : 0 for i in [0, size)
+cmp_type: EQ, NE, LT, LE, GT, GE
+Cast(xd, xn, size, src_dtype, dst_dtype)
+xd[i] = (dst_dtype)(xn[i]) for i in [0, size)
+Sum (xd, xn, M, size, N)
+sum xn of shape [M, size, N] along the penultimate dimension to xd of shape [M, 1, N]
+Max(xd, xn, M, size, N)
+compute max on xn of shape [M, size, N] along the penultimate dimension and store it in xd
+Min(xd, xn, M, size, N)
+compute min on xn of shape [M, size, N] along the penultimate dimension and store it in xd
+Select(xd, cond, xm, xn, size)
+xd[i] = (cond[i] != 0) ? xm[i] : xn[i] for i in [0, size)
+Figure 6: An example process of bytecode generation.
+matrix operation and the vector operations with the constraint
+that the vector operation can obtain its complete input data
+from the output of one matrix operation tile.
+Figure 6 shows the example tiling solution for an element-
+wise add operation, which takes two float16 tensors of shape
+[32, 1024] as input. Suppose that this operator runs on an
+NPU with 40 AI Cores, and the hardware instruction width is
+32 bytes. For this operator, hardware_align_div first finds the
+minimum-cost tile size 820 (the tile number is 40 and the tail
+tile size is 788), and then rounds it up to 832 (the tail tile will
+not be padded).
+Bytecode encoding. The tile computation will be encoded
+into a bytecode program. For each fused operator, its byte-
+code program consists of two parts: the code header and the
+code body, as shown by Figure 7. Specifically, the code body
+includes the bytecode of each operation in the fused operator.
+Each operation bytecode encodes the necessary running in-
+formation of the operation, including the operation type (the
+corresponding virtual instruction ID), the bytecode length (for
+later decoding), the input and output tile addresses (src and
+dst), the computation size (ComputeSize, corresponding to
+the “size” parameter for virtual instructions in Table 1), and
+other information, e.g., cond for Select in Table 1. The code
+header includes the three kinds of information: (1) the kernel
+type (KernelType), e.g., a meta-kernel running on Vector units,
+or a stacking-based kernel that parallels multiple meta-kernels
+spatially (more details in Section 5); (2) the code size (Code-
+Size), i.e., the size of the code body, used to determine the
+code body boundary and decode the operation bytecode, and
+(3) the total number of tiles, used for AI Cores to determine
+6
+Figure 7: Bytecode Program Format.
+their workloads. The bytecode program will be sent to the
+device for decoding and subsequent processing.
+Figure 6 prints an example bytecode program in readable
+format, from which we know the tile number (block_dim), the
+number of tiles for each AI Core (body_tile), and the kernel
+type (“vmain.aiv” for Vector unit meta-kernels). The program
+body contains the bytecode of each operation, together with
+the necessary synchronization operations that are automati-
+cally inserted.
+4.3
+Virtual Machine
+The virtual machine is a kernel function on NPU that inter-
+prets bytecode by decoding it into the pre-defined virtual
+instructions and calling the corresponding virtual instruction
+functions. Each AI Core runs a virtual machine. The byte-
+code decoding is completed by the Scalar unit, and the virtual
+instruction functions are executed by the corresponding units.
+Algorithm 2 describes how the virtual machine works.
+Given the bytecode program P and the virtual instruction ta-
+ble I that maps the virtual instruction ID to the corresponding
+virtual instruction function, the virtual machine first computes
+the number of tiles assigned to each AI Core (line 4) and then
+determines the tile range for it (line 5), based on its ID id, the
+total number of AI Cores N to use, and the total number of
+tiles M specified by P. For each tile in the range, the virtual
+machine interprets all the bytecodes in the code body of P.
+Specifically, a bytecode b is extracted based on its starting
+address p and its length Insn_Len. We start from the address
+of the code body of P to process the first bytecode and stop
+when reaching the code body boundary (line 6,7, 14). Each
+bytecode corresponds to a virtual instruction function call f()
+to finish the workload (line 9-13). If the bytecode is about
+memory operations, f also requires the tile ID as its input to
+load/store data to the correct global memory address (line 11).
+In practice, DVM can hide the decoding overhead well,
+because as shown by Figure 3, (1) the bytecode decoding
+and the instruction execution can be pipelined, and (2) the
+decoding, which runs scalar computation, is much faster than
+the vector/matrix/DMA instructions.
+5
+Operator Fusion
+Algorithm 2: Virtual Machine
+Input: Bytecode program P, virtual instruction table I
+1 id ←the ID of the current AI Core;
+2 N ←the total number of AI Cores to run P;
+3 M ←the total number of tiles specified by P;
+4 m ←⌈M/N⌉;
+5 for i ∈[m∗id,min(M,m∗(id+1)) do
+6
+p, p0 ←the address of the code body of P;
+7
+while p < p0 +P.CodeSize do
+8
+b ←the operation bytecode at p;
+9
+f ←I[b.Insn_ID]; // Virtual Insn function of b
+10
+if f is memory operation then
+11
+f(b,i); // memory operation requires tile ID
+12
+else
+13
+f(b);
+14
+p ←p+b.Insn_Len;
+In this section, we first introduce the fusion categories that
+we support to increase the fusion opportunities. Then, we
+introduce how to fuse operators on different types of compu-
+tation graphs.
+5.1
+Fusion Categories
+The runtime operator fuser supports two types of operator
+fusion, i.e., pattern-based fusion and stacking-based fusion,
+which are flexible and general enough to provide a lot of
+fusion opportunities.
+Pattern-based fusion tries to merge the iterations of multi-
+ple operators based on specific patterns. There are two typical
+fusion patterns for the Ascend NPU: (1) fusion between vec-
+tor operations, (2) fusion between cube and vector operations.
+Figure 8 shows an example of vector-vector fusion. Specifi-
+cally, the original operators are c = a+b,c = √c. By fusing
+the two operators, the result of a + b is stored in the local
+memory instead of the global memory for the following sqrt
+operation to read, therefore reducing the expensive global
+memory access. For the cube-vector fusion, we currently only
+support fusing a cube operation with multiple element-wise
+vector operations after it. The Vector and the Cube units can
+run in parallel in this case to overlap the computation la-
+tency. The kernels generated through pattern-based fusion,
+including the kernel of a single unfused operator, are called
+meta-kernels.
+Stacking-based fusion stacks different meta-kernels tem-
+porally and spatially to reduce latency (Figure 9). The spatial
+stacking schedules the tile computation of independent oper-
+ators to different AI Cores for higher computation resource
+utilization. The temporal stacking schedules different operator
+tiles to the same AI Core for sequential execution, to reduce
+the runtime scheduling overhead. The temporal stacking does
+7
+Figure 8: Fusing two vector operations via local memory.
+Figure 9: Stacking kernels spatially and temporally.
+not require operators to be independent. In practice, we can
+combine the two types of stacking for higher efficiency.
+5.2
+Fusion on Static/Dynamic Graphs
+We now introduce how we fuse operators on static and dy-
+namic computation graphs, respectively.
+Static computation graphs. The graph structure of the
+static computation graph is fixed and known before execution.
+Therefore, despite the lack of concrete operator shape infor-
+mation, we can check the fusion conditions, e.g., the iterations
+of two operators are mergeable, based on symbol deduction
+to make fusion decisions. Given a computation graph, we first
+group the basic operators into clusters to reduce the fusion
+complexity. For the subgraph of each basic operator cluster,
+we split it into multiple fused subgraphs based on pre-defined
+fusion rules. Specifically, for a cube operation, we will try to
+fuse it with the element-wise vector operations after it (if any).
+For vector operations, if their iteration spaces can be merged,
+we can fuse them, which leads to a pattern-based fusion; oth-
+erwise, we can apply stacking-based fusion to them.
+Dynamic computation graphs. For dynamic computation
+graphs whose graph structure is uncertain before execution,
+we make fusion decisions in a streaming way. Specifically,
+when a dynamic model is running, the operators that can be
+determined will be added to a buffer, and the fusion decisions
+will be made immediately based on the same rules for static
+graphs. The fused operators will be flushed to the operator
+compiler under some conditions, e.g., the newly added oper-
+ator cannot be fused, the computation result has to be sent
+back to the Host side (like printing the result).
+Figure 10 shows a running example of the operator fuser
+on dynamic graphs. In the example, a part of the model is
+to first compute c = a+b, d = √c, and then print the value
+of d, where all the variables are tensors. At runtime, the add
+operator and the sqrt operator are added to the buffer in order,
+with the necessary load operators being added as well. We can
+Figure 10: An example of operator fusion on dynamic graphs.
+fuse the add and the sqrt operators according to the vector-
+vector fusion pattern. However, the print operator requires
+the square root result to be sent back to the Host, so the fuser
+stops fusing, adds the necessary store operator, and flushes
+the fused operator to the operator compiler for compiling and
+execution.
+6
+Experiment
+In this section, we want to answer three questions: (1) Can
+DVM generate efficient implementations for (fused) operators?
+(2) Can the operator fuser fuse operators effectively? (3) Is the
+compilation overhead light enough to make the end-to-end
+running of models efficient?
+Datasets: We evaluate DVM on the operator, the subgraph,
+and the model level, respectively. For operator-level analysis,
+we focus on the dynamic matmul operator. For subgraph-
+level analysis, we test three compound operators: LayerNorm,
+addmm, and if-else-add ((a > b ? 2x : 4x)+y), where if-else-
+add has both a dynamic shape and a dynamic control flow.
+For model-level analysis, we test two small models, BERT
+(in training mode) and MMoE (in inference mode), as well as
+two LLMs, Qwen3-14B and Llama3.1-8B (both in finetuning
+mode). The details of the dynamic shape ranges of the 8
+test datasets are listed in Table 2. We randomly sample 60
+shapes for each dynamic operator/subgraph. For if-else-add,
+we also randomly set the condition value to make it execute
+different branches. For the dynamic models, we enumerate
+all the shapes in the possible shape sets.
+Qwen3-14B runs with the model parallelism degree of 8
+on 8 NPUs, and Llama3.1-8B runs with the data parallelism
+degree of 2 and the model parallelism degree of 4 on 8 NPUs,
+while other experiments are performed on a single NPU.
+Baselines: Because most of the existing works are not tar-
+geted and implemented for Ascend NPUs, we only include
+the available Ascend NPU compilers as the baselines for com-
+parison. Specifically, we have 4 baselines in our experiments:
+(1) PyTorch-eager (PT-eager): eager mode of torch-npu [6]
+(the version of PyTorch 2 [1] running on Ascend NPUs),
+based on AOL kernels [4] without automatic operator fusion.
+(2) TorchInductor-recompile (Inductor-r): the recompila-
+tion mode of the TorchInductor compiler in torch-npu [6]
+8
+Table 2: Dynamic shape ranges (D are shapes extracted from common LLMs)
+Name
+Input Shape
+Shape Range
+matmul
+([m,k],[k,n])
+m ∈[1,8192], (n,k) ∈D = {(4096,4096),(11008,4096),(4096,11008),
+(5120,5120),(13696,5120),(5120,13696),(8192,8192),
+(28672,8192),(8192,28672)}
+LayerNorm
+([b,s,h])
+b ∈[1,60], s = 8192, h ∈{1024,2048,3072,4096}
+addmm
+([m,k],[k,n],[m,n])
+m ∈[1,8192], (n,k) ∈D
+if-else-add
+([b,s, f])
+b ∈[1,256], s ∈[1,512], f ∈[1,8192]
+BERT (Train)
+([b,s])
+b ∈{2,4,8,16}, s = 128
+MMoE (Inference)
+([b, f])
+b ∈{2048,4096,8192,16384}, f = 47104
+Qwen3-14B (Finetune)
+([b,s])
+b ∈{1,2,4,8}, s = 4096
+Llama3.1-8B (Finetune)
+([b,s])
+b ∈{1,2,3,4}, s = 8192
+adapted from PyTorch 2 [1], which accepts the complete com-
+putation graph of a dynamic model to determine operator
+fusion before execution and recompiles the operator for each
+new shape encountered.
+(3) TorchInductor-dynamic (Inductor-d): the dynamic
+mode of the TorchInductor compiler in torch-npu [6] adapted
+from PyTorch 2 [1]. It performs the same operator fusion as
+Inductor-r, but only compiles a dynamic operator once, based
+on the size assumption it generates on the first input of the op-
+erator. When the size assumption does not hold, a just-in-time
+compilation will be triggered.
+(4) MindSpore-graph-O0 (MS-O0): MindSpore graph O0
+mode [8], based on AOL [4], no automatic operator fusion.
+When compiling operators, both Inductor-r and Inductor-
+d will generate multiple candidate kernels and benchmark
+them on the NPU. Both PT-eager and MS-O0 do not have
+compilation overhead, as they do not perform operator fusion
+and operator compilation.
+For comparison, we implement DVM as a compiler backend
+of torch-npu [6] and MindSpore [9], denoted by PT-DVM
+and MS-DVM respectively. All the operator and subgraph
+experiments are conducted on torch-npu, while the model
+experiments are run on both torch-npu and MindSpore. Based
+on the implementation in the current stage, we evaluate the
+small models on torch-npu and the LLMs on MindSpore. For
+the model-level evaluation on torch-npu, since the operator
+fuser of DVM has not been integrated into torch-npu currently,
+PT-DVM follows the operator fusion decisions as Inductor-
+r and Inductor-d; for the LLM evaluation on MindSpore, MS-
+DVM uses our static graph operator fuser.
+Metrics: We use two metrics in the evaluation, i.e., (1) the
+running time of an operator/subgraph/model instance (the
+host side cost in running is counted, e.g., computing buffer
+shapes dynamically) and (2) the corresponding compilation
+time. For Inductor-r and Inductor-d, the running time does
+not contain the compilation time because compilation is done
+before running a test case. For DVM, the compilation process is
+mixed with the running process. For analysis, we only collect
+Figure 11: matmul
+Figure 12: LayerNorm
+the host-side time cost as the compilation time of DVM. The
+running time of an operator/subgraph is the average latency
+of 100 executions, while for models, it is the average latency
+of 10 executions. To eliminate artifacts from consecutive runs,
+the L2 cache is cleared before each execution.
+Testbed: We mainly obtain the evaluation results on an
+openEuler 22.03 (LTS-SP4) machine with 4 64-core Kunpeng-
+920 CPUs (256 logical processors in total), 8 Ascend 910B2
+NPUs, and 2TB RAM. The results of BERT, MMoE, and
+Qwen3-14B are obtained on an openEuler 22.03 (LTS-SP4)
+machine with 4 48-core CPUs (384 logical processors in
+total), 8 Ascend 910 NPUs, and 2TB RAM, where the 910
+NPUs have a similar architecture to that of 910B NPUs but
+with higher computation power. The experiments are run
+with torch-npu 2.7.1, CANN 8.5.0, triton-ascend 3.4.0, and
+MindSpore 2.7.2 (for Llama3.1-8B) / MindSpore 2.8.0 (for
+Qwen3-14B).
+9
+(a) “True” branch
+(b) “False” branch
+Figure 13: if-else-add
+Figure 14: addmm
+6.1
+Running Time Comparison
+6.1.1
+Single Operator
+Figure 11 shows the speedups of all the methods, i.e., PT-
+DVM, Inductor-r, and Inductor-d, against PT-eager on matmul
+in terms of the operator running time, where each point corre-
+sponds to a sampled operator instance, and the dashed lines
+show the average speedups of the corresponding methods. Ta-
+ble 3 shows the running time speedups of PT-DVM against the
+baselines. For matmul, all the baselines run the correspond-
+ing AOL kernel [4]. However, the results of these baselines
+in Table 3 are different, due to the host side cost difference.
+For example, Inductor-r treats the operator instances as static,
+while Inductor-d not, resulting in extra running time for op-
+erations such as computing the output buffer shape for each
+operator instance; on the other hand, Inductor-r and Inductor-
+d perform more operations than PT-eager to launch a kernel,
+incurring higher host side cost. Compared with the three base-
+lines, PT-DVM is 0.88-2.62× better, with an average speedup
+of 1.09-1.31×. The results demonstrate the ability of DVM to
+find high-performance operator implementation efficiently,
+because the time of bytecode generation and decoding is in-
+cluded in the running time of PT-DVM.
+Figure 15: ML models
+Figure 16: LLM
+6.1.2
+Subgraph
+Figures 12 to 14 show the running time speedups of differ-
+ent methods against PT-eager. In terms of operator fusion,
+DVM can successfully fuse the operators for all the tested
+subgraphs; Inductor-r and Inductor-d can fuse the operators
+for LayerNorm and if-else-add, however, for addmm they di-
+rectly call the vendor-provided AOL kernels [4], which do not
+fuse the operators in it; PT-eager calls the AOL kernels for all
+the subgraphs, which only fuse the operators in LayerNorm,
+leaving other subgraphs unfused.
+Table 3 shows that, for addmm operators, PT-DVM beats
+PT-eager, Inductor-r, and Inductor-d on 98% of the sampled in-
+stances. Thanks to operator fusion, the maximum speedups of
+PT-DVM against the baselines are 5.96-6.81×, and the respec-
+tive average speedups are 1.59-1.82×. Inductor-r, Inductor-
+d and PT-eager have similar performance because they all call
+the AOL kernels. On LayerNorm, although all the methods
+run a fused operator, their performances are different. Specif-
+ically, PT-DVM is consistently better than all the baselines
+and Inductor-r outperforms PT-eager in most cases. However,
+Inductor-d can only beat PT-eager on 56% of the sampled in-
+stances, showing that the generated kernel of Inductor-d does
+not fully cover the possible shape range for LayerNorm. On if-
+else-add, Figure 13 reports the speedups of different methods
+when the “if” condition holds or not separately. All the meth-
+ods except PT-eager can fuse the multiplication and the add
+for each branch (Inductor-r and Inductor-d will try to recom-
+pile the subgraph when new execution paths are activated),
+10
+Table 3: PT-DVM Running Time Speedups against the base-
+lines.
+Name
+Method
+Avg. Speedup
+Speedup Range
+Ratio of
+speedup (>1)%
+matmul
+Inductor-r
+1.19
+0.88 - 2.18
+62
+Inductor-d
+1.31
+0.93 - 2.62
+93
+PT-eager
+1.09
+0.91 - 1.27
+93
+LayerNorm
+Inductor-r
+1.09
+1.01 - 1.45
+100
+Inductor-d
+1.63
+1.01 - 11.77
+100
+PT-eager
+1.32
+1.19 - 1.67
+100
+if-else-add
+Inductor-r
+1.21
+1.03 - 3.21
+100
+Inductor-d
+1.58
+1.06 - 6.88
+100
+PT-eager
+1.47
+0.93 - 1.63
+98
+addmm
+Inductor-r
+1.73
+0.90 - 6.59
+98
+Inductor-d
+1.82
+0.94 - 6.81
+98
+PT-eager
+1.59
+0.94 - 5.96
+98
+Table 4: Op & subgraph compilation time comparison (time
+in ms). CT: compilation time; RT: running time.
+Name
+Method
+Max CT
+Total CT
+Total RT
+Total CT /
+Total RT
+matmul
+PT-DVM
+0.11
+0.48
+123.26
+3.89×10−3
+Inductor-r
+115.88
+4339.33
+125.92
+3.45×101
+Inductor-d
+200.99
+354.53
+133.79
+2.65
+LayerNorm
+PT-DVM
+0.10
+1.51
+271.14
+5.57×10−3
+Inductor-r
+37802.36
+1517938.56
+282.74
+5.37×103
+Inductor-d
+35696.20
+108446.42
+357.43
+3.03×102
+if-else-add
+PT-DVM
+0.05
+2.12
+97.79
+2.17×10−2
+Inductor-r
+35352.37
+1683099.71
+106.74
+1.58×104
+Inductor-d
+35425.44
+66679.14
+120.13
+5.55×102
+addmm
+PT-DVM
+0.11
+1.41
+127.12
+1.11×10−2
+Inductor-r
+521.79
+6242.67
+168.29
+3.71×101
+Inductor-d
+288.30
+444.56
+172.67
+2.58
+therefore, they all outperform PT-eager when the FLOPs is
+large. For PT-DVM, since it needs to generate the correct if-
+else-add function definition each time a sampled instance is
+tested, its compilation time and hence the running time is in-
+creased, making it perform slightly worse than PT-eager when
+the computation FLOPs is small (less than 0.007ms). Inductor-
+d performs worse than PT-DVM and Inductor-r due to the
+lack of concrete shapes. Compared with Inductor-r, Inductor-
+d and PT-eager, PT-DVM is 1.21×, 1.58× and 1.47× better
+on average.
+6.1.3
+Model
+Figures 15 and 16 compare the model running time of dif-
+ferent methods, i.e., the time to run a batch of requests. PT-
+eager and MS-O0 both call AOL kernels and do not perform
+graph-level optimizations. Inductor-r treats the dynamic mod-
+els as static models with all shape information known. When
+the batch size is 16 for BERT, Inductor-r encounters an OOM
+problem in the NPU local memory, so we do not report its
+results on this case. The figures show that DVM consistently
+outperforms or achieves close performance compared with
+the other methods on all the model instances. Specifically,
+PT-DVM is 1.05-1.26× better than PT-eager, and 0.97-1.64×
+better than Inductor-r. Since PT-DVM share the same graph-
+level optimizations as Inductor-r in the model-level evaluation,
+this result demonstrates the effectiveness and efficiency of
+the operator optimization of DVM. On BERT, as the batch
+size increases, there is a clear increase in the running time
+for Inductor-r, while the running time of both PT-eager and
+PT-DVM remain relatively stable, which indicates that for
+PT-eager and PT-DVM, the NPU hardware resources are well
+utilized and have not been saturated by the computation work-
+loads. Compared with MS-O0, MS-DVM is 1.07-1.21× bet-
+ter, demonstrating the graph-level optimization capability of
+DVM on static graphs as well as the dynamic operator opti-
+mization capability of DVM.
+6.2
+Compilation Time Comparison
+Tables 4 to 6 compare the compilation time of different meth-
+ods in detail. Overall, the compilation time of DVM is negligi-
+ble; by contrast, Inductor-r and Inductor-d both perform mul-
+tiple hardware candidate kernel measurements, heavy graph-
+level analysis and a long compilation flow (e.g., many dialect
+conversions), which is time-consuming.
+Specifically, on matmul, the maximum compilation time
+of PT-DVM for an operator instance is 0.11 ms, and the ra-
+tio of the total compilation time to the total running time is
+0.389%, while the respective maximum compilation times
+of Inductor-r and Inductor-d are 115.88 ms and 200.99 ms
+for matmul. Note that for matmul, Inductor-r and Inductor-
+d choose to directly use the vendor-provided library with
+no operator compilation, so the compilation time for these
+two methods is simply the time to go through the complete
+compilation process. Since Inductor-r compiles each operator
+instance it encounters, while Inductor-d generates one kernel
+for different operator shapes, the total compilation time of
+Inductor-r is longer than that of Inductor-d. The total com-
+pilation times of Inductor-r and Inductor-d are 34.5× and
+2.65× of the total running time for matmul for the 60 sam-
+pled operator instances, respectively. Such compilation time
+can be unacceptable when there are multiple possible shapes
+or when there is a requirement of quick deployment of models
+on new hardware (even if Inductor-d only compiles a dynamic
+operator once, this total compilation time will be long if there
+are many dynamic operators to optimize).
+For the subgraph-level evaluation, the compilation time
+of Inductor-r and Inductor-d increases to tens of seconds on
+LayerNorm and if-else-add, because for these two kinds of
+operators, the operator compilation is triggered. The respec-
+tive compilation time ratios of Inductor-r and Inductor-d to
+the total running time are up to 1.58e4 and 5.55e2. Note
+that Inductor-d generates two kernels for if-else-add, one per
+branch, while for LayerNorm, Inductor-d assumes the reduc-
+tion dimension is static, therefore the just-in-time compilation
+is triggered four times in total, one for each reduction dimen-
+11
+Table 5: Compilation time comparison for MMoE and BERT.
+Group
+Method
+MMoE
+BERT
+Compilation
+Time (ms)
+Inductor-r
+4.84×105 - 3.76×106
+1.50×105 - 3.43×105
+PT-DVM
+2.71×101 - 2.04×102
+4.09×104 - 4.23×104
+Compilation/
+Running Time
+Inductor-r
+1.28×104 - 1.70×104
+3.00×103 - 9.24×103
+PT-DVM
+7.97×10−1 - 8.20×10−1
+1.11×103 - 1.28×103
+Table 6: Compilation time comparison for Qwen and Llama.
+Group
+Method
+Qwen
+Llama
+Compilation
+Time (ms)
+MS-O0
+2.66×102 - 8.41×102
+1.18×102 - 1.29×102
+MS-DVM
+2.78×102 - 3.02×102
+1.27×102, 1.28×102
+Compilation/
+Running Time
+MS-O0
+1.15×10−1 - 2.23×10−1
+2.41×10−2 - 7.55×10−2
+MS-DVM
+2.81×10−1 - 4.45×10−2
+2.55×10−2 - 9.20×10−2
+sion size (i.e., the value of h in the input shape in Table 2).
+By contrast, PT-DVM remains efficient on all the test cases,
+spending less than 2.17% of the total running time in com-
+pilation. The ratio 2.17% appears on if-else-add, because
+generating the correct function definition with the selected
+branch will increase the overhead. However, this ratio is still
+negligible.
+For the model-level evaluation, the compilation time of PT-
+DVM is the cost of the graph-level compilation in Inductor-r,
+which is much longer compared with the operator compilation
+time of PT-DVM (we can infer this by comparing the running
+time, where the operator optimization time is included, with
+the compilation time). The compilation time of Inductor-r in-
+cludes both the graph- and the operator-level optimization
+time, which is up to 3760s. By comparing Inductor-r and PT-
+DVM, the efficiency of our operator compiler can be validated
+again. On MindSpore, the compilation time of MS-DVM is
+the graph-level compilation time of it. The result that MS-
+DVM and MS-O0 have close compilation time means that
+the static graph compilation by DVM is efficient as well. Note
+that although the ratio of the compilation time to the model
+running time is up to 1.28 × 103 for DVM (on BERT), the
+compilation time, i.e., the graph-level optimization time, can
+be amortized given that (1) the reported model running time is
+per batch but a model can be run for multiple times in practice,
+and (2) the graph-level optimization result can be reused since
+these models are static graphs.
+7
+Related Work
+Dynamic Shape Operator optimization. Existing works on
+optimizing dynamic shape operators can be divided into 2
+categories: (1) One-kernel-per-shape [12–14] and (2) multi-
+kernels [3,15,18,20–22]. One-kernel-per-shape compilation
+recompiles the dynamic operators whenever new shapes are
+encountered, which suffers from the long compilation time
+of the backend compilers at the service time and the high
+compilation cache pressure due to the large number of opera-
+tor shapes. Multi-kernels refer to the solutions that compile
+multiple versions of the operator kernel before execution and
+dynamically select one for the encountered operator shape.
+Some works require experts to write efficient kernels, e.g.,
+cuBLAS [3] and PluS [18]. To prepare the kernel candidates
+automatically, the sampling-based methods [15,20,21] require
+obtaining the possible operator shapes to generate efficient
+kernels, while the sample-free methods [22] run bottom-up
+construction to get architecture-aligned kernels. However, the
+limited kernel candidates are not flexible and general enough
+to support the complex model dynamism in practice, e.g., the
+various kinds of fused operators.
+Operator fusion for dynamic models. Both dynamic oper-
+ator shapes and dynamic control flows need to be considered
+when making operator fusion decisions for dynamic mod-
+els. To deal with the dynamic shapes, some works [10, 23]
+apply basic fusion for memory-intensive operators, while
+BladeDISC [21] utilizes the equality relationship between
+tensor shapes, instead of the concrete shape values, to check
+locality information for advanced dynamic shape fusion de-
+cisions. To deal with the dynamic control flows, Tempo [11]
+focuses on recurrent computation graphs and eliminates the
+recurrent patterns via lifting. DyCL [2] converts a dynamic
+neural network into multiple static sub-neural networks, each
+with no conditional statements and compiled independently.
+Cocktailer [19] considers three kinds of control flows, i.e.,
+loops, branches, and recursion, and puts the control flow logic
+into kernels to process on the GPU, therefore reducing the
+CPU-accelerator synchronization overhead and enabling fu-
+sion opportunities (e.g., running independent operators in
+parallel) across control flow scopes. However, these meth-
+ods still cannot flexibly handle fusion opportunities in more
+complex control flows, e.g., fusing operators across multiple
+branches. Lazy Tensors [12] defers operation execution to
+accumulate a graph and then sends the accumulated graph
+to the XLA compiler [14]. In this way, it can make use of
+the actual execution paths and operator shapes for compila-
+tion. The accumulated graph is hashed to avoid unnecessary
+recompilation. PyTorch 2 [1] tries to reason the shapes to
+resolve control flow when given the model input and graph
+break when it fails. However, both Lazy Tensors [12] and
+PyTorch 2 [1] suffer from time-consuming recompilation, and
+the hashed graph maintenance in Lazy Tensors can cause extra
+overhead. By contrast, DVM can deal with the actual execu-
+tion paths and operator shapes at runtime efficiently without
+caching the fusion decisions or generated kernels, thanks to
+the virtual-machine-based efficient operator compiler.
+8
+Conclusion
+In this paper, we design a real-time compiler DVM, consisting
+of an operator compiler, which performs effective and efficient
+runtime operator compilation based on a virtual machine, and
+an operator fuser, which performs symbol-deduction-based
+12
+fusion on static graphs and runtime fusion on dynamic graphs.
+Both pattern- and stacking-based fusions are supported to
+increase fusion opportunities. Evaluation on operators, sub-
+graphs, and models shows that, compared with TorchInduc-
+tor, PyTorch-eager and MindSpore-graph-O0, we are up to
+11.77× better in terms of the operator/model efficiency and
+up to 5 orders of magnitude faster in terms of the maximum
+compilation time, which validates our significant superiority
+in developing and deploying dynamic models.
+Availability
+The code of DVM is available at https://gitcode.com/
+mindspore/dvm.
+References
+[1] Jason
+Ansel, Edward Yang, Horace
+He, Natalia
+Gimelshein, Animesh Jain, Michael Voznesensky, Bin
+Bao, Peter Bell, David Berard, Evgeni Burovski, et al.
+Pytorch 2: Faster machine learning through dynamic
+python bytecode transformation and graph compila-
+tion. In Proceedings of the 29th ACM international
+conference on architectural support for programming
+languages and operating systems, volume 2, pages 929–
+947, 2024.
+[2] Simin Chen, Shiyi Wei, Cong Liu, and Wei Yang.
+Dycl: Dynamic neural network compilation via program
+rewriting and graph optimization. In Proceedings of
+the 32nd ACM SIGSOFT International Symposium on
+Software Testing and Analysis, pages 614–626, 2023.
+[3] NVIDIA Corporation. NVIDIA cuBLAS Documen-
+tation.
+https://docs.nvidia.com/cuda/cublas/
+index.html, 2026. Accessed March 14, 2026.
+[4] Huawei.
+Ascend Operator Library.
+https:
+//www.hiascend.com/document/detail/
+en/canncommercial/800/apiref/aolapi/
+operatorlist_00001.html, 2025.
+Accessed
+March 16, 2026.
+[5] Huawei.
+Hardware
+architecture
+abstraction.
+https://www.hiascend.com/document/detail/
+en/canncommercial/800/opdevg/Ascendcopdevg/
+atlas_ascendc_10_0015.html, 2025.
+Accessed
+March 12, 2026.
+[6] Huawei.
+Ascend extension for pytorch.
+https:
+//gitcode.com/Ascend/pytorch, 2026.
+Accessed
+March 10, 2026.
+[7] Huawei. Heterogeneous parallel programming model.
+https://www.hiascend.com/document/detail/
+zh/canncommercial/850/opdevg/Ascendcopdevg/
+atlas_ascendc_10_00028.html, 2026.
+Accessed
+March 12, 2026.
+[8] Huawei.
+Introduction to graph mode program-
+ming. https://www.mindspore.cn/tutorials/en/
+r2.8.0/compile/static_graph.html, 2026.
+Ac-
+cessed March 12, 2026.
+[9] Huawei. MindSpore. https://www.mindspore.cn/,
+2026. Accessed March 16, 2026.
+[10] Haichen Shen, Jared Roesch, Zhi Chen, Wei Chen, Yong
+Wu, Mu Li, Vin Sharma, Zachary Tatlock, and Yida
+Wang. Nimble: Efficiently compiling dynamic neural
+networks for model inference. Proceedings of Machine
+Learning and Systems, 3:208–222, 2021.
+[11] Pedro F Silvestre and Peter Pietzuch. Tempo: Com-
+piled dynamic deep learning with symbolic dependence
+graphs. In Proceedings of the ACM SIGOPS 31st Sympo-
+sium on Operating Systems Principles, pages 572–588,
+2025.
+[12] Alex Suhan, Davide Libenzi, Ailing Zhang, Parker
+Schuh, Brennan Saeta, Jie Young Sohn, and Denys
+Shabalin.
+Lazytensor: combining eager execution
+with domain-specific compilers.
+arXiv preprint
+arXiv:2102.13267, 2021.
+[13] PyTorch XLA Team. PyTorch/XLA. https://github.
+com/pytorch/xla, 2026. Accessed March 14, 2026.
+[14] The
+XLA
+Team.
+XLA
+-
+Tensorflow, com-
+piled.
+https://developers.googleblog.com/
+xla-tensorflow-compiled/, 2017. Accessed March
+14, 2026.
+[15] Yao Wang. [RFC] Dynamic Shape Support - Graph
+Dispatching.
+https://github.com/apache/tvm/
+issues/4118, 2019. Accessed March 10, 2026.
+[16] Wikipedia.
+Java virtual machine.
+https://en.
+wikipedia.org/wiki/Java_virtual_machine,
+2026. Accessed March 12, 2026.
+[17] Wikipedia.
+Python
+(programming
+language).
+https://en.wikipedia.org/wiki/Python_
+(programming_language), 2026.
+Accessed March
+12, 2026.
+[18] Ruofan Wu, Zhen Zheng, Feng Zhang, Chuanjie Liu,
+Zaifeng Pan, Jidong Zhai, and Xiaoyong Du. {PluS}:
+Highly efficient and expandable {ML} compiler with
+pluggable graph schedules. In 2025 USENIX Annual
+Technical Conference (USENIX ATC 25), pages 647–
+663, 2025.
+13
+[19] Chen Zhang, Lingxiao Ma, Jilong Xue, Yining Shi, Zim-
+ing Miao, Fan Yang, Jidong Zhai, Zhi Yang, and Mao
+Yang. Cocktailer: Analyzing and optimizing dynamic
+control flow in deep learning. In 17th USENIX Sympo-
+sium on Operating Systems Design and Implementation
+(OSDI 23), pages 681–699, 2023.
+[20] Bojian Zheng, Ziheng Jiang, Cody Hao Yu, Haichen
+Shen, Joshua Fromm, Yizhi Liu, Yida Wang, Luis Ceze,
+Tianqi Chen, and Gennady Pekhimenko. Dietcode: Au-
+tomatic optimization for dynamic tensor programs. Pro-
+ceedings of Machine Learning and Systems, 4:848–863,
+2022.
+[21] Zhen Zheng, Zaifeng Pan, Dalin Wang, Kai Zhu, Wenyi
+Zhao, Tianyou Guo, Xiafei Qiu, Minmin Sun, Junjie
+Bai, Feng Zhang, et al. Bladedisc: Optimizing dynamic
+shape machine learning workloads via compiler ap-
+proach. Proceedings of the ACM on Management of
+Data, 1(3):1–29, 2023.
+[22] Yangjie Zhou, Honglin Zhu, Qian Qiu, Weihao Cui,
+Zihan Liu, Peng Chen, Mohamed Wahib, Cong Guo,
+Siyuan Feng, Jintao Meng, et al. A sample-free compi-
+lation framework for efficient dynamic tensor compu-
+tation. In Proceedings of the International Conference
+for High Performance Computing, Networking, Storage
+and Analysis, pages 167–184, 2025.
+[23] Kai Zhu, WY Zhao, Zhen Zheng, TY Guo, PZ Zhao,
+JJ Bai, Jun Yang, XY Liu, LS Diao, and Wei Lin. Disc:
+A dynamic shape compiler for machine learning work-
+loads. In Proceedings of the 1st Workshop on Machine
+Learning and Systems, pages 89–95, 2021.
+14

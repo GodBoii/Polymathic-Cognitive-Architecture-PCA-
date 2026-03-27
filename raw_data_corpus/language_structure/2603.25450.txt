@@ -1,0 +1,2633 @@
+Cross-Model Disagreement as a Label-Free Correctness Signal
+Matt Gorbett
+Independent Researcher
+matthewgorbett@gmail.com
+Suman Jana
+Department of Computer Science
+Columbia University
+New York, NY 10027, USA
+sj2536@columbia.edu
+Abstract
+Detecting when a language model is wrong without ground truth labels is
+a fundamental challenge for safe deployment. Existing approaches rely on
+a model’s own uncertainty, such as token entropy or confidence scores, but
+these signals fail critically on the most dangerous failure mode: confident
+errors, where a model is wrong but certain. In this work we introduce
+cross-model disagreement as a correctness indicator — a simple, training-
+free signal that can be dropped into existing production systems, routing
+pipelines, and deployment monitoring infrastructure without modification.
+Given a model’s generated answer, cross-model disagreement computes
+how surprised or uncertain a second verifier model is when reading that
+answer via a single forward pass. No generation from the verifying model is
+required, and no correctness labels are needed. We instantiate this principle
+as Cross-Model Perplexity (CMP), which measures the verifying model’s
+surprise at the generating model’s answer tokens, and Cross-Model Entropy
+(CME), which measures the verifying model’s uncertainty at those positions.
+Both CMP and CME outperform within-model uncertainty baselines across
+benchmarks spanning reasoning, retrieval, and mathematical problem
+solving (MMLU, TriviaQA, and GSM8K). On MMLU, CMP achieves a
+mean AUROC of 0.75 against a within-model entropy baseline of 0.59.
+These results establish cross-model disagreement as a practical, training-
+free approach to label-free correctness estimation, with direct applications in
+deployment monitoring, model routing, selective prediction, data filtering,
+and scalable oversight of production language model systems.
+1
+Introduction
+Language models fail in two distinct ways. The first is ignorance: the model does not
+know the answer and signals this through uncertainty. Token entropy, maximum softmax
+probability (Hendrycks & Gimpel, 2017), and related signals are reasonable proxies for this
+failure mode, and the routing literature has built effective systems around them (Ding et al.,
+2024; Ong et al., 2025). The second failure mode is harder: the model is wrong but certain.
+It produces a fluent, high-confidence answer that happens to be incorrect. Within-model
+uncertainty signals are blind to this case by construction, since a confident model has low
+entropy regardless of whether its answer is right (Guo et al., 2017). Yet this is precisely
+the failure mode that matters most in practice. A medical assistant confidently stating the
+wrong drug interaction, a legal summarizer confidently misreading a statute, a student
+model confidently propagating a misconception: these are the errors that cause harm, and
+existing signals give no warning.
+The confident error problem is not merely a calibration issue. Even well-calibrated models
+(Srinivas et al., 2024) cannot detect their own errors through introspection: a model that is
+wrong has, by definition, already committed to a wrong answer. Any signal derived solely
+from the generating model’s own distribution is fundamentally limited. It can tell you how
+confident the model is, but not whether that confidence is warranted. What is needed is an
+external perspective: a second model that can evaluate the generating model’s answer and
+flag disagreement.
+1
+arXiv:2603.25450v1  [cs.AI]  26 Mar 2026
+single forward pass
+Generator
+Llama-3-8B
+Verifier
+Qwen2.5-7B
+The
+year
+was
+1942
+.
+x: What year did US enter WWII? 
+The
+year
+was
+1942
+.
+low
+ŷ(greedy)
+Logits over ŷ
+(x, ŷ)
+Box height=logit probability
+Figure 1: Cross-model disagreement as a label-free correctness indicator. Given a prompt
+x, the generator (Llama-3-8B) produces an answer ˆy. The verifier (Qwen2.5-7B) performs
+a single forward pass over (x, ˆy) with no generation required. The verifier assigns low
+probability to the token “1942”, the generator’s confident but incorrect answer. Cross-model
+perplexity (CMP) aggregates this surprise signal into a single correctness indicator, and high
+CMP flags a likely error.
+This observation motivates cross-model disagreement as a practical signal. Rather than asking
+whether a model is uncertain about its own answer, we ask whether a second model is
+surprised by it. Concretely, given prompt x and generating model answer ˆy, we perform
+a single forward pass through a verifying model on (x, ˆy) and extract two signals: CMP,
+which aggregates the verifying model’s token-level surprise, and CME, which aggregates its
+token-level uncertainty. No generation from the verifier is required and no correctness labels
+are needed. The two signals are complementary: CMP is most effective when the generator
+is confidently wrong and the verifier assigns low probability to the specific incorrect tokens;
+CME is more informative on retrieval tasks where distributional uncertainty better reflects
+whether an answer is grounded. Across our evaluation, CMP outperforms within-model
+entropy on MMLU across 12 of 15 model pairs by AUROC, and CME leads on TriviaQA
+where distributional uncertainty is more informative than token-level surprise. When used
+as a routing signal—directing queries to the verifier only when disagreement is high—CMP
+recovers a substantial fraction of the performance gap between generator and verifier with
+no labels required, as measured by APGR (Ong et al., 2025). CMP wins 12 of 16 routing
+comparisons against within-model entropy on GSM8K, and achieves mean APGR of 0.915
+on MMLU versus 0.848 for G-Ent.
+The closest prior work uses cross-model consistency as a hallucination signal. SelfCheckGPT
+(Manakul et al., 2023) checks consistency across stochastic samples from the same model;
+CrossCheckGPT (Sun et al., 2024) compares outputs generated by multiple independent
+models. Both require multiple generations. Our setting is fundamentally different: we use a
+single greedy answer and a single forward pass through the verifier, with no generation
+from either model after the initial answer, and we target per-instance correctness prediction
+rather than hallucination ranking. More broadly, the uncertainty quantification literature
+has focused entirely on signals derived from the generating model itself (Kadavath et al.,
+2022; Kuhn et al., 2023; Liu et al., 2020), and prior work explicitly notes that within-model
+perplexity fails (Srinivas et al., 2024). To our knowledge, no prior work uses a verifying
+model’s logit-based signals on a generating model’s answer.
+CMP and CME have direct applications in several settings. In deployment monitoring, CMP
+and CME can be evaluated on every query without ground truth labels, serving as a cheap
+triage signal that flags likely errors for more expensive downstream verification—whether
+human review, re-querying, or generation-based methods such as LLM-as-judge (Zheng
+et al., 2023). In model routing, high disagreement triggers escalation to a stronger model,
+recovering a large fraction of the performance gap at a fraction of the cost of always using
+the strong model. Unlike supervised routers such as RouteLLM (Ong et al., 2025), CMP and
+CME require no preference labels and no router training, occupying a different point on
+the supervision-cost tradeoff. In data filtering, high CMP on a candidate example identifies
+instances where models disagree—a label-free signal for hard or ambiguous examples useful
+for training data curation and hard negative mining. Finally, in selective prediction (Geifman
+2
+& El-Yaniv, 2017), high CMP serves as an abstention signal, allowing a system to withhold
+predictions on inputs where confident errors are most likely — improving accuracy on the
+subset it does answer without any labeled data or threshold calibration.
+We further characterize when cross-model signals are most effective: on MMLU, CMP
+AUROC is uncorrelated with capability gap (ρ = 0.11, p = 0.72), suggesting architectural
+diversity drives correctness detection rather than capability asymmetry; on TriviaQA, CME
+is more robust across gap sizes; on GSM8K both signals improve modestly but without a
+significant trend. We discuss implications for scalable oversight and deployment monitoring
+in Section 5.
+Our contributions are as follows:
+• We introduce cross-model disagreement as a label-free, training-free correctness in-
+dicator, instantiated as CMP and CME, each requiring only a single forward pass
+through a verifying model with no generation, no correctness labels, and no router
+training.
+• We show that CMP and CME outperform within-model uncertainty baselines across
+MMLU, TriviaQA, and GSM8K, and characterize when each signal is most effective
+depending on the nature of the failure mode.
+• We show that on knowledge-intensive tasks, architectural diversity between same-
+sized models is sufficient for effective correctness detection, and capability asym-
+metry is not required, while on open-ended retrieval a stronger verifier provides
+meaningful additional benefit.
+2
+Related Work
+Our work sits at the intersection of several research areas: LLM uncertainty estimation,
+model routing, LLM-as-Judge, scalable oversight, ensemble methods, and speculative
+decoding. We review each, clarifying how cross-model disagreement relates to and differs
+from prior work.
+Uncertainty Estimation. A standard approach to predicting model correctness is to use the
+model’s own confidence as a proxy. Maximum softmax probability (Hendrycks & Gimpel,
+2017) and predictive entropy are common baselines, but modern networks are poorly
+calibrated (Guo et al., 2017) and frequently assign high confidence to incorrect predictions.
+Srinivas et al. (2024) show explicitly that within-model perplexity has limited predictive
+power in open-ended settings. Self-evaluation (Kadavath et al., 2022), semantic consistency
+(Kuhn et al., 2023), and cross-model consistency (Manakul et al., 2023; Sun et al., 2024)
+improve on this but require multiple generation passes. CMP and CME require a single
+verifier forward pass and remain informative precisely where within-model entropy is flat.
+LLM Routing. Routing systems reduce inference cost by directing queries to a stronger
+model only when needed. HybridLLM (Ding et al., 2024), RouteLLM (Ong et al., 2025),
+and FrugalGPT (Chen et al., 2023b) train routers on labeled preference data or correctness
+supervision; AutoMix (Aggarwal et al., 2024) uses a smaller model to self-verify before
+escalating but still requires a calibration step. All depend on task-specific labels. CMP and
+CME are parameter-free and require no router training, although they do require a single
+forward pass through a second model at inference time. We adopt the APGR metric from
+Ong et al. (2025) to measure routing quality in our experiments.
+Ensemble Methods. Ensemble methods reduce prediction uncertainty by aggregating
+disagreement across multiple independently trained models (Lakshminarayanan et al.,
+2017). Cross-model disagreement shares this intuition but is asymmetric: the verifier
+responds to the generator’s specific answer rather than contributing a symmetric vote.
+This makes CMP and CME directional correctness signals rather than general uncertainty
+measures, and requires no task-specific training or ensemble construction.
+LLM-as-Judge. A growing body of work uses a stronger language model to evaluate
+the outputs of a weaker one (Zheng et al., 2023; Dubois et al., 2024; Kim et al., 2024).
+These approaches target output quality and preference rather than per-instance correctness
+prediction, and all require generation from the judge—typically a full response or structured
+3
+critique. Our verifier performs only a single forward pass with no generation, producing a
+scalar correctness signal rather than natural language feedback.
+Scalable Oversight. Scalable oversight (Bowman et al., 2022) and weak-to-strong generaliza-
+tion (Burns et al., 2024) study how to supervise AI systems whose capabilities may exceed
+those of the overseer, generally assuming that effective verification requires a more capable
+model. We examine whether capability gap is necessary or whether architectural diversity
+alone is sufficient, evaluating pairs with similar task accuracy alongside asymmetric ones.
+Speculative Decoding. Speculative decoding (Leviathan et al., 2023; Chen et al., 2023a)
+accelerates inference by using a small draft model to propose tokens, which a larger target
+model verifies via acceptance sampling. CMP is the sequence-level analogue: rather than
+per-token accept/reject decisions, we aggregate verifier log-probabilities across the full
+answer into a single routing score. This connection grounds why CMP is most effective on
+tasks where errors manifest as low token-level acceptance probability.
+3
+Method
+In this section we describe cross-model disagreement. Given a generating model Mg and a
+verifying model Mv, we define two label-free signals for predicting whether Mg’s answer is
+correct.
+Problem Setup. Let x denote an input prompt. The generating model produces an answer
+ˆyg ∼Mg(· | x) autoregressivel via greedy decoding. Our goal is to predict whether ˆyg is
+correct without access to ground truth labels. We make no assumptions about the relative
+capability of Mg and Mv.
+3.1
+Cross-Model Perplexity
+Given ˆyg, we concatenate the prompt and answer to form (x, ˆyg) and perform a single
+forward pass through Mv. At each answer token position t ∈{1, . . . , T}, the forward pass
+yields logits over the full vocabulary. We define CMP as:
+CMP(x, ˆyg) = exp
+ 
+−1
+T
+T
+∑
+t=1
+log pv
+
+ˆy(t)
+g
+| x, ˆy(<t)
+g
+!
+(1)
+where pv denotes the verifying model’s conditional distribution and T is the num-
+ber of answer tokens. High CMP indicates that Mv assigns low probability to Mg’s
+answer—the models disagree. CMP connects formally to speculative decoding (Leviathan
+et al., 2023; Chen et al., 2023a), where the acceptance probability for a draft token xt is
+min(1, pv(xt)/pg(xt)). CMP aggregates this token-level acceptance signal across the full
+answer sequence, making a single binary decision rather than a token-level correction.
+3.2
+Cross-Model Entropy
+From the same single forward pass, we also compute CME as the mean entropy of the
+verifying model’s output distribution over answer token positions:
+CME(x, ˆyg) = −1
+T
+T
+∑
+t=1∑
+v
+pv(v | x, ˆy(<t)
+g
+) log pv(v | x, ˆy(<t)
+g
+)
+(2)
+Where CMP measures the verifying model’s surprise at the specific tokens produced, CME
+measures its general uncertainty at those positions. The two signals are complementary:
+CMP is most informative when the generator is confidently wrong and the verifier assigns
+low probability to the specific incorrect tokens; CME is most informative on retrieval tasks
+where the verifier’s distributional uncertainty better reflects whether the answer is grounded.
+Both signals are obtained at no additional computational cost beyond the single forward
+pass required for CMP.
+4
+MMLU
+TriviaQA
+(context)
+TriviaQA
+(no ctx)
+GSM8K
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+Mean AUROC
+n=11
+n=10
+n=16
+n=12
+A. Mean AUROC by dataset
+Random
+G-Ent
+G-PPL
+CMP
+CME
+MMLU
+TriviaQA
+(context)
+TriviaQA
+(no ctx)
+GSM8K
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Mean APGR
+n=9
+n=8
+n=15
+n=12
+B. Mean APGR by dataset (gap > 5pp)
+Random
+G-Ent
+G-PPL
+CMP
+CME
+Figure 2: CMP and CME performance across datasets compared to baselines. (A) Mean
+AUROC over all model pairs. G-Ent and G-PPL measure the generator’s own entropy and
+perplexity; CME and CMP measure the corresponding signals from a verifier model on the
+generator’s answer. APGR measures the fraction of the performance gap between weak and
+strong model that is recovered by routing, normalized so that random routing scores 0 and
+oracle routing scores 1; pairs with small gaps are excluded because the small denominator
+in the PGR formula produces unstable estimates. Error bars show standard error across
+pairs; n indicates the number of pairs per dataset.
+4
+Experiments
+We evaluate CMP and CME across four benchmarks datasets. Table 1 summarizes selected
+results; full results appear in Appendix A.
+Datasets. We evaluate on MMLU (Hendrycks et al., 2021) (multiple-choice), TriviaQA
+(Joshi et al., 2017) (with and without context), and GSM8K (Cobbe et al., 2021) (chain-of-
+thought reasoning), covering knowledge retrieval, reading comprehension, and multi-step
+arithmetic.
+Models. We evaluate seven instruction-tuned models spanning five families: Qwen2.5
+(0.5B, 7B), Llama-3 (1B, 8B), Gemma-3 (270M), Mistral (7B), and OLMo-3 (7B). We construct
+ordered model pairs across four datasets, covering both asymmetric pairs (small generator
+verified by large model, e.g. Qwen-0.5B →Qwen-7B) and same-sized cross-family pairs
+among the four 7–8B models (Qwen-7B, Llama-3-8B, Mistral-7B, OLMo-7B), which isolate
+architectural diversity from capability asymmetry. Full model details and per-pair results
+are in Appendix C.
+Baselines and metrics. We compare CMP and CME against two within-model baselines:
+generator entropy (G-Ent), the mean token-level entropy H = −∑v pv log pv over the genera-
+tor’s answer tokens, and generator perplexity (G-PPL), the mean token-level perplexity of the
+generator on its own answer. Both are standard unsupervised signals requiring no verifier.
+Together these serve as direct ablations of CME and CMP respectively: if the cross-model
+signals merely recover information already present in the generator’s own distribution,
+G-Ent and G-PPL should perform comparably. We additionally test explicit verification
+prompting (P(True); Kadavath et al., 2022) on GSM8K, where the verifier is asked directly
+whether the generator’s answer is correct (Appendix F). We also compare against RouteLLM
+(Ong et al., 2025), the strongest supervised routing baseline, which trains a router on human
+preference labels augmented with LLM-judge data; unlike our signals, it requires labeled
+data and a trained router model, and we treat it as an upper bound on what supervision
+buys in this setting.
+For correctness prediction we report AUROC against weak model incorrectness, which is
+threshold-free, requires no routing setup, and is our primary metric for evaluating signal
+quality across all pairs. For routing quality we report APGR (Average Performance Gap
+Recovered) (Ong et al., 2025). At each routing threshold, a fraction c of queries are sent to
+the strong model while the rest use the weak model’s answer, yielding accuracy a(c). The
+performance gap recovered at cost c is:
+PGR(c) = a(c) −aw
+as −aw
+,
+(3)
+5
+Table 1: Selected results across all four benchmarks. Bold = best per row among G-Ent,
+G-PPL, CMP, CME. Same-size cross-family pairs marked †. See Appendix for full results.
+Acc.
+AUROC ↑
+APGR ↑
+Dataset
+Generator
+Verifier
+Accg
+Accv
+Gap
+G-Ent
+G-PPL
+CMP
+CME
+G-Ent
+G-PPL
+CMP
+CME
+MMLU
+Qwen-0.5B
+Qwen-7B
+0.42
+0.72
+0.30
+0.591
+0.557
+0.842
+0.587
+0.522
+0.502
+0.789
+0.500
+Llama-1B
+Llama-3-8B
+0.43
+0.62
+0.18
+0.656
+0.655
+0.815
+0.679
+0.563
+0.603
+0.871
+0.542
+Llama-1B
+Qwen-7B
+0.43
+0.72
+0.29
+0.656
+0.655
+0.786
+0.638
+0.571
+0.595
+0.803
+0.565
+OLMo-7B†
+Qwen-7B
+0.56
+0.72
+0.16
+0.503
+0.599
+0.895
+0.695
+0.485
+0.544
+0.909
+0.452
+Mistral-7B†
+Llama-3-8B
+0.56
+0.62
+0.06
+0.720
+0.725
+0.753
+0.717
+0.712
+0.855
+0.956
+0.623
+Llama-3-8B†
+Qwen-7B
+0.62
+0.72
+0.10
+0.652
+0.685
+0.694
+0.633
+0.618
+0.655
+0.899
+0.600
+TriviaQA
+Llama-3-8B
+Mistral-7B
+0.43
+0.64
+0.20
+0.858
+0.887
+0.833
+0.923
+0.818
+0.838
+0.858
+0.785
+Qwen-0.5B
+Qwen-7B
+0.41
+0.65
+0.24
+0.773
+0.726
+0.818
+0.824
+0.619
+0.598
+0.737
+0.606
+Llama-1B
+Qwen-7B
+0.54
+0.65
+0.10
+0.805
+0.811
+0.691
+0.788
+0.696
+0.724
+0.764
+0.574
+Llama-3-8B†
+Qwen-7B
+0.43
+0.65
+0.21
+0.858
+0.887
+0.777
+0.875
+0.789
+0.812
+0.806
+0.755
+Mistral-7B†
+Qwen-7B
+0.64
+0.65
+0.01
+0.848
+0.300
+0.420
+0.766
+2.222
+-1.068
+-0.562
+0.093
+TriviaQA
+(no ctx)
+Llama-1B
+Llama-3-8B
+0.42
+0.67
+0.25
+0.840
+0.851
+0.938
+0.813
+0.687
+0.694
+0.813
+0.588
+Qwen-0.5B
+Qwen-7B
+0.21
+0.59
+0.38
+0.791
+0.786
+0.799
+0.827
+0.533
+0.536
+0.645
+0.514
+Llama-1B
+Qwen-7B
+0.42
+0.59
+0.17
+0.840
+0.851
+0.738
+0.806
+0.655
+0.675
+0.758
+0.506
+Qwen-7B†
+Llama-3-8B
+0.59
+0.67
+0.08
+0.823
+0.794
+0.752
+0.634
+0.993
+0.953
+0.976
+0.564
+GSM8K
+Mistral-7B†
+Llama-3-8B
+0.51
+0.61
+0.11
+0.655
+0.539
+0.719
+0.687
+0.872
+0.638
+0.998
+0.887
+Llama-1B
+Qwen-7B
+0.38
+0.90
+0.51
+0.543
+0.523
+0.668
+0.666
+0.511
+0.503
+0.574
+0.562
+Llama-1B
+Llama-3-8B
+0.38
+0.61
+0.23
+0.543
+0.523
+0.655
+0.606
+0.521
+0.505
+0.662
+0.585
+Qwen-0.5B
+Qwen-7B
+0.25
+0.90
+0.64
+0.616
+0.621
+0.629
+0.682
+0.520
+0.521
+0.528
+0.539
+OLMo-7B†
+Qwen-7B
+0.83
+0.90
+0.07
+0.763
+0.538
+0.748
+0.808
+0.960
+0.657
+0.956
+0.950
+Llama-3-8B†
+Qwen-7B
+0.61
+0.90
+0.28
+0.596
+0.577
+0.590
+0.480
+0.551
+0.538
+0.614
+0.456
+where aw and as are the weak and strong model accuracies. APGR averages PGR over
+c ∈(0, 1): a value of 0 corresponds to random routing and 1 to oracle routing. Small
+accuracy gaps produce unstable APGR estimates due to the small denominator in PGR(c);
+we therefore exclude such pairs from Figure 2.
+4.1
+Results
+We evaluate CMP and CME against within-model baselines across four benchmarks and
+model pairs spanning asymmetric and same-sized cross-family configurations. Table 1
+and Figure 2 summarize the main results: CMP leads on MMLU and GSM8K while CME
+is more competitive on TriviaQA, and both cross-model signals consistently outperform
+their within-model counterparts on tasks where the generator makes confident errors. The
+paragraphs below analyze the per-case signal structure, quintile separation, and conditions
+under which cross-model signals succeed or fail.
+CMP targets the failure mode G-Ent misses. Figure 3 isolates the four outcome categories.
+On MMLU (OLMo-7B →Llama-8B), CMP in the “generator wrong only” case is 155× the
+both-correct baseline—a 9× spike over the remaining cases—while G-Ent is flat across all
+four (≤1.0× variation). On TriviaQA (Llama-8B →Qwen-7B) the pattern sharpens: CMP
+reaches 834k versus 97 when both models are correct (10× selectivity), while G-Ent rises by
+only 1.6×. G-Ent is elevated whenever the generator is uncertain regardless of whether the
+verifier concurs; CMP selectively spikes only when the generator’s error is not shared by
+the verifier.
+Figure 2A reports mean AUROC across all model pairs. On MMLU, CMP achieves 0.797
+versus 0.630 for G-Ent and 0.646 for G-PPL, leading in all six pairs. On GSM8K, CMP
+(0.668) and CME (0.655) both outperform G-Ent (0.619) and G-PPL (0.553), with G-PPL
+performing worst of all four signals—consistent with the near-flat quintile spread in Figure 3.
+On TriviaQA (context), CME leads (0.835) with G-Ent close behind (0.828), while CMP
+underperforms on several pairs where the verifier shares similar knowledge gaps to the
+generator. On TriviaQA (no context) the signals cluster tightly (G-Ent 0.824, G-PPL 0.821,
+CMP 0.807, CME 0.770) with no clear winner, consistent with retrieval errors being detectable
+by within-model signals when context is absent.
+Task-dependent boundaries. On GSM8K, CMP achieves mean APGR of 0.589 versus 0.566
+for G-Ent and wins 12 of 16 routing comparisons, but the per-case spike is weaker than on
+MMLU or TriviaQA, and CME is preferable on several pairs (Table 1). The Mistral-7B →
+6
+Both
+correct
+Generator
+wrong only
+Generator
+correct only
+Both
+wrong
+0
+50
+100
+150
+200
+CMP
+1.60
+155
+29
+20
+CMP: 9× spike
+G-Ent: 1.0× spike
+A. MMLU: per-case signals
+OLMo-3-7B 
+ Llama-3-8B
+CMP (ours)
+G-Ent baseline
+Both
+correct
+Generator
+wrong only
+Generator
+correct only
+Both
+wrong
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+CMP
+1e6
+97
+834k
+5k
+258k
+CMP: 10× spike
+G-Ent: 1.6× spike
+B. TRIVIAQA: per-case signals
+Llama-3-8B 
+ Qwen2.5-7B
+Both
+correct
+Generator
+wrong only
+Generator
+correct only
+Both
+wrong
+0
+1
+2
+3
+4
+5
+6
+CMP
+1.83
+4.43
+2.01
+2.13
+CMP: 2× spike
+G-Ent: 1.4× spike
+C. GSM8K: per-case signals
+OLMo-3-7B 
+ Qwen2.5-7B
+0.673
+0.674
+0.675
+0.676
+0.677
+0.678
+0.679
+0.680
+G-Ent
+0.68
+0.68
+0.67
+0.68
+0.75
+1.00
+1.25
+1.50
+1.75
+2.00
+2.25
+G-Ent
+0.73
+1.80
+1.12
+1.62
+0.35
+0.40
+0.45
+0.50
+0.55
+0.60
+0.65
+0.70
+G-Ent
+0.34
+0.56
+0.40
+0.43
+Q1
+(low)
+Q2
+Q3
+Q4
+Q5
+(high)
+Signal quintile
+0%
+20%
+40%
+60%
+80%
+100%
+Generator accuracy (%)
+CMP: 74pp
+G-PPL: 20pp
+G-Ent: 24pp
+A. MMLU
+Qwen-0.5B 
+ Qwen-7B
+CMP (ours)
+G-PPL
+G-Ent
+Avg (42%)
+Q1
+(low)
+Q2
+Q3
+Q4
+Q5
+(high)
+Signal quintile
+0%
+20%
+40%
+60%
+80%
+100%
+Generator accuracy (%)
+CMP: 94pp
+G-PPL: 80pp
+G-Ent: 81pp
+B. TriviaQA (no context)
+Llama-1B 
+ Llama-3-8B
+CMP (ours)
+G-PPL
+G-Ent
+Avg (42%)
+Q1
+(low)
+Q2
+Q3
+Q4
+Q5
+(high)
+Signal quintile
+0%
+20%
+40%
+60%
+80%
+100%
+Generator accuracy (%)
+CMP: 53pp
+G-PPL: 4pp
+G-Ent: 39pp
+C. GSM8K
+Mistral-7B 
+ Llama-3-8B
+CMP (ours)
+G-PPL
+G-Ent
+Avg (51%)
+Figure 3: Top row: per-case signal means. Mean CMP (left axis, blue) and G-Ent (right
+axis, red) by outcome category. The shaded column highlights the “generator wrong only”
+case—confident errors the verifier does not share. On MMLU, CMP spikes 9× above the
+mean of the other three cases while G-Ent is flat (1.0×); on TriviaQA the spike is 10×
+vs. 1.6×; on GSM8K both signals rise modestly (2× and 1.4×), reflecting the difficulty of
+isolating chain-of-thought errors with token-level signals. Bottom row: accuracy by signal
+quintile. Samples sorted by signal strength (Q1 = lowest, Q5 = highest); bars show weak
+model accuracy within each bin. On MMLU, CMP produces a 74pp spread versus 24pp
+for G-Ent and 20pp for G-PPL. On TriviaQA (no context), all three signals are competitive
+(94pp, 81pp, 80pp). On GSM8K, CMP achieves a 53pp spread while G-PPL nearly collapses
+to 4pp, confirming that generator self-perplexity is uninformative on chain-of-thought tasks
+and that cross-model disagreement is doing genuine work.
+Qwen-7B pair on TriviaQA is a more extreme case: with only a 1pp accuracy gap, CMP and
+G-PPL collapse near chance (AUROC 0.42 and 0.30) while G-Ent remains strong (0.848). Both
+cases point to the same boundary condition: when the verifier shares the generator’s failure
+mode—either through similar knowledge gaps or nearly identical accuracy—cross-model
+disagreement loses its signal, and within-model entropy is the more reliable fallback.
+Final-answer tokens vs. full chain-of-thought. On GSM8K, we test whether CMP’s signal
+comes from the full chain-of-thought or only the final numerical answer. CMP restricted to
+answer tokens only (CMP-Final) achieves mean APGR of 0.665 versus 0.682 for the full trace
+(CMP-Full), indicating that the final answer carries most of the signal with a small additional
+benefit from the reasoning steps. This suggests CMP could be applied more efficiently by
+scoring only the answer tokens, avoiding the cost of processing the full chain-of-thought
+through the verifier.
+Implicit perplexity vs. explicit verification prompting. We test P(True) (Kadavath et al.,
+2022): prompting the verifier with ”’Is the proposed answer correct?” and extracting
+the probability of Yes. P(True) achieves mean APGR of only 0.492 (random) confirming
+that implicit token-level perplexity far outperforms explicit correctness judgments. This
+is consistent with known limitations of LLM self-evaluation on mathematical reasoning:
+models that cannot reliably solve a problem also cannot reliably judge whether a proposed
+solution is correct when asked directly. Full per-pair results in Appendix F.
+Comparison to supervised routing. RouteLLM (Ong et al., 2025) provides the nearest su-
+pervised baseline: a causal LLM classifier trained on tens of thousands of human preference
+labels from Chatbot Arena, augmented with LLM-judge synthetic labels, routing between
+GPT-4 and Mixtral-8x7B. Their best augmented router achieves APGR of 0.622 on GSM8K
+7
+and 0.603 on MMLU. CMP achieves mean APGR of 0.682 on GSM8K and 0.915 on MMLU
+with zero labeled data and no router training. These evaluations are not directly comparable:
+RouteLLM routes between a proprietary strong model and an open-weight weak model
+across a different task and label distribution, while we route between open-weight pairs
+on standard benchmarks. We include the comparison not as a controlled benchmark but
+to situate CMP on the broader supervision-cost tradeoff: a single verifier prefill with no
+labeled data is competitive with a trained supervised router on reasoning tasks, and the gap
+is substantial on knowledge-intensive multiple-choice. Where labeled routing data can be
+collected, supervised routers remain the appropriate choice.
+5
+Discussion
+5.1
+Routing performance and compute tradeoffs
+Figure 2B reports mean APGR across pairs with accuracy gap > 5pp. CMP leads on MMLU
+and GSM8K; on TriviaQA, G-Ent and CME are competitive, consistent with the AUROC
+results.
+The practical regime where CMP is most attractive is one where generation cost dominates
+and no labeled routing data is available. Routing with CMP or CME requires a single
+verifier prefill on every query, with no autoregressive generation from the verifier and no
+router model. On MMLU this prefill is negligible; on GSM8K, where chain-of-thought
+traces reach up to 256 tokens, it is more substantial but still well below the cost of strong-
+model generation. Critically, the prefill is incurred only to make a routing decision: queries
+correctly identified as easy are served by the weak model with no further large-model
+compute. If the verifier generated rather than prefilled, verifier compute would be incurred
+on every query regardless of the routing outcome, largely eliminating the cost benefit.
+Prefill-only is therefore what makes label-free routing economically viable on long-form
+tasks, not a concession.
+Existing approaches occupy different points on this tradeoff. Label-based routers such as
+RouteLLM (Ong et al., 2025) and HybridLLM (Ding et al., 2024) add negligible inference
+overhead but require labeled preference data and a trained router model. FrugalGPT (Chen
+et al., 2023b) and AutoMix (Aggarwal et al., 2024) avoid large-model compute on easy
+queries entirely but require calibration steps or supervised signals. CMP and CME occupy
+the opposite corner: zero labeled data, zero router training, one verifier prefill per query.
+The tradeoff is explicit: where labeled routing data can be collected, supervised routers
+remain the appropriate choice; CMP and CME are most valuable precisely when such data
+is unavailable.
+5.2
+When Does Capability Gap Matter?
+Figure 4 plots CMP AUROC against accuracy gap for all pairs across three benchmarks. The
+task-dependent pattern is stark. On MMLU, CMP is essentially uncorrelated with capability
+gap (ρ = +0.11, p = 0.72): pairs with a 6-point accuracy gap perform as well as pairs with a
+47-point gap, and the highest-scoring points are same-size cross-family pairs (blue), not the
+largest-gap pairs. The operative mechanism on knowledge-intensive multiple-choice tasks
+appears to be diversity of training rather than capability asymmetry—models from different
+families make different confident errors, and CMP captures this disagreement regardless of
+relative accuracy.
+On TriviaQA the picture is different. CMP shows a significant positive correlation with
+capability gap (ρ = +0.60, p = 0.04), with large-gap pairs substantially outperforming small-
+gap pairs (AUROC 0.78 vs. 0.59). Open-ended knowledge retrieval requires the verifier
+to have genuine knowledge the generator lacks; a same-sized peer from a different family
+may share the same knowledge gaps, reducing the informativeness of its surprise. The two
+same-size cross-family pairs on TriviaQA (blue) sit at the lower end of the performance
+range, consistent with this interpretation. CME is more robust to this effect, remaining
+competitive across gap sizes.
+On GSM8K there is no significant trend (ρ = −0.11, p = 0.40), with high variance across
+pairs at similar gap sizes. Signal quality on chain-of-thought tasks appears driven more by
+8
+0.1
+0.2
+0.3
+0.4
+Accuracy gap
+0.2
+0.4
+0.6
+0.8
+1.0
+CMP AUROC
+MMLU  (
+= +0.11, p = 0.72)
+0.10
+0.15
+0.20
+0.25
+0.30
+0.35
+0.40
+Accuracy gap
+0.2
+0.4
+0.6
+0.8
+1.0
+TriviaQA  (
+= +0.60, p = 0.04)
+0.2
+0.4
+0.6
+0.8
+Accuracy gap
+0.2
+0.4
+0.6
+0.8
+1.0
+GSM8K  (
+=
+0.23, p = 0.40)
+Same-size cross-family
+Cross-family
+Same-family
+Capability gap vs CMP AUROC by dataset
+Figure 4: CMP AUROC versus capability gap across three benchmarks. On MMLU, AU-
+ROC is uncorrelated with gap (ρ = +0.11, p = 0.72) and same-size cross-family pairs
+(blue) achieve the highest scores, suggesting model diversity drives the signal rather than
+capability asymmetry. On TriviaQA, gap correlates positively with AUROC (ρ = +0.60,
+p = 0.04), indicating a stronger verifier helps when errors are knowledge-driven. GSM8K
+shows no significant trend (ρ = −0.11, p = 0.40).
+model family and architectural diversity than by capability gap, though the modest overall
+AUROC levels make these patterns harder to interpret cleanly.
+5.3
+Implications for Scalable Oversight
+The scalable oversight literature (Bowman et al., 2022; Burns et al., 2024) has largely assumed
+that verifying a model’s outputs requires a more capable supervisor. Our results qualify
+this assumption in a task-dependent way. On MMLU, peer verification between same-sized
+models of different families is as effective as verification by a substantially stronger model,
+suggesting that for knowledge-intensive tasks the capability hierarchy is not a prerequisite
+for correctness detection — architectural diversity is sufficient. On open-ended retrieval
+tasks, a stronger verifier does provide meaningful benefit, consistent with the intuition that
+the verifier needs knowledge the generator lacks.
+The practical implication is straightforward: the right verification strategy depends on the
+likely failure mode of the deployed model. For knowledge-intensive tasks with constrained
+output formats, a diverse peer model is a sufficient and efficient verifier. For open-ended re-
+trieval, a stronger verifier improves detection quality. This task-dependent characterization
+is a concrete and actionable finding for deployment monitoring without labeled data.
+6
+Conclusion
+We have shown that cross-model disagreement—measured as CMP or CME via a single
+forward pass through a verifying model—is a reliable label-free correctness signal for
+language model outputs. The signal is strongest when errors are confident rather than
+ignorance-based, works between same-sized models of different families, and requires no
+labeled data or router training.
+Several directions remain open. First, we evaluate on greedy-decoded answers; extending
+cross-model disagreement to sampled or chain-of-thought outputs, where the generating
+model’s answer is not a single deterministic sequence, is a natural next step. Second, our
+results characterize which signal works for which failure mode empirically, but a theoretical
+account of this dependence would deepen the understanding. Third, we evaluate on
+classification and short-form generation; applying cross-model disagreement to long-form
+generation, code, and multi-step reasoning at scale would test the limits of the framework.
+Fourth, the diversity mechanism we identify raises a concrete design question: given a fixed
+verifier budget, how should one select a verifying model to maximize correctness signal?
+Representational similarity metrics may provide a principled answer. Finally, our scalable
+oversight results are at inference time on static benchmarks; whether peer verification can
+support iterative oversight loops as both models scale is the central open question that
+connects this work to the broader alignment agenda.
+9
+References
+Pranjal Aggarwal, Aman Madaan, Yiming Yang, and Mausam. AutoMix: Automatically
+mixing language models.
+In Findings of the Association for Computational Linguistics:
+EMNLP 2024, 2024.
+Samuel R Bowman, Jeeyoon Hyun, Ethan Perez, Edwin Chen, Craig Pettit, Scott Heiner,
+Kamil¯e Lukoˇsi¯ut¯e, Amanda Askell, Andy Jones, Anna Chen, et al. Measuring progress
+on scalable oversight for large language models. arXiv preprint arXiv:2211.03540, 2022.
+Collin Burns, Pavel Izmailov, Jan Hendrik Kirchner, Bowen Baker, Leo Gao, Leopold Aschen-
+brenner, Yining Chen, Adrien Ecoffet, Manas Joglekar, Jan Leike, Ilya Sutskever, and Jeff
+Wu. Weak-to-strong generalization: Eliciting strong capabilities with weak supervision.
+In International Conference on Machine Learning. PMLR, 2024.
+Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre,
+and John Jumper. Accelerating large language model decoding with speculative sampling.
+arXiv preprint arXiv:2302.01318, 2023a.
+Lingjiao Chen, Matei Zaharia, and James Zou. Frugalgpt: How to use large language models
+while reducing cost and improving performance, 2023b. URL https://arxiv.org/abs/
+2305.05176.
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers
+to solve math word problems. In arXiv preprint arXiv:2110.14168, 2021.
+Dujian Ding, Ankur Mallick, Chi Wang, Robert Sim, Subhabrata Mukherjee, Victor Ruhle,
+Laks VS Lakshmanan, and Ahmed Hassan Awadallah. Hybrid LLM: Cost-efficient and
+quality-aware query routing. In International Conference on Learning Representations, 2024.
+Yann Dubois, Chen Xuechen Li, Rohan Taori, Tianyi Zhang, Ishaan Gulrajani, Jimmy Ba,
+Carlos Guestrin, Percy S Liang, and Tatsunori B Hashimoto. AlpacaFarm: A simulation
+framework for methods that learn from human feedback. In Advances in Neural Information
+Processing Systems, volume 36, 2024.
+Yonatan Geifman and Ran El-Yaniv. Selective classification for deep neural networks. In
+Advances in Neural Information Processing Systems, volume 30, 2017.
+Chuan Guo, Geoff Pleiss, Yu Sun, and Kilian Q Weinberger. On calibration of modern neural
+networks. In International Conference on Machine Learning, pp. 1321–1330. PMLR, 2017.
+Dan Hendrycks and Kevin Gimpel. A baseline for detecting misclassified and out-of-
+distribution examples in neural networks. In International Conference on Learning Represen-
+tations, 2017.
+Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and
+Jacob Steinhardt. Measuring massive multitask language understanding. In International
+Conference on Learning Representations, 2021.
+Mandar Joshi, Eunsol Choi, Daniel S Weld, and Luke Zettlemoyer. TriviaQA: A reading
+comprehension dataset containing trivia questions. arXiv preprint arXiv:1705.03551, 2017.
+Saurav Kadavath, Tom Conerly, Amanda Askell, Tom Henighan, Dawn Drain, Ethan Perez,
+Nicholas Schiefer, Zac Hatfield-Dodds, Nova DasSarma, Eli Tran-Johnson, et al. Language
+models (mostly) know what they know. In arXiv preprint arXiv:2207.05221, 2022.
+Seungone Kim, Jamin Shin, Yejin Cho, Joel Han, Shayne Longpre, Hwaran Moon, Sangdoo
+Yun, Seongjin Shin, Sungdong Kim, James Thorne, et al. Prometheus: Inducing fine-
+grained evaluation capability in language models. In The Twelfth International Conference
+on Learning Representations, 2024.
+Lorenz Kuhn, Yarin Gal, and Sebastian Farquhar. Semantic uncertainty: Linguistic invari-
+ances for uncertainty estimation in natural language generation. In International Conference
+on Learning Representations, 2023.
+10
+Balaji Lakshminarayanan, Alexander Pritzel, and Charles Blundell. Simple and scalable
+predictive uncertainty estimation using deep ensembles. In Advances in Neural Information
+Processing Systems, 2017.
+Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via
+speculative decoding. In International Conference on Machine Learning, pp. 19274–19286.
+PMLR, 2023.
+Weitang Liu, Xiaoyun Wang, John Owens, and Yixuan Li. Energy-based out-of-distribution
+detection. In Advances in Neural Information Processing Systems, volume 33, pp. 21464–21475,
+2020.
+Potsawee Manakul, Adian Liusie, and Mark JF Gales. Selfcheckgpt: Zero-resource black-box
+hallucination detection for generative large language models. In Proceedings of the 2023
+Conference on Empirical Methods in Natural Language Processing, pp. 9004–9017, 2023.
+Isaac Ong, Amjad Almahairi, Vincent Wu, Wei-Lin Chiang, Tianhao Wu, Joseph E Gonzalez,
+M Waleed Kadous, and Ion Stoica. RouteLLM: Learning to route LLMs with preference
+data. In International Conference on Learning Representations, 2025.
+Nikhil Srinivas, Mohammed Shoaib, and Himabindu Lakkaraju. Large language models
+must be taught to know what they don’t know. In Advances in Neural Information Processing
+Systems, 2024.
+Guangzhi Sun, Potsawee Manakul, Adian Liusie, Kunat Pipatanakul, Chao Zhang, Phil
+Woodland, and Mark Gales. Crosscheckgpt: Universal hallucination ranking for multi-
+modal foundation models. arXiv preprint arXiv:2405.13684, 2024.
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao
+Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric Xing, et al. Judging LLM-as-a-judge
+with MT-bench and chatbot arena. In Advances in Neural Information Processing Systems,
+volume 36, 2023.
+11
+Appendix
+A
+Full Results
+Tables 2–5 report per-pair results across all four benchmarks. Pairs are grouped by type—
+same-size cross-family, cross-family asymmetric, and same-family asymmetric—and sorted
+by capability gap (descending) within each group. For each pair we report AUROC and
+APGR for the within-model entropy baseline (G-Ent), within-model perplexity (G-PPL),
+cross-model perplexity (CMP), and cross-model entropy (CME). Bold indicates the best
+signal per row.
+Table 2: Full results on MMLU. Pairs grouped by type and sorted by capability gap (de-
+scending). Bold = best per row among G-Ent, G-PPL, CMP, CME.
+AUROC ↑
+APGR ↑
+Generator
+Verifier
+Accg
+Accv
+Gap
+G-Ent
+G-PPL
+CMP
+CME
+G-Ent
+G-PPL
+CMP
+CME
+Same-size cross-family
+Mistral-7B
+Qwen-7B
+0.56
+0.72
+0.16
+0.720
+0.725
+0.712
+0.633
+0.607
+0.659
+0.808
+0.606
+OLMo-7B
+Qwen-7B
+0.56
+0.72
+0.16
+0.503
+0.599
+0.895
+0.695
+0.485
+0.544
+0.909
+0.452
+Llama-3-8B
+Qwen-7B
+0.62
+0.72
+0.10
+0.652
+0.685
+0.694
+0.633
+0.618
+0.655
+0.899
+0.600
+Mistral-7B
+Llama-3-8B
+0.56
+0.62
+0.06
+0.720
+0.725
+0.753
+0.717
+0.712
+0.855
+0.956
+0.623
+OLMo-7B
+Llama-3-8B
+0.56
+0.62
+0.05
+0.503
+0.599
+0.822
+0.690
+0.485
+0.581
+1.033
+0.256
+Mistral-7B
+OLMo-7B
+0.56
+0.56
+0.00
+0.720
+0.725
+0.584
+0.605
+4.333
+5.778
+1.472
+4.222
+Cross-family asymmetric
+Gemma-270M
+Qwen-7B
+0.24
+0.72
+0.48
+0.511
+0.515
+0.827
+0.612
+0.499
+0.499
+0.672
+0.538
+Gemma-270M
+Llama-3-8B
+0.24
+0.62
+0.37
+0.511
+0.515
+0.714
+0.599
+0.501
+0.495
+0.652
+0.521
+Llama-1B
+Qwen-7B
+0.43
+0.72
+0.29
+0.656
+0.655
+0.786
+0.638
+0.571
+0.595
+0.803
+0.565
+Qwen-0.5B
+Llama-3-8B
+0.42
+0.62
+0.19
+0.591
+0.557
+0.747
+0.642
+0.541
+0.523
+0.739
+0.476
+Gemma-270M
+Llama-1B
+0.24
+0.43
+0.19
+0.511
+0.515
+0.566
+0.538
+0.496
+0.509
+0.623
+0.422
+Gemma-270M
+Qwen-0.5B
+0.24
+0.42
+0.18
+0.511
+0.515
+0.570
+0.532
+0.515
+0.488
+0.680
+0.439
+Qwen-0.5B
+Llama-1B
+0.42
+0.43
+0.01
+0.591
+0.557
+0.580
+0.605
+1.267
+1.294
+1.811
+0.344
+Same-family asymmetric
+Qwen-0.5B
+Qwen-7B
+0.42
+0.72
+0.30
+0.591
+0.557
+0.842
+0.587
+0.522
+0.502
+0.789
+0.500
+Llama-1B
+Llama-3-8B
+0.43
+0.62
+0.18
+0.656
+0.655
+0.815
+0.679
+0.563
+0.603
+0.871
+0.542
+Mean
+0.596
+0.606
+0.727
+0.627
+0.848
+0.972
+0.915
+0.741
+Table 3: Full results on TriviaQA. Pairs grouped by type and sorted by capability gap
+(descending). Bold = best per row among G-Ent, G-PPL, CMP, CME.
+AUROC ↑
+APGR ↑
+Generator
+Verifier
+Accg
+Accv
+Gap
+G-Ent
+G-PPL
+CMP
+CME
+G-Ent
+G-PPL
+CMP
+CME
+Same-size cross-family
+Llama-3-8B
+Qwen-7B
+0.43
+0.65
+0.21
+0.858
+0.887
+0.777
+0.875
+0.789
+0.812
+0.806
+0.755
+Llama-3-8B
+Mistral-7B
+0.43
+0.64
+0.20
+0.858
+0.887
+0.833
+0.923
+0.818
+0.838
+0.858
+0.785
+OLMo-7B
+Qwen-7B
+0.51
+0.65
+0.13
+0.636
+0.429
+0.466
+0.844
+0.621
+0.434
+0.493
+0.725
+OLMo-7B
+Mistral-7B
+0.51
+0.64
+0.12
+0.636
+0.429
+0.588
+0.884
+0.658
+0.403
+0.623
+0.725
+Llama-3-8B
+OLMo-7B
+0.43
+0.51
+0.08
+0.858
+0.887
+0.611
+0.822
+1.068
+1.119
+0.774
+1.071
+Mistral-7B
+Qwen-7B
+0.64
+0.65
+0.01
+0.848
+0.300
+0.420
+0.766
+2.222
+-1.068
+-0.562
+0.093
+Cross-family asymmetric
+Gemma-270M
+Qwen-7B
+0.22
+0.65
+0.42
+0.605
+0.595
+0.771
+0.678
+0.522
+0.523
+0.631
+0.490
+Gemma-270M
+Llama-1B
+0.22
+0.54
+0.32
+0.605
+0.595
+0.686
+0.683
+0.509
+0.509
+0.596
+0.444
+Gemma-270M
+Llama-3-8B
+0.22
+0.43
+0.21
+0.605
+0.595
+0.766
+0.625
+0.522
+0.529
+0.665
+0.465
+Gemma-270M
+Qwen-0.5B
+0.22
+0.41
+0.18
+0.605
+0.595
+0.650
+0.601
+0.482
+0.491
+0.596
+0.368
+Qwen-0.5B
+Llama-1B
+0.41
+0.54
+0.14
+0.773
+0.726
+0.522
+0.557
+0.628
+0.623
+0.520
+0.417
+Llama-1B
+Qwen-7B
+0.54
+0.65
+0.10
+0.805
+0.811
+0.691
+0.788
+0.696
+0.724
+0.764
+0.574
+Qwen-0.5B
+Llama-3-8B
+0.41
+0.43
+0.03
+0.773
+0.726
+0.619
+0.525
+1.403
+1.264
+1.337
+0.472
+Same-family asymmetric
+Qwen-0.5B
+Qwen-7B
+0.41
+0.65
+0.24
+0.773
+0.726
+0.818
+0.824
+0.619
+0.598
+0.737
+0.606
+Mean
+0.731
+0.656
+0.658
+0.742
+0.825
+0.557
+0.631
+0.571
+12
+Table 4: Full results on TriviaQA (no ctx). Pairs grouped by type and sorted by capability
+gap (descending). Bold = best per row among G-Ent, G-PPL, CMP, CME.
+AUROC ↑
+APGR ↑
+Generator
+Verifier
+Accg
+Accv
+Gap
+G-Ent
+G-PPL
+CMP
+CME
+G-Ent
+G-PPL
+CMP
+CME
+Same-size cross-family
+OLMo-7B
+Llama-3-8B
+0.39
+0.67
+0.29
+0.774
+0.504
+0.706
+0.807
+0.664
+0.483
+0.626
+0.599
+OLMo-7B
+Mistral-7B
+0.39
+0.66
+0.28
+0.774
+0.504
+0.812
+0.884
+0.659
+0.488
+0.726
+0.634
+OLMo-7B
+Qwen-7B
+0.39
+0.59
+0.21
+0.774
+0.504
+0.673
+0.849
+0.635
+0.481
+0.614
+0.599
+Qwen-7B
+Llama-3-8B
+0.59
+0.67
+0.08
+0.823
+0.794
+0.752
+0.634
+0.993
+0.953
+0.976
+0.564
+Qwen-7B
+Llama-3-8B
+0.59
+0.67
+0.08
+0.823
+0.794
+0.752
+0.634
+0.993
+0.953
+0.976
+0.564
+Qwen-7B
+Mistral-7B
+0.59
+0.66
+0.07
+0.823
+0.794
+0.712
+0.682
+0.877
+0.843
+0.869
+0.596
+Qwen-7B
+Mistral-7B
+0.59
+0.66
+0.07
+0.823
+0.794
+0.712
+0.682
+0.877
+0.843
+0.869
+0.596
+Mistral-7B
+Llama-3-8B
+0.66
+0.67
+0.01
+0.852
+0.485
+0.598
+0.746
+3.800
+-0.607
+0.859
+0.400
+Cross-family asymmetric
+Gemma-270M
+Llama-3-8B
+0.10
+0.67
+0.57
+0.700
+0.666
+0.828
+0.696
+0.524
+0.525
+0.570
+0.470
+Gemma-270M
+Qwen-7B
+0.10
+0.59
+0.49
+0.700
+0.666
+0.792
+0.680
+0.499
+0.503
+0.591
+0.416
+Qwen-0.5B
+Llama-3-8B
+0.21
+0.67
+0.46
+0.791
+0.786
+0.772
+0.576
+0.561
+0.560
+0.614
+0.495
+Qwen-0.5B
+Llama-3-8B
+0.21
+0.67
+0.46
+0.791
+0.786
+0.772
+0.576
+0.561
+0.560
+0.614
+0.495
+Gemma-270M
+Llama-1B
+0.10
+0.42
+0.32
+0.700
+0.666
+0.764
+0.737
+0.486
+0.502
+0.573
+0.372
+Qwen-0.5B
+Llama-1B
+0.21
+0.42
+0.21
+0.791
+0.786
+0.613
+0.647
+0.529
+0.525
+0.585
+0.426
+Qwen-0.5B
+Llama-1B
+0.21
+0.42
+0.21
+0.791
+0.786
+0.613
+0.647
+0.529
+0.525
+0.585
+0.426
+Llama-1B
+Qwen-7B
+0.42
+0.59
+0.17
+0.840
+0.851
+0.738
+0.806
+0.655
+0.675
+0.758
+0.506
+Gemma-270M
+Qwen-0.5B
+0.10
+0.21
+0.11
+0.700
+0.666
+0.731
+0.681
+0.485
+0.522
+0.551
+0.281
+Same-family asymmetric
+Qwen-0.5B
+Qwen-7B
+0.21
+0.59
+0.38
+0.791
+0.786
+0.799
+0.827
+0.533
+0.536
+0.645
+0.514
+Qwen-0.5B
+Qwen-7B
+0.21
+0.59
+0.38
+0.791
+0.786
+0.799
+0.827
+0.533
+0.536
+0.645
+0.514
+Llama-1B
+Llama-3-8B
+0.42
+0.67
+0.25
+0.840
+0.851
+0.938
+0.813
+0.687
+0.694
+0.813
+0.588
+Mean
+0.785
+0.713
+0.744
+0.722
+0.804
+0.555
+0.703
+0.503
+Table 5: Full results on GSM8K. Pairs grouped by type and sorted by capability gap (de-
+scending). Bold = best per row among G-Ent, G-PPL, CMP, CME.
+AUROC ↑
+APGR ↑
+Generator
+Verifier
+Accg
+Accv
+Gap
+G-Ent
+G-PPL
+CMP
+CME
+G-Ent
+G-PPL
+CMP
+CME
+Same-size cross-family
+Mistral-7B
+Qwen-7B
+0.51
+0.90
+0.39
+0.655
+0.539
+0.668
+0.729
+0.575
+0.513
+0.590
+0.619
+Mistral-7B
+OLMo-7B
+0.51
+0.83
+0.32
+0.655
+0.539
+0.705
+0.699
+0.565
+0.507
+0.610
+0.584
+Llama-3-8B
+Qwen-7B
+0.61
+0.90
+0.28
+0.596
+0.577
+0.590
+0.480
+0.551
+0.538
+0.614
+0.456
+Llama-3-8B
+OLMo-7B
+0.61
+0.83
+0.22
+0.596
+0.577
+0.631
+0.522
+0.596
+0.583
+0.656
+0.489
+Qwen-7B
+Llama-3-8B
+0.60
+0.75
+0.15
+0.467
+0.479
+0.201
+0.207
+0.260
+0.310
+0.041
+0.013
+Mistral-7B
+Llama-3-8B
+0.51
+0.61
+0.11
+0.655
+0.539
+0.719
+0.687
+0.872
+0.638
+0.998
+0.887
+OLMo-7B
+Qwen-7B
+0.83
+0.90
+0.07
+0.763
+0.538
+0.748
+0.808
+0.960
+0.657
+0.956
+0.950
+Cross-family asymmetric
+Llama-1B
+Qwen-7B
+0.38
+0.90
+0.51
+0.543
+0.523
+0.668
+0.666
+0.511
+0.503
+0.574
+0.562
+Qwen-0.5B
+Llama-3-8B
+0.25
+0.61
+0.36
+0.616
+0.621
+0.627
+0.622
+0.544
+0.545
+0.530
+0.527
+Qwen-0.5B
+Llama-1B
+0.25
+0.38
+0.13
+0.616
+0.621
+0.574
+0.581
+0.651
+0.662
+0.643
+0.626
+Same-family asymmetric
+Qwen-0.5B
+Qwen-7B
+0.25
+0.90
+0.64
+0.616
+0.621
+0.629
+0.682
+0.520
+0.521
+0.528
+0.539
+Llama-1B
+Llama-3-8B
+0.38
+0.61
+0.23
+0.543
+0.523
+0.655
+0.606
+0.521
+0.505
+0.662
+0.585
+Mean
+0.597
+0.559
+0.617
+0.607
+0.598
+0.539
+0.617
+0.571
+13
+0%
+20%
+40%
+60%
+80%
+100%
+Fraction retained (coverage)
+0%
+20%
+40%
+60%
+80%
+100%
+Generator accuracy (%)
+AUC  CMP: 65.6
+       G-Ent: 50.3
+A. MMLU
+Qwen-0.5B 
+ Qwen-7B
+CMP (ours)
+G-Ent
+Full-set (42%)
+0%
+20%
+40%
+60%
+80%
+100%
+Fraction retained (coverage)
+0%
+20%
+40%
+60%
+80%
+100%
+Generator accuracy (%)
+AUC  CMP: 66.5
+       G-Ent: 63.1
+B. GSM8K
+Mistral-7B 
+ Llama-3-8B
+CMP (ours)
+G-Ent
+Full-set (51%)
+Figure 5: Coverage–accuracy curves (single pair). At each coverage level we abstain on
+instances whose signal score exceeds a swept threshold and report generator accuracy on
+the retained subset. CMP (blue, solid) maintains higher accuracy than G-Ent (red, dashed)
+across nearly all operating points on both MMLU (Qwen-0.5B →Qwen-7B) and GSM8K
+(Mistral-7B →Llama-3-8B). The dotted line marks full-set accuracy.
+A.1
+Selective Prediction Analysis
+The aggregate metrics in Section 4 (AUROC, APGR, quintile spread) summarise each signal’s
+ability to rank instances by expected correctness. A complementary perspective comes from
+selective prediction (Geifman & El-Yaniv, 2017), which asks: if we are allowed to abstain on a
+fraction of inputs, how accurate can we be on the remainder?
+We construct coverage–accuracy curves by sweeping an abstention threshold on each signal
+score. At each threshold we retain only the instances on which the signal is most confident
+(lowest score) and compute generator accuracy on that retained subset. A stronger signal
+produces a curve that lies higher: it achieves greater accuracy at the same coverage, or
+equivalently reaches a target accuracy while retaining more examples.
+Single-pair examples. Figure 5 shows curves for two representative pairs (the same ones
+featured in the quintile figure): Qwen-0.5B →Qwen-7B on MMLU and Mistral-7B →Llama-
+3-8B on GSM8K. On MMLU, CMP dominates G-Ent across nearly the full coverage range;
+at 20% coverage the most confident CMP predictions approach perfect accuracy, whereas
+G-Ent remains closer to the full-set baseline. On GSM8K the two curves are closer together,
+but CMP maintains a consistent advantage, particularly at low coverage.
+Aggregate trends. To verify that these patterns are not pair-specific, Figure 6 averages the
+coverage–accuracy curves across all 15 model pairs per benchmark (shaded bands show ±1
+standard error). The averaged curves confirm the single-pair findings: CMP lies above G-Ent
+at virtually every operating point on both MMLU (AUC 60.4 vs. 53.1) and GSM8K (AUC
+42.5 vs. 40.3). These AUC summaries are consistent with the AUROC and quintile-spread
+rankings in Section 4, and confirm that the advantage of cross-model perplexity extends
+to the operationally relevant setting where a system must decide, per query, whether to
+serve a generation or abstain. This makes CMP directly applicable as an abstention trigger
+in high-stakes settings where a confident wrong answer is costlier than no answer.
+B
+Effect of Capability Gap
+Figures 7 and 8 provide additional context for the capability gap by including within-model
+entropy as a comparison signal. Figure 7 plots both CMP and entropy AUROC on the same
+axes, showing that the positive gap effect on TriviaQA is specific to CMP — entropy shows
+no significant correlation with gap on any dataset. Figure 8 plots the difference directly
+(∆AUROC = CMP −G-Ent), confirming that CMP’s advantage over entropy grows with
+capability gap on TriviaQA (ρ = +0.75, p < 0.01) but not on MMLU or GSM8K.
+14
+0%
+20%
+40%
+60%
+80%
+100%
+Fraction retained (coverage)
+0%
+20%
+40%
+60%
+80%
+100%
+Generator accuracy (%)
+AUC  CMP: 60.4
+       G-Ent: 51.1
+A. MMLU
+mean over 15 pairs
+CMP (15 pairs)
+G-Ent (15 pairs)
+Full-set (49%)
+0%
+20%
+40%
+60%
+80%
+100%
+Fraction retained (coverage)
+0%
+20%
+40%
+60%
+80%
+100%
+Generator accuracy (%)
+AUC  CMP: 42.5
+       G-Ent: 40.3
+B. GSM8K
+mean over 15 pairs
+CMP (15 pairs)
+G-Ent (15 pairs)
+Full-set (45%)
+Figure 6: Coverage–accuracy curves (averaged over all pairs). Curves are averaged across
+all 15 model pairs per benchmark; shaded bands show ±1 SE. CMP consistently achieves
+higher accuracy than G-Ent at equal coverage on both MMLU and GSM8K.
+0.1
+0.2
+0.3
+0.4
+Accuracy gap
+0.2
+0.4
+0.6
+0.8
+1.0
+AUROC
+MMLU
+CMP 
+= +0.11 (p = 0.72)  Ent 
+=
+0.06 (p = 0.84)
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+0.35
+0.40
+Accuracy gap
+0.2
+0.4
+0.6
+0.8
+1.0
+TriviaQA
+CMP 
+= +0.62 (p = 0.03)  Ent 
+=
+0.40 (p = 0.17)
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+Accuracy gap
+0.2
+0.4
+0.6
+0.8
+1.0
+GSM8K
+CMP 
+=
+0.23 (p = 0.40)  Ent 
+=
+0.35 (p = 0.18)
+Same-size cross-family
+Cross-family
+Same-family
+CMP (filled)
+W-Ent (open)
+CMP vs within-model entropy AUROC as a function of capability gap
+Figure 7: CMP (filled circles) and within-model entropy (open squares) AUROC versus
+capability gap. The positive gap effect on TriviaQA is specific to CMP — entropy AUROC is
+uncorrelated with gap on all three datasets.
+0.1
+0.2
+0.3
+0.4
+Accuracy gap
+0.3
+0.2
+0.1
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+CMP AUROC 
+ W-Ent AUROC
+CMP better
+W-Ent better
+MMLU
+= +0.26, p = 0.39
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+0.35
+0.40
+Accuracy gap
+CMP better
+W-Ent better
+TriviaQA
+= +0.75, p = 0.00
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+Accuracy gap
+CMP better
+W-Ent better
+GSM8K
+= +0.34, p = 0.19
+Same-size cross-family
+Cross-family
+Same-family
+CMP advantage over within-model entropy ( AUROC) vs capability gap
+Figure 8: CMP advantage over within-model entropy (∆AUROC = CMP −G-Ent) versus
+capability gap. CMP’s advantage grows significantly with gap on TriviaQA (ρ = +0.75,
+p < 0.01), while on MMLU CMP leads regardless of gap size. GSM8K shows a positive but
+non-significant trend (ρ = +0.34, p = 0.19).
+15
+C
+Experimental Setup Details
+Models. We evaluate across a diverse set of model pairs spanning multiple families and
+capability levels. Generating models include Qwen2.5-0.5B-Instruct, Qwen2.5-1.5B-Instruct,
+Llama-3.2-1B-Instruct, Llama-3.2-3B-Instruct, gemma-3-270m-it, and SmolLM2-1.7B-Instruct.
+Verifying models include Qwen2.5-7B-Instruct and Meta-Llama-3-8B-Instruct. We addition-
+ally evaluate same-sized cross-family pairs—models with comparable parameter counts but
+different architectures and training corpora, including Mistral-7B-Instruct-v0.3, OLMo-3-
+7B-Instruct, and Meta-Llama-3-8B-Instruct as both generators and verifiers—to isolate the
+effect of model diversity from capability asymmetry.
+Datasets. We evaluate on four benchmarks spanning distinct task types. MMLU (Hendrycks
+et al., 2021) is a 57-subject multiple-choice benchmark testing knowledge and reasoning;
+we use single-token answer generation. TriviaQA (Joshi et al., 2017) is evaluated in both
+the no-context variant, testing pure knowledge retrieval, and the context variant, testing
+reading comprehension. GSM8K (Cobbe et al., 2021) requires multi-step chain-of-thought
+reasoning, with answers evaluated by extracting the final numerical value. We evaluate on
+up to 2000 examples per dataset with a fixed random seed.
+Implementation. All models are loaded in bfloat16 precision. Generations use greedy
+decoding with maximum token lengths of 5 (MMLU), 8 (TriviaQA), and 256 (GSM8K). The
+verifying model performs only a single prefill forward pass and never generates tokens. All
+experiments are run on a single NVIDIA A10G GPU (24GB).
+D
+Relationship to Generation-Based Correctness Signals
+The baselines in our main experiments—generator entropy (G-Ent) and generator perplexity
+(G-PPL)—are chosen as direct ablations of the cross-model design decision: they answer
+whether the verifying model’s distribution adds signal over the generating model’s own
+distribution, holding the computational regime constant. This appendix clarifies how CMP
+and CME relate to generation-based correctness signals that occupy a different point on the
+compute-accuracy tradeoff.
+D.1 Consistency-Based Methods
+SelfCheckGPT (Manakul et al., 2023) and CrossCheckGPT (Sun et al., 2024) detect errors
+by measuring consistency across multiple stochastic samples from the same model or
+across outputs from independent models. These methods can achieve strong hallucination
+detection performance, but operate in a fundamentally different compute regime: they
+require k full autoregressive generation passes, where k is typically 3–5, compared to the
+single prefill forward pass required by CMP and CME. For answer lengths typical of
+our benchmarks (up to 256 tokens for GSM8K) this represents a substantial difference in
+inference cost.
+Beyond compute, consistency-based methods are conceptually distinct from cross-model
+disagreement. SelfCheckGPT measures whether a model agrees with itself across samples;
+CMP measures whether a second model is surprised by the generating model’s specific
+answer. The two signals are complementary: consistency captures within-model variance,
+while CMP captures between-model disagreement on a fixed output. CMP could in principle
+be extended to sampled rather than greedy answers—computing mean verifier perplexity
+over k samples—which would interpolate between the two approaches and may improve
+signal quality at higher compute cost. We leave this extension to future work.
+We do not claim that CMP outperforms consistency-based methods unconditionally. Rather,
+CMP occupies the low-cost end of the correctness signal spectrum: it provides a meaningful
+signal with no labeled data, no generation from the verifier, and no repeated sampling
+from the generator. This makes it most attractive in latency-constrained or cost-constrained
+deployment settings where multiple generation passes are not feasible.
+16
+D.2 Generation-Based Judge Methods
+A related line of work uses a language model as a judge to evaluate another model’s outputs
+(Zheng et al., 2023; Kim et al., 2024; Dubois et al., 2024). These approaches require the judge
+model to generate a response—typically a scalar rating or structured critique—which is one
+to two orders of magnitude more expensive than a prefill pass. They also target output
+quality and preference rather than per-instance binary correctness, making direct AUROC
+comparison inappropriate. Self-evaluation methods such as P(True) (Kadavath et al., 2022)
+similarly require generation from the evaluating model and are known to be unreliable on
+smaller models, which constitute most of our generator set.
+CMP and CME differ from all of these in that the verifying model never generates tokens:
+it performs only a prefill pass and produces a scalar signal directly from its output logits.
+This constraint is what enables the single-forward-pass efficiency claim, and it is what
+distinguishes our contribution from the LLM-as-Judge literature.
+D.3 Why G-Ent and G-PPL Are the Appropriate Ablations
+Given the above, G-Ent and G-PPL are the correct ablation baselines for our research
+question. The central claim of this paper is that a verifying model’s distribution over a
+generating model’s answer contains correctness signal beyond what is already present in the
+generating model’s own distribution. G-Ent and G-PPL isolate exactly this question: they are
+the within-model analogues of CME and CMP respectively, computed from the same answer
+under the same greedy decoding setting, with no verifier involved. Any performance gap
+between CMP and G-PPL, or between CME and G-Ent, is attributable solely to the cross-
+model signal. Comparing against generation-based methods would conflate this signal with
+sampling variance, generation length, or judge calibration, obscuring the contribution we
+seek to measure.
+E
+Failure Mode: Very Weak Generators on Reasoning Tasks
+CMP requires the generator to produce a meaningful mixture of correct and incorrect
+answers. On knowledge tasks (MMLU, TriviaQA), even Gemma-3-270M at 10–24% accuracy
+provides enough signal for CMP to achieve AUROC 0.57–0.83. However, on GSM8K where
+Gemma-3-270M achieves only 4% accuracy, CMP collapses to near-random (Table 6). At
+this accuracy level, virtually all generated answers are incorrect chain-of-thought reasoning
+with wrong final numbers, leaving the verifier no distributional contrast to exploit. We
+observe that CMP degrades gracefully: the threshold for useful signal is approximately
+10% generator accuracy, below which both CMP and generator-entropy baselines become
+uninformative.
+Table 6: GSM8K results with Gemma-3-270M as generator (4% accuracy). All routing signals
+collapse to near-random when the generator almost never produces correct answers.
+AUROC ↑
+APGR ↑
+Verifier
+Accv
+Gap
+G-Ent
+CMP
+G-Ent
+CMP
+Qwen-7B
+0.90
+0.85
+0.463
+0.508
+0.500
+0.508
+Llama-3-8B
+0.61
+0.57
+0.463
+0.546
+0.476
+0.487
+Llama-1B
+0.38
+0.34
+0.463
+0.520
+0.506
+0.533
+Qwen-0.5B
+0.25
+0.21
+0.463
+0.509
+0.453
+0.489
+Mean
+0.463
+0.521
+0.484
+0.504
+F
+GSM8K: Final-Answer Tokens and Verification Prompting
+The chain-of-thought sequences in GSM8K raise a natural question: does the routing signal
+come from the full reasoning trace or only the final numerical answer? We additionally test
+whether an explicit verification prompt—asking the verifier “Is this answer correct?”—can
+match or exceed the implicit signal in CMP.
+Final-answer CMP. We extract the token positions corresponding to the final numerical
+answer (the digits after the ANSWER: marker) and compute CMP restricted to those positions
+17
+Table 7: GSM8K correctness prediction (AUROC): Full chain-of-thought CMP vs. final-
+answer-only CMP vs. P(True) verification prompting. CMP-Full and CMP-Final perform
+comparably, while P(True) is near random. Bold = best among CMP-Full, CMP-Final,
+P(True).
+AUROC ↑
+Baselines
+Generator
+Verifier
+Accg
+Gap
+CMP-Full
+CMP-Final
+P(True)
+G-Ent
+G-PPL
+Qwen-0.5B
+Qwen-7B
+0.25
+0.64
+0.629
+0.456
+0.495
+0.616
+0.621
+Llama-1B
+Qwen-7B
+0.38
+0.51
+0.668
+0.755
+0.463
+0.543
+0.523
+Mistral-7B
+Qwen-7B
+0.51
+0.39
+0.668
+0.574
+0.487
+0.655
+0.539
+Qwen-0.5B
+Llama-3-8B
+0.25
+0.36
+0.627
+0.525
+0.431
+0.616
+0.621
+Llama-3-8B
+Qwen-7B
+0.61
+0.28
+0.590
+0.584
+0.476
+0.596
+0.577
+Llama-1B
+Llama-3-8B
+0.38
+0.23
+0.655
+0.611
+0.417
+0.543
+0.523
+Mistral-7B
+Llama-3-8B
+0.51
+0.11
+0.719
+0.583
+0.436
+0.655
+0.539
+OLMo-7B
+Qwen-7B
+0.83
+0.07
+0.748
+0.854
+0.497
+0.763
+0.538
+Mean
+0.663
+0.618
+0.463
+0.623
+0.560
+only (CMP-Final), compared to CMP over the full chain-of-thought (CMP-Full). Across 8
+model pairs (Table 7), CMP-Final achieves mean AUROC of 0.618 versus 0.663 for CMP-
+Full and mean APGR of 0.665 versus 0.682 (Table 8). On most pairs CMP-Full leads, but
+CMP-Final matches or exceeds it on two pairs (Llama-1B →Qwen-7B and OLMo-7B →
+Qwen-7B), suggesting that the verifier’s disagreement signal is largely concentrated in the
+final answer rather than distributed across intermediate reasoning steps. This implies CMP
+could be applied more efficiently by scoring only the answer tokens, avoiding the cost of
+processing the full chain-of-thought through the verifier.
+Verification prompting. We test an explicit P(True) baseline (Kadavath et al., 2022): we
+prompt the verifier with the question and the generator’s proposed answer, asking “Is the
+proposed answer correct? Yes or No,” and extract the probability assigned to the “Yes”
+token. Despite being a natural approach to answer verification, P(True) achieves mean
+AUROC of only 0.463—below random (0.504)—and mean APGR of 0.492. The verifier’s
+explicit judgment of correctness is far less informative than its implicit token-level perplexity
+on the same answer. This is consistent with known limitations of LLM self-evaluation on
+mathematical reasoning: models that cannot reliably solve a problem also cannot reliably
+judge whether a solution is correct when asked directly.
+Table 8: GSM8K routing performance (APGR): Full chain-of-thought CMP vs. final-answer-
+only CMP vs. P(True). Pairs with gap < 5pp excluded. Bold = best among CMP-Full,
+CMP-Final, P(True).
+APGR ↑
+Baselines
+Generator
+Verifier
+Accg
+Gap
+CMP-Full
+CMP-Final
+P(True)
+G-Ent
+G-PPL
+Qwen-0.5B
+Qwen-7B
+0.25
+0.64
+0.528
+0.484
+0.499
+0.520
+0.521
+Llama-1B
+Qwen-7B
+0.38
+0.51
+0.574
+0.621
+0.481
+0.511
+0.503
+Mistral-7B
+Qwen-7B
+0.51
+0.39
+0.590
+0.524
+0.506
+0.575
+0.513
+Qwen-0.5B
+Llama-3-8B
+0.25
+0.36
+0.530
+0.509
+0.492
+0.544
+0.545
+Llama-3-8B
+Qwen-7B
+0.61
+0.28
+0.614
+0.579
+0.488
+0.551
+0.538
+Llama-1B
+Llama-3-8B
+0.38
+0.23
+0.662
+0.636
+0.463
+0.521
+0.505
+Mistral-7B
+Llama-3-8B
+0.51
+0.11
+0.998
+0.967
+0.483
+0.872
+0.638
+OLMo-7B
+Qwen-7B
+0.83
+0.07
+0.956
+1.000
+0.525
+0.960
+0.657
+Mean
+0.682
+0.665
+0.492
+0.632
+0.552
+18

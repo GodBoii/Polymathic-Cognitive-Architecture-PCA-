@@ -1,0 +1,1927 @@
+Sparse Visual Thought Circuits in Vision–Language Models
+Yunpeng Zhou
+University of Reading, Reading, UK
+kc804139@student.reading.ac.uk
+Abstract
+Sparse autoencoders (SAEs) improve inter-
+pretability in multimodal models, but it remains
+unclear whether SAE features form modular, com-
+posable units for reasoning—an assumption un-
+derlying many intervention-based steering meth-
+ods.
+We test this modularity hypothesis and
+find it often fails: intervening on a task-selective
+feature set can modestly improve reasoning ac-
+curacy, while intervening on the union of two
+such sets reliably induces output drift (large un-
+intended changes in predictions) and degrades
+accuracy, even under norm-matched perturba-
+tions. This non-modular circuit interference is
+consistent with shared internal pathways where
+feature unions amplify activation shifts. We de-
+velop a reproducible causal pipeline to localize
+and test these sparse visual thought circuits in
+Qwen3-VL-8B. On a controlled synthetic bench-
+mark with seven task types and three difficulty
+levels, linear probes identify a mid-decoder lo-
+cus for task-type information. We train SAEs
+at this layer, construct task-selective sets via an
+explicit rule, and perform inference-time scal-
+ing/ablation while quantifying accuracy and drift.
+Our findings—validated with bootstrapped sub-
+samples and permutation controls, and replicated
+across multiple VLM families and five diverse
+datasets—clarify the boundaries of SAE feature
+composability and provide a rigorous diagnostic
+framework for more reliable VLM control.
+1. Introduction
+Visual reasoning in Multimodal Large Language Models
+(VLMs) remains an enigma: while models successfully de-
+compose complex scenes into logical deductions, the neural
+circuitry driving this process is largely unmapped. Cur-
+rent interpretability methods, such as attention visualization
+or causal tracing, primarily identify where information is
+processed but fail to isolate the specific atomic features
+responsible for visual thought. Consequently, a fundamen-
+tal question remains unresolved: Does visual reasoning
+emerge from distinct, modular components that can be lin-
+early composed, or is it an inherently entangled process? Im-
+plicit in many steering techniques is the Linear Modularity
+Hypothesis—that identifying and amplifying task-relevant
+directions should monotonically improve performance. In
+this work, we rigorously test this hypothesis by isolating
+and manipulating the Visual Thought Circuit in a frozen
+VLM. We employ signal amplification to test the sufficiency
+of these features for reasoning, and zero-ablation to verify
+their causal necessity.
+We employ Sparse Autoencoders (SAEs) as a causal micro-
+scope to decompose the dense activations of the model’s
+middle layers into sparse, interpretable feature directions.
+Our investigation reveals a striking dichotomy between the
+causal necessity of these features and their functional com-
+posability. On one hand, we establish the physical reality
+of these circuits: projecting SAE latents back to image
+space reveals that they act as precise semantic detectors,
+spatially grounded to specific visual objects. Zero-ablation
+of these sparse features—constituting less than 0.5% of the
+dictionary—induces a 57% flip rate in model predictions,
+confirming they are load-bearing components of inference.
+On the other hand, we identify a critical limit to modular-
+ity. While steering the model along specific, task-aligned
+directions (Pattern Set) enhances reasoning precision, ag-
+gregating all task-relevant features (Union Set) triggers non-
+modular interference. Contrary to the expectation that more
+signal yields better performance, the combined interven-
+tion drives the residual stream off-manifold, causing severe
+output drift. We trace this phenomenon to a geometric ori-
+gin: the latent space exhibits significant non-orthogonality,
+where semantic concepts occupy overlapping subspaces,
+leading to resource competition during simultaneous activa-
+tion. This interference is structurally determined, appearing
+most prominently in the middle layers (Layers 18–23) which
+serve as the model’s semantic bottleneck.
+1
+arXiv:2603.25075v1  [cs.AI]  26 Mar 2026
+Sparse Visual Thought Circuits in Vision–Language Models
+Image
+Encoder
+Pattern +
+Global (20)
+Sparse codes z
+Pattern (10)
+Global (10)
+Inference-time
+Intervention
+Visual Reasoning
+Instance
+Questions
+7 Task Types
+3 Difficulties
+Train/Val/Test
+Text
+Encoder
+Set Construction Rule
+SAE Hook Mechanism
+Evaluation Protocol
+ΔAcc (pp)
+Changed (%)
+Train SAE on h
+Linear probe
+localization
+(Task Type/Difficulty)
+Update
+Best class
+match
+Top-k
+Size
+matching
+Union
+Scale
+Zero
+(pooled mean)
+Encode z
+Pooled
+Mean
+SAE
+Hidden
+Modify 
+Decode
+recon
++
+Add
+delta
+Hidden’
+Selectivity scoring
+Subsample
+seeds
+Middle_2
+Bootstrap
+summary
+Controls
+Random/Permutation
+Held-out/Bootstrap
+Output Token Drift
+VLM
+A
+B
+C
+Val/Test
+Performance
+Union
+Scaled Up Activations
+Scale: Amplify
+selected features
+Zero: Ablate
+selected features
+Selectivity Statistics
+Hooking Logic
+Heatmap
+Figure 1. Sparse Visual Thought Circuits (SVTC) in a frozen vision–language model. We (1) localize reasoning-related signals by probing
+pooled hidden states across layer groups for task type (7-way) and difficulty (3-way), selecting a predictive site (e.g., decoder Mmiddle 2);
+(2) train a sparse autoencoder at that site to map activations h ∈R4096 to sparse codes z ∈R32768 and construct task-selective feature
+sets (Pattern, Global, and their union) via rule-based selectivity; and (3) perform inference-time interventions by modifying selected
+coordinates of z (scaling/ablation), decoding a reconstruction, and applying the resulting update to obtain h′. We report accuracy change
+∆Acc (pp), output drift Changed (%), and perturbation magnitude E[∥∆∥/∥h∥], with negative controls (random and permutation sets),
+bootstrap over subsampling seeds, and held-out validation on val/test.
+Our contributions are threefold: (1) We propose a repro-
+ducible pipeline for localizing and verifying reasoning cir-
+cuits, demonstrating their explicit spatial grounding. (2)
+We uncover the mechanism of interference, quantifying
+how geometric entanglement limits the linear composability
+of visual features. (3) We demonstrate robust generaliza-
+tion, showing that these structural properties replicate across
+model architectures and out-of-distribution datasets.
+2. Related Work
+From Coarse-Grained Probing to Circuit Discovery.
+Recent VLM interpretability has largely focused on macro-
+scopic analysis. Work by Kaduri et al. (2024) and Neo
+et al. (2025) characterizes how visual information propa-
+gates across layers, while Golovanevsky et al. (2025) use
+intervention tests to identify relied-upon evidence. While
+these studies successfully localize reasoning regions, they
+remain at the level of dense activations. Recently, sparse
+autoencoders have been applied to vision-only backbones to
+isolate perceptual features (Zaigrajew et al., 2025; Lieberum
+et al., 2024). Crucially, our work advances this to the cross-
+modal interface, employing SAEs to decompose dense rea-
+soning states and demonstrating—via spatial grounding
+(Figure A1)—that these units are physically anchored to
+visual objects.
+SAEs and the Limits of Linear Modularity.
+Current
+SAE research often operates under an implicit assumption
+of linear composability (Templeton et al., 2024; Marks et al.,
+2025). While nascent VLM studies are beginning to map
+multimodal latent spaces (Engels et al., 2025), they rarely
+test the limits of feature interaction. Unlike recent NLP-
+focused steering (Arad et al., 2025) that displays precise con-
+trol, our experiments reveal a critical “Interference Bound-
+ary.” We show that while individual visual features are steer-
+able, their union suffers from geometric non-orthogonality.
+This identifies a structural divergence between current VLM
+latent spaces and the idealized modularity of pure language
+models, distinguishing our contribution from a simple appli-
+cation of NLP techniques.
+Causal Inference beyond Attribution.
+A recurring chal-
+lenge is distinguishing causal mechanisms from confound-
+ing correlations, such as object hallucination drivers (Ma
+et al., 2025; Li et al., 2025). While previous methods quan-
+tify feature contributions via attribution scores, they often
+lack rigorous controls for intervention magnitude and com-
+2
+Sparse Visual Thought Circuits in Vision–Language Models
+position. Our work introduces a stricter diagnostic frame-
+work: by pairing targeted steering with geometric analysis
+(cosine similarity) and layer-wise sensitivity checks, we
+shift focus from merely “attributing” errors to explaining
+the mechanism of failure (i.e., constructive interference driv-
+ing residual streams off-manifold). This connects external
+reasoning traces (Shao et al., 2024) to internal geometric
+pathologies.
+Challenges in Cross-Modal Disentanglement.
+While
+SAEs successfully decompose discrete textual representa-
+tions (Bricken et al., 2023), applying them to VLMs intro-
+duces a continuity-discreteness mismatch.
+Unlike sym-
+bolic text tokens, visual patches encode continuous, high-
+dimensional perceptual signals (e.g., texture, illumination)
+alongside semantic concepts (Liang et al., 2022). Recent
+studies suggest this dual nature forces models to employ
+dense superposition schemes where semantic features are
+entangled with high-frequency noise (Bai et al., 2022). We
+hypothesize that this makes VLM SAEs inherently prone
+to polysemantic interference: weak interventions may in-
+advertently amplify dense perceptual artifacts rather than
+the sparse semantic signal, a phenomenon we verify as the
+“collapse regime” in Section 6.5.
+3. Sparse Decomposition
+We formulate the VLM residual stream as a high-
+dimensional vector space H ≃Rd. We hypothesize that
+visual reasoning operates within a low-dimensional seman-
+tic subspace Stask ⊂H, while the orthogonal complement
+S⊥
+task contains nuisance variables (e.g., background textures,
+syntax). Our objective is to recover the sparse basis of Stask.
+Locus Identification via Linear Probing.
+Let M be a
+VLM where hl(x) ∈RT ×d denotes the activation sequence
+at layer l (with sequence length T). We treat the localization
+of reasoning as an optimization problem. Given a dataset
+Dprobe = {(xn, yn)}, we define the pooled representation
+¯hl =
+1
+T
+PT
+t=1 hl,t and seek the critical layer l∗that mini-
+mizes the linear probing loss:
+l∗= argmin
+l
+X
+(x,y)∈Dprobe
+LCE(Softmax(Wl¯hl(x)), y) (1)
+This operation identifies the computational bottleneck where
+task-relevant semantic information is maximally linearly
+separable. In Qwen3-VL, this localizes our analysis to the
+mid-decoder layers.
+Basis Extraction with Sparse Autoencoders.
+To resolve
+the superposition at l∗, we employ a TopK Sparse Autoen-
+coder (SAE) to approximate the dense state h as a linear
+combination of atomic features. The SAE learns an over-
+complete dictionary D ∈Rd×m (m ≫d) and an encoder
+E(h). Unlike standard L1-regularized models, the TopK-
+SAE enforces a hard sparsity constraint:
+z = TopKk(ReLU(Wench + benc))
+(2)
+LSAE = ∥h −(Dz + bdec)∥2
+2
+s.t. ∥D·,i∥2 = 1
+(3)
+where TopKk(·) keeps only the k largest activations and
+zeros out the rest. This ensures a fixed sparsity budget
+(L0 = k) while avoiding the shrinkage bias associated with
+L1 penalties.
+Spatial Verification via Back-Projection.
+Unlike text-
+only models, VLM features must possess physical reality.
+We define the set of image patch indices Timg ⊂{1, . . . , T}.
+To verify grounding, we define the Spatial Activation Map
+Mi ∈RH×W for feature i:
+Mi(x) = ReshapeH×W ({zi,t | t ∈Timg})
+(4)
+We validate our circuits by requiring that active regions
+(Mi(x) > 0) explicitly align with semantic objects rather
+than background noise (Figure A1 in Appendix C).
+Formal Definition of Thought Circuits.
+We reject ad-
+hoc selection. For a reasoning task τ, we define the selectiv-
+ity score σi(τ) as the standardized difference in activation
+means:
+σi(τ) =
+µi,τ −µi,¬τ
+q
+1
+2(νi,τ + νi,¬τ) + ϵ
+(5)
+Based on this variance-normalized metric, we construct: (1)
+The PATTERN SET Pτ: features maximizing σi comparing
+task-positive vs. task-negative samples. (2) The GLOBAL
+SET G: features discriminating complex reasoning from
+plain captioning distributions. These sets constitute the
+static basis of the visual thought circuit. Formally, these
+identified subsets serve as the precise coordinate inputs for
+the Masked Intervention Operator introduced in Section 4.
+4. Interference Dynamics
+Having established the basis, we define the causal dynamics
+of the system under intervention and the geometric condi-
+tions leading to modular failure.
+Masked Interventional Calculus.
+We introduce a
+Masked Intervention Operator Oλ
+S to rigorously isolate vi-
+sual reasoning from language modeling. Let fj ≡D·,j
+denote the decoder direction for feature j. We apply a token-
+affinity mask mt = I(t ∈Timg). The perturbed hidden state
+h′
+t is defined as:
+h′
+t = ht + mt ·
+X
+j∈S
+(λj −1)zj,tfj
+(6)
+3
+Sparse Visual Thought Circuits in Vision–Language Models
+Here, λ defines the regime: λ > 1 (Steering) tests suffi-
+ciency by amplifying the signal, while λ = 0 (Ablation)
+tests necessity by projecting the state onto the null space of
+S. The mask mt guarantees that performance shifts stem
+strictly from visual representation manipulation.
+Quantifying Drift and Layer Sensitivity.
+We track two
+metrics.
+First, Output Drift Rdrift measures the rate of
+ground-truth-independent label switching. Second, to ana-
+lyze depth-dependence, we define the Layerwise Sensitivity
+Profile S(l) as the empirical impact of intervention at layer
+l:
+S(l) =
+∆Acc(Oλ
+S at l)
+
+(7)
+Evaluating S(l) allows us to identify Phase Transitions
+where the system shifts from pixel-level processing to ab-
+stract semantic reasoning (typically peaking at Layer 21).
+The Mechanism of Geometric Interference.
+We posit
+that modular failure arises from subspace entanglement. We
+quantify this via the Cosine Similarity ρ between the mean
+effective directions of sets P (Pattern) and G (Global):
+ρ(P, G) = ⟨∆P, ∆G⟩
+∥∆P∥∥∆G∥,
+∆S ≜Ex
+h P
+j∈S zj(x)fj
+i
+(8)
+Theoretical Insight:
+Signal-to-Noise Collapse.
+We
+define Non-Modular Interference as the regime where
+ρ(P, G) < 0 (antagonistic alignment). This causes the
+magnitude of the union intervention vector to collapse:
+∥δ∪∥≪∥δP∥+ ∥δG∥. Consider the effective signal update
+δ in the presence of orthogonal noise ϵ. We derive the Signal
+Degradation Law post-LayerNorm:
+SNR(LN(h + δ∪)) ∝
+∥δsignal∥
+∥δsignal∥+ ∥ϵ∥
+(9)
+As geometric antagonism cancels out the semantic signal
+(∥δsignal∥→0), the ratio of nuisance variables ϵ (e.g., pol-
+ysemantic artifacts) is relatively amplified. This illustrates
+that interference does not merely “nullify” the reasoning
+boost; it actively amplifies orthogonal noise, driving the la-
+tent state off the functional manifold and maximizing output
+drift Rdrift.
+5. Experimental Setup
+To empirically validate the Noise Amplification Law and the
+existence of Visual Thought Circuits, we design a controlled
+evaluation pipeline that bridges mechanistic precision with
+out-of-distribution (OOD) generalization.
+5.1. Data Topology: Diagnostics and Generalization
+We adopt a dual-track data regime to isolate internal causal
+mechanisms and verify their stability across distribution
+shifts.
+Diagnostic Testbed: Synthetic Visual Reasoning (SVR).
+Our primary investigation utilizes a procedurally generated
+SVR benchmark, designed for fine-grained counterfactual
+control. Each scene is rendered on a discrete 4 × 4 grid,
+featuring a combinatorially controlled vocabulary of colors,
+shapes, and sizes. Questions are instantiated from deter-
+ministic templates across seven cognitive dimensions: spa-
+tial, pattern, counting, existence, comparison, attribute, and
+global. The key advantage of SVR is its difficulty-stratified
+design (easy, medium, hard), which allows us to trace
+the emergence of circuit failure as task complexity increases.
+Full generative grammars and quality control protocols are
+detailed in Appendix A.
+OOD Stress Test: External Benchmarks.
+To test the
+“ecological validity” of the identified circuits, we extend
+our evaluation to four established benchmarks: NLVR2,
+SNLI-VE, CLEVR, and VSR. These datasets span a spec-
+trum from synthetic-but-standardized scenes (CLEVR) to
+unconstrained natural images (NLVR2). We convert these
+into a unified multiple-choice format, enabling a consistent
+assessment of intervention effects across disparate visual
+and linguistic domains.
+5.2. Implementation of Sparse Decomposition
+Layerwise Localization and Validation.
+We analyze the
+Qwen3-VL-8B-Instruct backbone in bfloat16 preci-
+sion.
+Following Eq. 1, we train linear probes to iden-
+tify the semantic bottleneck. We observe a dramatic peak
+in task-type separability at the representative layer of the
+M middle 2 group (Layer 21), where the probe achieves
+an accuracy of 99.37% ± 0.12% for the 7-way classifi-
+cation task. This contrasts sharply with the early vision
+backbone (∼34.0%). To ensure this represents genuine se-
+mantic localization, a shuffled-label check confirms that
+accuracy drops to near-chance levels (∼14.3%) upon label
+randomization. We define this locus as l⋆.
+SAE Training and Mathematical Constraints.
+At l⋆,
+we train an overcomplete Sparse Autoencoder (SAE) with
+an expansion factor F = 8 (dhidden = 32,768) on residual
+stream activations. Crucially, we enforce a Unit Norm
+Constraint on the decoder dictionary (∥fi∥2 = 1) during
+training. This ensures that sparse activation magnitudes z
+faithfully represent feature importance, decoupling semantic
+direction from raw activation energy.
+Circuit Selection and Transfer Protocol.
+We construct
+the PATTERN (P) and GLOBAL (G) sets using the variance-
+normalized selectivity score σi (Eq. 5) calculated strictly
+on the SVR training split. To test the universality of these
+4
+Sparse Visual Thought Circuits in Vision–Language Models
+circuits, we adhere to a Zero-shot Intervention Transfer
+(Scheme A): for all external datasets, we reuse the same fea-
+ture sets and the same SAE weights without further tuning
+or re-selection.
+5.3. Intervention and Calibration Protocols
+We execute the Masked Intervention Operator Oλ (Eq. 6)
+targeting image patch tokens.
+Norm-Matched Calibration.
+To disentangle composi-
+tional interference from raw magnitude effects, we perform
+an exhaustive grid search to calibrate the intervention scale.
+Since the Union set involves significantly more concurrent
+features than the Pattern subset, applying the same scale
+would inject disproportionate energy. Consequently, we
+identify λ∗= 0.5 for the union set (P ∪G) as the optimal
+scale that matches the perturbation intensity of the pattern-
+only baseline (λ = 2.0). This calibration yields a minimal
+relative perturbation difference of 8.7 × 10−4, effectively
+isolating geometric interference as the sole causal driver of
+performance collapse.
+Statistical Rigor and Controls.
+We compare our findings
+against three rigorous controls:
+• Random Subspace Control: Intervening on size-
+matched random feature sets to establish the baseline
+effect of arbitrary latent perturbations.
+• Permutation Control: Shuffling membership within
+the union pool while preserving the total intervention
+norm ∥δ∥, isolating the causal significance of specific
+semantic directions.
+• Norm-Matched Single-Set Control: Matching the
+norm of a single-set intervention to that of the union to
+verify if failure is a consequence of Geometric Inter-
+ference rather than raw magnitude.
+To ensure robustness, we report mean ± std across 15 inde-
+pendent runs (3 permutation seeds × 5 data subsamples).
+Each trial is conducted with a fixed sample size of n = 600.
+5.4. Evaluation Metrics
+We report accuracy (Acc), intervention effect (∆Acc), and
+output drift (Rdrift). All metrics are computed under a strict
+multiple-choice normalization function ϕ(·), providing a
+conservative and objective measure of model behavior under
+intervention.
+6. Results
+We evaluate the structural and causal integrity of the identi-
+fied Visual Thought Circuits in Qwen3-VL-8B. Our results
+transition from demonstrating the physical grounding of
+SAE features to revealing the catastrophic failure of modu-
+lar composition through a geometric lens.
+6.1. Result 1: Feature Grounding and Causal
+Sufficiency
+Before assessing intervention outcomes, we verify that the
+SAE features at l⋆(Layer 21) possess physical reality. Spa-
+tial back-projection confirms that the Pattern features zj
+exhibit high-fidelity localization on task-relevant image
+patches. This grounding is not a mere visual correlation;
+instead, these features serve as necessary causal carriers,
+anchoring abstract symbolic computations to concrete per-
+ceptual tokens in the model’s hierarchy.
+The causal sufficiency of these features is evidenced by our
+steering experiments. As shown in Table 1, amplifying the
+Pattern set (s = 2.0) consistently yields positive perfor-
+mance gains (∆pp) across all splits. Scale-response curves
+further demonstrate that output drift increases linearly with
+s (R2 > 0.98), suggesting that SAE features act as precise
+“causal levers” rather than triggering chaotic breakdowns at
+this depth.
+6.2. Result 2: The Modularity Paradox and OOD
+Generalization
+While individual steering is effective, composability remains
+elusive. We test the modularity hypothesis by comparing
+Pattern amplification with the Norm-Matched Union inter-
+vention (P ∪G, s = 0.5).
+Table 1. Cross-model intervention summary across splits. We re-
+port base accuracy (Base), intervention effect ∆Acc in percentage
+points (∆pp), and output change rate (Chg%) for Qwen3-VL-8B
+and baseline models. All numbers are pooled over 5 seeds.
+MODEL
+PATTERN @ s=2.0
+UNION @ s=0.5
+BASE
+∆PP
+CHG(%) ∆PP
+CHG(%)
+Train Set (n=600 PER SEED)
+QWEN3-VL-8B
+0.712 +1.03
+10.97
+-1.67
+14.73
+INTERNVL3.5-8B 0.676 -1.30
+13.89
+-1.83
+17.43
+PHI-4-MM
+0.609 +0.62
+19.85
+-2.15
+21.78
+GEMMA-3N-E4B
+0.633 +0.63
+22.68
+-2.65
+23.77
+Val Set (n=600 PER SEED)
+QWEN3-VL-8B
+0.683 +0.50
+10.50
+-1.70
+16.23
+Test Set (n=600 PER SEED)
+QWEN3-VL-8B
+0.708 +0.37
+11.43
+-1.71
+14.90
+Across all models, a consistent paradox emerges: joint in-
+tervention on task-relevant Pattern and Global sets reverses
+the gains of independent steering. For Qwen3-VL-8B, the
+positive ∆pp (+0.37) collapses to -1.71 under the Union
+regime, with output drift (Chg%) increasing significantly.
+5
+Sparse Visual Thought Circuits in Vision–Language Models
+This non-modularity is not a synthetic artifact: Table 2
+shows that applying SVR-derived circuits to NLVR2 and
+CLEVR triggers the same catastrophic collapse, proving the
+observed interference is a fundamental property of the latent
+geometry.
+Table 2. Cross-dataset generalization on Qwen3-VL-8B. SAE
+weights and feature sets are fixed from Synthetic and applied
+verbatim to external benchmarks.
+DATASET
+N
+BASE PATTERN (s=2.0)
+UNION (s=0.5)
+∆PP
+CHG(%)
+∆PP
+CHG(%)
+SYNTHETIC 1500 0.706 +0.22
+10.44
+-2.33
+14.44
+NLVR2
+1500 0.895 +2.54
+4.83
+-6.29
+6.72
+VSR
+1500 0.828 +1.37
+11.50
+-4.53
+14.17
+SNLI-VE
+1500 0.407 -0.33
+5.35
+-3.18
+11.31
+CLEVR
+1500 0.532 +1.53
+21.50
+-2.68
+22.36
+6.3. Result 3: Causal Necessity via Zero-Ablation
+To complement sufficiency, we establish necessity via zero-
+ablation. Clamping Pattern set activations to zero at l⋆alters
+the model’s decision in 57.0% of test cases, despite these
+features comprising < 0.5% (nearly < 0.03%)of the dictio-
+nary. Ablating the Union set increases the flip rate to 77.0%,
+confirming these circuits as load-bearing components of the
+reasoning computation.
+6.4. Result 4: Mechanism of Interference: Geometric
+Antagonism
+Why does the joint activation of necessary and co-active
+circuits lead to failure? Our analysis reveals a critical mis-
+match between firing patterns and intervention geometry.
+Natural Co-activation and Antagonism.
+In clean infer-
+ence, these sets exhibit a near-perfect conditional firing prob-
+ability (P(G | P) ≈100%). However, their mean update
+vectors are geometrically opposed: CosSim( ¯∆p, ¯∆g) =
+−0.33. Pairwise distribution analysis shows that 45% of
+cross-set feature pairs are negatively aligned, indicating a
+diffuse, macroscopic antagonism between the two functional
+subspaces.
+Noise Amplification Law.
+The observed “interference” is
+characterized not by the injection of stochastic noise, but
+by the systematic geometric cancellation of task-relevant
+feature vectors. This vector-wise negation collapses the ef-
+fective semantic signal ∥δ∥→0. As modeled in Appendix,
+the LayerNorm operator LN(x) = γ x−µ
+σ
++ β acts as a
+stochastic multiplier during this collapse: since the standard
+deviation σ becomes dominated by latent background noise
+as the signal vanishes, the normalization process scales
+this residual noise by a factor proportional to 1/∥δ∥. This
+mechanism provides a theoretical rationale for the observed
+exponential surge in predictive entropy and output drift,
+effectively erasing the model’s visual-causal anchor.
+6.5. Layer Specificity and Phase Transitions
+Table 3. Robustness controls. (Top) Permutation control rules out
+sampling noise. (Bottom) Subsample-size N confirms stability of
+the intervention effect.
+CONFIG (N=600)
+∆PP
+CHG(%)
+PATTERN (PERM, s=2.0)
+-0.77 ± 1.0
+15.41 ± 1.8
+UNION (PERM, s=0.5)
+-0.67 ± 0.5
+14.73 ± 1.8
+Whole-layer scans reveal a critical phase transition in steer-
+ability. Earlier layers (M middle 1) exhibit hypersensi-
+tivity, where any intervention triggers chaotic collapse
+(∆pp ≈−16.0). In contrast, Layer 21 (M middle 2) op-
+erates in a robust semantic regime, allowing for stable
+steering. This identifies the mid-decoder as the optimal
+locus where stable visual thought circuits emerge from sen-
+sory noise.
+Table 4. Non-monotonic Sensitivity at Layer 10. Results reveal
+a U-shaped recovery: weak intervention scales (s < 0.5) trigger
+noise-amplified collapse, while higher magnitudes (s →2.0)
+override the noise threshold to restore performance. Mean ± std
+over 2 seeds.
+LOW–MID SCALE
+MID–HIGH SCALE
+s
+∆PP
+DRIFT (%)
+s
+∆PP
+DRIFT (%)
+0.20
+-25.5 ± 3.8
+48.1 ± 2.9
+0.65
+-15.8 ± 0.5
+33.3 ± 1.1
+0.33
+-19.2 ± 2.8
+39.1 ± 3.7
+0.75
+-16.1 ± 0.8
+33.4 ± 2.0
+0.35
+-18.8 ± 2.2
+38.9 ± 2.7
+1.00
+-16.0 ± 0.7
+33.1 ± 0.8
+0.40
+-18.3 ± 1.4
+37.0 ± 2.1
+1.25
+-17.2 ± 0.7
+35.8 ± 1.5
+0.45
+-16.5 ± 0.9
+34.8 ± 1.5
+1.50
+-17.8 ± 1.6
+38.2 ± 2.6
+0.50
+-16.6 ± 1.1
+34.5 ± 2.1
+1.75
+-11.2 ± 0.2
+31.0 ± 1.2
+0.55
+-15.8 ± 0.4
+33.5 ± 1.6
+2.00
+-4.7 ± 0.1
+27.2 ± 1.2
+0.60
+-15.7 ± 0.7
+33.7 ± 1.2
+–
+–
+–
+The Signal-to-Noise Threshold at Layer 10.
+To contex-
+tualize l⋆stability, we sweep s ∈[0.2, 2.0] at Layer 10 to
+probe the perceptual-semantic boundary (Table 4). The re-
+sponse is non-monotonic: minimal steering (s ∈[0.2, 0.4])
+acts as adversarial noise, degrading accuracy by > 25 pp
+with 48% drift.
+Performance paradoxically recovers at
+higher magnitudes; strong steering (s = 2.0) suppresses
+latent noise, restoring accuracy to within 4.7 pp. This U-
+shaped recovery indicates a critical signal-to-noise threshold
+in shallow layers. Unlike the semantic linearity at l⋆, Layer
+10 representations remain entangled. There, weak δ vectors
+fail to command semantics and are amplified as noise; only
+high-magnitude injection (s > 1.5) overrides the chaotic
+background, validating l⋆as the locus of linear steerability.
+6
+Sparse Visual Thought Circuits in Vision–Language Models
+0
+8
+16
+20
+24
+28
+Probing Accuracy
+Layer Depth
+Output Drift (Chg%)
+Acc. Change (pp)
+Acc. Change (pp)
+Intervention Scale (s)
+(A) Circuit Localization
+(B) The Compositional Paradox
+(C) Mechanism: Signal-to-Noise
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+36
+0
+5
+10
+15
+20
+25
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+2.00
+Output Drift (Chg%)
+-8
+-4
+-2
+0
+2
+4
+L = 21
+Semantic Reasoning
+Output
+Perception
+Middle 2
+-6
+NLVR2
+Synthetic
+VSR
+CLEVR
+Pattern
+Union
+-30
+-25
+-20
+-15
+-10
+-5
+50
+45
+40
+35
+30
+25
+SNLI-VE
+Collapse Regime
+Acc. Change
+Output Drift
+Noise Dominant
+(Collapse)
+Signal Dominant
+(Recovery)
+4
+12
+Figure 2. The Compositional Paradox: From Circuit Discovery to Mechanical Failure. (A) Circuit Localization: Layerwise probing
+reveals a clear phase transition: visual reasoning capability (l⋆) emerges and peaks at Layer 21 (99.2% accuracy), distinct from the
+early Perception stage and the late Output saturation. (B) The Paradox: Across five benchmarks, while individual Pattern steering
+(circles) generally yields positive gains, the joint Union intervention (squares) consistently drives the model into the “Collapse Regime”
+(shaded pink), characterized by high output drift and accuracy degradation. (C) Mechanism Validation: Fine-grained analysis on the
+hypersensitive Layer 10 reveals a non-monotonic U-shaped recovery. Weak signals (s < 0.5) act as adversarial noise causing collapse,
+confirming that a critical signal-to-noise threshold must be overcome for effective steering.
+Figure 3. Mechanism of Compositional Collapse. (A) Geomet-
+ric Antagonism: Although individual Pattern and Global vectors
+are strong, their antagonistic alignment (θ > 90◦) causes the
+Union vector to shrink significantly inside the unit circle (Signal
+Collapse). (B) Noise Amplification: This reduced signal mag-
+nitude ∥δ∥pushes the system into the hypersensitive “Collapse
+Regime,” where the layer normalization operator forces an expo-
+nential amplification of latent noise.
+6.6. Robustness and Control Studies
+Ruling out Statistical Artifacts.
+To rule out the possibil-
+ity that the observed interference is an artifact of sampling
+variance or feature selection, we conduct control experi-
+ments on two dimensions: (1) Subsample Stability, varying
+evaluation set size N from 200 to 1000 to test statistical reli-
+ability; and (2) Permutation Control, intervening on random
+feature sets of equivalent sparsity to verify semantic speci-
+ficity. As detailed in Table 5, the intervention effects exhibit
+remarkable stability. The Pattern set consistently improves
+accuracy across all sample sizes, with the standard deviation
+shrinking as expected as N increases (0.7 →0.5). Crucially,
+the Union intervention triggers the same distinctive “col-
+Table 5. Comprehensive Control Experiments on Synthetic.
+(Top) Subsample Robustness: We vary the evaluation size N to
+test stability against sampling noise. The Union collapse signature
+persists across all sizes. (Bottom) Specificity Check: We apply
+random permutations to the feature indices. The null effect con-
+firms that the observed phenomena are specific to the identified
+semantic circuits. Data pooled over 5 seeds.
+CONFIG
+PATTERN (s=2.0)
+UNION (s=0.5)
+∆PP
+CHG(%)
+∆PP
+CHG(%)
+A. Subsample Size Robustness
+N=200
++1.40 ± 0.7 13.00 ± 3.4 -0.10 ± 1.1 15.20 ± 3.2
+N=400
++1.55 ± 0.6 10.65 ± 1.4 -1.55 ± 0.5 14.15 ± 1.0
+N=600
++1.03 ± 0.7 10.97 ± 1.6 -1.67 ± 0.6 14.73 ± 1.9
+N=800
++0.63 ± 0.3 10.55 ± 0.8 -1.38 ± 0.8 14.75 ± 0.9
+N=1000
++0.88 ± 0.5 11.10 ± 0.7 -0.62 ± 0.8 15.22 ± 0.7
+B. SPECIFICITY CONTROL
+PERMUTATION -0.77 ± 1.0 15.41 ± 1.8 -0.67 ± 0.5 14.73 ± 1.8
+lapse signature”—negative ∆pp combined with high output
+drift—even at low sample sizes (N=200), effectively ruling
+out data noise as a causal factor. This persistence confirms
+that the functional divergence between individual and com-
+posite steering is structurally determined, not a statistical
+fluctuation.
+Furthermore, permutation control yields a near-zero accu-
+racy change (∆pp ≈−0.7), confirming that observed ef-
+fects are driven by specific semantic content rather than
+injected energy magnitude. This serves as a null hypothesis,
+proving that interference arises strictly from the geometric
+interaction of meaningful features, validating the Composi-
+tional Paradox as a robust, intrinsic property of the model’s
+latent geometry.
+7
+Sparse Visual Thought Circuits in Vision–Language Models
+7. Discussion
+Our findings establish a dichotomy in VLM steering: while
+individual features are manipulable, their compositions are
+fragile, and the optimal control locus is remarkably narrow
+(l⋆= 21). We propose structural hypotheses for these
+phenomena below.
+7.1. Hypothesizing the Phase Transition: Why Layer
+21?
+The emergence of steerability at Layer 21 suggests a critical
+Perceptual-Semantic Interface within the transformer hierar-
+chy. We interpret this phase transition through the evolution
+of the model’s weight structure:
+• Early Layers (Entangled Regime): Below Layer 10,
+residual streams are dominated by high-frequency per-
+ceptual signals. SAE features here are likely polyse-
+mantic, encoding pixel correlations over conceptual
+distinctness. Interventions fail as “semantic directions”
+are ill-defined; δ injection acts as adversarial noise
+against the dense perceptual manifold, triggering the
+observed signal-to-noise collapse.
+• Layer 21 (The Saddle Point): We characterize Layer
+21 as a potential Global Convergence Point, where
+visual tokens are projected onto the semantic space.
+We hypothesize that the representation manifold at this
+layer exhibits maximum linear separability, allowing
+steering vectors to operate with minimal interference.
+• Late Layers (Saturated Regime): Beyond Layer 24,
+drift becomes increasingly non-linear. While rigor-
+ous characterization via Hessian spectral analysis is
+left for future work, this suggests significant manifold
+curvature. Such curvature renders linear interventions
+(⃗h + λ⃗v) imprecise, as steering vectors diverge from
+the curved semantic geodesic, manifesting as output
+saturation.
+7.2. The Compositional Paradox: Geometric
+Interference
+Union steering failure exposes fundamental limits of the
+Linear Representation Hypothesis in VLMs. While standard
+theory assumes concepts span orthogonal subspaces, our
+results show visual features share a non-orthogonal basis
+(consistent with the observed CosSim ≈−0.33), leading to
+systematic interference.
+We propose that activating the Union set (Punion) triggers
+Destructive Interference. Unlike abstract linguistic tokens,
+visual concepts are physically grounded and likely constrain
+the available latent capacity. When multiple high-level con-
+cepts (e.g., “counting” and “spatial relation”) are activated
+simultaneously, they may compete for shared subspaces
+within the residual stream.
+Instead of a clean superposition, the combined vector mag-
+nitude likely pushes the hidden state off-manifold—into
+undefined regions of the activation space where the model’s
+transfer functions are ill-conditioned. This geometric ex-
+planation aligns with the observed Collapse Regime: the
+interference is not merely additive noise, but a structural
+incompatibility driven by Visual Grounding Conflicts.
+7.3. Implications and Limitations
+We challenge the “lever” metaphor, which assumes latent
+spaces can be manipulated via linear offsets regardless of
+data distribution. Findings suggest modular composition
+fails when the residual stream is driven off-manifold. We
+thus advocate for Manifold-Aware Steering, a paradigm
+ensuring causal interventions remain constrained to the local
+tangent space of learned representations.
+Structural Limitations. Our study relies on a single SAE
+architecture (Qwen3-VL). While our geometric interpreta-
+tion is consistent with the data, the precise depth of the
+phase transition may shift in other models. Furthermore,
+our “Union” definition is currently restricted to additive
+composition; extending this to complex logical interactions
+remains an open frontier.
+Temporal Limitations. Our intervention enforces Temporal
+Stationarity by clamping vectors with constant magnitude.
+This conflicts with the inherent dynamism of reasoning.
+Global clamping lacks the precision to respect transient
+feature windows, effectively “over-steering” during non-
+relevant timesteps. Future work must develop dynamic
+schedules to minimize output drift.
+8. Conclusion
+We established a causal pipeline to localize and dissect Vi-
+sual Thought Circuits in Qwen3-VL-8B-Instruct. While
+we isolated features with near-perfect task selectivity and
+demonstrated causal necessity, we uncovered a critical
+boundary:
+the failure of modular composition.
+Our
+findings—validated across five datasets—confirm that VLM
+latent space is non-modular when subjected to composite
+causal steering. By identifying geometric antagonism and
+noise amplification as primary drivers of interference, we
+provide a diagnostic framework for the interpretability com-
+munity. These insights suggest the path toward controllable
+VLM reasoning lies not just in identifying more features,
+but in mastering the geometric coordination between them.
+Future work must extend this lens to broader model families
+and multi-site interventions, moving beyond additive steer-
+ing toward robust, manifold-aware control in multimodal
+settings.
+8
+Sparse Visual Thought Circuits in Vision–Language Models
+References
+Arad, D., Mueller, A., and Belinkov, Y. Saes are good for
+steering – if you select the right features. In Proceedings
+of the 2025 Conference on Empirical Methods in Natu-
+ral Language Processing, pp. 10252–10270. Association
+for Computational Linguistics, 2025. doi: 10.18653/v1/
+2025.emnlp-main.519. URL http://dx.doi.org/
+10.18653/v1/2025.emnlp-main.519.
+Bai, J., Yuan, L., Xia, S.-T., Yan, S., Li, Z., and Liu,
+W. Improving vision transformers by revisiting high-
+frequency components, 2022. URL https://arxiv.
+org/abs/2204.00993.
+Bricken, T., Templeton, A., Batson, J., Chen, B.,
+Jermyn, A., Conerly, T., Turner, N., Anil, C., Deni-
+son, C., Askell, A., et al.
+Towards monoseman-
+ticity:
+Decomposing language models with dictio-
+nary learning.
+Transformer Circuits Thread, 2023.
+URL https://transformer-circuits.pub/
+2023/monosemantic-features.
+Dafnis, K. M. and Metaxas, D. N. Test-time spectrum-aware
+latent steering for zero-shot generalization in vision-
+language models, 2025. URL https://arxiv.org/
+abs/2511.09809.
+Engels, J., Michaud, E. J., Liao, I., Gurnee, W., and
+Tegmark, M. Not all language model features are one-
+dimensionally linear, 2025. URL https://arxiv.
+org/abs/2405.14860.
+Golovanevsky, M., Rudman, W., Palit, V., Singh, R., and
+Eickhoff, C. What do vlms notice? a mechanistic inter-
+pretability pipeline for gaussian-noise-free text-image cor-
+ruption and evaluation, 2025. URL https://arxiv.
+org/abs/2406.16320.
+Kaduri, O., Bagon, S., and Dekel, T. What’s in the image? a
+deep-dive into the vision of vision language models, 2024.
+URL https://arxiv.org/abs/2411.17491.
+Li, Q., Ye, Z., Feng, X., Zhong, W., Ma, W., and Feng, X.
+Causal tracing of object representations in large vision
+language models: Mechanistic interpretability and hal-
+lucination mitigation, 2025. URL https://arxiv.
+org/abs/2511.05923.
+Liang, W., Zhang, Y., Kwon, Y., Yeung, S., and Zou, J.
+Mind the gap: Understanding the modality gap in multi-
+modal contrastive representation learning, 2022. URL
+https://arxiv.org/abs/2203.02053.
+Lieberum, T., Rajamanoharan, S., Conmy, A., Smith, L.,
+Sonnerat, N., Varma, V., Kram´ar, J., Dragan, A., Shah, R.,
+and Nanda, N. Gemma scope: Open sparse autoencoders
+everywhere all at once on gemma 2, 2024. URL https:
+//arxiv.org/abs/2408.05147.
+Ma, R., Yan, Y., Zhang, C., Yin, M., Liu, X., Jin, Z., and
+Hu, Z. Watch closely: Mitigating object hallucinations
+in large vision-language models with disentangled decod-
+ing, 2025. URL https://arxiv.org/abs/2512.
+19070.
+Marks, S., Rager, C., Michaud, E. J., Belinkov, Y., Bau, D.,
+and Mueller, A. Sparse feature circuits: Discovering and
+editing interpretable causal graphs in language models.
+In The Thirteenth International Conference on Learning
+Representations, 2025. URL https://openreview.
+net/forum?id=I4e82CIDxv.
+Neo, C., Ong, L., Torr, P., Geva, M., Krueger, D., and Barez,
+F. Towards interpreting visual information processing in
+vision-language models, 2025. URL https://arxiv.
+org/abs/2410.07149.
+Shao, H., Qian, S., Xiao, H., Song, G., Zong, Z., Wang,
+L., Liu, Y., and Li, H. Visual cot: Advancing multi-
+modal language models with a comprehensive dataset and
+benchmark for chain-of-thought reasoning, 2024. URL
+https://arxiv.org/abs/2403.16999.
+Sivakumar, A., Zhang, A., Hakim, Z., and Thomas, C.
+Steervlm: Robust model control through lightweight acti-
+vation steering for vision language models, 2025. URL
+https://arxiv.org/abs/2510.26769.
+Templeton, A., Conerly, T., Marcus, J., Lindsey, J., Bricken,
+T., Chen, B., Pearce, A., Citro, C., Ameisen, E., Jones, A.,
+Cunningham, H., Turner, N. L., McDougall, C., Mac-
+Diarmid, M., Freeman, C. D., Sumers, T. R., Rees,
+E., Batson, J., Jermyn, A., Carter, S., Olah, C., and
+Henighan, T.
+Extracting interpretable features from
+claude 3 sonnet.
+Transformer Circuits Thread, May
+2024. URL https://transformer-circuits.
+pub/2024/scaling-monosemanticity/.
+Ac-
+cessed: 2026-01-09.
+Zaigrajew, V., Baniecki, H., and Biecek, P. Interpreting
+clip with hierarchical sparse autoencoders, 2025. URL
+https://arxiv.org/abs/2502.20578.
+Zou, Z., Gao, Y., Guan, J., Li, B., and Marttinen, P. Adaptive
+residual-update steering for low-overhead hallucination
+mitigation in large vision language models, 2025. URL
+https://arxiv.org/abs/2511.10292.
+9
+Sparse Visual Thought Circuits in Vision–Language Models
+A. Synthetic Visual Reasoning Dataset
+Generation pipeline.
+We construct a small, fully syn-
+thetic visual reasoning dataset to probe internal representa-
+tions of a frozen vision–language model. Each image is ren-
+dered as a 128×128 RGB canvas with a discrete 4×4 grid.
+For each example, we first sample a scene configuration
+under a global random seed: we draw the number of objects,
+assign each object a shape, color, size, and grid location
+(with at most one object per cell), and then render the scene
+with a deterministic renderer. Conditioned on the resulting
+symbolic scene state, we sample one reasoning task type
+(Section 5.1) and instantiate a question–answer pair from
+task-specific templates. We generate train/validation/test
+splits with fixed seeds; for the main configuration used
+throughout the paper, this yields 6,000/1,500/1,500 exam-
+ples, respectively. The generator can optionally emit paired
+non-reasoning controls (e.g., caption-like or attribute-only
+questions), but in this work we focus on the reasoning sub-
+set.
+Visual elements.
+Visual content is defined by a config-
+urable vocabulary stored in a JSON file. The color palette
+contains 12 discrete colors specified as hex RGB codes
+(e.g., 003049 for navy, D62828 for red) together with
+human-readable names used in text. The shape vocabulary
+contains 15 shape IDs (e.g., circle, square, triangle, ellipse,
+diamond, star, heart, arrow, moon), each mapped to a con-
+crete renderer and a display name. Objects also carry a
+coarse size attribute (small or large) and a grid location
+(x, y) ∈{0, . . . , 3}2. The generator writes both symbolic
+attributes and renderer parameters (including hex codes)
+into metadata, making the visual space easy to extend and
+the dataset easy to regenerate under alternative vocabularies.
+Task types and question templates.
+Each example is
+labeled with one of seven task types: counting, comparison,
+spatial, pattern, existence, global, and attribute logic. For
+each type we implement a family of question templates with
+light surface variation:
+• Counting asks for the number of objects satisfying a
+predicate, e.g., “How many navy triangles are there?”
+or “What is the number of red circles in the picture?”.
+• Comparison compares counts of two sets, e.g., “Are
+there more yellow squares than blue circles?”, “Do we
+have at least as many green stars as purple hearts?”, or
+“Are there fewer moons than diamonds?”.
+• Spatial queries relative positions, e.g., “Is the red circle
+to the left of the blue square?”, “Is any teal triangle
+directly above a navy ellipse?”, or “Does a yellow star
+appear below the purple heart?”.
+• Pattern renders a dedicated 3×3 colored-tile panel
+(embedded in the scene) with one masked cell, and
+asks for the missing color under a simple rule (e.g.,
+row-wise repetition or horizontal symmetry), e.g., “To
+complete the pattern, what color should fill the top-
+middle position?”.
+• Existence asks for the presence or absence of a set,
+e.g., “Is there an orange triangle in the scene?” or “Do
+you see any large blue squares?”.
+• Global queries whole-image properties, e.g., “Are all
+objects the same color?”, “Are there more than three
+objects in total?”, or “Is the total number of objects at
+most four?”.
+• Attribute logic combines attributes with logical opera-
+tors, e.g., “Are there any ellipses that are not rust red?”
+or “Is every triangle either yellow or teal?”.
+To avoid degenerate questions, we explicitly rule out ill-
+posed templates (e.g., comparing a set to itself, or querying
+attributes that are absent from the underlying scene), and
+resample whenever such configurations would arise.
+Difficulty control.
+Each example is labeled with a dis-
+crete difficulty level (easy, medium, or hard). Difficulty
+is controlled by task-specific heuristics along three axes: (1)
+the number of objects and distractors in the scene, (2) the
+combinatorial complexity of the queried condition, and (3)
+the structure of the underlying pattern rule (for pattern). For
+instance, easy counting and existence questions typically
+involve a single attribute predicate and sparse scenes, while
+medium/hard instances add more objects, distractors, and
+tighter thresholds. Spatial questions become harder when
+distractors with similar attributes are added or when rela-
+tions are chained. For pattern questions, hardness increases
+with rule family (e.g., symmetry vs. repetition) and with the
+ambiguity induced by distractor colors.
+Quality control and release.
+The generator logs full
+scene metadata for every example, including the list of ob-
+jects and task-specific fields (e.g., pattern grids and thresh-
+old parameters). We implement an independent validator
+that recomputes the correct answer from metadata for each
+example and compares it to the stored answer. On the final
+synthetic splits used in our experiments (9,000 examples
+in total), this logical recomputation check reports zero mis-
+matches. The dataset is not derived from any existing bench-
+mark and is intentionally kept small to keep experiments
+computationally lightweight. We will release the generation
+code, configuration files, and the exact train/validation/test
+splits used in this paper to support reproducibility and
+follow-up work.
+A1
+Sparse Visual Thought Circuits in Vision–Language Models
+B. External Datasets and Cross-Dataset
+Protocol
+Goal and scope.
+This appendix specifies (i) how we con-
+vert external benchmarks into the unified SVTC format, and
+(ii) the precise protocol used for Table 2. We emphasize
+that our cross-dataset experiment evaluates transfer of in-
+tervention behavior (changes in accuracy and drift) under
+distribution shift, rather than claiming that Synthetic task-
+type selectivity is preserved as a semantic taxonomy on each
+external dataset.
+Scheme A (fixed circuits; no per-dataset re-selection).
+For all external datasets, we reuse the same SAE trained on
+Synthetic at the probe-selected locus, and we reuse the same
+feature sets constructed from Synthetic selectivity: pattern
+at s=2.0 and union (pattern plus global) at s=0.5. That
+is, we do not compute dataset-specific selectivity scores
+and we do not re-define task labels to rebuild sets on each
+dataset. This design makes cross-dataset evaluation a direct
+stress test of whether the non-modularity signature (union
+hurting accuracy while increasing drift) persists when the
+input distribution and label space change.
+Unified data format.
+Each dataset is stored under a
+dataset root with an images/ directory and a reason-
+ing test.jsonl file (and optionally reasoning train.jsonl, rea-
+soning val.jsonl for bookkeeping). Each JSONL record
+contains (at minimum) an image path, a natural-language
+prompt/question, and a discrete target answer from a fixed
+candidate set. We also include dataset-specific metadata
+fields (e.g., original IDs and raw labels) to enable auditing
+and reconstruction.
+Evaluation protocol (strict multiple-choice).
+All cross-
+dataset results use strict evaluation: we score an example
+as correct if and only if the model’s discrete predicted op-
+tion matches the ground-truth option after deterministic
+normalization. For binary tasks, the candidate set is {A, B}
+(mapped from {true,false} or {entails, contradicts} depend-
+ing on the dataset). For multi-class tasks, we map labels to
+a fixed option alphabet and enforce a single-option output.
+We report Base accuracy, intervention effect ∆Acc in per-
+centage points (∆pp), and Chg(%), where Chg(%) is the
+fraction of evaluated test examples whose discrete predicted
+option changes under the intervention.
+Test splits.
+In Table 2, N denotes the number of test ex-
+amples in our processed test split. For all datasets reported,
+N=1500 and we evaluate on the entire processed test split
+(i.e., no additional subsampling at evaluation time). When
+the original benchmark test set exceeds 1500 examples, we
+form a fixed-size test split by deterministic sampling with
+a fixed global seed and log the selected example IDs for
+reproducibility.
+NLVR2.
+NLVR2 is a compositional visual reasoning
+benchmark where each example consists of two images
+and a textual statement with a binary label. We convert
+each example into a single SVTC instance by representing
+the paired images as a two-image input to the VLM and
+mapping the binary label to a two-option multiple-choice
+target. We preserve the original example IDs and the raw
+label in metadata.
+SNLI-VE.
+SNLI-VE is a visual entailment benchmark
+consisting of an image, a hypothesis sentence, and an en-
+tailment relation label. For strict multiple-choice evaluation,
+we map the label space into a fixed option set. In our binary
+variant used here, we map the task to entails vs. not-entails
+(where not-entails aggregates non-entailment relations) and
+record the original fine-grained label in metadata. This
+yields a two-option strict classification setting compatible
+with our intervention metrics.
+CLEVR.
+CLEVR is a synthetic-but-standardized visual
+QA benchmark with programmatically generated scenes
+and questions. We use the official images and questions,
+and we convert answers into a fixed discrete option set by
+enumerating the answer vocabulary for the selected split and
+mapping each answer string to an option ID. We also retain
+the original question family/program annotations (when
+available) in metadata, although we do not use them for
+feature-set construction under Scheme A.
+VSR (random).
+VSR is a visual–semantic reasoning
+benchmark with image–text inputs and discrete labels. We
+construct an offline processed split with fixed sampling
+(seeded) and store a stable image map {split}.jsonl
+to ensure each record points to a local file under images/.
+We map the label space into strict multiple-choice options
+and retain the original IDs/relations in metadata.
+Reproducibility notes.
+For each dataset, we log: (i) the
+exact list of example IDs included in the processed test split,
+(ii) the label-to-option mapping, and (iii) the prompt tem-
+plate used to enforce single-option outputs. All cross-dataset
+interventions reuse the same Synthetic-trained SAE check-
+point and the same Synthetic-derived feature sets without
+modification, ensuring that Table 2 reflects a direct transfer
+test of intervention behavior.
+C. Expanded Discussions
+Why Single-Layer Intervention is Sufficient?
+One
+might ask whether multi-layer interventions could alter the
+observed non-modular behavior. Our layer-wise analysis
+(Appendix I) provides strong evidence against this utility.
+A2
+Sparse Visual Thought Circuits in Vision–Language Models
+Since early-middle layers (e.g., Layer 10) operate in a hy-
+persensitive regime where interventions trigger collapse,
+jointly intervening on them would likely introduce destruc-
+tive noise rather than constructive signal. This suggests that
+the ”Visual Thought Circuit” is spatially localized at the
+network’s semantic bottleneck (Layers 16–20), justifying
+our focus on identifying and steering the single most critical
+representational stage.
+The Paradox of Global Pooling and Spatial Precision.
+A methodological critique of our approach might target the
+use of global average pooling for feature discovery. Given
+that visual reasoning is inherently spatial (e.g., ”left of”,
+”top corner”), does pooling destroy necessary topological in-
+formation? Figure A1 offers a compelling counter-evidence.
+Although the SAE features were learned from spatially
+pooled signals, the resulting feature activations retain pre-
+cise localization when mapped back to the 2D grid. Feature
+#2398 (Pattern Detector), for instance, stays dormant on
+background patches and activates exclusively on the task-
+relevant colored tiles. This implies a Holographic Property
+of VLM representations at Layer 21: the semantic identity
+of a visual concept is encoded globally in the channel di-
+mension, while its occurrence is preserved locally in the
+sequence dimension. This validates our decision to steer
+via global vectors—we are essentially amplifying the ”con-
+cept” channel globally, relying on the model’s internal atten-
+tion heads to route this amplification to the correct spatial
+patches.
+Is Drift Driven by Magnitude or Direction?
+We consid-
+ered the possibility that the ”Union” failure (drift) is sim-
+ply an artifact of excessive norm magnitude (∥vunion∥≈
+2∥vsingle∥). However, two observations refute this ”Mag-
+nitude Hypothesis”: (1) Even when we clamp the Union
+vector norm to match the single-task norm (∥vunion∥←
+∥vpattern∥), accuracy does not recover to additive levels,
+and drift remains higher than the baseline. (2) In the single-
+feature sweep (Table 4), high magnitudes (s = 2.0) on
+aligned features actually reduce drift compared to low mag-
+nitudes (s = 0.2). This confirms that the ”Interference
+Boundary” is a geometric phenomenon, not a scalar one.
+The model tolerates high-energy interventions provided they
+lie on the semantic manifold; it is the off-manifold direc-
+tionality of the Union vector (caused by the negative cosine
+similarity) that triggers the hallucination regime.
+Layer 21 as an Implicit Visual Chain-of-Thought.
+Why
+does the ”Thought Circuit” emerge specifically at Layer
+21? In text-only LLMs, ”thinking” is often explicit, mani-
+fested as generated Chain-of-Thought tokens. In VLMs, we
+hypothesize Layer 21 represents an Implicit Visual CoT.
+Before this layer, the model performs ”Perception” (binding
+Figure A1. Spatial Grounding of Visual Thought. Activation
+heatmap of Feature #2398 from the Pattern Set. Despite being
+discovered via global pooling, the feature functions as a precise
+semantic detector, selectively activating (red) on the target visual
+objects while ignoring the background (blue).
+pixels to local features); after this layer, it performs ”Gen-
+eration” (mapping semantics to tokens). Layer 21 acts as
+the Reasoning Bridge—a transient state where the visual
+scene is fully abstracted into manipulable concepts (e.g.,
+”count=3”, ”shape=circle”) but not yet collapsed into lan-
+guage syntax. Intervening here is akin to injecting a ”silent
+thought” directly into the model’s working memory. Fu-
+ture work might explore if extracting activations from this
+layer could supervise explicit CoT generation, closing the
+loop between mechanistic interpretability and behavioral
+alignment.
+D. Mathematical Formalism
+D.1. Objective of Top-K Sparse Autoencoders
+Let x ∈Rdmodel denote the input activation vector. We
+formulate the SAE training as a constrained optimization
+problem seeking a dictionary D ∈Rdsae×dmodel and dis-
+crete codes z. Unlike L1-relaxed objectives, the Top-K
+formulation imposes a strict cardinality constraint on the
+latent support supp(z):
+min
+D,z Ex
+
+∥x −Dz∥2
+2
+
+s.t.
+∥z∥0 = k,
+∥Di∥2 = 1
+(10)
+where the encoding step z(x) approximates the solution to
+the sparse coding problem via a truncated projection:
+z(x) = TopKk (ReLU(Wencx + benc))
+(11)
+This formulation prevents the ”shrinkage bias” inherent in
+Lasso-style objectives, ensuring that the feature magnitudes
+in z faithfully represent semantic activation strengths.
+D.2. Theoretical Framework for Geometric Interference
+To provide a rigorous geometric intuition for the empirically
+observed ’Drift’, we model the steering operation using a
+A3
+Sparse Visual Thought Circuits in Vision–Language Models
+manifold perturbation framework. In Section 7, we identi-
+fied that the Union intervention leads to functional collapse.
+Here, we demonstrate that this is not merely due to linear
+cancellation, but due to nonlinear amplification of noise via
+Layer Normalization.
+Let h ∈Rd be the residual stream state. We decompose h
+into a semantic signal component δ and an orthogonal noise
+component ϵ:
+h = δ + ϵ,
+where δ ⊥ϵ
+(12)
+The intervention injects steering vectors such that the com-
+posite signal is δ = hs + α(vA + vB). In the case of
+Geometric Antagonism, where cos(vA, vB) ≈−0.33, the
+vector-wise negation leads to a signal collapse: ∥δ∥→0.
+We define the effective Signal-to-Noise Ratio (SNR) as:
+SNR = ∥δ∥2
+∥ϵ∥2
+(13)
+The Stochastic Multiplier Effect.
+Transformer blocks
+apply Layer Normalization (LN) which re-scales the vector
+to a fixed gain γ. The post-intervention normalized state is:
+LN(˜h) = γ
+δ + ϵ
+p
+∥δ∥2 + ∥ϵ∥2 + β
+(14)
+We define the Noise-to-Signal Ratio (NSR) in the output
+as the magnitude of the noise component relative to the
+semantic signal. The relative amplification factor is:
+NSRout = ∥ϵ∥
+∥δ∥∝
+1
+∥δ∥
+(15)
+As ∥δ∥→0, the term 1/∥δ∥grows exponentially, providing
+the formal basis for the Noise Amplification Law proposed
+in Section 5.4.
+D.3. Impact on Attention Mechanism and Object
+Grounding
+To understand how the signal-to-Noise ratio (SNR) collapse
+derived in Eq. 13 translates to functional failure (hallucina-
+tion), we examine the self-attention mechanism. Consider
+a single head at layer l with query and key projections
+WQ, WK. The pre-softmax attention score between a query
+token i and a visual patch j is:
+aij =
+1
+√dk
+(WQ˜hi)T (WK˜hj)
+(16)
+Substituting the intervened state ˜h = hs + hϵ (where hs is
+the suppressed signal and hϵ is the amplified noise):
+aij ≈
+1
+√dk
+
+(WQhs)T (WKhs)
+|
+{z
+}
+Semantic Affinity
++ (WQhϵ)T (WKhϵ)
+|
+{z
+}
+Noise Correlation
++O(Cross-terms)
+
+(17)
+Under normal operation, the Semantic Affinity term domi-
+nates, creating a peaked attention distribution (low entropy)
+focused on relevant objects. However, under destructive
+interference, ∥hs∥→0 while ∥hϵ∥increases. The attention
+scores become dominated by the Noise Correlation term.
+Since hϵ represents high-frequency perceptual noise, it is
+likely isotropic or weakly correlated across patches. Con-
+sequently, the attention logits aij shrink in variance (or are
+driven by random noise correlations), causing the attention
+weights αij = Softmax(aij) to approach a uniform distri-
+bution:
+lim
+∥hs∥→0 Entropy(αi) →Max Entropy
+(18)
+This Attention Entropy Maximization implies that the
+model loses its ”visual pointer,” attending globally to the
+entire image rather than the specific object. The subse-
+quent MLP layers, receiving this diffuse context, default to
+language-prior-driven generation (hallucination) rather than
+grounded reasoning.
+D.4. Curvature Analysis via Taylor Expansion
+We theoretically bound the error of our linear intervention
+assumption. Let M ⊂Rd be the semantic manifold of the
+VLM. The ”true” steering operation corresponds to mov-
+ing along a geodesic γ(t) on M starting at h0 with initial
+velocity v. Our linear intervention approximates this as
+˜hlin = h0 + αv. Using the second-order Taylor expansion
+of the geodesic map (the exponential map exph0(αv)):
+γ(α) = h0 + αv + α2
+2 Γh0(v, v) + O(α3)
+(19)
+where Γh0(·, ·) represents the Christoffel symbols (connec-
+tion coefficients) characterizing the local curvature of the
+manifold at h0. The Drift Error Edrift is the Euclidean
+distance between our linear point and the true manifold
+point:
+Edrift(α) = ∥˜hlin −γ(α)∥≈α2
+2 ∥Γh0(v, v)∥
+(20)
+This derivation explains the layer-wise phenomenology:
+1. Layer 21 (Flat Regime): The manifold is locally Eu-
+clidean (Γ ≈0), meaning linear vectors approximate
+A4
+Sparse Visual Thought Circuits in Vision–Language Models
+geodesics well (Edrift ≈0). This explains the high
+efficacy and low drift.
+2. Late Layers (Curved Regime): As the representa-
+tions specialize for token prediction, the manifold cur-
+vature ∥Γ∥increases significantly. Even for constant
+α, the quadratic error term α2
+2 ∥Γ∥grows, pushing ˜hlin
+off-manifold. This provides a geometric justification
+for the ”Drift” metric rising in deeper layers despite
+constant intervention strength.
+E. Implementation Details
+Model Architecture and Environment.
+All experiments
+are conducted primarily on Qwen3-VL-8B-Instruct, whose
+language decoder consists of 36 transformer layers with
+hidden size 4096. The model is loaded in BF16 precision
+to reduce memory footprint. We intervene on the decoder
+residual stream at the output of selected transformer blocks
+(post-MLP). All input images are resized to 336×336 pixels
+(padded with neutral gray), yielding a fixed 24×24 visual
+patch grid. Inference is performed with greedy decoding
+(temperature 0.0) for reproducibility unless otherwise speci-
+fied. Optimizer: Adam.
+SAE Training Configuration.
+We train a TopK sparse
+autoencoder (SAE) on activations extracted from Layer 21,
+which serves as the representative locus for the fixed decoder
+layer group M middle 2. The SAE has input dimension
+din = 4096 and dictionary size dhidden = 32768 (expansion
+factor 8×), with sparsity level k = 32. Training uses ac-
+tivations collected from the Synthetic dataset (train split).
+All downstream analyses and interventions reuse the same
+trained SAE checkpoint to ensure comparability across set-
+tings. Full optimizer settings and training schedules are
+provided in the released code.
+Layer Group Definition.
+For Qwen3-VL-8B-Instruct (36
+decoder layers), we define the functional stages based on
+relative depth: Early: 0–11, Middle-1: 12–17, Middle-2:
+18–23 (Target Group), Late: 24–35.
+Prompting Template and Evaluation.
+We follow the
+official chat template of Qwen3-VL for all evaluations:
+<|im start|>system
+You are a helpful assistant.
+<|im end|>
+<|im start|>user
+<image>
+{Question}
+<|im end|>
+<|im start|>assistant
+For multiple-choice evaluation, we append “Answer with
+the option letter only.” to the user prompt to enable deter-
+ministic parsing.
+F. Sensitivity Analysis and Ablations
+To ensure our findings are not artifacts of specific hyper-
+parameter choices, we conducted the following sensitivity
+checks.
+Sensitivity to Selectivity Threshold (τ).
+Our main ex-
+periments use a selectivity threshold of τ = 1.5 (Co-
+hen’s d) to identify task-specific features.
+We varied
+τ ∈{0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5}.
+• Lower τ (1.0): Includes more ”noisy” features. The
+intervention magnitude increases, leading to slightly
+higher efficacy but significantly higher drift (hallucina-
+tion).
+• Higher τ (2.0+): Selects fewer, highly specific fea-
+tures. While drift decreases, the ”Flip Rate” (interven-
+tion success) drops by ∼15%, as the steering vector
+lacks sufficient energy to override the model’s priors.
+• Conclusion: τ = 1.5 represents an optimal trade-off
+between control strength and semantic precision.
+Random Feature Control.
+To verify that the ”Collapse
+Regime” (Section 6.5) is caused by semantic interference
+and not just random vector addition, we performed a control
+experiment adding random vectors with the same norm as
+the Union vector (vrand ∈Rd, ∥vrand∥= ∥vunion∥). Ran-
+dom vectors caused a uniform drop in accuracy across all
+tasks but did not trigger the specific ”Object Hallucination”
+patterns (e.g., describing non-existent objects) observed
+in the Union case. This confirms that the interference is
+structurally driven by the conflict between specific visual
+concepts.
+G. Mitigation Strategies and Baseline
+Comparisons
+G.1. Comparison with Adaptive Steering Baselines
+A critical critique involves how our identified “Union Col-
+lapse” relates to modern steering countermeasures such as
+RUDDER (Zou et al., 2025), SteerVLM (Sivakumar et al.,
+2025), and spectrum-constrained approaches like STS (Daf-
+nis & Metaxas, 2025). These frameworks employ adaptive
+mechanisms (e.g., the CARD+Beta gate or SteeringGate)
+or spectral projections to scale interventions per-token. Our
+findings provide a mechanistic explanation for their suc-
+cess: these methods likely prevent the residual stream from
+crossing the signal-to-noise collapse threshold we identified
+(Sec 6.5). By dynamically reducing α or constraining the
+A5
+Sparse Visual Thought Circuits in Vision–Language Models
+steering spectrum when geometric antagonism is detected,
+they avoid triggering the Noise Amplification Law.
+G.2. Remedies: Orthogonalized Signal Projection (OSP)
+To address alternative composition strategies, we propose
+Orthogonalized Signal Projection (OSP), which shares
+the geometric intuition of basis disentanglement found in
+spectral methods like STS (Dafnis & Metaxas, 2025). Un-
+like naive addition, OSP constrains composite signals to the
+local tangent space:
+δUnion = δP + (δG −projδP(δG))
+(21)
+By ensuring CosSim(δP, δnew) = 0, OSP prevents the de-
+structive interference (∥δ∥→0) that leads to hallucination.
+G.3. Quantitative Grounding and Hallucination
+Protocols
+While current spatial grounding is qualitative, we propose an
+Interference-Hallucination Correlation Protocol for future
+validation. By measuring Object Hallucination Rates (via
+POPE/CHAIR) against the Noise-to-Signal Ratio derived
+in Eq. 15, researchers can quantitatively map the phase
+transition where geometric antagonism forces the decoder
+to fallback onto linguistic priors.
+H. Broader Impact and Ethical Considerations
+Reliability and Hallucination Mitigation.
+Our work pro-
+vides a mechanistic groundwork for trusting VLM outputs.
+By identifying geometric antagonism as a driver of hallu-
+cination, we offer a concrete metric for safety engineering.
+Future systems could implement “geometric guardrails” that
+monitor the off-manifold drift of residual streams in real-
+time, potentially preempting confabulated responses in high-
+stakes applications such as medical imaging or autonomous
+navigation.
+Algorithmic Bias and Feature Entanglement.
+A critical
+ethical implication of steering lies in the non-orthogonality
+of latent features. Since our results (Section 7) highlight
+that concepts are often entangled, there is a risk that steering
+a benign visual feature (e.g., ”person”) could inadvertently
+amplify correlated socio-demographic biases (e.g., gender or
+racial stereotypes) inherited from the training data. We urge
+practitioners to rigorously test for such “side-effect” bias
+amplification before deploying steering-based interventions
+in user-facing systems.
+Dual-Use and Adversarial Risks.
+The ability to mechan-
+ically control VLM perception raises dual-use concerns.
+Adversarial actors with white-box access could theoretically
+use our method to blind models to safety-critical inputs
+(e.g., suppressing the detection of weapons or hate sym-
+bols). While this risk is inherent to open-weight model
+interpretability, our work also acts as a defensive blueprint:
+understanding how representations collapse is the first step
+toward designing architectures resilient to such activation
+attacks.
+Compute and Environmental Efficiency.
+Standard align-
+ment techniques (RLHF, fine-tuning) are computationally
+expensive. In contrast, our approach focuses on inference-
+time intervention and lightweight SAE training (< 5 GPU
+hours). This offers a carbon-efficient pathway to improving
+model reliability and steerability without the massive envi-
+ronmental footprint associated with retraining foundation
+models.
+I. Extended Layer-wise Analysis
+To comprehensively validate our choice of Layer 21 as the
+optimal intervention locus, we performed a dense sweep
+across the entire decoder depth of Qwen3-VL-8B. This sec-
+tion details the layer-wise metrics for both Linear Probing
+Accuracy (Localization) and Intervention Sensitivity (Causal
+Steering).
+Full Linear Probing Trajectory.
+As described in Sec-
+tion 3, we trained linear probes on the pooled hidden states
+of all 36 decoder layers to classify the 7 SVR task types.
+Table A1 or the data trend reveals a sigmoid-like emergence
+of semantic separability:
+• Layers 0–11 (Perceptual): Accuracy remains low
+(< 40%), indicating that early representations are en-
+tangled with low-level visual features (edges, textures).
+• Layers 12–23 (Semantic Transition): A sharp phase
+transition occurs here. Accuracy climbs rapidly, peak-
+ing at 99.37% at Layer 21. This confirms that Layer
+21 is not an arbitrary choice but the mathematical max-
+imum of linear task separability.
+• Layers 24–35 (Output/Syntax): Accuracy plateaus or
+slightly degrades as the representation shifts towards
+autoregressive token prediction (next-token probabil-
+ity), becoming less abstract.
+Sensitivity Sweep Details.
+In addition to the Layer 10
+analysis presented in Table 4, we measured the ”Flip Rate”
+(percentage of answer changes) under a fixed-norm inter-
+vention (s = 1.0) across key layers. We define Steerability
+as the ratio of ∆Acc to Output Drift. Layer 21 yields
+the highest Steerability Score, maximizing accuracy gain
+while minimizing task-irrelevant hallucination. In contrast,
+shallow layers (< 15) exhibit a high Drift-to-Signal ratio,
+A6
+Sparse Visual Thought Circuits in Vision–Language Models
+confirming the ”Noise Amplification Law” derived in Sec-
+tion 4.
+Feature Overlap Across Layers.
+We also computed the
+cosine similarity of the Pattern vector δP between adja-
+cent layers. High similarity (> 0.9) is observed within the
+M middle 2 group (Layers 18–23), validating our treat-
+ment of this block as a functionally unified ”Reasoning
+Stage.”
+Table A1. Full Layer-wise Linear Probing Trajectory on Qwen3-
+VL-8B. We report the classification accuracy (mean ± std). Layer
+21 represents the global maximum (l⋆).
+Layer Group
+Depth
+Acc. (%) Interpretation
+Baselines
+Chance Level
+–
+14.28
+Random Guess
+Shuffled Labels
+All
+14.31±0.05 No Causal Signal
+Qwen3-VL-8B Decoder Layers
+Early (Embed)
+L0–L5
+34.05±1.2 Perceptual Noise
+Middle-1
+L6–L11 58.60±2.4
+Middle-2 (Start) L12–L17 85.40±1.1 Semantic Emergence
+Middle-2 (Peak)
+L21
+99.37±0.1 Optimal Locus (l⋆)
+Middle-2 (End)
+L22–L23 98.80±0.2 Stable Plateau
+Late
+L24–L35 96.50±0.5 Output Saturation
+J. Extended Perspectives on Compositional
+Interference
+The discovery of the Compositional Paradox and the Noise
+Amplification Law opens a new frontier in the causal ma-
+nipulation of Multimodal LLMs. This section provides an
+in-depth discussion on overcoming geometric limitations,
+advancing beyond additive feature logic, and formalizing
+the mechanistic link between structural interference and
+object hallucination.
+J.1. Engineering Solutions: Overcoming Geometric
+Antagonism
+Our results establish that naive additive steering (δ∪=
+P δi) is structurally vulnerable to Geometric Antagonism.
+When task-specific vectors are negatively aligned, their lin-
+ear sum collapses the effective signal, driving the residual
+stream into a noise-dominant regime. We propose two engi-
+neering paradigms to rectify this:
+1. Orthogonalized Signal Projection (OSP).
+A primary
+solution to mitigate antagonism is to transform the inter-
+vention from a simple addition to a constrained projec-
+tion. We propose the Orthogonalized Signal Projection
+method, where secondary circuit components are projected
+onto the orthogonal complement of the primary reasoning
+direction before injection. If δP is the load-bearing pat-
+tern signal, any auxiliary signal δG should be modified to
+δ′
+G = δG −projδP(δG). This ensures that the combined steer-
+ing vector δtotal = δP +δ′
+G is by definition non-antagonistic
+(CosSim ≥0), preventing signal cancellation and preserv-
+ing the manifold integrity.
+2. Manifold-Constrained Steering.
+Instead of injecting
+vectors in the raw residual space, engineering solutions
+should move toward Manifold-Aware Intervention. This in-
+volves calculating the local Jacobian of the model’s transfer
+function to ensure that the composite vector δ∪lies within
+the ”functional tangent space” of the latent manifold. By
+penalizing components that drive the hidden state into low-
+density regions of the activation space, we can maintain the
+model’s predictive stability even under multi-set interven-
+tions.
+J.2. Beyond Additivity: Non-Linear and Boolean Logic
+Synthesis
+The current definition of the ”Union Set” as a linear sum
+(P zi) is a first-order approximation. However, visual rea-
+soning is inherently non-linear and often follows discrete
+Boolean logic (e.g., ConceptA AND ConceptB). The fail-
+ure of linear addition suggests that VLM latent spaces do
+not naturally support a ”flat” modular superposition.
+Logical Gating vs. Additive Sums.
+We hypothesize that
+the model’s internal processing of multiple visual features
+resembles a Gated Competition rather than a cooperative ad-
+dition. Engineering a more sophisticated ”Union” requires
+move from static weights to Conditional Activation Gates.
+A future implementation should employ non-linear opera-
+tors (e.g., product-based gates or MLP-based adapters) to
+coordinate features. For instance, a ”Logical AND” cir-
+cuit would only amplify a feature if its geometric neighbors
+are also active, effectively filtering out the incoherent noise
+that arises from the simple addition of non-orthogonal SAE
+directions.
+The Competition for Latent Capacity.
+The observed
+antagonism may stem from a fundamental ”resource compe-
+tition” within the residual stream. If the model uses a dense
+superposition scheme to maximize capacity, forcing the
+simultaneous activation of multiple sparse features may trig-
+ger a ”collision” where different semantic concepts attempt
+to utilize the same geometric dimensions. Addressing this
+requires a more granular mapping of feature hierarchies to
+identify which subsets are naturally compatible (orthogonal)
+and which require mutually exclusive activation.
+A7
+Sparse Visual Thought Circuits in Vision–Language Models
+J.3. Mechanistic Link: From Interference to
+Hallucination
+A critical implication of the Noise Amplification Law is
+its potential role in triggering object hallucination. While
+our discussion on hallucination mitigation in Section 7 was
+qualitative, we here provide the mechanistic rationale for
+this link.
+Visual Signal Erasure and Prior Dominance.
+Object
+hallucination in VLMs often occurs when the model’s lin-
+guistic prior (the ”language bottleneck”) overrides the visual
+evidence. We posit that Geometric Interference acts as a
+”Causal Eraser” of visual context. When δP and δG antag-
+onize each other, the resulting signal collapse leaves the
+hidden state in a semantic vacuum. In this state, the Layer-
+Norm operator amplifies background noise, destroying the
+precise spatial grounding of the visual tokens.
+The Vacuum-Induced Hallucination.
+While this remains
+a mechanistic hypothesis, it is strongly supported by the
+30% increase in predictive entropy observed during Union
+interventions. This entropy surge indicates that as geomet-
+ric antagonism erases the visual signal, the model’s output
+distribution flattens, effectively creating a “semantic vac-
+uum.” In this state, the autoregressive decoder is no longer
+anchored by visual truth and must fill the void using high-
+probability linguistic priors, leading to the observed hallu-
+cinations. Future work should involve a per-token entropy
+mapping to further visualize this transition.
+K. Extended Discussion on Methodological
+Scope and Limitations
+This section provides a deeper contextualization of our
+methodological choices and addresses potential technical
+concerns regarding the formalization of our findings and the
+scope of our experimental setup.
+On the Formalism of Geometric Laws.
+While our Noise
+Amplification Law and the discussion on manifold curva-
+ture are primarily mechanistic and explanatory, they are
+supported by the quasi-formal derivations in Appendix D.
+We characterize the LayerNorm operator as a stochastic
+multiplier during signal collapse—a model that provides a
+theoretical rationale for the observed entropy surges. We
+acknowledge that a fully rigorous Riemannian proof would
+require Hessian spectral analysis of the loss landscape at
+each layer; however, our empirical “Drift” metric serves as
+a reliable first-order proxy for geodesic divergence on the
+latent manifold.
+Relationship to Adaptive Steering Baselines.
+Our study
+focuses on the fundamental failure modes of additive compo-
+sition. We recognize recent advancements in inference-time
+steering, such as RUDDER (Zou et al., 2025) and SteerVLM
+(Sivakumar et al., 2025), which utilize adaptive gating (e.g.,
+the CARD+Beta gate) to mitigate drift. Our findings com-
+plement these works by providing the underlying geomet-
+ric reason why such gating is necessary: they prevent the
+residual stream from entering the unstable SNR regime we
+identify in Section 6.5. While we did not implement these
+adaptive gates as baselines, our proposed Orthogonalized
+Signal Projection (OSP) in Appendix G offers a comple-
+mentary geometric remedy.
+Spatial Grounding and Quantitative Metrics.
+Our eval-
+uation of feature grounding relies on qualitative spatial back-
+projection. While we demonstrate high-fidelity localiza-
+tion, we recognize the value of quantitative metrics such as
+IoU (Intersection over Union) or Pointing Game accuracy.
+We view our current qualitative verification as a necessary
+“Causal Sufficiency” check. Future extensions of this work
+will implement patch-level precision/recall metrics to more
+granularly map the emergence of visual thought circuits.
+Compositional Diversity and Benchmark Artifacts.
+We
+defined the “Union” operation primarily through the inter-
+action of Pattern and Global features. While this pairing
+revealed the fundamental geometric antagonism of the la-
+tent space, we acknowledge that different feature pairings
+or larger compositional sets may exhibit varying degrees of
+interference. Furthermore, our conversion of OOD bench-
+marks (e.g., NLVR2) into a unified multiple-choice format
+was designed to ensure a consistent logit-based assessment
+across domains. We recognize that this mapping may sim-
+plify certain reasoning nuances, but it maintains the relative
+causal delta required for a stable cross-dataset comparison.
+A8

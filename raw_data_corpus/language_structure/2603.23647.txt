@@ -1,0 +1,5191 @@
+λSPLIT: SELF-SUPERVISED CONTENT-AWARE
+SPECTRAL UNMIXING FOR FLUORESCENCE MICROSCOPY
+Federico Carrara
+Fondazione Human Technopole, Milan, Italy
+Università Campus Bio-Medico, Rome, Italy
+federico.carrara@fht.org
+Talley Lambert
+Harvard Medical School, Boston, MA, USA
+talley_lambert@hms.harvard.edu
+Mehdi Seifi
+Fondazione Human Technopole, Milan, Italy
+mehdi.seifi@fht.org
+Florian Jug
+Fondazione Human Technopole, Milan, Italy
+florian.jug@fht.org
+ABSTRACT
+In fluorescence microscopy, spectral unmixing aims to recover individual fluorophore con-
+centrations from spectral images that capture mixed fluorophore emissions. Since classical
+methods operate pixel-wise and rely on least-squares fitting, their performance degrades
+with increasingly overlapping emission spectra and higher levels of noise, suggesting that
+a data-driven approach that can learn and utilize a structural prior might lead to improved
+results. Learning-based approaches for spectral imaging do exist, but they are either not
+optimized for microscopy data or are developed for very specific cases that are not applicable
+to fluorescence microscopy settings. To address this, we propose λSplit, a physics-informed
+deep generative model that learns a conditional distribution over concentration maps using
+a hierarchical Variational Autoencoder. A fully differentiable Spectral Mixer enforces
+consistency with the image formation process, while the learned structural priors enable
+state-of-the-art unmixing and implicit noise removal. We demonstrate λSplit on 3 real-world
+datasets that we synthetically cast into a total of 66 challenging spectral unmixing bench-
+marks. We compare our results against a total of 10 baseline methods, including classical
+methods and a range of learning-based methods. Our results consistently show competitive
+performance and improved robustness in high noise regimes, when spectra overlap consider-
+ably, or when the spectral dimensionality is lowered, making λSplit a new state-of-the-art
+for spectral unmixing of fluorescent microscopy data. Importantly, λSplit is compatible
+with spectral data produced by standard confocal microscopes, enabling immediate adoption
+without specialized hardware modifications.
+Keywords Spectral Unmixing · Hierarchical Variational Inference
+1
+Introduction
+Fluorescence microscopy is a fundamental tool for biomedical discovery in the life sciences, enabling us to
+visualize selected biological structures labeled with fluorescent markers called fluorescent probes (FPs). The
+most common way to image biological samples is arguably multiplexed imaging, where multiple FPs labeling
+different structures in a sample are imaged one at a time using appropriate bandpass filtering (see fig. 1). Due
+arXiv:2603.23647v1  [cs.CV]  24 Mar 2026
+λSPLIT
+Labeled Sample
+F fluorescent probes
+λ
+Spectral Imaging Bands
+Multiplexed Imaging Channels
+L spectral bands
+Spectral Image
+λSplit
+Unmixed Image
+F concentration maps
+Figure 1: Spectral Imaging and Unmixing in a nutshell. A biological sample is labeled with F fluorescent
+probes (FPs) whose emission spectra typically overlap. While for multiplexed imaging each FP is imaged
+in isolation using F appropriate band-pass filters (see Multiplexed Imaging Channels), spectral imaging,
+instead, acquires L spectral bands in which photons of all FPs are unfiltered and therefore mixed (see Spectral
+Imaging Bands). Note that multiplexed imaging can suffer from bleed-through artifacts due to overlapping
+emission spectra. To retrieve all F unmixed concentration maps (right) we propose λSplit, a self-supervised
+method that leverages on learned structural priors to achieve state-of-the-art results even when spectra overlap
+considerably, when imaging noise is high, and when the spectral dimensionality L is lowered.
+to the emission properties of FPs, the limited spectral range of visible light, and the available microscopy
+hardware, multiplexed imaging is, in practice, used to image 2 to 4 structures in their respective image
+channels. In addition to this limitation, sequential acquisitions also increase the required imaging time and,
+for live samples, lead to channels that do not correspond to the same time point. Last but not least, repeated
+rounds of imaging can lead to increased light exposure and, therefore, a higher degree of photobleaching
+and phototoxic effects, which are naturally undesired [1–4]. These limitations motivate other approaches to
+image multiple fluorescently labeled structures in a biological sample, i.e., spectral imaging approaches.
+Spectral fluorescence microscopy does not image FPs one at a time but instead collects all emitted light at
+once [5, 6]. To later recover the individual FP emissions (fluorophore concentrations), the emitted light is
+collected in a fixed number of spectral bands. Here, the signal at each spatial location is not a single intensity
+value but a spectral measurement that quantifies how much light was collected over a set of wavelength
+intervals (bands), as shown in fig. 1.
+Spectral imaging shifts the burden from hardware-based channel separation to computational separation of
+fluorophore emissions. This separation is commonly addressed through spectral unmixing, where classical
+approaches estimate fluorophore contributions independently at each pixel using least-squares fitting to
+reference spectra [7].
+While conceptually simple, such pixel-wise formulations degrade when spectra overlap considerably,
+when noise levels are high, or when the spectral dimensionality is lowered (i.e., when fewer bands are being
+imaged). Learning-based approaches offer an alternative by incorporating spatial context and data-driven
+structural priors. However, existing methods either do not account for the optics and noise characteristics of
+fluorescence microscopy, or they are tailored to narrowly defined acquisition settings.
+To address these limitations, we introduce λSplit, a physics-informed deep generative framework for
+spectral unmixing in fluorescence microscopy that leverages a fully differentiable spectral mixing module
+(i.e., the Spectral Mixer), which enables self-supervised training. Our approach achieves robust unmixing
+and implicit denoising across challenging imaging conditions, as we demonstrate experimentally on a total
+of 66 benchmarks we defined for this work.
+Importantly, λSplit operates directly on spectral acquisitions produced by standard point-scanning confo-
+cal microscopes, enabling immediate integration into existing experimental workflows without hardware
+modifications.
+2
+λSPLIT
+2
+Problem Setting
+A spectral image can be represented as S ∈RL×Z×Y ×X, where (Z, Y, X) denotes the spatial dimensions
+and L denotes the spectral dimension, i.e., the number of spectral bands. Depending on the microscope
+configuration, L can vary substantially: some systems provide relatively dense spectral sampling with
+a number of contiguous, equispaced, narrow bands of up to 32, while others rely on coarser spectral
+measurements, leading to only 4 or 5 bands that can even be flexibly tuned to cover arbitrary wavelength
+intervals.
+The measured spectral signal at each spatial location arises from the union of all photons emitted by FPs
+that are present at that location. Because FPs typically exhibit relatively broad and overlapping emission
+spectra (see, e.g., fig. S.2), the signal in each spectral band contains contributions from multiple fluorescent
+sources.
+The goal of spectral unmixing is therefore to recover, from an observed spectral acquisition S, a set of
+images representing the spatial concentration maps of the individual FPs, also referred to as the unmixed
+images U [7]. The spectral image formation process can be described by a linear mixing model:
+S = MU + ε,
+(1)
+where U ∈RF×Z×Y ×X denotes the unknown fluorophore concentration maps for F FPs, M ∈RL×F is
+the mixing matrix whose columns correspond to the discretized emission spectra of the fluorophores, and ε
+represents pixel noise.
+The unmixing problem at hand is inherently an ill-posed inverse problem. Overlap between emission
+spectra makes the unmixing harder, and together with additional noise introduces ambiguities for this inverse
+problem. Additionally, a limited number of spectral bands (lower spectral dimensionality) can render the
+system underdetermined, particularly in regimes where L < F. These challenges are further amplified in
+realistic biological samples, where fluorophores may be spatially co-localized, and experimental conditions
+can induce spatial and spectral variability.
+3
+Related Work
+Classical spectral unmixing.
+A widely used approach is linear unmixing (LU), which estimates fluo-
+rophore concentration maps by solving a least-squares problem given reference spectra [7]. Common variants,
+non-negative LU (NNLU) and fully constrained LU (FCLU), incorporate additional constraints such as
+non-negativity and sum-to-one priors [8–10]. While efficient and widely adopted in fluorescence microscopy,
+these pixel-wise formulations remain sensitive to noise, spectral overlap, and reduced spectral dimensionality.
+Alternative approaches, such as Richardson–Lucy unmixing (RLU) [11] and hybrid phasor-based methods
+(HyU) [12] improve robustness in noisy regimes while still operating pixel by pixel.
+Blind spectral unmixing.
+Blind unmixing methods estimate both emission spectra and fluorophore
+concentrations directly from spectral data. A common approach is non-negative matrix factorization
+(NMF) [13], including variants developed for microscopy such as NMF-RI [14, 15]. These approaches
+still rely on pixel-wise LU once spectra are estimated. Other approaches formulate unmixing as a mutual
+information minimization problem between target structures, such as PICASSO and Mosaic-PICASSO [16,
+17]. Still, their practical applicability remains limited to cases where the spectral dimensionality matches the
+number of target structures.
+Learning-based approaches.
+Learning-based spectral unmixing methods have recently emerged in
+both microscopy and remote sensing. In fluorescence microscopy, clustering-based approaches such as
+LUMoS [18] and supervised convolutional models such as AutoUnmix [19] and UNMIX-ME [20] have
+been proposed. More broadly, a large body of work in remote sensing explores deep architectures for
+hyperspectral unmixing, including autoencoder-based models, convolutional networks exploiting spatial
+context, and model-inspired networks that incorporate the mixing process into the decoder or unroll iterative
+optimization schemes [21–28]. Despite conceptual similarities, the microscopy setting differs substantially
+due to its high spatial resolution, limited spectral dimensionality, and distinct noise characteristics.
+3
+λSPLIT
+L×[Z]×Y×X
+L×[Z]×Y×X
+F×[Z]×Y×X
+z3
+z2
+z1
+µq,1
+σq,1
+µq,2
+σq,2
+µq,3
+σq,3
+µq,4
+σq,4
+posteriors
+latent samples
+z4
+p1
+p2
+p3
+priors
+p4
+unmixing conv block
+KL
+Spectral MSE(Input, Reconstr.)
+Reconstr.
+Input
+Spectral Mixer (MT)
+F×L
+×
+Discretized
+ Spectra
+MT[0,:]
+MT[1,:]
+MT[2,:]
+MT[3,:]
+h4
+h3
+h2
+h1
+Figure 2: Proposed architecture of λSplit. The model builds on an LVAE backbone [35], where a bottom-
+up encoder produces features hi at multiple hierarchy levels. At the highest hierarchy level we employ
+a default multivariate Gaussian prior, followed by learnable top-down priors pi (conditioned from above)
+that, combined with the respective hi, form the final posterior distributions (µq,i, σq,i). Latent samples are
+generated by drawing from the topmost Gaussian and successively propagating and resampling down the
+hierarchy through a deterministic decoder to, finally, generate FP concentration maps. The last decoder
+layer comprises an unmixing convolutional block (blue) that maps the final activation into the desired
+unmixed concentration map tensor. To render our method fully self-supervised, a differentiable Spectral
+Mixer multiplies the predicted concentration maps by the transposed mixing matrix MT ∈RF×L, obtainable
+by discretizing the emission spectra of the FPs contained in the imaged sample (bottom). This models the
+physical image formation process and, given that the predicted concentration maps are correct, reconstructs
+the spectral image we received as input, rendering this setup an end-to-end trainable variational autoencoder.
+The model is trained by minimizing the sum of the hierarchical KL divergence (computed from latent
+samples) and a spectral MSE reconstruction loss.
+Content-aware models in microscopy.
+Recent work has shown that content-aware priors can substan-
+tially improve inverse problems in fluorescence microscopy [29–33]. MicroSplit [34], for example, uses
+hierarchical variational architectures to separate multiple structures from a single fluorescence image. While
+this approach does not model spectral mixing, it highlights the potential of learned structural priors for
+decomposing microscopy images.
+A more extensive discussion of related work and methodological differences can be found in the supplemen-
+tary material (section S.2).
+4
+Methods
+Our approach builds on three key components. First, we introduce a convolutional hierarchical variational
+framework based on a Ladder Variational Autoencoder (LVAE) backbone [35], replacing pixel-wise esti-
+mation with a spatially aware model that learns multi-scale structural priors from data. The variational
+formulation implicitly regularizes the inverse problem, models a conditional distribution over fluorophore
+concentration maps, and improves robustness under noise, spectral overlap, and varying acquisition con-
+figurations. Second, we incorporate a fixed, fully differentiable spectral mixing module that implements
+the physics-based linear image formation model by mapping predicted concentration maps into spectral
+space using known emission profiles. This enables self-supervised training directly from mixed spectral
+observations while maintaining interpretability and general applicability across acquisition setups. Third, we
+perform extensive validation using a high-fidelity spectral simulation pipeline and three real multiplexed
+4
+λSPLIT
+microscopy datasets, constructing 66 controlled unmixing benchmarks that systematically vary photon noise,
+spectral overlap, and spectral dimensionality, including underdetermined regimes. Across these settings, we
+demonstrate improved robustness and stability compared to classical and learning-based baselines. Note that
+we will publicly release our code and all benchmarks to enable others to directly compare against our results
+and the same problem settings we defined in this work.
+As introduced in section 2, given a spectral image S ∈RL×Z×Y ×X, our goal is to recover FP concentration
+maps U ∈RF×Z×Y ×X. Here, our objective is to learn a conditional generative model pθ(U|S) that captures
+a distribution over plausible unmixed solutions while remaining consistent with the physically grounded
+linear mixing process introduced in eq. (1). To enforce this consistency, we introduce a differentiable Spectral
+Mixer that reconstructs a spectral image ˆS directly from the generated unmixed output U via multiplication
+with the spectral mixing matrix M ∈RL×F . The column M:,j = [m1j, m2j, . . . , mLj]⊤of the mixing
+matrix encodes the discretized spectrum of the fluorophore j, with entries mℓj obtained by averaging the
+continuous emission profile over the ℓ-th spectral band. In practice, these spectra can either be obtained from
+public databases such as FPBase [36] or measured directly from dataset-specific single-fluorophore control
+samples. We further ℓ1-normalize each spectrum such that PL
+ℓ=1 mℓj = 1, ensuring that the Spectral Mixer
+preserves the total intensity between spectral and unmixed images, i.e.,
+L
+X
+ℓ=1
+ˆSℓ,p =
+L
+X
+ℓ=1
+F
+X
+j=1
+mℓjUj,p =
+F
+X
+j=1
+Uj,p,
+(2)
+for all spatial locations p.
+Modified ELBO and LVAE Loss for Spectral Unmixing.
+To model the generative conditional distribution
+pθ(U|S), we train a hierarchical VAE, specifically an LVAE [35]. Our objective is therefore to maximize the
+conditional log-likelihood
+arg max
+θ
+N
+X
+i=1
+log pθ(Ui | Si),
+(3)
+where θ denotes the decoder parameters defining the generative distribution. By introducing hierarchical
+latent variables z = {z1, . . . , zK}, where K is the number of hierarchy levels, and the variational posterior
+parameterized by the encoder qϕ(z | S) with parameters ϕ, we obtain the standard variational evidence lower
+bound (ELBO), which, according to our notation, reads as
+Eqϕ(z|S)
+
+log pθ(U|z)
+
+−KL
+ qϕ(z|S) ∥pθ(z)
+
+.
+(4)
+As the unmixed FP concentration channels U are not directly observable, and to recover a self-supervised
+autoencoder setup in which the reconstructed output can be compared to the spectral measurement given as
+the original input, we map U back to the spectral domain as a reconstructed image ˆS, using the previously
+introduced Spectral Mixer. This fully differentiable spectral mixing layer also ensures consistency with the
+physical image formation process.
+Hence, the spectral observation is now obtained through a fixed, deterministic mixing process, S =
+g(U) = MU. Given latent variables z sampled from the variational posterior qϕ(z | S), the decoder predicts
+fluorophore concentration maps U(z) ∼pθ(U | z), which are subsequently mapped to the spectral domain
+to generate a reconstructed spectral image ˆS(z) = MU(z).
+Since the spectral formation process is deterministic and we do not assume a probabilistic noise model,
+the conditional likelihood pθ(S | z) cannot be directly specified in closed form. In practice, we approximate
+the corresponding reconstruction term using the spectral mean squared error (MSE) between the observed
+spectral image and its reconstruction,
+LspMSE
+ S, ˆS
+
+=
+1
+LP
+L
+X
+ℓ=1
+P
+X
+p=1
+ Sℓ,p −ˆSℓ,p
+2,
+(5)
+5
+λSPLIT
+where P = Z · Y · X is the total number of voxels in the image. The resulting training objective is therefore
+defined as
+L = Eqϕ(z|S)
+h
+LspMSE
+ S, ˆS(z)
+i
++ KL
+ qϕ(z | S) ∥pθ(z)
+
+.
+(6)
+Implementation Details.
+As mentioned before, we employ an LVAE architecture [37]. Since it allows
+sampling from the posterior distribution over unmixed images, we infer predictions by averaging 50 posterior
+samples, giving us an approximate MMSE estimate [32].
+The latent hierarchy we employ consists of four stochastic levels, for which the spatial resolution is
+progressively reduced by factors of two, while the feature channel dimensionality is kept constant at 128.
+Our implementation can operate on 2D and 3D spectral data by employing 2D and 3D convolutional layers,
+respectively. While training is performed on randomly extracted patches of size 64 × 64 for 2D inputs and
+8 × 64 × 64 for 3D data, at inference time we employ inner tiling [38], with one-quarter overlap between
+neighboring tiles.
+Models are trained using the Adamax [39] optimizer with default hyperparameters. We use a batch size
+of 32 and an initial learning rate of 10−3. Training is performed for 150 epochs using mixed precision and
+early stopping with patience set to 30 epochs. An epoch is defined by as many randomly sampled patches as
+needed to match the dataset size. The learning rate is reduced on plateau with a patience of 15 epochs. To
+preserve the relative intensity between spectral bands, input spectral images are normalized using global
+mean–standard deviation normalization. All models were trained on an NVIDIA DGX H200 system using
+either an 18GB or 35GB MIG partition for 2D and 3D models, respectively. Training time depends on the
+dataset size and dimensionality, typically ranging from 2 hours to approximately one day.
+Baselines.
+We compare λSplit against a set of classical and learning-based spectral unmixing base-
+lines. As direct linear methods based on least-squares, we include linear unmixing (LU), non-negative
+LU (NNLU) [10], and fully-constrained LU (FCLU) [9]. We further evaluate HyU [12], Richardson–Lucy
+Unmixing (RLU) [11], and NMF-RI [15], which are specifically developed for fluorescence microscopy
+and low-photon settings. We additionally consider learning-based methods. For low-band settings (≤5
+bands), we compare to LUMoS clustering-based unmixing [18]. Additionally, we include the Transformer
+Unmixing Autoencoder (TAEU) [28], developed for spectral unmixing in remote sensing. The motivation for
+choosing this algorithm is its popularity and success in the field, as well as the availability of an open-source
+implementation. Finally, we also compare λSplit against two supervised DL-based methods: a standard
+supervised UNet [40] and AutoUnmix [19].
+Please find additional information about baselines and their implementation in section S.3.1.
+Evaluation Metrics.
+We evaluate unmixing performance using a combination of intensity-based, structural,
+perceptual, and signal-quality metrics. We report range-invariant PSNR and MS-SSIM (abbreviated as
+MS3IM), as introduced in [29], which compensate for global intensity scaling differences between prediction
+and ground truth (e.g., due to different output normalization). Moreover, we include the Pearson correlation
+coefficient, LPIPS [41], and SNR of the predicted unmixed images. Finally, we also report MicroMS-
+SSIM [42] (abbreviated as µMS3IM), which is a structural similarity metric tailored to microscopy data.
+More details about the implementation of the employed metrics are reported in section S.3.2.
+5
+Data and Data Handling
+Data Simulation Pipeline.
+Since ground-truth (GT) fluorophore concentration maps are typically un-
+available (and even unobtainable) in microscopy settings, we rely on synthetic data to enable controlled
+benchmarking across acquisition conditions with variable noise, spectral overlap, and spectral dimensionality.
+To generate realistic spectral mixtures, we use a powerful microscopy simulation pipeline based on the open-
+source microsim Python package [43]. Multi-channel inputs, either real multiplexed fluorescence images or
+multiclass segmentation maps, are interpreted as spatial fluorophore concentration fields and serve as GT
+for evaluation. Each channel is associated with a fluorophore emission spectrum, from which a noise-free
+spectral volume is generated. The simulator then models optical effects (e.g., point spread functions) and
+6
+λSPLIT
+GT
+λSplit
+LU
+HyU
+RLU
+NMF-RI
+NNLU
+FCLU
+TAEU
+BioSR - Exp=10
+F-Actin
+ER
+CCPs
+Microtubules
+Figure 3: Qualitative results on high-noise BioSR data (exposure 10 ms). Compared to 7 baselines,
+λSplit produces the cleanest results, also benefiting from its implicit noise removal capabilities. Objects and
+details (e.g., puncta in the CCPs channel or F-Actin structures) are well recovered, enabling best possible
+downstream analyses.
+the image acquisition process, including photon statistics, readout noise, and configurable spectral band
+placements that emulate realistic spectral microscopy setups. This pipeline enables the controlled generation
+of physically consistent spectral mixtures across diverse experimental settings. Additional details and a
+schematic overview are provided in the supplementary material (fig. S.1).
+Real-world Datasets.
+We use three publicly available fluorescence microscopy datasets as inputs for our
+simulation pipeline. The BioSR dataset [44] consists of 2D high-SNR fluorescence images (1004×1004
+pixels) of four organelles (microtubules, F-actin, endoplasmic reticulum (ER), and clathrin-coated pits
+(CCPs)). These images provide structurally well-resolved organelle distributions suitable for controlled
+spectral simulations. The CellAtlas dataset contains four-channel multiplexed images from the Human
+Protein Atlas project [45, 46], comprising tens of thousands of 2D images across diverse cell types. In
+this work, we select a subset of 300, 2048×2048 images where the four channels correspond to nuclei,
+microtubules, endoplasmic reticulum, and mitochondria. Finally, the HHMI-D25-8bit dataset introduced
+in [34], here referred to as HHMI25, includes 3D multiplexed fluorescence volumes (17×2048×2048)
+acquired from mouse liver tissue samples. Each volume contains five labeled structures: lipid droplets,
+nuclei, peroxisomes, cortical actin, and lysosomes, enabling us to conduct volumetric spectral simulations.
+6
+Experiments and Results
+We evaluate λSplit across a series of controlled spectral unmixing benchmarks that we designed to isolate
+the main sources of difficulty on microscopy data. Specifically, we analyze robustness to noise, increasing
+spectral overlap between FP emissions, and reduced spectral dimensionality (fewer spectral bands). In all
+cases, we compare against classical and learning-based baselines to better understand the advantages of the
+method we propose.
+6.1
+Spectral Unmixing and Noisy Data
+To assess robustness to pixel noises, we evaluate all applicable baselines on simulated 32-band spectral
+data derived from the BioSR, CellAtlas, and HHMI25 datasets. To simulate a realistic setting, we assigned
+four partially overlapping fluorophores (mTurquoise, EGFP, EYFP, and mOrange) to the four structures
+7
+λSPLIT
+Table 1: Quantitative results on the CellAtlas data for various noise levels. Columns, from left to right,
+report: (i) exposure times (less causing more noise); (ii) the resulting SNR of the spectral input images
+(aggregated over all spectral bands); (iii) baselines considered for the set of experiments; (iv) quality metrics,
+i.e., PSNR, MS-MSSIM (MS3IM), MicroMS-SSIM (µMS3IM), LPIPS, Pearson correlation coefficient, and
+average SNR of unmixed images (see main text for details). Higher values are better, except for LPIPS. In
+each metric column, the best result is shown in bold, while the second best is underlined.
+Exp
+SNRsp
+Method
+PSNR ↑
+MS3IM ↑
+µMS3IM ↑
+LPIPS ↓
+Pearson ↑
+SNRu ↑
+2ms
+5.33
+LU [7]
+23.96
+0.799
+0.647
+0.485
+0.779
+8.44
+NNLU [10]
+24.06
+0.803
+0.647
+0.439
+0.785
+8.59
+FCLU [9]
+20.70
+0.520
+0.619
+0.511
+0.540
+5.04
+HyU [12]
+24.28
+0.803
+0.500
+0.442
+0.795
+11.35
+RLU [11]
+23.98
+0.799
+0.647
+0.442
+0.781
+8.47
+NMF-RI [15]
+24.09
+0.803
+0.474
+0.440
+0.790
+8.69
+TAEU [28]
+24.52
+0.761
+0.652
+0.520
+0.800
+60.79
+λSplit (ours)
+27.14
+0.904
+0.625
+0.373
+0.885
+21.35
+5ms
+11.04
+LU
+28.52
+0.921
+0.792
+0.378
+0.920
+20.33
+NNLU
+28.55
+0.921
+0.721
+0.319
+0.921
+20.34
+FCLU
+22.03
+0.595
+0.607
+0.435
+0.685
+9.57
+HyU
+27.52
+0.892
+0.790
+0.369
+0.897
+29.28
+RLU
+28.91
+0.927
+0.659
+0.316
+0.929
+20.50
+NMF-RI
+28.86
+0.927
+0.795
+0.315
+0.926
+20.91
+TAEU
+23.97
+0.735
+0.655
+0.520
+0.786
+66.67
+λSplit (ours)
+34.03
+0.980
+0.979
+0.155
+0.975
+2047.10
+10ms
+22.57
+LU
+32.56
+0.966
+0.834
+0.307
+0.961
+41.38
+NNLU
+32.64
+0.967
+0.834
+0.228
+0.962
+41.35
+FCLU
+22.52
+0.621
+0.638
+0.404
+0.716
+14.76
+HyU
+29.84
+0.929
+0.650
+0.274
+0.926
+62.78
+RLU
+33.14
+0.971
+0.850
+0.221
+0.968
+41.48
+NMF-RI
+32.99
+0.971
+0.839
+0.224
+0.967
+42.93
+TAEU
+24.26
+0.767
+0.694
+0.452
+0.801
+101.82
+λSplit (ours)
+36.66
+0.989
+0.988
+0.137
+0.986
+2041.18
+20ms
+43.05
+LU
+35.91
+0.985
+0.696
+0.194
+0.987
+75.87
+NNLU
+36.02
+0.986
+0.696
+0.128
+0.988
+75.78
+FCLU
+22.38
+0.614
+0.626
+0.361
+0.720
+21.75
+HyU
+30.37
+0.936
+0.873
+0.184
+0.953
+109.65
+RLU
+36.68
+0.988
+0.907
+0.125
+0.990
+75.83
+NMF-RI
+36.49
+0.989
+0.703
+0.124
+0.989
+77.96
+TAEU
+23.66
+0.739
+0.675
+0.479
+0.797
+781.03
+λSplit (ours)
+36.46
+0.988
+0.988
+0.155
+0.988
+2697.59
+(fluorescent channels) in the BioSR and CellAtlas data. For the HHMI25 data, which has 5 channels, we
+added mScarlet. The emission spectra of all used FPs are shown in figs. S.2 and S.3.
+For each dataset, we simulate four exposure levels with increasing Poisson noise while keeping Gaussian
+readout noise fixed at realistic magnitudes. The highest signal-to-noise ratio (SNR) configuration is selected
+such that baseline methods perform well, representing a well-conditioned regime in which classical methods
+perform comparably to λSplit. As shown in tables 1 to S.2, λSplit continues to perform well as SNR
+decreases, consistently outperforming all baselines. Note that λSplit’s reported SNRu values are much higher
+than those of other baseline methods. This is a result of the implicit denoising capabilities of our proposed
+method. An analysis supporting this observation is reported in the supplement (see section S.5.2).
+Qualitative comparisons also reveal that pixel-wise methods naturally propagate the noise in the input into
+the unmixed channels. Results obtained with λSplit, in comparison, can discriminate the imaged structures
+from purely stochastic pixel fluctuations, preserving boundary sharpness and leading to denoised predictions
+(see fig. 3).
+8
+λSPLIT
+Wavelength
+∆λ=2
+∆λ=5
+∆λ=10
+∆λ=20
+∆λ=50
+EGFP
+Wavelength
+∆λ=2
+∆λ=5
+∆λ=10
+∆λ=20
+∆λ=50
+mTurquoise
+c
+a
+b
+e
+f
+d
+g
+h
+λSplit
+HyU
+GT
+λSplit
+HyU
+GT
+λSplit
+RLU
+GT
+λSplit
+RLU
+GT
+Original
+Original
+Figure 4: Spectral unmixing with controlled spectral overlap (32 bands). For this experiment, we use the
+Microtubules and CCPs structures from the BioSR dataset, with 32 spectral bands imaged. a,e Synthetically
+shifted EGFP and mTurquoise emission spectra, respectively. While we fix the spectrum associated with
+Microtubules, the emission spectrum of CCPs is rigidly shifted with increasing ∆λ. b,f Quantitative metrics
+over ∆λ, showing that λSplit (blue) consistently outperforms all other baselines and that the performance
+gap widens when spectral overlap is larger (hence, when ∆λ is smaller). c,d,g,h Representative crops
+from unmixing results for ∆λ = 2 nm by λSplit and the best-performing baseline (w.r.t. PSNR), plus the
+corresponding ground truth (GT) in the center. In c,d, we show Microtubules, while in g,h, we show CCPs.
+Finally, we observe that the data-driven TAEU [28] and classical FCLU [9] baselines, both created for
+spectral unmixing in remote sensing applications, seem unsuitable for application to fluorescence microscopy
+data, leading to sub-par results in all our experiments. For this reason, and to save space, we do not report
+results for these two baselines in subsequent sections.
+6.2
+Spectral Unmixing and Overlapping Spectra
+Next, we ask how unmixing performance changes if the used FPs have increasingly higher overlap. Every-
+thing else remains unchanged, allowing us to isolate the effect of spectral overlap. To this end, we conducted
+a total of 48 experiments where we simulated spectral data, just as before, but moved the emission spectra
+closer together without changing their shape.
+9
+λSPLIT
+Table 2: Quantitative results on CellAtlas for varying spectral dimensionality. We evaluate spectral
+unmixing performance when reducing the number of acquisition bands. Two experimental settings are
+considered: (left) the number of bands is reduced while keeping the per-band SNR constant, isolating the
+effect of spectral dimensionality; (right) the total photon budget is fixed, such that fewer bands lead to higher
+per-band SNR. Find more details in section 6.3. Best results are shown in bold, second best underlined.
+# bands
+Same per-band SNR
+# bands
+Same total photon budget
+Metric
+Method
+3
+4
+5
+32
+3
+4
+5
+32
+PSNR ↑
+LU [7]
+23.69
+26.76
+27.77
+35.91
+23.72
+27.77
+27.77
+25.81
+NNLU [10]
+26.21
+27.30
+28.56
+36.02
+26.79
+28.36
+28.56
+25.83
+HyU [12]
+23.69
+26.87
+27.19
+30.37
+23.72
+27.61
+27.19
+25.66
+RLU [11]
+26.39
+27.56
+28.91
+36.68
+27.13
+28.63
+28.91
+26.15
+NMF-RI [15]
+26.31
+27.76
+28.38
+36.49
+26.77
+28.70
+28.38
+26.13
+LUMoS [18]
+21.97
+21.98
+21.37
+23.21
+21.40
+22.14
+21.37
+21.47
+λSplit (ours)
+27.25
+29.95
+31.12
+36.46
+27.45
+31.54
+31.12
+31.32
+MS3IM ↑
+LU
+0.760
+0.904
+0.925
+0.985
+0.773
+0.924
+0.925
+0.864
+NNLU
+0.863
+0.916
+0.938
+0.986
+0.874
+0.934
+0.938
+0.865
+HyU
+0.759
+0.895
+0.900
+0.936
+0.773
+0.906
+0.900
+0.855
+RLU
+0.866
+0.921
+0.943
+0.988
+0.882
+0.938
+0.943
+0.872
+NMF-RI
+0.857
+0.918
+0.934
+0.989
+0.866
+0.935
+0.934
+0.872
+LUMoS
+0.723
+0.764
+0.743
+0.796
+0.704
+0.766
+0.743
+0.748
+λSplit (ours)
+0.878
+0.960
+0.971
+0.988
+0.868
+0.967
+0.971
+0.971
+LPIPS ↓
+LU
+0.431
+0.436
+0.427
+0.194
+0.397
+0.413
+0.427
+0.441
+NNLU
+0.239
+0.267
+0.232
+0.128
+0.192
+0.238
+0.232
+0.392
+HyU
+0.434
+0.364
+0.398
+0.184
+0.398
+0.341
+0.398
+0.412
+RLU
+0.238
+0.258
+0.220
+0.125
+0.187
+0.229
+0.220
+0.387
+NMF-RI
+0.237
+0.247
+0.227
+0.124
+0.185
+0.217
+0.227
+0.389
+LUMoS
+0.324
+0.327
+0.310
+0.287
+0.293
+0.314
+0.310
+0.381
+λSplit (ours)
+0.283
+0.267
+0.313
+0.155
+0.273
+0.238
+0.313
+0.218
+More concretely, we have used two pairs of the BioSR structures (Microtubules + CCPs and ER + CCPs),
+and assigned to both the same emission spectrum (either EGFP or mTurquoise). For the second structure
+(CCPs), we have then rigidly shifted its spectrum by ∆λ ∈{2nm, 5nm, 10nm, 20nm, 50nm} (see fig. 4a,c
+for an illustration).
+Further, we conducted these experiments for a 32 and a 5 band acquisition regime, in-line with existing
+and commonly used commercial microscopy setups. To keep the total photon budget fixed, we left the laser
+power and exposure times (20ms) unchanged in both cases, which leads to higher per-band SNR when fewer
+are being imaged. This, again, leads to an initial regime (for ∆λ = 50) in which classical baselines lead to
+results comparable to those of λSplit.
+For smaller values of ∆λ, the quality gap of predictions consistently widens, showing that λSplit can
+effectively utilize its learned structural prior in these more difficult settings (see fig. 4 and figs. S.7 to S.9 and
+tables S.3 to S.6), where it consistently outperforms all other baselines.
+6.3
+Spectral Unmixing and Spectral Dimensionality
+Next, we studied the effect of reducing the number of spectral bands. While classical methods desire the
+number of bands to be at least equal to the number of unknowns (i.e., the number of used FPs), having a
+higher number of bands offers numerical advantages.
+We conducted two sets of experiments on the CellAtlas data: (i) we take the highest SNR setup from
+section 6.1 for the 32 band setup (note that the respective column in table 2 reports the same values as table 1).
+We then reduced the number of bands to 5, 4, and 3 while keeping the per-band SNR constant. This removes
+SNR as a confounder, isolating the effect of spectral dimensionality, and (ii) we take the total photon budget
+of the 5-band setup from above and simulate a 3-, 4-, and 32-band setup. Note that the 5-band results in
+10
+λSPLIT
+table 2 are, for this reason, also identical. The question we are asking here is, therefore, how the potential
+downside of having fewer bands balances with the advantage of having them at a higher SNR.
+Overall, we observe that, as spectral dimensionality is reduced, λSplit consistently outperforms the
+baselines in PSNR and MS-SSIM while remaining competitive in perceptual quality (evaluated via LPIPS).
+It is important to note that when the number of bands drops below the number of unknowns (i.e., where the
+number of structures to be unmixed is larger than the spectral dimension), the inverse problem becomes
+underdetermined, and the performance of classical least-squares methods (i.e., LU or HyU) drops significantly
+(see the columns showing results for 3 bands in table 2). In this regime, λSplit leverages its learned structural
+prior and consistently leads to state-of-the-art results.
+6.4
+λSplit vs. Supervised Spectral Unmixing
+Finally, we compare λSplit with a supervised UNet and AutoUnmix, a supervised convolutional neural
+network for spectral unmixing in fluorescence microscopy. For both baselines, we use noise-free ground-truth
+(GT) concentration maps as targets, which is possible because of our data simulations. Note that this enables
+supervised baselines to also learn to perform supervised denoising, giving them an additional advantage.
+In the low spectral dimensionality experiments (table S.8 and fig. S.11), we immediately observe that the
+performance discrepancy between λSplit and AutoUnmix progressively decreases as the number of bands
+increases: richer spectral sampling provides λSplit with more information about the emission profiles, while
+AutoUnmix benefits less from additional bands since the supervision signal and overall signal content remain
+essentially unchanged.
+Conversely, in the increasing spectral overlap experiments (tables S.9 to S.12 and fig. S.12), we observe
+that, as the overlap becomes less, λSplit matches or surpasses AutoUnmix results.
+Still, AutoUnmix is not a practical alternative for λSplit. On one hand, supervised training data is not
+available in practice; we could only train it due to our synthetic data generation setup. On the other hand,
+the model size of AutoUnmix scales combinatorially with the number of spectral bands, leading to a 450M
+parameter model for 5 bands and a 10B parameter model for 32 bands (compared to λSplit’s 3M parameters
+for both cases).
+Finally, we observe that, for both experimental settings, the UNet baseline consistently performs substan-
+tially worse than both λSplit and AutoUnmix (see fig. S.11).
+In summary, high-fidelity predictions can be obtained with a significantly more compact, physics-
+consistent, and self-supervised framework that can instantly be applied to real-world imaging setups.
+7
+Discussion
+The results presented in this work indicate that spectral unmixing in fluorescence microscopy benefits
+substantially from incorporating learned structural priors in addition to explicit spectral modeling. Across
+66 controlled experiments varying noise, spectral overlap, and spectral dimensionality, λSplit consistently
+remains stable in regimes where purely pixel-wise, least-squares-based baselines, as well as existing data-
+driven methods, lead to sub-par results. This suggests that resolving ambiguities in spectral data is not solely
+determined by spectral separability, but also by constraining solutions to structurally plausible patterns (via
+forcing consistency with a learned structural prior).
+A key consequence of our formulation is that such structural priors can be learned in a fully self-supervised
+manner by embedding the spectral mixing process into the model. This removes the dependence on paired
+unmixed ground truth while maintaining physical consistency and interpretability. In practice, this makes
+data-driven spectral unmixing accessible in realistic microscopy settings where labeled training data are
+unavailable.
+More broadly, our findings support a shift away from purely analytical, pixel-wise inversion schemes
+toward hybrid approaches that combine explicit forward models with learned, content-aware priors. While
+our current formulation assumes linear mixing with known spectra, future extensions may relax these
+assumptions and incorporate spectrum estimation or uncertainty-aware downstream analysis.
+11
+λSPLIT
+Disclosure.
+A patent application related to the methods described in this work has been filed.
+References
+[1] Jeff W Lichtman and José-Angel Conchello. Fluorescence microscopy. Nat. Methods, 2(12):910–919,
+December 2005.
+[2] Nathan C Shaner, Paul A Steinbach, and Roger Y Tsien. A guide to choosing fluorescent proteins. Nat.
+Methods, 2(12):905–909, December 2005.
+[3] Jaroslav Icha, Michael Weber, Jennifer C Waters, and Caren Norden. Phototoxicity in live fluorescence
+microscopy, and how to avoid it. Bioessays, 39(8):1700003, August 2017.
+[4] Jennifer C Waters and Torsten Wittmann. Quantitative imaging in cell biology. preface. Methods Cell
+Biol., 123:xix–xx, 2014.
+[5] Yasushi Hiraoka, Takeshi Shimi, and Tokuko Haraguchi. Multispectral imaging fluorescence mi-
+croscopy for living cells. Cell Struct. Funct., 27(5):367–374, October 2002.
+[6] Timo Zimmermann, Jens Rietdorf, and Rainer Pepperkok. Spectral imaging and its applications in live
+cell microscopy. FEBS Lett., 546(1):87–92, July 2003.
+[7] Timo Zimmermann, Joanne Marrison, Karen Hogg, and Peter O’Toole. Clearing up the signal: spectral
+imaging and linear unmixing in fluorescence microscopy. Methods Mol. Biol., 1075:129–148, 2014.
+[8] José M Bioucas-Dias, Antonio Plaza, Nicolas Dobigeon, Mario Parente, Qian Du, Paul Gader, and
+Jocelyn Chanussot. Hyperspectral unmixing overview: Geometrical, statistical, and sparse regression-
+based approaches. IEEE J. Sel. Top. Appl. Earth Obs. Remote Sens., 5(2):354–379, April 2012.
+[9] C-I C Heinz. Fully constrained least-squares linear spectral mixture analysis method material quantifi-
+cation hyper- spectral imagery. IEEE Trans. Geosci. Remote Sens, 29(3):529–545, March 2001.
+[10] Martin Slawski and Matthias Hein. Sparse recovery by thresholded non-negative least squares. In
+J Shawe-Taylor, R Zemel, P Bartlett, F Pereira, and K Q Weinberger, editors, Advances in Neural
+Information Processing Systems, volume 24. Curran Associates, Inc., 2011.
+[11] Akaash Kumar, Kerrie E McNally, Yuexuan Zhang, Alex Haslett-Saunders, Xinru Wang, Jordi Guillem-
+Marti, David Lee, Buwei Huang, Sjoerd Stallinga, Robert R Kay, David Baker, Emmanuel Derivery,
+and James D Manton. Multispectral live-cell imaging with uncompromised spatiotemporal resolution.
+Nat. Photonics, 19(10):1146–1156, September 2025.
+[12] Hsiao Ju Chiang, Daniel E S Koo, Masahiro Kitano, Sean Burkitt, Jay R Unruh, Cristina Zavaleta, Le A
+Trinh, Scott E Fraser, and Francesco Cutrale. HyU: Hybrid unmixing for longitudinal in vivo imaging
+of low signal-to-noise fluorescence. Nat. Methods, 20(2):248–258, February 2023.
+[13] D D Lee and H S Seung. Learning the parts of objects by non-negative matrix factorization. Nature,
+401(6755):788–791, October 1999.
+[14] C Ortiz de Solorzano, T Pengo, and I Zudaire. Efficient blind spectral unmixing fluorescently labeled
+samples using multi-layer non- negative matrix factorization. PLoS ONE, 8(11), 2013.
+[15] Daniel Jiménez-Sánchez, Mikel Ariz, José Mário Morgado, Iván Cortés-Domínguez, and Carlos
+Ortiz-de Solórzano. NMF-RI: blind spectral unmixing of highly mixed multispectral flow and image
+cytometry data. Bioinformatics, 36(5):1590–1598, March 2020.
+[16] Junyoung Seo, Yeonbo Sim, Jeewon Kim, Hyunwoo Kim, In Cho, Hoyeon Nam, Young-Gyu Yoon, and
+Jae-Byum Chang. PICASSO allows ultra-multiplexed fluorescence imaging of spatially overlapping
+proteins without reference spectra measurements. Nat. Commun., 13(1):2475, May 2022.
+[17] Hu Cang, Yang Liu, and Jianhua Xing. Mosaic-PICASSO: accurate crosstalk removal for multiplex
+fluorescence imaging. Bioinformatics, 40(1), January 2024.
+12
+λSPLIT
+[18] Tristan D McRae, David Oleksyn, Jim Miller, and Yu-Rong Gao. Robust blind spectral unmixing for
+fluorescence microscopy using unsupervised learning. PLoS One, 14(12):e0225410, December 2019.
+[19] Yuan Jiang, Hao Sha, Shuai Liu, Peiwu Qin, and Yongbing Zhang. AutoUnmix: an autoencoder-based
+spectral unmixing method for multi-color fluorescence microscopy imaging. Biomed. Opt. Express, 14
+(9):4814–4827, September 2023.
+[20] Jason T Smith, Marien Ochoa, and Xavier Intes. UNMIX-ME: spectral and lifetime fluorescence
+unmixing via deep learning. Biomed. Opt. Express, 11(7):3857–3874, July 2020.
+[21] Burkni Palsson, Jakob Sigurdsson, Johannes R Sveinsson, and Magnus O Ulfarsson. Hyperspectral
+unmixing using a neural network autoencoder. IEEE Access, 6:25646–25656, 2018.
+[22] Yuanchao Su, Jun Li, Antonio Plaza, Andrea Marinoni, Paolo Gamba, and Somdatta Chakravortty.
+DAEN: Deep autoencoder networks for hyperspectral unmixing. IEEE Trans. Geosci. Remote Sens., 57
+(7):4309–4321, July 2019.
+[23] Burkni Palsson, Magnus O Ulfarsson, and Johannes R Sveinsson. Convolutional autoencoder for
+Spectral–Spatial hyperspectral unmixing. IEEE Trans. Geosci. Remote Sens., 59(1):535–549, January
+2021.
+[24] Danfeng Hong, Lianru Gao, Jing Yao, Naoto Yokoya, Jocelyn Chanussot, Uta Heiden, and Bing
+Zhang. Endmember-guided unmixing network (EGU-net): A general deep learning framework for
+self-supervised hyperspectral unmixing. IEEE Trans Neural Netw Learn Syst, 33(11):6518–6531,
+November 2022.
+[25] Behnood Rasti, Bikram Koirala, Paul Scheunders, and Jocelyn Chanussot. MiSiCNet: Minimum
+simplex convolutional network for deep hyperspectral unmixing. IEEE Trans. Geosci. Remote Sens.,
+60:1–15, 2022.
+[26] Behnood Rasti, Bikram Koirala, Paul Scheunders, and Pedram Ghamisi. UnDIP: Hyperspectral
+unmixing using deep image prior. IEEE Trans. Geosci. Remote Sens., 60:1–15, 2022.
+[27] Lianru Gao, Zhu Han, Danfeng Hong, Bing Zhang, and Jocelyn Chanussot. CyCU-net: Cycle-
+consistency unmixing network by learning cascaded autoencoders. IEEE Trans. Geosci. Remote Sens.,
+60:1–14, 2022.
+[28] Preetam Ghosh, Swalpa Kumar Roy, Bikram Koirala, Behnood Rasti, and Paul Scheunders. Hyperspec-
+tral unmixing using transformer network. IEEE Trans. Geosci. Remote Sens., 60:1–16, 2022.
+[29] Martin Weigert, Uwe Schmidt, Tobias Boothe, Andreas Müller, Alexandr Dibrov, Akanksha Jain,
+Benjamin Wilhelm, Deborah Schmidt, Coleman Broaddus, Siân Culley, Mauricio Rocha-Martins,
+Fabián Segovia-Miranda, Caren Norden, Ricardo Henriques, Marino Zerial, Michele Solimena, Jochen
+Rink, Pavel Tomancak, Loic Royer, Florian Jug, and Eugene W Myers. Content-aware image restoration:
+pushing the limits of fluorescence microscopy. Nat. Methods, 15(12):1090–1097, December 2018.
+[30] Alexander Krull, Tim-Oliver Buchholz, and Florian Jug. Noise2Void - learning denoising from single
+noisy images. arXiv [cs.CV], November 2018.
+[31] A Krull, T Viˇcar, M Prakash, M Lalit, and others. Probabilistic noise2void: Unsupervised content-aware
+denoising. Frontiers in Computer, 2020.
+[32] M Prakash, Alexander Krull, and F Jug. Fully unsupervised diversity denoising with convolutional
+variational autoencoders. Int Conf Learn Represent, 2021.
+[33] Mangal Prakash, Mauricio Delbracio, Peyman Milanfar, and Florian Jug. Interpretable unsupervised
+diversity denoising and artefact removal. arXiv [eess.IV], April 2021.
+[34] Ashesh Ashesh, Federico Carrara, Igor Zubarev, Vera Galinova, Melisande Croft, Melissa Pezzotti,
+Daozheng Gong, Francesca Casagrande, Elisa Colombo, Stefania Giussani, Elena Restelli, Eugenia
+Cammarota, Juan Manuel Battagliotti, Nikolai Klena, Moises Di Sante, Gaia Pigino, Elena Taverna,
+13
+λSPLIT
+Oliver Harschnitz, Nicola Maghelli, Norbert F Scherer, Damian Edward Dalle Nogare, Joran Dechamps,
+Francesco Pasqualini, and Florian Jug. MicroSplit: Semantic unmixing of fluorescent microscopy data.
+bioRxiv, February 2025.
+[35] Casper Kaae Sønderby, Tapani Raiko, Lars Maaløe, Søren Kaae Sønderby, and Ole Winther. Ladder
+variational autoencoders. arXiv [stat.ML], February 2016.
+[36] Talley J Lambert. FPbase: a community-editable fluorescent protein database. Nat. Methods, 16(4):
+277–278, April 2019.
+[37] Arash Vahdat and Jan Kautz. NVAE: A deep hierarchical variational autoencoder. arXiv [stat.ML],
+July 2020.
+[38] Ashesh, Alexander Krull, Moises Di Sante, Francesco Silvio Pasqualini, and Florian Jug. µsplit:
+efficient image decomposition for microscopy data. arXiv [cs.CV], November 2022.
+[39] Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. arXiv [cs.LG],
+December 2014.
+[40] Olaf Ronneberger, Philipp Fischer, and Thomas Brox. U-net: Convolutional networks for biomedical
+image segmentation. arXiv [cs.CV], May 2015.
+[41] Richard Zhang, Phillip Isola, Alexei A Efros, Eli Shechtman, and Oliver Wang. The unreasonable
+effectiveness of deep features as a perceptual metric. arXiv [cs.CV], January 2018.
+[42] Ashesh Ashesh, Joran Deschamps, and Florian Jug. MicroSSIM: Improved structural similarity for
+comparing microscopy data. arXiv [eess.IV], August 2024.
+[43] Talley Lambert, Federico Carrara, Melisande Croft, ashesh, Antoine A Ruzette, and Vera Galinova.
+tlambert03/microsim: v0.0.12.post0, 2026.
+[44] Chang Qiao and Di Li. BioSR: a biological image dataset for super-resolution microscopy, January
+2024.
+[45] Mathias Uhlén, Linn Fagerberg, Björn M Hallström, Cecilia Lindskog, Per Oksvold, Adil Mardinoglu,
+Asa Sivertsson, Caroline Kampf, Evelina Sjöstedt, Anna Asplund, Ingmarie Olsson, Karolina Edlund,
+Emma Lundberg, Sanjay Navani, Cristina Al-Khalili Szigyarto, Jacob Odeberg, Dijana Djureinovic,
+Jenny Ottosson Takanen, Sophia Hober, Tove Alm, Per-Henrik Edqvist, Holger Berling, Hanna Tegel,
+Jan Mulder, Johan Rockberg, Peter Nilsson, Jochen M Schwenk, Marica Hamsten, Kalle von Feilitzen,
+Mattias Forsberg, Lukas Persson, Fredric Johansson, Martin Zwahlen, Gunnar von Heijne, Jens Nielsen,
+and Fredrik Pontén. Proteomics. tissue-based map of the human proteome. Science, 347(6220):1260419,
+January 2015.
+[46] Wei Ouyang, Casper F Winsnes, Martin Hjelmare, Anthony J Cesnik, Lovisa Åkesson, Hao Xu, Devin P
+Sullivan, Shubin Dai, Jun Lan, Park Jinmo, Shaikat M Galib, Christof Henkel, Kevin Hwang, Dmytro
+Poplavskiy, Bojan Tunguz, Russel D Wolfinger, Yinzheng Gu, Chuanpeng Li, Jinbin Xie, Dmitry
+Buslov, Sergei Fironov, Alexander Kiselev, Dmytro Panchenko, Xuan Cao, Runmin Wei, Yuanhao
+Wu, Xun Zhu, Kuan-Lun Tseng, Zhifeng Gao, Cheng Ju, Xiaohan Yi, Hongdong Zheng, Constantin
+Kappel, and Emma Lundberg. Analysis of the human protein atlas image classification competition.
+Nat. Methods, 16(12):1254–1261, December 2019.
+[47] Jignesh S Bhatt and M V Joshi. Deep learning in hyperspectral unmixing: A review. In IGARSS
+2020 - 2020 IEEE International Geoscience and Remote Sensing Symposium, pages 2189–2192. IEEE,
+September 2020.
+[48] William Hadley Richardson. Bayesian-based iterative method of image restoration. J. Opt. Soc. Am.,
+62(1):55, January 1972.
+[49] L B Lucy. An iterative technique for the rectification of observed distributions. Astron. J., 79:745, June
+1974.
+14
+λSPLIT
+Supplementary Material
+λSplit: Self-Supervised Content-Aware
+Spectral Unmixing for Fluorescence Microscopy
+Federico Carrara, Talley Lambert, Mehdi Seifi, Florian Jug
+S.1
+Limitations of Pixel-wise Least-Squares Spectral Unmixing
+Classical spectral unmixing methods typically estimate fluorophore concentration maps by solving a linear
+least-squares (LS) problem independently at each spatial location (i.e., pixel or voxel).
+Let s ∈RL denote the spectral measurement at some pixel and u ∈RF the corresponding vector of
+fluorophore concentrations. The mixing model presented in eq. (1) then reduces to the pixel-wise linear
+system
+s = Mu + ε.
+(S.1)
+A common estimator is obtained by solving the LS problem, that is, minimizing the squared reconstruction
+error
+ˆu = arg min
+u ∥s −Mu∥2
+2.
+(S.2)
+When the mixing matrix M has full column rank, and the number of spectral bands satisfies L ≥F, the
+optimization problem above admits the closed-form solution
+ˆu = (M⊤M)−1M⊤s = M†s,
+(S.3)
+where M† denotes the Moore–Penrose pseudo–inverse of M. While computationally efficient and widely
+adopted in fluorescence microscopy, this pixel-wise LS formulation exhibits several limitations in realistic
+imaging scenarios.
+Spectral overlap causes numerical instability of LS solution.
+The main limitation is numerical stability
+and arises when FP emission spectra overlap significantly. As introduced above, the columns of the mixing
+matrix M ∈RL×F correspond to the discretized FP emission spectra. When spectral overlap is substantial,
+these columns become increasingly correlated and may approach linear dependence, which affects the
+stability of the inversion of the mixing process.
+The stability of the LS solution can be quantified through the condition number of the mixing matrix,
+κ(M) = σmax(M)
+σmin(M) ,
+(S.4)
+where σmax(M) and σmin(M) denote the largest and smallest singular values of M. Increasing spectral
+overlap causes σmin(M) to become tiny, leading to a large condition number, and, in practice, to an
+ill-conditioned inverse problem.
+This can be better understood by focusing on the singular value decomposition (SVD) of the mixing
+matrix. Let M = UΣV ⊤denote the SVD of M, where Σ = diag(σ1, . . . , σF ) contains the singular values
+with σ1 ≥· · · ≥σF > 0, i.e., σmin(M) = σF . The Moore–Penrose pseudo–inverse used in LS inversion
+can then be written as
+M† = V Σ−1U⊤,
+(S.5)
+where Σ−1 = diag(1/σ1, . . . , 1/σF ). When the smallest singular value σF becomes very small, i.e., σF ≈0,
+the corresponding entry 1/σF becomes large, making the pseudo-inverse numerically unstable.
+S.1
+λSPLIT
+This instability directly affects the propagation of measurement noise. Substituting the forward model
+from eq. (S.1) into the LS solution in eq. (S.3) yields
+ˆu = M†(Mu + ε) = u + M†ε.
+(S.6)
+Hence, the estimation error is given by
+ˆu −u = M†ε.
+(S.7)
+Therefore, the magnitude of this error is bounded by
+∥ˆu −u∥2 = ∥M†ε∥2 ≤∥M†∥2 ∥ε∥2 ≤σ−1
+F ∥ε∥2,
+(S.8)
+since the spectral norm of a matrix is equal to its largest singular value. Therefore, it is evident that when the
+smallest singular value of M approaches zero (i.e., when the system is ill-conditioned), measurement noise
+is strongly amplified in the LS estimate. Consequently, even small perturbations in spectral measurements
+can lead to large errors in the estimated fluorophore concentrations. This effect becomes particularly severe
+in high-noise regimes, such as those reported in the experiments in section 6.1.
+S.2
+Extended Related Works
+A widely used approach for spectral unmixing is linear unmixing (LU), where concentration maps U are
+estimated by solving a least-squares problem given reference spectra M [7]. While the simplicity and
+interpretability of this approach are arguably reasons for its success, linear unmixing is sensitive to noise and
+spectral overlap, requires accurate reference spectra, and operates independently at each spatial location,
+thereby not leveraging spatial information or structural priors.
+In the hyperspectral imaging and remote sensing literature, the concentration maps in U are also commonly
+referred to as abundances, while the columns of M are known as endmembers [47].
+Common variants of linear unmixing are non-negative LU (NNLU) and fully constrained LU (FCLU) [8–
+10], which solve the least-squares problem while also enforcing physically meaningful priors such as
+non-negativity and sum-to-one constraints. While these approaches remain widely used due to their simple
+formulation and efficiency, the resulting linear system may become ill-conditioned under strong spectral
+overlap and low spectral dimensionality, compromising numerical stability and, hence, unmixing accuracy.
+Additionally, the sum-to-one constraint naturally induces sparse solutions that may not be well suited to
+microscopy data, where signals from different emitters often show substantial colocalization.
+Alternative methods have been introduced to improve robustness in noisy settings. Richardson–Lucy
+Unmixing (RLU) [11] adapts the classical Richardson–Lucy deconvolution algorithm [48, 49] by replacing
+the convolution operator with the spectral mixing matrix, yielding an iterative maximum-likelihood procedure
+tailored to Poisson photon noise. HyU [12] leverages hyperspectral phasor analysis to aggregate similar
+spectra into histogram bins before applying linear unmixing on the averaged signals, enhancing unmixing
+robustness in low-photon conditions. However, both methods are pixel-wise and, therefore, do not exploit
+spatial correlations or structural priors in the unmixed images.
+Blind unmixing approaches aim to recover FP concentration maps without relying on reference spectra.
+Instead, they jointly estimate the FPs’ emission spectra and the corresponding concentrations directly from the
+observed mixed spectral image. A widely used framework is Non-negative Matrix Factorization (NMF) [13],
+which iteratively decomposes spectral data into non-negative spectra and concentration maps. NMF is
+generally sensitive to initialization and may converge to suboptimal local minima. To alleviate the issue,
+several variants have been proposed. NMF-ML and NMF-RI [14, 15], two of the most notable examples in
+fluorescence microscopy, adopt multi-layer factorization schemes and informed initialization strategies using
+theoretical emission spectra to improve convergence. Nevertheless, once the emission spectra are estimated,
+these approaches typically resort to pixel-wise LU to recover concentration maps. PICASSO and its variant
+Mosaic-PICASSO [16, 17] formulate spectral unmixing in fluorescence microscopy as a mutual information
+minimization problem between pairs of target structures. Their formulation assumes that the number of
+spectral bands matches the number of structures to be unmixed, which makes it difficult to apply directly to
+common spectral imaging setups that provide many contiguous bands.
+S.2
+λSPLIT
+Learning-based methods tailored for spectral unmixing in fluorescence microscopy have begun to emerge,
+but they remain relatively limited. LUMoS [18] performs hard pixel-wise assignments through k-Means spec-
+tral clustering, which may lead to spatial inconsistencies and fail to exploit the inherent spatial smoothness
+of microscopy images. Supervised convolutional models such as AutoUnmix [19] and UNMIX-ME [20]
+learn a direct mapping from spectral images to concentration maps but require paired ground-truth unmixed
+data, which are rarely available in practical spectral microscopy settings. Moreover, these models do not
+explicitly incorporate the underlying spectral-mixing physics, and in the case of AutoUnmix, architectural
+design scales combinatorially with the number of spectral bands, rendering it impractical for spectral images
+with more than a handful of bands.
+Recent works such as MicroSplit [34] explore content-aware image decomposition in fluorescence
+microscopy using hierarchical variational architectures. Unlike spectral unmixing, MicroSplit addresses a
+conceptually different inverse problem: given a single superimposed fluorescence image containing multiple
+biological structures, it learns, in a supervised manner, to decompose it into separate semantic channels.
+Although it does not model spectral mixing, the shared microscopy domain and use of content-aware priors
+make several of its methodological ideas transferable to spectral unmixing scenarios.
+Finally, a substantial body of work on deep learning–based spectral unmixing has been developed in
+the remote sensing community. Recent approaches include autoencoder-based architectures that embed
+abundance constraints in the latent space, convolutional networks exploiting spatial context, and model-
+inspired networks that incorporate the mixing process into the decoder or unroll iterative optimization
+schemes [21–28]. However, despite the many conceptual similarities, spectral unmixing in fluorescence
+microscopy differs fundamentally from remote sensing. As a matter of fact, the two domains exhibit an
+inverse relationship between spatial and spectral dimensionality: microscopy images provide extremely
+high spatial resolution with fine, crisp structures, but only a limited number of spectral bands, whereas
+hyperspectral remote sensing data offer hundreds of spectral bands but orders-of-magnitude coarser spatial
+resolution. Additionally, the two settings differ substantially in their noise characteristics and magnitude,
+as well as in the nature and sources of spectral variability within the observed scene. These factors greatly
+hinder the direct transferability of remote sensing unmixing architectures to microscopy settings, motivating
+domain-specific models that exploit biological spatial priors.
+S.3
+Extended Methods
+S.3.1
+Implementation Details of Baselines
+In this section, we provide additional implementation details for the baselines included in our benchmarks.
+All methods use the fixed ground-truth mixing matrix of emission spectra when required by the algorithm.
+Unless stated otherwise, hyperparameters are set to the values recommended in the original publications or
+reference implementations. When these default settings resulted in suboptimal performance, we performed
+a grid search over the most relevant hyperparameters to identify configurations better suited to our data.
+Finally, all baselines are executed using our unified evaluation pipeline to ensure consistent data processing
+and metric computation.
+Linear Unmixing.
+Our implementation solves the linear unmixing problem via pixel-wise least-squares
+using its closed-form solution. The algorithm operates directly on the measured spectral intensities without
+additional normalization.
+Non-negative Linear Unmixing.
+Our implementation solves the linear unmixing problem under a non-
+negativity constraint on concentrations using the Alternating Direction Method of Multipliers (ADMM)
+approach. Specifically, we use an ADMM penalty parameter ρ = 1, a convergence tolerance of 10−6, and a
+maximum of 200 iterations. The algorithm operates directly on the measured spectral intensities without
+additional normalization.
+S.3
+λSPLIT
+Fully Constrained Linear Unmixing.
+As in the previous baseline, we solve the unmixing problem under
+non-negativity and sum-to-one constraints using ADMM. Specifically, we use an ADMM penalty parameter
+ρ = 1, a convergence tolerance of 10−6, and a maximum of 200 iterations. To enforce the constraints, at
+each iteration, the abundance estimates are projected onto the probability simplex. In addition, we apply
+pixel-wise ℓ1 normalization to the input spectral data to ensure consistency with the imposed sum-to-one
+constraint on the abundances. Indeed, since the mixing spectra are ℓ1-normalized and the abundances satisfy
+PF
+i=1 ui = 1, the mixing model s = Mu implies ∥s∥1 = 1 (see eq. (2)). We therefore normalize the input
+spectra to ensure the constraint remains mathematically consistent.
+HyU.
+Due to the lack of an open-source code repository, we provide our own Python implementation of
+the HyU algorithm, faithfully following the description reported in the original paper. Some hyperparameters
+are selected via grid search. In particular, we use the 1st harmonic for phasor representation and construct a
+2D histogram with 128×128 equispaced bins over the [−1, 1] × [−1, 1] domain in the phasor space, which
+achieved the best performance on the datasets used in our experiments. Prior to computing the phasor
+transform, each pixel spectrum is normalized by its ℓ1 norm so that phasor coordinates depend only on
+spectral shape. Pixel spectra falling in the same phasor histogram bin are averaged to obtain a representative
+sample for that bin. These representative spectra are then unmixed using the linear unmixing implementation
+described above. The resulting abundance estimates are subsequently mapped back to the corresponding
+pixels and rescaled by the integrated intensity of the original spectra to restore the original signal magnitude.
+Richardson–Lucy Unmixing.
+The algorithm’s implementation is taken from the official code repository
+available at https://github.com/jdmanton/rlsu. The abundance estimates are initialized uniformly
+and updated using the multiplicative Richardson–Lucy rule, which inherently enforces non-negativity. The
+algorithm operates directly on the measured spectral intensities without additional normalization. The
+number of iterations is empirically set to 100.
+NMF-RI.
+We provide our own Python implementation of the NMF-RI algorithm, faithfully reproducing
+the official MATLAB code publicly available at https://github.com/djimenezsanchez/NMF-RI. In
+our experiments, we initialize the mixing matrix with the ground-truth spectra used in the simulation. This
+provides the algorithm with a favorable initialization and ensures a fair comparison with the other non-blind
+baselines, which also assume known mixing spectra. The abundance matrix is initialized with random
+non-negative values and optimized for 500 iterations.
+Transformer Unmixing Autoencoder (TAEU).
+We rely on the official open-source implementation avail-
+able at https://github.com/preetam22n/DeepTrans-HSU. We adapt the architecture to fluorescence
+microscopy data as follows: (i) we replace the softmax activation applied to the FP concentration estimate
+with a leaky-ReLU to remove the sum-to-one constraint, which we found to further degrade unmixing perfor-
+mance on spectral fluorescence microscopy data; (ii) we train the model on 96×96 patches, to approximately
+match the lateral resolution of hyperspectral satellite images used in the original paper; (iii) we initialize the
+decoder with the GT spectra and we keep it frozen during training. The model is trained in a self-supervised
+fashion by minimizing the MSE between the input spectra and the spectra reconstructed from the predicted
+abundances. Optimization is performed using Adam with a learning rate of 10−3 for 100 epochs. The TAEU
+architecture only works on 2D spectral data. Additionally, we observed unstable training when the number
+of spectral bands is below 32. This behavior is consistent with the model’s original design, which is intended
+for hyperspectral remote sensing data with hundreds of spectral bands.
+LUMoS.
+We
+use
+our
+own
+Python
+implementation
+of
+the
+LUMoS
+algorithm
+based
+on
+the
+existing
+open-source
+code
+for
+the
+ImageJ
+LUMoS
+plug-in
+written
+in
+Java
+and
+avail-
+able at
+https://github.com/tristan-mcrae-rochester/Multiphoton-Image-Analysis/blob/
+master/Spectral%20Unmixing/Code/ImageJ-FIJI/LUMoS_Spectral_Unmixing.java. Prior to clus-
+tering, each pixel spectrum is normalized by its ℓ1 norm so that clustering is driven by spectral shape rather
+than absolute intensity. We run LUMoS with 10 different K-means initializations, each optimized for up to
+S.4
+λSPLIT
+200 iterations, and report the run with the lowest reconstruction error. This baseline is evaluated only for
+low-band settings, since clustering high-dimensional spectra (e.g., 32-band) is substantially harder due to the
+curse of dimensionality.
+AutoUnmix.
+We use the official code available at https://github.com/AlphaYuan/AutoUnmix. We
+train AutoUnmix with input size (256×256) for 100 epochs, utilizing Adam as optimizer with betas (0.5,
+0.999) and a learning rate of 0.0002 for consistency with the official implementation. As previously
+mentioned, AutoUnmix creates a different encoder branch for each pair of input channels. Therefore, the
+model size scales combinatorially and becomes huge as the number of input spectral bands increases; for
+instance, with 16 input bands, the model comprises about 5 billion trainable parameters, which increases to
+more than 10 billion with 32 input bands. For this reason, we train AutoUnmix and report results only for
+spectral data with 3, 4, and 5 bands.
+UNet.
+We rely on the popular open-source UNet implementation available at https://github.com/
+milesial/Pytorch-UNet. The UNet architecture employed in our experiments has a depth of four (i.e.,
+4-layer encoder and decoder). The model is trained in a supervised fashion using the MSE loss and the
+AdamW optimizer, with a weight decay of 0.0001 and a learning rate of 0.0002, for 150 epochs and using
+early stopping with a patience of 20 epochs.
+S.3.2
+Evaluation Metrics
+Here, we report the implementation details of the evaluation metrics used throughout the experiments. Unless
+otherwise specified, metrics are computed using their standard implementations available in common Python
+libraries. All evaluation metrics computed on unmixed images are first evaluated independently for each
+fluorophore channel and then averaged across channels.
+Range-Invariant PSNR and MS-SSIM.
+Following Weigert et al. [29], predictions ˆU are rescaled by a
+single global scalar ˜α applied to the entire image,
+˜α = arg min
+α ∥U −α ˆU∥2
+2.
+Therefore, PSNR and MS-SSIM are computed between the GT unmixed image U and the rescaled prediction
+˜α ˆU. This formulation makes the metrics invariant to linear intensity scaling, ensuring robustness to range
+mismatches introduced by different normalization schemes.
+Signal-to-Noise Ratio (SNR).
+SNR is defined as
+SNR = P99(X) −µbg
+σbg
+,
+(S.9)
+where X represents one predicted unmixed channel and P99(X) denotes its 99th percentile intensity, chosen
+instead of the maximum to mitigate potential outliers such as saturated pixels. A set of background patches
+is selected to estimate the background mean µbg—an estimate of the acquisition offset—and the background
+standard deviation σbg—an estimate of the pixel noise. Specifically, background patches are automatically
+identified as those with the lowest 2% of intensity standard deviation, providing a more robust estimate of
+these background statistics. Finally, for a spectral image, we compute the spectral SNR (SNRsp) as the
+median across spectral bands, which improves robustness to potential SNR outliers in bands with very low
+signal.
+MicroMS-SSIM.
+MicroMS-SSIM is a variant of MS-SSIM designed for benchmarking image regression
+tasks such as denoising and unmixing, specifically tailored to capture the distinctive characteristics of
+microscopy images [42]. We use the open-source implementation available at https://github.com/
+juglab/MicroSSIM. Note that this implementation currently only supports 2D images.
+S.5
+λSPLIT
+LPIPS.
+Before evaluation, both GT and predicted images are normalized to the unit interval using min–
+max normalization. Since the neural network used to compute LPIPS (SqueezeNet in our case) is pre-trained
+on RGB data and thus expects three-channel inputs, grayscale predictions are replicated across three channels
+before computing the perceptual distance.
+S.4
+Extended Data Simulation Pipeline
+As reported in the main manuscript, we generate synthetic fluorescence spectral images under controlled
+acquisition conditions using a microscopy simulation pipeline built on the open-source Python package
+microsim [43]. An illustrated overview of our data simulation pipeline is shown in fig. S.1.
+Multi-channel inputs, such as real multiplexed fluorescence microscopy images or multiclass segmentation
+maps, are interpreted as spatial fluorophore concentration fields and serve as GT for quantitative evaluation
+of spectral unmixing. We denote these GT concentration maps as UGT ∈RF×Z×Y ×X, where F represents
+the number of fluorophores or, equivalently, of channels.
+As mentioned above, GT channels are associated with specific FPs characterized by their excitation and
+emission spectra. Hence, a per-fluorophore noise-free spectral emission volume Semission ∈RL×F×Z×Y ×X
+is generated by combining the GT concentration maps with the corresponding emission spectra, which are
+previously discretized over the spectral dimension L. At this stage, tunable illumination power and the
+excitation and emission efficiencies of each fluorophore are modeled to generate realistic emission profiles.
+The simulator then models microscope-specific optical effects, including configurable point spread
+functions (PSFs) to reproduce different imaging modalities, such as widefield or confocal microscopy, as well
+as optical aberrations introduced by the imaging system. Notice that when the inputs consist of experimentally
+acquired microscopy images, these optical effects are not applied, as already present in the data source.
+After optical effects are applied to the input volume Semission, the obtained per-fluorophore optical array is
+integrated over the FP dimension (F), resulting in the optical spectral volume Sopt ∈RL×Z×Y ×X.
+Finally, microsim simulates the image acquisition process with high fidelity. First, it models realistic
+photon and detector noise (e.g., read-out noise, thermal noise, and other sensor-specific sources). Additionally,
+the simulator allows the explicit specification of the bandwidth and placement of the L spectral detection
+bands defined above, enabling emulation of a variety of spectral imaging configurations. The resulting
+digitalized spectral volume is denoted as Sdig ∈RL×Z×Y ×X.
+Overall, this framework enables the controlled generation of physically consistent spectral mixtures across
+diverse experimental conditions.
+S.5
+Additional Results
+S.5.1
+Spectral Unmixing and Noisy Data
+This section provides additional experimental details and results supporting the evaluation presented in sec-
+tion 6.1. We first describe the spectral simulation setup used in these experiments by reporting the excitation
+and emission configurations of the employed fluorophores (figs. S.2 and S.3). We then report the full quantita-
+tive results for the BioSR and HHMI25 datasets under varying noise levels (tables S.1 and S.2), together with
+additional qualitative comparisons illustrating the behavior of the evaluated methods in low-SNR regimes
+(figs. S.4 and S.5). These figures complement the examples shown in the main paper and further illustrate
+the robustness of λSplit under increasing noise conditions.
+S.5.2
+SNR Computation and Implicit Denoising in λSplit
+To better understand the large SNRu improvements observed for λSplit in the experiments using increasingly
+noisy data, we analyze representative examples from the three evaluated datasets. fig. S.6 illustrates an
+example of SNR computation and highlights the differences between λSplit and classical baselines. Across
+all examples, pixel-wise methods tend to propagate measurement noise from the spectral input into the
+unmixed channels, leading to larger signal fluctuations. In contrast, λSplit produces considerably smoother
+S.6
+λSPLIT
+UGT : F×[Z]×Y×X
+Emission
+• Illumination 
+power
+• Excitation and 
+emission 
+efficiency
+• Discretization 
+into spectral 
+bands
+Semission : L×F×[Z]×Y×X
+M : L×F
+Optics
+Sopt : L×[Z]×Y×X
+• Imaging 
+modality & 
+optics (PSF)
+Sdig : L×[Z]×Y×X
+Detection
+• Photon & 
+Detector noise
+Figure S.1:
+Overview of the spectral fluorescence microscopy simulation pipeline based on
+microsim [43]. Multi-channel inputs are interpreted as fluorophore concentration maps UGT, where
+each channel corresponds to a fluorescent probe (FP) with a known emission spectrum. First, for each
+FP, a noise-free spectral emission volume Semission is generated by combining concentration maps with
+their discretized emission spectra M, while modeling tunable illumination power and fluorophore-specific
+emission and excitation efficiency. Next, microscope-specific optical effects, such as point-spread functions
+(PSFs), are applied, and per-fluorophore emission volumes are combined to obtain an optical spectral volume
+Sopt consistent with the chosen imaging modality. Finally, the detection process introduces realistic noise
+sources, including photon and detector noise, producing the final digital spectral image Sdig.
+fpbase.org
+λ(nm)
+mTurquoise EGFP EYFP mOrange
+350
+375
+400
+425
+450
+475
+500
+525
+550
+575
+Excitation
+435nm
+488nm
+514nm
+555nm
+450
+475
+500
+525
+550
+575
+600
+625
+λ(nm)
+mTurquoise EGFP EYFP mOrange
+462nm
+Emission
+590nm
+fpbase.org
+32 bands
+Figure S.2: Four FP setup for CellAtlas and BioSR datasets for the Spectral Unmixing and Noisy Data
+experiment. On the left, we report the excitation spectra of the four fluorophores together with the positions
+of the four excitation lasers. The number of lasers, their placement, and their relative power are selected
+by solving an optimization problem to achieve balanced excitation across all fluorophores, accounting for
+their excitation and emission efficiency (excitation cross-sections and quantum yields). On the right, we
+display the corresponding emission spectra alongside the placement of the 32 spectral detection bands used
+for imaging.
+background regions while preserving structural foreground details, effectively increasing the separation
+between background noise and signal peaks. This alone accounts for significantly higher SNRu values
+reported for λSplit in the quantitative results.
+S.5.3
+Spectral Unmixing and Overlapping Spectra
+This section reports additional results for the spectral overlap experiments introduced in section 6.2. We
+provide the full quantitative results for all evaluated fluorophore pairs (tables S.3 to S.6) together with
+additional qualitative examples for both 5- and 32-band acquisition setups (figs. S.7 to S.9). These figures
+and tables complement the discussion in the main paper and further illustrate the behavior of the evaluated
+methods as spectral overlap increases.
+S.7
+λSPLIT
+mTurquoise EGFP EYFP mOrange mScarlet
+fpbase.org
+λ(nm)
+350
+375
+400
+425
+450
+475
+500
+525
+550
+575
+600
+625
+Excitation
+398nm
+504nm
+579nm
+mTurquoise EGFP EYFP mOrange mScarlet
+Emission
+462nm
+622nm
+450
+475
+500
+525
+550
+575
+600
+625
+650
+fpbase.org
+λ(nm)
+32 bands
+Figure S.3: Five FP setup for HHMI25 dataset for the Spectral Unmixing and Noisy Data experiment.
+On the left, we report the excitation spectra of the five fluorophores together with the positions of the
+three excitation lasers. The number of lasers, their placement, and their relative power are selected by
+solving an optimization problem to achieve balanced excitation across all fluorophores, accounting for their
+excitation and emission efficiency (excitation cross-sections and quantum yields). On the right, we display
+the corresponding emission spectra alongside the placement of the 32 spectral detection bands used for
+imaging.
+CellAtlas - Exp=2
+GT
+λSplit
+LU
+HyU
+RLU
+NMF-RI
+NNLU
+FCLU
+TAEU
+Mitochondria
+ER
+Nuclei
+Microtubules
+Figure S.4: Qualitative results on high-noise CellAtlas data (exposure 2 ms). Compared to 7 baselines,
+λSplit produces the cleanest results, also benefiting from its implicit noise removal capabilities. Still, in
+this example, we see that very high levels of noise cannot be fully denoised solely by relying on λSplit’s
+implicit capabilities, suggesting that future work should also focus on incorporating explicit denoising
+modules [31–33]. Objects and details (e.g., puncta and roundish structures in the mitochondria and ER
+channels or elongated microtubule structures) are well recovered, facilitating possible downstream analyses.
+S.5.4
+Spectral Unmixing and Spectral Dimensionality
+In this section, we present additional results from experiments investigating the effect of reducing the number
+of spectral bands. We report the quantitative results for MicroMS-SSIM, Pearson, and SNR over unmixed
+images for all evaluated configurations in table S.7. These tables complement the discussion in section 6.3
+and further illustrate the behavior of the evaluated methods as spectral dimensionality decreases, including
+regimes where the number of bands falls below the number of fluorophores. Additional qualitative examples
+are also included to visually compare the reconstructions produced by the different approaches fig. S.10.
+S.8
+λSPLIT
+Table S.1: Quantitative results on the BioSR dataset for various noise levels. Columns, from left to right,
+report: (i) exposure times (less causing more noise); (ii) the resulting SNR of the spectral input images
+(aggregated over all spectral bands); (iii) baselines considered for the set of experiments; (iv) quality metrics,
+i.e., PSNR, MS-MSSIM (MS3IM), MicroMS-SSIM (µMS3IM), LPIPS, Pearson correlation coefficient, and
+average SNR of unmixed images (see main text for details). Higher values are better, except for LPIPS. In
+each metric column, the best result is shown in bold, while the second best is underlined.
+Exp
+SNRsp
+Method
+PSNR ↑
+MS3IM ↑
+µMS3IM ↑
+LPIPS ↓
+Pearson ↑
+SNRu ↑
+10ms
+5.60
+LU [7]
+30.33
+0.922
+0.837
+0.548
+0.849
+9.86
+NNLU [10]
+30.42
+0.923
+0.842
+0.503
+0.852
+10.69
+FCLU [9]
+26.63
+0.752
+0.736
+0.638
+0.607
+5.51
+HyU [12]
+30.34
+0.900
+0.845
+0.476
+0.852
+15.17
+RLU [11]
+30.54
+0.925
+0.846
+0.502
+0.854
+11.45
+NMF-RI [15]
+30.56
+0.925
+0.842
+0.497
+0.854
+10.59
+TAEU [28]
+28.06
+0.801
+0.785
+0.505
+0.682
+35.12
+λSplit (ours)
+38.55
+0.979
+0.943
+0.134
+0.976
+51.63
+20ms
+9.77
+LU
+34.42
+0.965
+0.907
+0.368
+0.938
+18.21
+NNLU
+34.51
+0.966
+0.910
+0.325
+0.939
+19.77
+FCLU
+27.53
+0.773
+0.764
+0.588
+0.681
+8.48
+HyU
+33.29
+0.940
+0.673
+0.318
+0.919
+28.83
+RLU
+34.64
+0.966
+0.914
+0.321
+0.939
+21.64
+NMF-RI
+34.63
+0.966
+0.911
+0.319
+0.939
+19.86
+TAEU
+27.44
+0.784
+0.766
+0.448
+0.644
+34.59
+λSplit (ours)
+44.42
+0.993
+0.988
+0.078
+0.995
+384.85
+100ms
+33.45
+LU
+42.68
+0.989
+0.958
+0.107
+0.987
+67.26
+NNLU
+42.76
+0.989
+0.711
+0.072
+0.987
+71.88
+FCLU
+27.91
+0.789
+0.790
+0.459
+0.731
+16.77
+HyU
+37.78
+0.971
+0.461
+0.124
+0.962
+93.38
+RLU
+43.00
+0.989
+0.960
+0.068
+0.986
+74.90
+NMF-RI
+42.98
+0.989
+0.959
+0.071
+0.987
+73.25
+TAEU
+28.00
+0.803
+0.791
+0.398
+0.686
+161.53
+λSplit (ours)
+45.90
+0.994
+0.991
+0.087
+0.996
+521.78
+300ms
+57.43
+LU
+46.08
+0.991
+0.498
+0.068
+0.991
+124.25
+NNLU
+46.10
+0.991
+0.748
+0.039
+0.991
+129.21
+FCLU
+27.85
+0.790
+0.792
+0.391
+0.725
+25.00
+HyU
+39.12
+0.976
+0.953
+0.092
+0.969
+162.10
+RLU
+46.66
+0.990
+0.749
+0.037
+0.989
+135.53
+NMF-RI
+46.77
+0.991
+0.749
+0.039
+0.991
+125.27
+TAEU
+27.79
+0.791
+0.779
+0.409
+0.676
+87.34
+λSplit (ours)
+45.72
+0.993
+0.989
+0.091
+0.996
+522.18
+S.5.5
+λSplit vs. Supervised Spectral Unmixing
+This section provides additional quantitative and qualitative comparisons between λSplit and the supervised
+baselines AutoUnmix and UNet. We report result tables for the reduced spectral dimensionality experiment
+(table S.8) as well as for scenarios with increasing spectral overlap between fluorophores (tables S.9 to S.12).
+These tables complement the discussion in section 6.4 and further illustrate the behavior of the considered
+approaches under increasingly ill-conditioned unmixing settings. Additional qualitative comparisons (see
+figs. S.11 and S.12) are included to compare unmixing quality and fidelity between λSplit AutoUnmix and
+to visually assess the sub-par results produced by the UNet baseline.
+S.9
+λSPLIT
+Table S.2: Quantitative results on the HHMI25 dataset for various noise levels. Columns, from left
+to right, report: (i) exposure times (less causing more noise); (ii) the resulting SNR of the spectral input
+images (aggregated over all spectral bands); (iii) baselines considered for the set of experiments; (iv) quality
+metrics, i.e., PSNR, MS-MSSIM (MS3IM), LPIPS, Pearson correlation coefficient, and average SNR of
+unmixed images (see main text for details). MicroMS-SSIM is not reported as not implemented for 3D
+images. Higher values are better, except for LPIPS. In each metric column, the best result is shown in bold,
+while the second best is underlined.
+Exp
+SNRsp
+Method
+PSNR ↑
+MS3IM ↑
+LPIPS ↓
+Pearson ↑
+SNRu ↑
+2ms
+4.49
+LU [7]
+27.60
+0.878
+0.419
+0.665
+4.88
+NNLU [10]
+27.62
+0.878
+0.333
+0.666
+4.91
+FCLU [9]
+26.01
+0.772
+0.398
+0.524
+4.39
+HyU [12]
+27.94
+0.873
+0.402
+0.687
+9.49
+RLU [11]
+27.77
+0.882
+0.332
+0.679
+5.57
+NMF-RI [15]
+27.83
+0.885
+0.347
+0.684
+5.84
+λSplit (ours)
+29.02
+0.916
+0.273
+0.753
+9.87
+5ms
+8.64
+LU
+31.65
+0.949
+0.336
+0.864
+9.63
+NNLU
+31.76
+0.951
+0.219
+0.868
+9.63
+FCLU
+27.73
+0.818
+0.324
+0.690
+7.10
+HyU
+30.54
+0.925
+0.302
+0.815
+16.77
+RLU
+32.05
+0.956
+0.216
+0.875
+9.58
+NMF-RI
+31.96
+0.957
+0.223
+0.874
+9.72
+λSplit (ours)
+34.69
+0.978
+0.132
+0.934
+64.58
+10ms
+12.25
+LU
+35.07
+0.972
+0.253
+0.935
+13.20
+NNLU
+35.38
+0.976
+0.121
+0.940
+13.14
+FCLU
+28.65
+0.830
+0.263
+0.748
+7.69
+HyU
+31.84
+0.940
+0.233
+0.856
+21.90
+RLU
+35.76
+0.980
+0.120
+0.944
+13.30
+NMF-RI
+35.57
+0.980
+0.122
+0.943
+13.32
+λSplit (ours)
+36.91
+0.986
+0.090
+0.960
+75.01
+20ms
+16.62
+LU
+38.13
+0.981
+0.202
+0.965
+17.66
+NNLU
+38.73
+0.987
+0.065
+0.970
+17.61
+FCLU
+28.87
+0.832
+0.216
+0.767
+7.38
+HyU
+32.65
+0.947
+0.170
+0.877
+23.35
+RLU
+39.22
+0.989
+0.065
+0.973
+17.69
+NMF-RI
+39.00
+0.990
+0.064
+0.971
+17.74
+λSplit (ours)
+38.03
+0.989
+0.079
+0.969
+72.02
+S.10
+λSPLIT
+HHMI25 - Exp=2
+GT
+λSplit
+LU
+HyU
+RLU
+NMF-RI
+NNLU
+FCLU
+Nuclei
+Lysosomes
+Lipid Droplets
+Peroxisomes
+Actin
+Figure S.5: Qualitative results on high-noise HHMI25 data (exposure 2 ms). Compared to 7 baselines,
+λSplit produces the cleanest results, also benefiting from its implicit noise removal capabilities. Still, in
+this example, we see that very high levels of noise cannot be fully denoised solely by relying on λSplit’s
+implicit capabilities, suggesting that future work should also focus on incorporating explicit denoising
+modules [31–33]. Objects and details (e.g., puncta and roundish structures in the mitochondria and ER
+channels or elongated microtubule structures) are well recovered, facilitating downstream analyses.
+S.11
+λSPLIT
+CellAtlas - Exp=5ms - Nuclei
+BioSR - Exp=20ms - Microtubules
+HHMI25 - Exp=5ms - Nuclei
+SNR = 15.31
+Spectral Band
+SNR = 10501.66
+GT
+SNR = 2031.85
+SNR = 35.96
+HyU
+SNR = 34.98
+Linear Unmixing
+0
+50
+100
+150
+200
+250
+300
+Position (px)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Intensity
+0
+50
+100
+150
+200
+250
+300
+Position (px)
+0
+50
+100
+150
+200
+250
+300
+Position (px)
+0
+50
+100
+150
+200
+250
+300
+Position (px)
+0
+50
+100
+150
+200
+250
+300
+Position (px)
+Position (px)
+Intensity
+Position (px)
+Position (px)
+Position (px)
+Position (px)
+Position (px)
+Intensity
+Position (px)
+Position (px)
+Position (px)
+Position (px)
+µ=0.1595
+σ=0.0337
+µ=0.0000
+σ=0.0001
+µ=0.0179
+σ=0.0004
+µ=0.1299
+σ=0.0179
+µ=0.0953
+σ=0.0194
+λSplit
+Spectral Band
+GT
+HyU
+Linear Unmixing
+λSplit
+Spectral Band
+GT
+HyU
+Linear Unmixing
+λSplit
+SNR = 7.06
+SNR = 34.36
+SNR = 63.91
+SNR = 16.32
+SNR = 7.15
+0
+50
+100
+150
+200
+250
+300
+0.0
+0.2
+0.4
+0.6
+0.8
+0
+50
+100
+150
+200
+250
+300
+0
+50
+100
+150
+200
+250
+300
+0
+50
+100
+150
+200
+250
+300
+0
+50
+100
+150
+200
+250
+300
+µ=0.1903
+σ=0.0419
+µ=0.0042
+σ=0.0122
+µ=0.0721
+σ=0.0055
+µ=0.1358
+σ=0.0196
+µ=0.2515
+σ=0.0368
+SNR = 9.38
+SNR = 66.15
+SNR = 92.57
+SNR = 25.19
+SNR = 21.20
+0
+20
+40
+60
+80
+100
+120
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0
+20
+40
+60
+80
+100
+120
+0
+20
+40
+60
+80
+100
+120
+0
+20
+40
+60
+80
+100
+120
+0
+20
+40
+60
+80
+100
+120
+µ=0.1534
+σ=0.0440
+µ=0.0218
+σ=0.0086
+µ=0.0237
+σ=0.0059
+µ=0.0705
+σ=0.0203
+µ=0.0913
+σ=0.0243
+Figure S.6: Analysis of the SNR computation and the implicit denoising capability of λSplit. For each
+dataset used in the increasing noise set of experiments, we show a representative structure and exposure
+level. In each top row, from left to right, we report example crops from: (i) the spectral band corresponding
+to the emission peak of the FP associated with the structure; (ii) the ground truth (GT) concentration map;
+(iii) the concentration map predicted by λSplit; (iv) the baseline methods achieving the highest SNR in that
+setting; (v) the concentration map obtained from linear unmixing. All crops are min-max normalized to have
+the same intensity range. For each image, a background patch used for SNR estimation is highlighted (red
+square); the content of the extracted patch is displayed in a corner, together with its mean (µ) and standard
+deviation (σ); the resulting SNR value is also reported. Notice that the SNR values differ from those reported
+in the result tables, as they are computed only on a small sample crop rather than the entire dataset. The
+orange profiles show intensity along the annotated 10-pixel thick line and highlight the denoising effect of
+λSplit. Indeed, we observe a reduction in noise, as evidenced by fewer oscillations in the line histogram and
+a larger gap separating the signal peaks from the background level.
+S.12
+λSPLIT
+Table S.3: Quantitative results for different spectral overlaps. For these experiments, we use the ER
+and CCP structures from the BioSR dataset and associate them with the EGFP fluorophore. We report the
+results for both 5- and 32-band input spectral data. For each metric, the best result is shown in bold, while
+the second best is underlined.
+EGFP – ER/CCPs
+Metric
+Method
+5 bands
+32 bands
+∆λ = 2 ∆λ = 5 ∆λ = 10 ∆λ = 20 ∆λ = 50 ∆λ = 2 ∆λ = 5 ∆λ = 10 ∆λ = 20 ∆λ = 50
+PSNR ↑
+LU [7]
+31.73
+38.45
+43.77
+49.13
+53.31
+31.44
+38.35
+43.75
+48.52
+52.52
+NNLU [10]
+32.76
+38.98
+44.17
+49.44
+53.38
+31.53
+37.15
+43.65
+48.52
+52.52
+HyU [12]
+31.88
+38.56
+43.66
+49.31
+53.12
+32.50
+39.63
+44.64
+48.74
+52.16
+RLU [11]
+31.69
+37.68
+44.07
+49.68
+53.95
+32.02
+38.05
+43.79
+48.55
+52.75
+NMF-RI [15]
+31.38
+36.01
+42.58
+46.99
+48.78
+31.70
+37.45
+43.39
+47.97
+51.30
+λSplit (ours)
+37.61
+42.91
+47.55
+51.40
+54.29
+36.97
+42.68
+47.43
+49.57
+54.78
+MS3IM ↑
+LU
+0.923
+0.976
+0.992
+0.998
+1.000
+0.917
+0.976
+0.992
+0.998
+0.999
+NNLU
+0.916
+0.977
+0.993
+0.998
+1.000
+0.891
+0.947
+0.992
+0.998
+0.999
+HyU
+0.922
+0.974
+0.991
+0.998
+0.999
+0.928
+0.978
+0.993
+0.998
+0.999
+RLU
+0.892
+0.946
+0.986
+0.998
+1.000
+0.895
+0.954
+0.988
+0.997
+0.999
+NMF-RI
+0.908
+0.940
+0.985
+0.993
+0.993
+0.916
+0.961
+0.990
+0.997
+0.998
+λSplit (ours)
+0.949
+0.981
+0.994
+0.998
+0.999
+0.947
+0.983
+0.994
+0.997
+0.999
+LPIPS ↓
+LU
+0.436
+0.223
+0.097
+0.041
+0.013
+0.484
+0.230
+0.097
+0.047
+0.017
+NNLU
+0.314
+0.183
+0.088
+0.037
+0.013
+0.219
+0.188
+0.096
+0.046
+0.017
+HyU
+0.370
+0.186
+0.093
+0.037
+0.013
+0.370
+0.178
+0.075
+0.043
+0.018
+RLU
+0.220
+0.160
+0.075
+0.032
+0.011
+0.242
+0.168
+0.085
+0.043
+0.017
+NMF-RI
+0.323
+0.197
+0.099
+0.046
+0.021
+0.364
+0.198
+0.096
+0.048
+0.017
+λSplit (ours)
+0.196
+0.094
+0.041
+0.022
+0.027
+0.195
+0.084
+0.040
+0.024
+0.024
+µMS3IM ↑
+LU
+0.448
+0.493
+0.499
+0.502
+0.988
+0.439
+0.492
+0.499
+0.501
+0.983
+NNLU
+0.001
+0.495
+0.499
+0.502
+0.988
+0.895
+0.495
+0.499
+0.501
+0.983
+HyU
+0.003
+0.494
+0.499
+0.502
+0.989
+0.003
+0.495
+0.005
+0.502
+0.983
+RLU
+0.896
+0.496
+0.500
+0.503
+0.991
+0.477
+0.496
+0.005
+0.502
+0.984
+NMF-RI
+0.441
+0.490
+0.499
+0.502
+0.936
+0.454
+0.004
+0.499
+0.501
+0.968
+λSplit (ours)
+0.914
+0.926
+0.969
+0.993
+0.999
+0.911
+0.927
+0.969
+0.991
+0.999
+Pearson ↑
+LU
+0.858
+0.963
+0.989
+0.997
+0.999
+0.852
+0.963
+0.989
+0.997
+0.999
+NNLU
+0.820
+0.965
+0.990
+0.997
+0.999
+0.725
+0.912
+0.988
+0.997
+0.999
+HyU
+0.845
+0.961
+0.988
+0.997
+0.999
+0.873
+0.970
+0.991
+0.997
+0.999
+RLU
+0.731
+0.910
+0.984
+0.997
+0.999
+0.746
+0.928
+0.986
+0.996
+0.999
+NMF-RI
+0.818
+0.886
+0.981
+0.993
+0.993
+0.830
+0.942
+0.987
+0.996
+0.998
+λSplit (ours)
+0.933
+0.982
+0.995
+0.998
+0.999
+0.933
+0.983
+0.994
+0.998
+0.999
+SNRu ↑
+LU
+17.13
+40.01
+69.29
+106.67
+147.93
+14.53
+35.36
+63.55
+95.07
+126.88
+NNLSU
+28.03
+47.92
+75.24
+110.00
+148.17
+61.43
+43.69
+63.89
+95.08
+126.88
+HyU
+20.02
+44.80
+73.23
+113.25
+150.13
+20.46
+48.75
+78.98
+104.54
+130.17
+RLU
+65.21
+56.78
+83.00
+114.46
+155.26
+45.77
+43.08
+68.53
+98.69
+128.24
+NMF-RI
+22.67
+46.90
+70.89
+108.97
+151.94
+17.75
+37.46
+64.00
+95.90
+127.94
+λSplit (ours)
+727.70
+1048.60
+1287.36
+1356.12
+1711.83
+611.02
+1119.60
+1074.09
+775.49
+2599.14
+S.13
+λSPLIT
+Table S.4:
+Quantitative results for different spectral overlaps.
+For these experiments, we use the
+Microtubule and CCP structures from the BioSR dataset and associate them with the EGFP fluorophore. We
+report the results for both 5- and 32-band input spectral data. For each metric, the best result is shown in
+bold, while the second best is underlined.
+EGFP – Microtubules/CCPs
+Metric
+Method
+5 bands
+32 bands
+∆λ = 2 ∆λ = 5 ∆λ = 10 ∆λ = 20 ∆λ = 50 ∆λ = 2 ∆λ = 5 ∆λ = 10 ∆λ = 20 ∆λ = 50
+PSNR ↑
+LU [7]
+32.76
+39.59
+44.95
+50.36
+54.53
+32.34
+39.33
+44.77
+49.57
+53.44
+NNLU [10]
+33.78
+40.15
+45.33
+50.65
+54.60
+32.16
+38.06
+44.67
+49.56
+53.44
+HyU [12]
+32.98
+39.76
+44.86
+50.54
+54.12
+33.34
+40.49
+45.53
+49.64
+52.75
+RLU [11]
+32.33
+38.59
+45.14
+50.83
+55.13
+32.66
+38.86
+44.60
+49.16
+53.60
+NMF-RI [15]
+33.06
+38.76
+44.12
+48.65
+50.70
+32.68
+38.82
+44.26
+49.02
+53.01
+λSplit (ours)
+37.91
+42.81
+47.31
+51.27
+52.65
+37.07
+43.19
+47.37
+51.00
+52.81
+MS3IM ↑
+LU
+0.939
+0.981
+0.994
+0.999
+1.000
+0.932
+0.980
+0.994
+0.998
+1.000
+NNLU
+0.928
+0.981
+0.994
+0.999
+1.000
+0.900
+0.953
+0.993
+0.998
+1.000
+HyU
+0.938
+0.979
+0.993
+0.999
+1.000
+0.939
+0.981
+0.994
+0.998
+0.999
+RLU
+0.902
+0.951
+0.988
+0.998
+1.000
+0.905
+0.958
+0.989
+0.997
+1.000
+NMF-RI
+0.934
+0.967
+0.989
+0.996
+0.996
+0.936
+0.970
+0.990
+0.997
+0.999
+λSplit (ours)
+0.954
+0.983
+0.994
+0.998
+0.999
+0.952
+0.984
+0.995
+0.998
+0.999
+LPIPS ↓
+LU
+0.400
+0.171
+0.083
+0.030
+0.008
+0.431
+0.191
+0.082
+0.034
+0.012
+NNLU
+0.242
+0.119
+0.055
+0.023
+0.008
+0.189
+0.148
+0.069
+0.032
+0.012
+HyU
+0.370
+0.159
+0.072
+0.028
+0.008
+0.344
+0.147
+0.066
+0.030
+0.013
+RLU
+0.181
+0.126
+0.056
+0.021
+0.007
+0.205
+0.137
+0.067
+0.031
+0.012
+NMF-RI
+0.257
+0.134
+0.065
+0.031
+0.014
+0.318
+0.150
+0.071
+0.034
+0.012
+λSplit (ours)
+0.209
+0.109
+0.049
+0.024
+0.030
+0.210
+0.104
+0.048
+0.026
+0.033
+µMS3IM ↑
+LU
+0.003
+0.497
+0.501
+0.505
+0.991
+0.449
+0.494
+0.500
+0.502
+0.986
+NNLU
+0.489
+0.499
+0.501
+0.980
+0.991
+0.001
+0.496
+0.500
+0.502
+0.986
+HyU
+0.474
+0.497
+0.501
+0.977
+0.992
+0.469
+0.497
+0.501
+0.503
+0.986
+RLU
+0.426
+0.499
+0.502
+0.979
+0.496
+0.480
+0.497
+0.500
+0.502
+0.986
+NMF-RI
+0.477
+0.497
+0.501
+0.958
+0.964
+0.460
+0.495
+0.500
+0.006
+0.983
+λSplit (ours)
+0.920
+0.932
+0.971
+0.996
+0.998
+0.916
+0.933
+0.972
+0.994
+0.999
+Pearson ↑
+LU
+0.872
+0.968
+0.990
+0.998
+0.999
+0.862
+0.967
+0.990
+0.997
+0.999
+NNLU
+0.832
+0.969
+0.991
+0.998
+0.999
+0.733
+0.919
+0.989
+0.997
+0.999
+HyU
+0.864
+0.967
+0.990
+0.998
+0.999
+0.880
+0.973
+0.992
+0.997
+0.999
+RLU
+0.740
+0.916
+0.986
+0.997
+0.999
+0.755
+0.932
+0.986
+0.996
+0.999
+NMF-RI
+0.855
+0.948
+0.986
+0.995
+0.996
+0.862
+0.952
+0.987
+0.996
+0.999
+λSplit (ours)
+0.935
+0.982
+0.995
+0.998
+0.999
+0.935
+0.983
+0.995
+0.998
+0.999
+SNRu ↑
+LU
+38.68
+89.39
+166.18
+305.16
+377.91
+21.08
+48.13
+90.37
+145.91
+190.71
+NNLU
+114.91
+133.05
+175.20
+305.04
+377.89
+86.79
+61.46
+90.91
+145.92
+190.71
+HyU
+46.41
+103.64
+180.91
+327.08
+378.66
+28.97
+67.99
+116.35
+163.07
+192.73
+RLU
+177.47
+140.60
+211.90
+324.53
+374.01
+56.95
+54.30
+94.91
+146.09
+179.04
+NMF-RI
+81.04
+111.52
+174.90
+308.57
+379.94
+24.68
+51.03
+93.59
+147.59
+190.77
+λSplit (ours)
+806.40
+1017.92
+1527.50
+1170.58
+992.97
+638.38
+1027.20
+1105.19
+1663.74
+1337.86
+S.14
+λSPLIT
+Table S.5: Quantitative results for different spectral overlaps. For these experiments, we use the ER and
+CCP structures from the BioSR dataset and associate them with the mTurquoise fluorophore. We report the
+results for both 5- and 32-band input spectral data. For each metric, the best result is shown in bold, while
+the second best is underlined.
+mTurquoise – ER/CCPs
+Metric
+Method
+5 bands
+32 bands
+∆λ = 2 ∆λ = 5 ∆λ = 10 ∆λ = 20 ∆λ = 50 ∆λ = 2 ∆λ = 5 ∆λ = 10 ∆λ = 20 ∆λ = 50
+PSNR ↑
+LU [7]
+29.96
+36.21
+41.30
+45.18
+50.55
+29.57
+35.78
+40.83
+45.20
+49.68
+NNLU [10]
+31.50
+37.05
+42.19
+45.63
+50.69
+30.91
+34.63
+40.53
+45.20
+49.68
+HyU [12]
+29.85
+36.41
+41.53
+45.01
+50.34
+30.54
+37.45
+42.32
+45.87
+49.52
+RLU [11]
+31.07
+35.65
+41.82
+46.00
+51.29
+31.32
+35.91
+40.88
+45.14
+49.77
+NMF-RI [15]
+31.13
+35.47
+41.03
+44.28
+47.45
+29.86
+35.21
+40.40
+44.81
+49.22
+λSplit (ours)
+36.88
+42.24
+47.32
+49.75
+52.60
+36.48
+43.74
+48.07
+50.93
+53.29
+MS3IM ↑
+LU
+0.904
+0.968
+0.988
+0.995
+0.999
+0.891
+0.967
+0.989
+0.996
+0.999
+NNLU
+0.904
+0.971
+0.990
+0.995
+0.999
+0.885
+0.925
+0.984
+0.996
+0.999
+HyU
+0.898
+0.963
+0.986
+0.994
+0.999
+0.908
+0.972
+0.991
+0.997
+0.999
+RLU
+0.887
+0.933
+0.979
+0.994
+0.999
+0.889
+0.939
+0.979
+0.994
+0.999
+NMF-RI
+0.922
+0.948
+0.984
+0.990
+0.993
+0.895
+0.951
+0.985
+0.995
+0.998
+λSplit (ours)
+0.950
+0.980
+0.992
+0.996
+0.999
+0.945
+0.983
+0.995
+0.998
+0.999
+µMS3IM ↑
+LU
+0.418
+0.004
+0.498
+0.932
+0.972
+0.006
+0.482
+0.497
+0.931
+0.962
+NNLU
+0.465
+0.492
+0.440
+0.944
+0.972
+0.890
+0.427
+0.497
+0.931
+0.962
+HyU
+0.423
+0.489
+0.433
+0.934
+0.975
+0.442
+0.492
+0.926
+0.937
+0.963
+RLU
+0.892
+0.913
+0.924
+0.937
+0.980
+0.891
+0.007
+0.921
+0.931
+0.964
+NMF-RI
+0.010
+0.004
+0.923
+0.927
+0.933
+0.006
+0.485
+0.497
+0.930
+0.956
+λSplit (ours)
+0.911
+0.925
+0.953
+0.983
+0.997
+0.909
+0.927
+0.976
+0.994
+0.997
+Pearson ↑
+LU
+0.794
+0.943
+0.981
+0.992
+0.998
+0.777
+0.939
+0.980
+0.993
+0.998
+NNLU
+0.784
+0.950
+0.984
+0.993
+0.998
+0.701
+0.855
+0.975
+0.993
+0.998
+HyU
+0.774
+0.939
+0.979
+0.991
+0.998
+0.801
+0.955
+0.985
+0.994
+0.998
+RLU
+0.708
+0.875
+0.975
+0.993
+0.998
+0.725
+0.894
+0.973
+0.992
+0.998
+NMF-RI
+0.839
+0.908
+0.978
+0.988
+0.992
+0.784
+0.916
+0.976
+0.991
+0.997
+λSplit (ours)
+0.935
+0.979
+0.993
+0.997
+0.999
+0.930
+0.984
+0.995
+0.998
+0.999
+LPIPS ↓
+LU
+0.534
+0.298
+0.147
+0.082
+0.028
+0.547
+0.315
+0.171
+0.089
+0.039
+NNLU
+0.374
+0.238
+0.120
+0.071
+0.026
+0.230
+0.248
+0.163
+0.086
+0.039
+HyU
+0.475
+0.248
+0.123
+0.075
+0.029
+0.449
+0.216
+0.123
+0.076
+0.039
+RLU
+0.235
+0.214
+0.109
+0.062
+0.022
+0.279
+0.224
+0.141
+0.077
+0.036
+NMF-RI
+0.383
+0.241
+0.137
+0.080
+0.036
+0.459
+0.285
+0.164
+0.086
+0.038
+λSplit (ours)
+0.173
+0.122
+0.051
+0.030
+0.026
+0.201
+0.093
+0.036
+0.023
+0.024
+SNRu ↑
+LU
+12.12
+28.90
+51.52
+75.28
+114.32
+9.58
+22.66
+41.30
+65.31
+96.84
+NNLU
+22.80
+37.17
+62.54
+80.67
+114.71
+58.85
+34.72
+42.68
+65.32
+96.84
+HyU
+13.94
+34.03
+60.23
+79.59
+114.71
+14.56
+35.00
+57.16
+75.30
+99.31
+RLU
+62.90
+44.40
+65.03
+84.18
+120.36
+37.21
+33.43
+47.26
+71.12
+99.55
+NMF-RI
+16.91
+32.87
+54.50
+77.56
+117.50
+11.30
+24.53
+42.00
+66.19
+97.37
+λSplit (ours)
+428.91
+735.90
+1331.06
+1641.54
+1028.25
+684.31
+1015.44
+1017.81
+1278.92
+1873.25
+S.15
+λSPLIT
+Table S.6:
+Quantitative results for different spectral overlaps.
+For these experiments, we use the
+Microtubule and CCP structures from the BioSR dataset and associate them with the mTurquoise fluorophore.
+We report the results for both 5- and 32-band input spectral data. For each metric, the best result is shown in
+bold, while the second best is underlined.
+mTurquoise – Microtubules/CCPs
+Metric
+Method
+5 bands
+32 bands
+∆λ = 2 ∆λ = 5 ∆λ = 10 ∆λ = 20 ∆λ = 50 ∆λ = 2 ∆λ = 5 ∆λ = 10 ∆λ = 20 ∆λ = 50
+PSNR ↑
+LU [7]
+30.95
+37.33
+42.48
+46.38
+51.76
+30.36
+36.67
+41.76
+46.17
+50.57
+NNLU[10]
+32.46
+38.22
+43.39
+46.80
+51.89
+31.52
+35.41
+41.47
+46.17
+50.57
+HyU [12]
+30.97
+37.65
+42.81
+46.25
+51.55
+31.35
+38.18
+43.08
+46.66
+50.30
+RLU [11]
+31.70
+36.52
+42.88
+47.08
+52.42
+31.96
+36.67
+41.63
+45.60
+50.41
+NMF-RI [15]
+31.67
+37.11
+41.68
+45.66
+49.21
+30.79
+36.64
+41.14
+45.87
+50.31
+λSplit (ours)
+37.64
+43.17
+46.52
+49.26
+53.27
+36.79
+42.73
+47.46
+50.71
+53.28
+MS3IM ↑
+LU
+0.925
+0.975
+0.991
+0.996
+0.999
+0.908
+0.974
+0.991
+0.997
+0.999
+NNLU
+0.918
+0.976
+0.992
+0.996
+0.999
+0.894
+0.933
+0.987
+0.997
+0.999
+HyU
+0.921
+0.972
+0.989
+0.995
+0.999
+0.922
+0.977
+0.992
+0.997
+0.999
+RLU
+0.896
+0.940
+0.982
+0.995
+0.999
+0.899
+0.946
+0.981
+0.993
+0.999
+NMF-RI
+0.930
+0.963
+0.981
+0.993
+0.995
+0.914
+0.971
+0.984
+0.996
+0.999
+λSplit (ours)
+0.956
+0.982
+0.992
+0.996
+0.999
+0.950
+0.983
+0.995
+0.998
+0.999
+µMS3IM ↑
+LU
+0.436
+0.492
+0.500
+0.942
+0.979
+0.409
+0.484
+0.498
+0.938
+0.968
+NNLU
+0.479
+0.497
+0.942
+0.956
+0.978
+0.900
+0.916
+0.498
+0.938
+0.968
+HyU
+0.445
+0.005
+0.933
+0.945
+0.981
+0.446
+0.493
+0.932
+0.945
+0.969
+RLU
+0.902
+0.430
+0.930
+0.947
+0.985
+0.899
+0.492
+0.927
+0.936
+0.968
+NMF-RI
+0.459
+0.494
+0.929
+0.442
+0.956
+0.006
+0.485
+0.498
+0.938
+0.966
+λSplit (ours)
+0.919
+0.931
+0.956
+0.983
+0.999
+0.917
+0.932
+0.973
+0.996
+0.999
+LPIPS ↓
+LU
+0.497
+0.244
+0.107
+0.056
+0.019
+0.526
+0.284
+0.129
+0.066
+0.028
+NNLU
+0.289
+0.156
+0.079
+0.047
+0.016
+0.201
+0.206
+0.120
+0.062
+0.028
+HyU
+0.436
+0.205
+0.088
+0.052
+0.019
+0.445
+0.215
+0.089
+0.053
+0.029
+RLU
+0.189
+0.161
+0.080
+0.042
+0.013
+0.239
+0.191
+0.109
+0.058
+0.026
+NMF-RI
+0.333
+0.178
+0.098
+0.054
+0.024
+0.404
+0.235
+0.122
+0.063
+0.028
+λSplit (ours)
+0.205
+0.120
+0.064
+0.030
+0.016
+0.213
+0.117
+0.047
+0.026
+0.022
+Pearson ↑
+LU
+0.812
+0.950
+0.983
+0.993
+0.998
+0.786
+0.943
+0.981
+0.993
+0.998
+NNLU
+0.798
+0.956
+0.986
+0.994
+0.998
+0.708
+0.863
+0.978
+0.993
+0.998
+HyU
+0.800
+0.949
+0.983
+0.993
+0.998
+0.812
+0.957
+0.986
+0.994
+0.998
+RLU
+0.716
+0.883
+0.977
+0.993
+0.999
+0.734
+0.901
+0.974
+0.991
+0.998
+NMF-RI
+0.834
+0.934
+0.974
+0.991
+0.995
+0.801
+0.941
+0.975
+0.992
+0.997
+λSplit (ours)
+0.942
+0.981
+0.993
+0.997
+0.999
+0.927
+0.982
+0.995
+0.998
+0.999
+SNRu ↑
+LU
+25.40
+58.26
+105.80
+158.97
+269.47
+12.87
+28.39
+51.33
+84.45
+128.62
+NNLU
+71.14
+92.65
+136.55
+162.99
+269.43
+72.72
+43.96
+53.23
+84.46
+128.63
+HyU
+30.24
+72.08
+129.74
+171.86
+269.86
+19.00
+41.86
+72.44
+99.56
+129.57
+RLU
+153.65
+101.24
+130.79
+205.80
+282.33
+42.54
+39.83
+57.90
+92.04
+127.37
+NMF-RI
+40.83
+72.62
+117.14
+161.55
+271.72
+16.00
+29.41
+53.38
+85.61
+128.76
+λSplit (ours)
+680.76
+1071.93
+1533.56
+1446.52
+1436.26
+800.66
+1190.44
+1109.60
+1204.03
+1253.93
+S.16
+λSPLIT
+Wavelength
+∆λ=2
+∆λ=5
+∆λ=10
+∆λ=20
+∆λ=50
+EGFP
+Wavelength
+∆λ=2
+∆λ=5
+∆λ=10
+∆λ=20
+∆λ=50
+mTurquoise
+λSplit
+HyU
+GT
+λSplit
+HyU
+GT
+λSplit
+HyU
+GT
+λSplit
+HyU
+GT
+Original
+Original
+a
+b
+e
+f
+c
+d
+g
+h
+Figure S.7: Spectral unmixing with controlled spectral overlap (32 bands). For this experiment, we use
+the ER and CCPs structures from the BioSR dataset, with 32 spectral bands imaged. a,e Synthetically shifted
+EGFP and mTurquoise emission spectra, respectively. While we fix the spectrum associated with ER, the
+emission spectrum of CCPs is rigidly shifted with increasing ∆λ. b,f Quantitative metrics over ∆λ, showing
+that λSplit (blue) consistently outperforms all other baselines and that the performance gap widens when
+spectral overlap is larger (hence, when ∆λ is smaller). c,d,g,h Representative crops from unmixing results
+for ∆λ = 2 nm by λSplit and the best-performing baseline (w.r.t. PSNR), plus the corresponding ground
+truth (GT) in the center. In c,d, we show ER, while in d,h, we show CCPs.
+S.17
+λSPLIT
+Wavelength
+∆λ=2
+∆λ=5
+∆λ=10
+∆λ=20
+∆λ=50
+EGFP
+Wavelength
+∆λ=2
+∆λ=5
+∆λ=10
+∆λ=20
+∆λ=50
+mTurquoise
+λSplit
+GT
+λSplit
+GT
+NNLU
+NNLU
+λSplit
+GT
+λSplit
+NNLU
+NNLU
+GT
+Original
+Original
+a
+b
+e
+f
+c
+d
+g
+h
+Figure S.8:
+Spectral unmixing with controlled spectral overlap (5 bands). For this experiment, we
+use the ER and CCPs structures from the BioSR dataset, with 5 spectral bands imaged. a,e Synthetically
+shifted EGFP and mTurquoise emission spectra, respectively. While we fix the spectrum associated with
+ER, the emission spectrum of CCPs is rigidly shifted with increasing ∆λ. b,f Quantitative metrics over ∆λ,
+showing that λSplit (blue) consistently outperforms all other baselines and that the performance gap widens
+when spectral overlap is larger (hence, when ∆λ is smaller). c,d,g,h Representative crops from unmixing
+results for ∆λ = 2 nm, by λSplit and the best-performing baseline (w.r.t. PSNR), plus the corresponding
+ground-truth (GT) in the center. In c,d, we show ER, while in d,h, we show CCPs.
+S.18
+λSPLIT
+Wavelength
+∆λ=2
+∆λ=5
+∆λ=10
+∆λ=20
+∆λ=50
+EGFP
+Wavelength
+∆λ=2
+∆λ=5
+∆λ=10
+∆λ=20
+∆λ=50
+mTurquoise
+λSplit
+GT
+λSplit
+GT
+NNLU
+NNLU
+λSplit
+GT
+λSplit
+NNLU
+NNLU
+GT
+Original
+Original
+a
+b
+e
+f
+d
+c
+g
+h
+Figure S.9: Spectral unmixing with controlled spectral overlap (5 bands). For this experiment, we use the
+Microtubules and CCPs structures from the BioSR dataset, with 5 spectral bands imaged. a,e Synthetically
+shifted EGFP and mTurquoise emission spectra, respectively. While we fix the spectrum associated with
+Microtubules, the emission spectrum of CCPs is rigidly shifted with increasing ∆λ. b,f Quantitative metrics
+over ∆λ, showing that λSplit (blue) consistently outperforms all other baselines and that the performance
+gap widens when spectral overlap is larger (hence, when ∆λ is smaller). c,d,g,h Representative crops
+from unmixing results for ∆λ = 2 nm, by λSplit and the best-performing baseline (w.r.t. PSNR), plus the
+corresponding ground-truth (GT) in the center. In c,d, we show Microtubules, while in d,h, we show CCPs.
+S.19
+λSPLIT
+Table S.7: Quantitative results on CellAtlas for varying spectral dimensionality. We evaluate spectral
+unmixing performance when reducing the number of acquisition bands. Two experimental settings are
+considered: (left) the number of bands is reduced while keeping the per-band SNR constant, isolating the
+effect of spectral dimensionality; (right) the total photon budget is fixed, such that fewer bands lead to higher
+per-band SNR. Find more details in section 6.3. Best results are shown in bold, second best underlined.
+Note that SNRu is not available for LUMoS, as the algorithm performs hard clustering and thus produces a
+flat, uniform background with a standard deviation of 0, rendering our SNR computation ill-posed (see also
+eq. (S.9))
+# bands
+Same per-band SNR
+# bands
+Same total photon budget
+Metric
+Method
+3
+4
+5
+32
+3
+4
+5
+32
+µMS3IM ↑
+LU [7]
+0.516
+0.548
+0.597
+0.696
+0.564
+0.726
+0.597
+0.770
+NNLU [10]
+0.728
+0.691
+0.620
+0.696
+0.773
+0.750
+0.620
+0.770
+HyU [12]
+0.516
+0.460
+0.781
+0.873
+0.564
+0.751
+0.781
+0.660
+RLU [11]
+0.733
+0.693
+0.813
+0.907
+0.631
+0.752
+0.813
+0.713
+NMF-RI [15]
+0.724
+0.700
+0.544
+0.703
+0.757
+0.747
+0.544
+0.596
+LUMoS [18]
+0.688
+0.617
+0.647
+0.642
+0.721
+0.644
+0.647
+0.682
+λSplit (ours)
+0.752
+0.873
+0.910
+0.988
+0.737
+0.893
+0.910
+0.930
+Pearson ↑
+LU
+0.733
+0.879
+0.912
+0.987
+0.761
+0.898
+0.912
+0.877
+NNLU
+0.837
+0.897
+0.933
+0.988
+0.866
+0.916
+0.933
+0.877
+HyU
+0.732
+0.883
+0.898
+0.953
+0.761
+0.893
+0.898
+0.873
+RLU
+0.843
+0.905
+0.939
+0.990
+0.879
+0.922
+0.939
+0.888
+NMF-RI
+0.832
+0.910
+0.928
+0.989
+0.854
+0.923
+0.928
+0.886
+LUMoS
+0.522
+0.603
+0.581
+0.625
+0.540
+0.593
+0.581
+0.547
+λSplit (ours)
+0.843
+0.939
+0.959
+0.988
+0.859
+0.955
+0.959
+0.964
+SNR ↑
+LU
+25.64
+21.65
+30.34
+78.53
+41.43
+28.59
+30.34
+13.76
+NNLU
+27.12
+22.25
+31.31
+78.39
+46.82
+29.43
+31.31
+13.77
+HyU
+25.68
+33.49
+47.55
+115.94
+41.48
+42.34
+47.55
+19.16
+RLU
+29.36
+23.12
+33.30
+78.75
+48.20
+30.42
+33.30
+13.86
+NMF-RI
+31.27
+26.09
+33.51
+81.31
+52.78
+32.36
+33.51
+14.29
+LUMoS
+–
+–
+–
+–
+–
+–
+–
+–
+λSplit (ours)
+525.91
+922.37
+2508.35
+1681.98
+759.06
+1640.65
+2508.35
+318.82
+Table S.8:
+Quantitative comparison of λSplit vs. supervised spectral unmixing baselines for low
+spectral dimensionality. The first four columns, from left to right report: (i) the number of bands in
+the input spectral data; (ii) the considered baselines; (iii) whether the method is self-supervised; (iv) the
+number of parameters in the architecture used by each baseline. The following columns report a subset of
+metrics for experiments in which: (left) the number of bands is reduced while keeping the per-band SNR
+constant, isolating the effect of spectral dimensionality; (right) the total photon budget is fixed, such that
+fewer bands lead to higher per-band SNR.
+Same per-band SNR
+Same tot. photon budget
+Bands
+Method
+SSL
+Params
+PSNR↑
+MS3IM↑
+LPIPS↓
+PSNR↑
+MS3IM↑
+LPIPS↓
+3
+AutoUnmix [19]
+✗
+167M
+32.24
+0.961
+0.106
+33.05
+0.973
+0.086
+UNet [40]
+✗
+31M
+19.96
+0.621
+0.631
+20.11
+0.606
+0.496
+λSplit (ours)
+✓
+3M
+27.25
+0.878
+0.283
+27.45
+0.868
+0.273
+4
+AutoUnmix
+✗
+293M
+34.01
+0.980
+0.088
+34.50
+0.982
+0.081
+UNet
+✗
+31M
+20.22
+0.642
+0.526
+19.38
+0.638
+0.549
+λSplit (ours)
+✓
+3M
+29.95
+0.960
+0.267
+31.54
+0.967
+0.238
+5
+AutoUnmix
+✗
+450M
+34.16
+0.983
+0.076
+34.16
+0.983
+0.076
+UNet
+✗
+31M
+18.57
+0.611
+0.494
+18.57
+0.611
+0.494
+λSplit (ours)
+✓
+3M
+31.12
+0.971
+0.313
+31.12
+0.971
+0.313
+S.20
+λSPLIT
+GT
+λSplit
+LU
+HyU
+RLU
+NMF-RI
+NNLU
+LUMoS
+CellAtlas - 5 bands
+Nuclei
+ER
+Microtubules
+Mitochondria
+Figure S.10: Qualitative results for the reduced spectral dimensionality experiments (CellAtlas, 5-band
+acquisition). We compare λSplit against six baselines on representative structures. Although λSplit achieves
+the best quantitative fidelity, its predictions do not always appear as high-contrast as those of some baselines.
+This behavior can be attributed to two design choices. First, the network is trained solely with an MSE
+objective and does not include perceptual losses, which could be explored in future work to improve visual
+appearance. Second, λSplit does not impose constraints on the unmixed images (e.g., non-negativity or
+sparsity), allowing the model to fully exploit learned structural priors. While this flexibility improves
+reconstruction fidelity, spectral overlap can induce intensity redistribution across channels. For instance,
+bright structures in one channel may appear as faint negative counterparts in another, reducing perceived
+contrast in our figure while still yielding the best MSE.
+S.21
+λSPLIT
+Table S.9: Quantitative comparison of λSplit vs. supervised spectral unmixing baselines for different
+spectral overlaps. In these experiments, we consider the ER and CCPs structures from the BioSR dataset
+and associate them with the EGFP fluorophore. The datasets used here comprise 5-band spectral images.
+EGFP – ER/CCPs – 5 bands
+Metric
+Method
+SSL
+Params
+∆λ = 2
+∆λ = 5
+∆λ = 10
+∆λ = 20
+∆λ = 50
+PSNR ↑
+AutoUnmix [19]
+✗
+450M
+46.82
+50.14
+51.10
+50.50
+52.62
+UNet [40]
+✗
+31M
+25.40
+27.06
+25.85
+26.43
+25.87
+λSplit (ours)
+✓
+3M
+37.61
+42.91
+47.55
+51.40
+54.29
+MS3IM ↑
+AutoUnmix
+✗
+450M
+0.998
+0.999
+0.999
+0.999
+0.999
+UNet
+✗
+31M
+0.689
+0.799
+0.758
+0.760
+0.672
+λSplit (ours)
+✓
+3M
+0.949
+0.981
+0.994
+0.998
+0.999
+LPIPS ↓
+AutoUnmix
+✗
+450M
+0.031
+0.016
+0.012
+0.011
+0.008
+UNet
+✗
+31M
+0.578
+0.412
+0.554
+0.600
+0.646
+λSplit (ours)
+✓
+3M
+0.196
+0.094
+0.041
+0.022
+0.027
+µMS3IM ↑
+AutoUnmix
+✗
+450M
+0.997
+0.999
+0.999
+0.999
+0.999
+UNet
+✗
+31M
+0.698
+0.807
+0.688
+0.689
+0.699
+λSplit (ours)
+✓
+3M
+0.914
+0.926
+0.969
+0.993
+0.999
+Pearson ↑
+AutoUnmix
+✗
+450M
+0.995
+0.998
+0.998
+0.998
+0.999
+UNet
+✗
+31M
+-0.235
+0.528
+-0.274
+-0.495
+-0.368
+λSplit (ours)
+✓
+3M
+0.933
+0.982
+0.995
+0.998
+0.999
+SNRu ↑
+AutoUnmix
+✗
+450M
+1573.79
+inf
+1951.91
+inf
+inf
+UNet
+✗
+31M
+35.69
+125.38
+24.63
+36.23
+10.34
+λSplit (ours)
+✓
+3M
+727.70
+1048.60
+1287.36
+1356.12
+1711.83
+Table S.10: Quantitative comparison of λSplit vs. supervised spectral unmixing baselines for different
+spectral overlaps. In these experiments, we consider the Microtubules and CCPs structures from the BioSR
+dataset and associate them with the EGFP fluorophore. The datasets used here comprise 5-band spectral
+images.
+EGFP – Microtubules/CCPs – 5 bands
+Metric
+Method
+SSL
+#params
+∆λ = 2
+∆λ = 5
+∆λ = 10
+∆λ = 20
+∆λ = 50
+PSNR ↑
+AutoUnmix [19]
+✗
+450M
+48.08
+49.70
+51.30
+52.88
+53.62
+UNet [40]
+✗
+31M
+26.52
+28.52
+27.00
+26.59
+27.33
+λSplit (ours)
+✓
+3M
+37.91
+42.81
+47.31
+51.27
+52.65
+MS3IM ↑
+AutoUnmix
+✗
+450M
+0.998
+0.999
+0.999
+1.000
+1.000
+UNet
+✗
+31M
+0.728
+0.836
+0.726
+0.736
+0.746
+λSplit (ours)
+✓
+3M
+0.954
+0.983
+0.994
+0.998
+0.999
+LPIPS ↓
+AutoUnmix
+✗
+450M
+0.018
+0.012
+0.009
+0.005
+0.004
+UNet
+✗
+31M
+0.590
+0.422
+0.469
+0.626
+0.598
+λSplit (ours)
+✓
+3M
+0.209
+0.109
+0.049
+0.024
+0.030
+µMS3IM ↑
+AutoUnmix
+✗
+450M
+0.998
+0.999
+0.999
+1.000
+1.000
+UNet
+✗
+31M
+0.668
+0.839
+0.668
+0.753
+0.663
+λSplit (ours)
+✓
+3M
+0.920
+0.932
+0.971
+0.996
+0.998
+Pearson ↑
+AutoUnmix
+✗
+450M
+0.996
+0.998
+0.998
+0.999
+0.999
+UNet
+✗
+31M
+-0.245
+0.533
+-0.143
+0.012
+-0.413
+λSplit (ours)
+✓
+3M
+0.935
+0.982
+0.995
+0.998
+0.999
+SNRu ↑
+AutoUnmix
+✗
+450M
+3202.17
+inf
+inf
+inf
+inf
+UNet
+✗
+31M
+32.11
+141.62
+133.68
+70.90
+68.56
+λSplit (ours)
+✓
+3M
+806.40
+1017.92
+1527.50
+1170.58
+992.97
+S.22
+λSPLIT
+Table S.11: Quantitative comparison of λSplit vs. supervised spectral unmixing baselines for different
+spectral overlaps. In these experiments, we consider the ER and CCPs structures from the BioSR dataset and
+associate them with the mTurquoise fluorophore. The datasets used here comprise 5-band spectral images.
+mTurquoise – ER/CCPs – 5 bands
+Metric
+Method
+SSL
+#params
+∆λ = 2
+∆λ = 5
+∆λ = 10
+∆λ = 20
+∆λ = 50
+PSNR ↑
+AutoUnmix [19]
+✗
+450M
+43.18
+48.58
+49.39
+49.67
+52.27
+UNet [40]
+✗
+31M
+27.84
+28.67
+28.31
+29.29
+25.76
+λSplit (ours)
+✓
+3M
+36.88
+42.24
+47.32
+49.75
+52.60
+MS3IM ↑
+AutoUnmix
+✗
+450M
+0.993
+0.998
+0.999
+0.999
+0.999
+UNet
+✗
+31M
+0.817
+0.861
+0.832
+0.879
+0.747
+λSplit (ours)
+✓
+3M
+0.950
+0.980
+0.992
+0.996
+0.999
+LPIPS ↓
+AutoUnmix
+✗
+450M
+0.057
+0.019
+0.015
+0.014
+0.010
+UNet
+✗
+31M
+0.631
+0.376
+0.315
+0.609
+0.574
+λSplit (ours)
+✓
+3M
+0.173
+0.122
+0.051
+0.030
+0.026
+µMS3IM ↑
+AutoUnmix
+✗
+450M
+0.993
+0.998
+0.999
+0.999
+0.999
+UNet
+✗
+31M
+0.684
+0.848
+0.807
+0.675
+0.772
+λSplit (ours)
+✓
+3M
+0.911
+0.925
+0.953
+0.983
+0.997
+Pearson ↑
+AutoUnmix
+✗
+450M
+0.991
+0.997
+0.998
+0.998
+0.999
+UNet
+✗
+31M
+-0.560
+0.637
+0.533
+-0.545
+0.151
+λSplit (ours)
+✓
+3M
+0.935
+0.979
+0.993
+0.997
+0.999
+SNRu ↑
+AutoUnmix
+✗
+450M
+inf
+774.84
+5229.45
+1439.43
+inf
+UNet
+✗
+31M
+17.66
+64.19
+105.41
+4.12
+20.81
+λSplit (ours)
+✓
+3M
+428.91
+735.90
+1331.06
+1641.54
+1028.25
+Table S.12: Quantitative comparison of λSplit vs. supervised spectral unmixing baselines for different
+spectral overlaps. In these experiments, we consider the Microtubules and CCPs structures from the BioSR
+dataset and associate them with the mTurquoise fluorophore. The simulated datasets used here comprise
+5-band spectral images.
+mTurquoise – Microtubules/CCPs – 5 bands
+Metric
+Method
+SSL
+#params
+∆λ = 2
+∆λ = 5
+∆λ = 10
+∆λ = 20
+∆λ = 50
+PSNR ↑
+AutoUnmix [19]
+✗
+450M
+46.09
+48.47
+49.85
+51.69
+52.52
+UNet [40]
+✗
+31M
+26.01
+26.32
+26.56
+28.36
+27.54
+λSplit (ours)
+✓
+3M
+37.64
+43.17
+46.52
+49.26
+53.27
+MS3IM ↑
+AutoUnmix
+✗
+450M
+0.997
+0.998
+0.999
+0.999
+1.000
+UNet
+✗
+31M
+0.662
+0.704
+0.716
+0.827
+0.801
+λSplit (ours)
+✓
+3M
+0.956
+0.982
+0.992
+0.996
+0.999
+LPIPS ↓
+AutoUnmix
+✗
+450M
+0.026
+0.021
+0.011
+0.009
+0.005
+UNet
+✗
+31M
+0.460
+0.488
+0.516
+0.462
+0.400
+λSplit (ours)
+✓
+3M
+0.205
+0.120
+0.064
+0.030
+0.016
+µMS3IM ↑
+AutoUnmix
+✗
+450M
+0.997
+0.998
+0.999
+0.999
+0.999
+UNet
+✗
+31M
+0.688
+0.718
+0.666
+0.838
+0.809
+λSplit (ours)
+✓
+3M
+0.919
+0.931
+0.956
+0.983
+0.999
+Pearson ↑
+AutoUnmix
+✗
+450M
+0.994
+0.997
+0.998
+0.999
+0.999
+UNet
+✗
+31M
+0.050
+0.303
+-0.155
+0.419
+0.348
+λSplit (ours)
+✓
+3M
+0.942
+0.981
+0.993
+0.997
+0.999
+SNRu ↑
+AutoUnmix
+✗
+450M
+inf
+3665.90
+1398.69
+1567.03
+7436.73
+UNet
+✗
+31M
+84.42
+68.99
+91.40
+113.04
+117.00
+λSplit (ours)
+✓
+3M
+680.76
+1071.93
+1533.56
+1446.52
+1436.26
+S.23
+λSPLIT
+CellAtlas - 5 bands 
+GT 
+λSplit 
+AutoUnmix 
+UNet 
+Nuclei
+Mitochondria
+Microtubules
+ER
+Figure S.11: Qualitative results for supervised baselines for the reduced spectral dimensionality experi-
+ments (CellAtlas, 5-band acquisition). We compare λSplit against two supervised baselines, AutoUnmix and
+UNet. AutoUnmix produces high-quality unmixing results, benefiting from strong supervision through paired
+noise-free GT unmixed targets and a large-capacity architecture. In contrast, the standard UNet baseline fails
+to reliably separate the fluorophore signals, producing visibly mixed structures. λSplit predictions remain
+structurally consistent and faithfully recover the underlying biological structures, although they may appear
+perceptually less contrasted than AutoUnmix.
+S.24
+λSPLIT
+EGFP - 5 bands
+ER
+CCPs
+λSplit
+GT
+AutoUnmix
+ER
+CCPs
+mTurquoise - 5 bands
+Figure S.12: Qualitative comparison with AutoUnmix for increasing spectral overlap experiments.
+Representative unmixed concentration maps of ER and CCP structures on the BioSR dataset with 5 spectral
+bands are shown for λSplit and AutoUnmix at ∆λ = 50. At this level of spectral separation, λSplit produces
+results comparable to AutoUnmix both visually and according to the corresponding intensity histograms,
+despite operating without supervision or explicit denoising.
+S.25

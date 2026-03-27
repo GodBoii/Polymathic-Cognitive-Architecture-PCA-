@@ -1,0 +1,3773 @@
+VFig: Vectorizing Complex Figures in
+SVG with Vision-Language Models
+Qijia He⋆1, Xunmei Liu⋆1, Hammaad Memon⋆1, Ziang Li⋆1, Zixian Ma⋆†1,2,
+Jaemin Cho1,2, Zhongzheng Ren1,2,3, Dan Weld1,2, and Ranjay Krishna1,2
+1 University of Washington
+2 Allen Institute for Artificial Intelligence
+3 UNC-Chapel Hill
+Ñ Project page: vfig-proj.github.io
+§ Code: github.com/RAIVNLab/VFig
+Abstract. Scalable Vector Graphics (SVG) are an essential format for technical illustration and digital
+design, offering precise resolution independence and flexible semantic editability. In practice, however, orig-
+inal vector source files are frequently lost or inaccessible, leaving only “flat” rasterized versions (e.g., PNG
+or JPEG) that are difficult to modify or scale. Manually reconstructing these figures is a prohibitively
+labor-intensive process, requiring specialized expertise to recover the original geometric intent. To bridge
+this gap, we propose VFig, a family of Vision–Language Models trained for complex and high-fidelity
+figure-to-SVG conversion. While this task is inherently data-driven, existing datasets are typically small-
+scale and lack the complexity of professional diagrams. We address this by introducing VFig-Data, a
+large-scale dataset of 66K high-quality figure–SVG pairs, curated from a diverse mix of real-world paper
+figures and procedurally generated diagrams. Recognizing that SVGs are composed of recurring primi-
+tives and hierarchical local structures, we introduce a coarse-to-fine training curriculum that begins with
+supervised fine-tuning (SFT) to learn atomic primitives and transitions to reinforcement learning (RL)
+refinement to optimize global diagram fidelity, layout consistency, and topological edge cases. Finally, we
+introduce VFig-Bench, a comprehensive evaluation suite with novel metrics designed to measure the
+structural integrity of complex figures. VFig achieves state-of-the-art performance among open-source
+models and performs on par with GPT-5.2, achieving a VLM-Judge score of 0.829 on VFig-Bench.
+1
+Introduction
+Scalable Vector Graphics (SVG) serve as a cornerstone of technical illustration and digital design, offering res-
+olution independence, semantic editability, and a text-based structure amenable to both human editing and
+machine generation, all within a W3C-standard format supported by modern browsers and major graphics edi-
+tors. From scientific research and engineering to education, design, and media, SVG figures distill complex ideas,
+processes, and relationships into precise visual forms that shape how concepts are understood and remembered.
+For instance, widely recognized architectures in AI such as ResNet [9] and Transformers [26] are often recalled
+through their canonical diagrams. Such figures are often structurally complex, combining nested layouts, het-
+erogeneous primitives, precise alignments, and intricate connectivity that together convey meaning no single
+element could express alone. Yet in practice, original vector source files are frequently lost or inaccessible, leav-
+ing only flat rasterized versions (e.g., PNG or JPEG) that are difficult to modify, scale, or re-purpose. Manually
+reconstructing these figures is prohibitively labor-intensive, demanding specialized expertise to faithfully recover
+the original geometric intent, styling, and compositional structure.
+Automating the conversion from a rasterized complex image back to editable clean SVG code—bridging the
+visual and textual modalities—would therefore unlock significant practical value: accelerating revision work-
+flows, lowering the barrier to professional visualization, and enabling faithful reuse across platforms. A central
+challenge, however, is that this task requires joint reasoning over both visual content (e.g., spatial layouts,
+styling, and compositional hierarchy) and the structured code needed to faithfully reproduce it. This naturally
+lends itself to a vision-language modeling formulation, and we therefore propose a VLM-based approach that
+takes a raster image as input and produces a structured, editable SVG code. An overview of our method is
+shown in Fig. 1.
+* denotes joint first authors † denotes project lead
+arXiv:2603.24575v1  [cs.CV]  25 Mar 2026
+V-Fig
+˝Generate the svg 
+code for this figure.˛
+Rasterize
+Generate 
+SVG code
+Input
+Model outputs 
+(rasterized)
+Model inputs
+Fig. 1: Overview of VFig. Given complex raster images (top row) as input, VFig generates editable, high-fidelity
+SVG code (pink box). Rendering the generated SVG (bottom row) produces outputs nearly indistinguishable from the
+inputs.
+Despite growing interest in figure-to-SVG generation, no prior work has systematically studied whether
+modern machine learning models can produce high-fidelity, editable SVG code for structurally complex figures.
+Existing approaches span classical contour-tracing methods [24, 27], learning-based techniques [3, 13, 20], and
+more recent LLM/VLM-based generation methods [21,23,33,34,36]. While these methods have shown promising
+results, they are predominantly developed and evaluated on relatively simple graphics such as icons or small
+diagrams. It remains unclear how well they scale to the kind of figures encountered in practice, such as those
+with multi-panel layouts, dense annotations, hierarchical grouping, and precise connectivity, which are precisely
+the figures where automated reconstruction would be most valuable.
+Complex figure-to-SVG generation poses several concrete technical challenges. First, not all visual content is
+well-suited for vectorization: natural images, heavy textures, and complex mathematical equations often demand
+dense low-level primitives that resist clean SVG representation, necessitating careful data curation. Second, as
+diagram complexity increases, SVG token sequences grow dramatically, making long-horizon generation and
+syntactic consistency substantially harder. Third, compositional figures, with repeated modules, hierarchical
+groupings, and precise alignments, are difficult to learn from a cold start compared to isolated icons. Finally,
+fine-grained geometric and stylistic details are hard to reproduce purely through token prediction without visual
+feedback. We address these challenges with the following contributions:
+Data. We construct VFig-Data, a large-scale dataset of 66K complex figure–SVG pairs curated from real-world
+paper figures and procedurally generated diagrams. Our pipeline explicitly (1) excludes figures fundamentally
+unsuitable for faithful vectorization (e.g., natural images or mathematical equations), (2) preserves structural
+semantics and editability to support compositional learning, and (3) controls sequence length to reduce long-
+horizon generation instability.
+Training. To address the compositional difficulty of complex figures and the limitations of pure next-token
+supervision, we propose a two-stage training strategy tailored to structured SVG generation. We first apply
+a coarse-to-fine curriculum during supervised fine-tuning (SFT), stabilizing primitive-level generation before
+scaling to multi-panel, hierarchical compositions. We then apply reinforcement learning (RL) with rendering-
+aware, structure-focused rewards that provide explicit visual feedback on alignment, grouping, connectivity, and
+layout.
+Evaluation. We introduce VFig-Bench, a comprehensive benchmark built on VFig-Data’s held-out split,
+specifically targeting complex figures. Unlike prior work that relies on a single evaluation axis, VFig-Bench
+Fig. 2: Examples of VFig-Data and academic data. We show the three sources: simple diagrams from academic
+datasets, complex diagram layouts, and a curated set of basic shapes and arrows to support structured SVG generation.
+features a novel coarse-to-fine evaluation protocol that assesses generation quality across three complementary
+granularities: pixel-level metrics (e.g., LPIPS [38]) for low-level visual fidelity, component-level scores (e.g.,
+rule-based arrow and shape matching) for structural correctness, and image-level judgments (e.g., Gemini [7]
+and GPT [17]-based evaluation) for holistic compositional quality. This multi-granularity design provides a
+comprehensive and nuanced picture of model capabilities that no single metric can capture alone.
+Experiments. We train a family of VLMs for figure-to-SVG conversion and conduct a systematic empirical
+study organized around four research questions:(1) How well can current VLMs convert complex figures into
+faithful, editable SVG code? (2) Does coarse-to-fine curriculum SFT improve learning of compositional figure
+generation? (3) Does RL-based visual feedback improve structural fidelity and fine-grained detail reproduction?
+(4) At what granularity of visual feedback, pixel-level reconstruction versus higher-level structural judgment,
+does RL optimization yield the greatest gains?
+Our experiments yield several clear findings: coarse-to-fine curriculum SFT consistently improves composi-
+tional stability, RL with visual feedback further enhances geometric fidelity, and structure-aware VLM-based
+judging signals prove substantially more effective than low-level pixel metrics for optimizing complex diagrams.
+Notably, VFig achieves state-of-the-art performance among open-source models and competitive performance
+with substantially larger proprietary systems such as GPT-5.2, reaching a VLM-Judge score of 0.829 on VFig-
+Bench. This demonstrates that targeted data curation, structured training, and task-specific evaluation can
+narrow the performance gap with scale. Together, these findings establish a principled foundation for advancing
+VLM-based complex figure-to-SVG generation.
+2
+VFig-Data
+To enable realistic figure-to-SVG generation for complex scientific diagrams, we curate VFig-Data, a large-scale
+dataset of 66K rigorously filtered image-SVG pairs. Unlike prior SVG datasets that focus predominantly on icons
+or decorative graphics, VFig-Data targets diagram-centric scientific figures and we visualized representative
+examples in Fig. 2. To our knowledge, VFig-Data is the first dataset of this scale purpose-built for structured
+scientific figure generation. In the following, we describe our data generation pipeline (Sec. 2.1) and our rigorous
+filtering procedure (Sec. 2.2). To further improve performance and generalization, we also incorporate 78K data
+points from academic SVG datasets after applying a similar filtering process (Sec. 2.3). Lastly, we provide a
+statistical analysis of the entire training data mixture (Sec. 2.4).
+Academic Data
+VFig-Complex-Diagrams
+VFig-Shapes-and-Arrows
+Randomize
+Filter
+Describe
+Filter
+Filter
+Crawl
+Write templates
+Generate
+VLM
+VLM
+LLM
+Rasterize
+Filter
+Fig. 3: Data generation and filtering pipelines. We show the data generation and filtering processes for curated
+academic figures, complex diagrams created through a VLM-based describe-and-generate pipeline from crawled images,
+and shapes and arrows produced by LLM-generated templates with randomized elements.
+2.1
+Data Generation
+Specifically, VFig-Data contains two complementary subsets: (1) VFig-Data-Complex-Diagrams: real-world
+scientific paper figures collected as raster images and converted into structured SVG (Fig. 2, center), and (2)
+VFig-Data-Shapes-and-Arrows: programmatically generated diagrams featuring diverse shapes, connectors,
+and spatial layouts (Fig. 2, right). We develop a dedicated data pipeline for each source, detailed below.
+VFig-Data-Complex-Diagrams. Scientific papers represent the richest and most diverse source of complex
+diagrams, encompassing flowcharts, architecture diagrams, process illustrations, and multi-panel figures with
+varied visual vocabularies. Leveraging this naturally occurring data allows us to capture the full complexity
+and stylistic diversity of real-world figures, which would be difficult to replicate through synthetic generation
+alone. However, these figures are predominantly distributed as raster images (PNG/JPG), necessitating their
+conversion into high-quality, semantically structured SVG code. Directly prompting a VLM to generate SVG
+in a single pass often yields incomplete structures, imprecise layouts, or path-heavy outputs that lack semantic
+organization. To address this, we design a two-stage generation pipeline (Fig. 3, center).
+In the first step, we prompt a VLM to produce a structured description of the input figure, capturing geo-
+metric elements, textual content, spatial layout, and inter-object relationships. This intermediate representation
+decomposes the figure into semantic components that closely mirror SVG primitives. In the second step, we
+prompt the VLM again to generate SVG code conditioned on both the original image and the structured de-
+scription. We empirically find that this two-step approach substantially improves layout accuracy, text rendering,
+and shape selection compared to single-pass generation. To select the optimal VLM backbone, we qualitatively
+evaluate over 20 VLMs in an internal sandbox through side-by-side comparisons of rendered outputs. Based
+on a human preference study, a unified Gemini-3-Pro pipeline—using Gemini-3-Pro for both the description
+and generation stages—is preferred in 88.7% of pairwise comparisons and is adopted as our final configuration
+(details in Appendix).
+VFig-Data-Shapes-and-Arrows. Despite strong overall performance of above generation pipeline, we ob-
+serve systematic errors in fine-grained attributes such as arrow styles, fonts, fill patterns, and certain geometric
+variations. These properties are difficult to reliably infer from raster images alone and are often weakly captured
+by automatic evaluation metrics.
+To address this limitation, we construct VFig-Data-Shapes-and-Arrows, a programmatically generated
+dataset of diagrams with precise control over visual attributes (Fig. 2, right). Diagrams are synthesized directly
+in SVG using 19 layout templates and their combinations, where shapes, arrows, fonts, and styles are instan-
+tiated with randomized parameters to produce diverse yet structurally valid outputs. Each generated SVG is
+rendered into a raster image to form paired image–SVG training data. Because the diagrams are constructed
+programmatically, all visual attributes are recorded as structured metadata, providing precise and noise-free
+supervision; additional details are provided in Appendix.
+<svg width="800" height="600" viewBox="0 0 800 600" xmlns=...>
+  ...
+  <line x1="290" y1="210" x2="500" y2="120" class="line" />
+  <line x1="290" y1="390" x2="500" y2="480" class="line" />
+
+  <rect x="50" y="180" width="240" height="240" fill="white" ... />
+  <text x="170" y="275" ...
+    <tspan x="170" dy="0">Global</tspan>
+   ...
+  <g transform="translate(520, 40)">
+    <rect x="40" y="0" width="120" height="150" .../>
+    ...
+    <text x="60" y="220" ... B</text>
+  </g>
+
+  <g transform="translate(510, 400)">
+    <rect x="0" y="0" width="170" .../>
+    ...
+    <text x="85" y="205" ... C</text>
+  </g>
+</svg>
+<svg width="800" height="600" viewBox="0 0 800 600" xmlns=...>
+  ...
+  <line x1="290" y1="210" x2="500" y2="120" class="line" />
+  <line x1="290" y1="390" x2="500" y2="480" class="line" />
+
+  <rect x="50" y="180" width="240" height="240" fill="white" ... />
+  <text x="170" y="275" ...
+    <tspan x="170" dy="0">Global</tspan>
+   ...
+  <g transform="translate(520, 40)">
+    <rect x="40" y="0" width="120" height="150" .../>
+    ...
+    <text x="60" y="220" ... B</text>
+  </g>
+
+  <g transform="translate(510, 400)">
+    <rect x="0" y="0" width="170" .../>
+    ...
+    <text x="85" y="205" ... C</text>
+  </g>
+</svg>
+Render
+Fig. 4: Cleaned SVG and rendered diagram. The left shows filtered SVG code with primitives and grouped blocks
+(pink/blue/purple); rendering produces the diagram on the right. Elements A, B, and C correspond to the highlighted
+code segments, preserving semantic structure while avoiding path-heavy SVGs.
+2.2
+Data Filtering
+To ensure high-quality training data, we apply two rigorous filters: (1) image filtering, which removes figures
+unsuitable for vectorization, and (2) Code filtering, which discards outputs dominated by free-form paths that
+cause token explosion due to verbose coordinate definitions. We provide more details about filtering in Appendix.
+Image Filtering. In image filtering, we remove figures dominated by natural images, screenshots, or math
+equations (which are better represented in LATEX), as well as plots and tables. We use Gemini-3 Flash (preview)
+to classify each figure into one of four categories: KEEP, IMAGE, MATH, and PLOT. We retain only figures classified as
+KEEP (diagram-centric figures) and discard the rest. We apply this filtering to both newly collected arXiv figures
+and the Paper2Fig [22] figures to obtain clean, diagram-centric samples for VFig-Data-Complex-Diagrams.
+Code Filtering. Beyond image-level filtering, we apply SVG code filtering to remove <path>-dominated or
+structurally noisy outputs and retain figures composed of semantically meaningful primitives. We prioritize
+reducing <path> elements for two reasons: (1) they often contain extremely long coordinate sequences with
+excessive floating-point precision, leading to prohibitive token counts under a VLM’s tokenizer; and (2) they
+frequently bundle semantically distinct elements into monolithic definitions, hindering downstream editability.
+While recent models [36] demonstrate the ability to process SVG sequences exceeding 10K tokens, we argue
+that replacing free-form paths with geometric primitives (e.g., <rect>, <circle>) where possible substantially
+reduces sequence length without sacrificing expressiveness, yielding more efficient and semantically transparent
+representations.
+Concretely, we filter the SVG code using a ratio-based heuristic that retains diagrams dominated by structural
+primitives while removing path-heavy artistic SVGs. We group SVG elements into three categories: basic shapes
+(rect, circle, ellipse), connectors (line, polyline), and complex shapes (path, polygon). Let the total
+number of geometric elements be the sum of these three groups. We enforce two rules: (1) the proportion of basic
+shapes and connectors must be at least 40% of all geometric elements, and (2) the absolute number of complex
+shapes must not exceed 50. These rules filter out tracing-style SVGs dominated by long path sequences while
+preserving diagram-style figures composed of simple geometric primitives. We further apply light cleaning to
+reduce syntactic noise including removing redundant metadata, standardizing canvas settings, and normalizing
+coordinate precision without affecting visual fidelity. Corrupted samples with abnormal repeated numeric or
+character patterns are discarded.
+2.3
+Academic Data
+Besides our own data, we also mix in publicly available SVG diagram resources in our training mixture. Specif-
+ically, StarVector [21] introduces SVG-Diagrams, a dataset specifically designed for structured diagram genera-
+tion. It is constructed by filtering SVG files that contain <text> elements, thereby focusing on layouts composed
+of discrete primitives such as <rect>, <text>, and arrows rather than free-form artistic paths.
+We additionally incorporate SVG diagram data from Molmo2-SynMultiImageQA [4] to further strengthen
+primitive-aware generation. However, these datasets are relatively limited in scale and domain diversity compared
+to real-world diagrams.
+Table 1: Summary of the training mixture. We present the statistics of all datasets used in model training,
+highlighting the higher structural complexity in VFig-Data-Complex-Diagrams.
+Data Source
+Image
+Filtering
+Code
+Filtering
+Final
+Size
+Structural
+Complexity
+Element
+Complexity
+SVG
+Cleanliness
+Path
+Dominance
+(academic) SVG-Diagrams [21]
+✗
+✓
+27.6k
+32.0
+3.4
+0.8
+0.2
+(academic) Molmo2-Diagram [4]
+✓
+✓
+51.2k
+26.9
+3.3
+0.9
+0.1
+VFig-Data-Shapes-and-Arrows
+✗
+✓
+6.5k
+22.2
+3.7
+0.5
+0.5
+VFig-Data-Complex-Diagrams
+✓
+✓
+60.0k
+55.3
+4.0
+0.8
+0.2
+2.4
+Training Mixture & Statistics
+Table 1 summarizes the four data sources used in our model training: two from existing datasets – SVG-
+Diagrams [21] and Molmo2-Diagram (a diagram-focused subset of Molmo2-SynMultiImageQA [4])—and two
+newly introduced by us – VFig-Data-Complex-Diagrams and VFig-Data-Shapes-and-Arrows. We also define
+and report metrics that quantify SVG’s complexity and cleanliness: Structural Complexity measures the
+overall structural burden of an SVG, reflecting how difficult it may be to model long-range layout and com-
+positional structure; Element Complexity captures figure density by counting geometric and text elements
+(log-scaled), with higher values indicating more objects and annotations; SVG Cleanliness measures the pro-
+portion of semantic primitives and connectors (e.g., rect, circle, line) among all geometric elements, where
+higher is better for editability and learning; Path Dominance quantifies reliance on tracing-style elements (e.g.,
+path, polygon), where lower values indicate less path-heavy, more structured SVG code. Formal definitions of
+these metrics can be found in Appendix.
+3
+VFig Model
+Given an input figure image x ∈X, the goal is to generate a structured SVG program y ∈Y that reconstructs
+the visual content while preserving the semantic and compositional structure of the diagram. Our training data
+consists of paired figure–SVG examples D = {(xi, yi)}N
+i=1, where each input figure is rendered directly from its
+ground-truth SVG code to ensure exact visual–structural alignment. Given an input figure and a simple prompt,
+i.e., “Generate the SVG for this figure”, the model is trained to produce the corresponding SVG code. To
+achieve faithful figure-to-SVG generation, we propose training VFig with supervised fine-tuning (Sec. 3.1)
+followed by reinforcement learning with visual feedback for structural refinement (Sec. 3.2).
+3.1
+SFT Training Curriculum
+SFT aims to enable the model to generate syntactically valid and structurally plausible SVG programs that
+capture common diagram patterns, including geometric primitives, text annotations, and hierarchical groupings.
+Specifically, we fine-tune a VLM with parameters θ to model the conditional distribution pθ(y | x) over SVG
+programs given an input image. The supervised fine-tuning objective maximizes the likelihood of training data:
+  \m a thcal {L} _{\t ext { SFT }} = -\mathbb {E}_{(x,y)\sim \mathcal {D}} \left [\log p_\theta (y \mid x)\right ]. \label {eq:sft} 
+(1)
+Notably, training directly on complex scientific figures from the outset often leads to unstable convergence
+and degenerate outputs, as the model must simultaneously learn low-level primitive generation and high-level
+compositional reasoning. To mitigate this, we adopt a two-stage curriculum strategy: the model is first trained on
+structurally simpler diagrams (SVG-Diagrams [21], Molmo2-Diagram [4], and VFig-Data-Shapes-and-Arrows)
+to establish robust primitive-level generation and basic layout understanding, and then fine-tuned on complex
+scientific figures (VFig-Data-Complex-Diagrams) to develop compositional reasoning and structural fidelity.
+This progressive training schedule allows the model to build a strong foundation in shape and text rendering
+before tackling the full complexity of real-world diagrams.
+3.2
+Reinforcement Learning with Visual Feedback
+While SFT enables the model to produce plausible SVG programs, it optimizes token-level likelihood rather than
+the visual quality of the rendered output—a mismatch that can leave perceptible layout and rendering errors
+unaddressed. To close this gap, we introduce a reinforcement learning stage with visual feedback that directly
+optimizes for visual fidelity and structural correctness. Specifically, we adopt Group Relative Policy Optimization
+(GRPO) [25], which estimates advantages from group-level comparisons without requiring a separate reward
+model, making it well suited for our setting where reward signals are derived from rendered image quality.
+For each input figure x ∈D, the model samples multiple SVG programs, each of which is rendered into ˆy
+and scored by a reward function R(x, ˆy) that measures visual similarity. Programs that fail to produce valid
+renderings (e.g., due to syntax errors or rendering timeouts) receive zero reward, naturally penalizing malformed
+outputs. The resulting scalar rewards are used to update the policy via GRPO with KL regularization against
+the SFT checkpoint to prevent reward hacking and maintain generation stability. Formally, GRPO maximizes
+the following objective:
+  \ma t hcal {L}_{\text  {GRP O}}  =  \mathbb { E }_{x \sim \ mathcal {D},\, \hat {y} \sim \pi _\theta (\cdot |x)} \left [ R(x,\hat {y}) - \beta \,\mathrm {KL}\!\left ( \pi _\theta (\cdot |x)\,\|\,\pi _{\text {ref}}(\cdot |x) \right ) \right ], 
+(2)
+where πref is the frozen SFT policy and β controls the strength of KL.
+Reward Designs. To calculate the reward, the predicted SVG is first extracted from the <svg>...</svg>
+block and rendered into a raster image using CairoSVG 4 at the same resolution as the reference image. A VLM
+judge (Gemini-3-Flash) then compares the rendered prediction against the ground-truth image and outputs four
+rubric scores in [0, 1]:
+– Presence (rpres). Measures whether all required visual elements (shapes, arrows, labels) are present. This
+term penalizes missing components and discourages incomplete diagram generation.
+– Layout (rlayout). Evaluates spatial arrangement, alignment, and relative positioning. Scientific diagrams
+require precise structural placement; this term ensures geometric correctness beyond mere element existence.
+– Connectivity (rconn). Checks whether arrows and lines connect the correct endpoints. This is critical for
+preserving relational semantics (e.g., source–destination correctness), which pixel similarity metrics often
+fail to capture.
+– Details (rdet). Assesses text accuracy and fine styling attributes such as font, stroke, and color. This term
+encourages preservation of fine-grained visual fidelity important for scientific readability.
+The final reward is an unweighted average across the four individual rewards: R = 1
+4 (rpres + rlayout + rconn + rdet).
+We adopt a rubric-based VLM judge to provide high-level rewards instead of using pixel-level distance metrics
+(e.g., L2, SSIM, LPIPS) because scientific diagrams require structural and semantic fidelity beyond perceptual
+similarity. For example, pixel-level visual similarity metrics may assign high scores to outputs with very different
+arrows due to their relatively small areas, whereas rubric-based evaluation captures semantic differences better
+and aligns with human judgment of diagram fidelity. Empirically, Gemini judge scores exhibit strong Pearson
+correlation with human judgments on 100 annotated examples (overall r = 0.89; presence r = 0.79; layout
+r = 0.63; connectivity r = 0.83; details r = 0.87), indicating good alignment with human perception of diagram
+structure and visual fidelity.
+4
+Experiments
+We conduct a systematic empirical study to answer these four research questions: (1) How effectively can current
+VLMs convert complex figures into faithful, editable SVG code? (2) Does coarse-to-fine curriculum SFT improve
+compositional figure generation? (3) Can RL with visual feedback improve structural fidelity and fine-grained
+detail reproduction? (4) Which level of visual feedback—pixel-level reconstruction or higher-level structural
+judgment—yields the largest gains during RL optimization? In this section, we first detail our experimental
+setups and discuss our results to these questions.
+4.1
+Training Setup
+SFT. We experiment with recent vision-language models as our backbones, including Qwen3-VL-4B, Qwen3-VL-
+8B [1], Qwen2.5-VL-3B [2], and InternVL3.5-4B [40]. To adapt these models efficiently, we employ LoRA-based
+parameter-efficient fine-tuning [10], update only the language model parameters while keeping the vision encoder
+4 https://cairosvg.org/
+Table 2: Benchmark results across three datasets. VisualSim reports the average cosine similarity of DINO, CLIP,
+and SigLIP image embeddings. VLM-Judge denotes the mean score of Gemini and GPT judges, evaluating semantic and
+structural correctness of rendered figures. Clean means the svg cleanliness, and Render reports the successful rendering
+rate of generated SVG programs. For OmniSVG-4B and Starvector-8B, we follow the default decoding parameters
+recommended by their official repositories. We highlight the best numbers among open-source VLMs by bolding them.
+VFig-Bench
+Molmo2-Diagram [4]
+SVG-Diagrams [21]
+Model
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-Judge↑
+Clean↑
+Render↑
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-Judge↑
+Clean↑
+Render↑
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-judge↑
+Clean↑
+Render↑
+Classical raster-to-vector
+VTracer
+0.950
+0.092
+0.938
+0.838
+0.000
+0.997
+0.942
+0.113
+0.886
+0.757
+0.000
+1.000
+0.885
+0.130
+0.903
+0.806
+0.000
+1.000
+Closed-source VLMs
+GPT-5.2
+0.727
+0.364
+0.957
+0.858
+0.731
+0.995
+0.763
+0.283
+0.955
+0.894
+0.792
+1.000
+0.606
+0.349
+0.936
+0.781
+0.688
+0.984
+Gemini-3-flash
+0.772
+0.258
+0.964
+0.913
+0.788
+0.990
+0.828
+0.162
+0.965
+0.936
+0.833
+0.992
+0.672
+0.245
+0.950
+0.893
+0.680
+0.991
+Gemini-3-pro
+0.756
+0.303
+0.964
+0.932
+0.787
+0.902
+0.784
+0.244
+0.959
+0.929
+0.814
+0.930
+0.637
+0.311
+0.943
+0.887
+0.669
+0.945
+Open-source VLMs
+OmniSVG-4B
+0.695
+0.601
+0.505
+0.039
+0.000
+0.819
+0.705
+0.545
+0.504
+0.096
+0.000
+0.894
+0.586
+0.573
+0.569
+0.089
+0.000
+0.875
+Starvector-8B
+0.699
+0.380
+0.851
+0.548
+0.544
+0.093
+0.755
+0.310
+0.845
+0.650
+0.731
+0.134
+0.677
+0.299
+0.905
+0.701
+0.426
+0.543
+Qwen3-VL-4B
+0.708
+0.574
+0.857
+0.466
+0.794
+0.476
+0.722
+0.512
+0.859
+0.540
+0.774
+0.629
+0.614
+0.554
+0.805
+0.449
+0.591
+0.495
+Ours
+VFig-4B (SFT)
+0.763
+0.264
+0.951
+0.781
+0.784
+0.884
+0.783
+0.226
+0.937
+0.776
+0.828
+0.966
+0.633
+0.311
+0.907
+0.653
+0.710
+0.939
+VFig-4B (SFT+RL) 0.778 0.212
+0.957
+0.829
+0.853 0.960 0.800 0.177
+0.949
+0.834
+0.855 0.976
+0.654
+0.267
+0.919
+0.705
+0.788 0.973
+and multimodal projector frozen. This configuration provides a favorable trade-off between performance and
+computational efficiency. We use LoRA with rank 64 and train for 3 epochs with a maximum sequence length of
+8192 tokens. All models are trained on 5×NVIDIA L40S GPUs. Additional implementation details and ablation
+settings are provided in the Appendix.
+RL. We perform RL with GRPO [25] on the SFT checkpoints. For each prompt, we sample n = 8 candidate
+SVG responses and compute group-wise normalized advantages from their scalar rewards defined in Sec. 3.2.
+The policy is initialized from the SFT checkpoint. Similar to SFT, we apply LoRA (rank 64) to the language
+backbone to enable stable and efficient policy updates. Training follows an actor–rollout–reference configuration
+with a KL regularizer (coefficient 0.01) to constrain policy drift from the SFT initialization. We also include
+an entropy bonus (coefficient 0.001) to encourage exploration during optimization. RL training is conducted on
+4×NVIDIA L40S GPUs.
+4.2
+Evaluation Setup
+Baselines. We compare our approach against a diverse set of baselines, including proprietary VLMs (Gemini 3
+Flash, Gemini 3 Pro [7], and GPT-5.2 [17]) specialized SVG generation VLMs (OmniSVG [36], StarVector [21])
+and classical raster-to-vector method VTracer [27].
+Benchmark. We evaluate figure-to-SVG generation on three diagram-centric benchmarks. VFig-Bench con-
+tains 392 realistic scientific figures held out from VFig-Data-Complex-Diagrams. The Molmo2-Diagrams bench-
+mark consists of 500 diagram samples held out from the Molmo2-Diagram [4]. SVG-Diagrams benchmark in-
+cludes 474 diagram-oriented SVG examples from the official test split of the StarVector dataset [21]. Together,
+these benchmarks cover both simple diagrams and complex real-world paper figures.
+Metrics. We evaluate figure-to-SVG generation by comparing the rasterized prediction with the ground-truth
+image. For pixel-level similarity, we report SSIM [29] and LPIPS [38]. We further report VisualSim, defined as
+the average of cosine similarities between DINO [18], CLIP [19], and SigLIP [37] embeddings of the reference
+image and rendered prediction, which captures image-level visual similarity. Beyond perceptual similarity, we
+employ rubric-based VLM judges to score diagram quality following the same rubric used in our RL reward
+(Sec. 3.2).
+We report the overall average score across four dimensions: presence, layout, connectivity, and details. In
+addition to Gemini-3-Flash, which is also used to provide training rewards, we additionally apply GPT-5.2 as
+another VLM judge.
+We also report svg cleanliness and render rate to measure the generated SVG code’s quality. svg cleanliness
+measures the proportion of semantic primitives and connectors (e.g., rect, circle, line) among all geometric
+P: 1.0  L: 0.9  C: 0.8  D: 0.8
+Rasterized SVG
+P: 0.9  L: 0.8  C: 0.5  D: 0.7
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+Input Image
+Ours (VFig)
+Gemini3-Flash
+StarVector-8B
+OmniSVG
+Qwen3-VL-4B-Instruct
+P: 0.8  L: 0.3  C: 0.2  D: 0.4
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+Render Failure
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 0.7  L: 0.3  C: 0.4  D: 0.3
+P: 0.05  L: 0.0  C: 0.0  D: 0.0
+P: 0.05  L: 0.0  C: 0.0  D: 0.0
+P: 0.05  L: 0.0  C: 0.0  D: 0.0
+P: 0.1  L: 0.1  C: 0.0  D: 0.0
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 1.0  L: 0.8  C: 0.7  D: 0.7
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 0.7  L: 0.4  C: 0.1  D: 0.2
+P: 1.0  L: 0.9  C: 1.0  D: 0.9
+P: 0.9  L: 0.8 C: 0.6 D: 0.5
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Fig. 5: Qualitative comparison across models. Given the same input raster image, we compare the rendered SVG
+outputs produced by different methods. Our model more faithfully preserves the structure of the input diagram. P/L/C/D
+denote the Gemini judge scores for presence, layout, connectivity, and details.
+elements, where higher values indicate more structured and editable SVG representations. Render rate is the
+percentage of generated SVG code that can be successfully rendered into images.
+For the programmatically generated benchmark, where ground-truth structural metadata is available, we
+additionally report a rule-based evaluation score that directly compares predicted SVG elements with the ref-
+erence specification. The metric evaluates correctness of shapes and arrows (e.g., geometry, connectivity, and
+style attributes) and aggregates them into a structural fidelity score; full details are provided in Appendix.
+4.3
+Results
+This section answers the research questions outlined in the introduction. The main takeaways are: (1) Current
+VLMs can render figures but still struggle to produce faithful, editable SVGs: classical raster-to-vector methods
+achieve high pixel similarity but fail to generate clean primitives, while open-source VLM baselines perform
+worse in both visual fidelity and structural correctness (Table 2). (2) Coarse-to-fine curriculum SFT improves
+compositional stability, with two-stage training producing more consistent structures and higher judge scores
+(Table 4). (3) RL with visual feedback further improves generation quality, consistently outperforming SFT alone
+across evaluation metrics (Table 2). (4) Structure-aware rewards are more effective than pixel-level objectives:
+structural rewards improve judge-based metrics, while pixel losses may increase SSIM but degrade structural
+quality (Table 5).
+Table 2 reports performance across the three datasets. Our method achieves the best overall performance
+among open-source approaches. In particular, Ours (SFT+RL) obtains the best LPIPS, VisualSim, VLM-
+Judge, Clean, and Render scores across all three benchmarks, indicating stronger visual fidelity, structural
+correctness, and SVG editability. On pixel-level metrics, it also achieves the best SSIM on VFig-Bench and
+Molmo2-Diagram, while Starvector-8B attains the highest SSIM on SVG-Diagrams. Compared with the su-
+pervised baseline Ours (SFT), reinforcement learning further improves performance consistently across all
+reported metrics on all three datasets. Figure 5 further illustrates qualitative differences between methods.
+Table 3: Backbone. Qwen3-VL consistently outperforms
+the other backbones by large margins on visual metrics,
+with the 8B model slightly better than 4B across all metrics.
+Average across VFig-Bench + Molmo2-Diagram + SVG-Diagram
+Models
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-Judge↑
+Clean↑
+Render↑
+InternVL3.5-4B
+0.700
+0.393
+0.901
+0.629
+0.769
+0.778
+Qwen2.5-VL-4B
+0.693
+0.441
+0.883
+0.527
+0.760
+0.823
+Qwen3-VL-4B
+0.749
+0.270
+0.925
+0.712
+0.761
+0.749
+Qwen3-VL-8B
+0.750
+0.261
+0.938
+0.746
+0.776
+0.859
+Table 4: Curriculum. We note that the two-stage cur-
+riculum improves the render success rate by a lot over the
+one-stage one and slightly increases the VLM-judge score.
+Average across VFig-Bench + Molmo2-Diagram + SVG-Diagram
+Model
+Curriculum
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-Judge↑
+Clean↑
+Render↑
+Qwen3-VL-4B
+one-stage
+0.749
+0.270
+0.925
+0.712
+0.761
+0.749
+two-stage
+0.727
+0.265
+0.931
+0.737
+0.776
+0.933
+Qwen3-VL-8B
+one-stage
+0.750
+0.261
+0.938
+0.746
+0.776
+0.859
+two-stage
+0.727
+0.258
+0.931
+0.750
+0.759
+0.945
+Table 5: RL reward. We find that using all four rubrics for the Gemini reward achieves the best scores on all metrics,
+except for SSIM, where the Gemini + Pixel reward wins by a small margin.
+Average across VFig-Bench + Molmo2-Diagram + SVG-Diagram
+Rewards
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-Judge↑
+Clean↑
+Render↑
+Gemini Full Reward
+0.747
+0.207
+0.943
+0.804
+0.842
+0.978
+No Presence
+0.744
+0.214
+0.943
+0.792
+0.829
+0.951
+No Connectivity
+0.745
+0.214
+0.943
+0.796
+0.839
+0.968
+No Layout
+0.742
+0.220
+0.941
+0.787
+0.831
+0.957
+No Details
+0.744
+0.220
+0.941
+0.789
+0.833
+0.961
+Gemini + Pixel
+0.752
+0.208
+0.943
+0.779
+0.816
+0.957
+Hard Data
+0.741
+0.225
+0.940
+0.776
+0.826
+0.965
+4.4
+Ablations
+SFT Backbone. Table 3 reports results aggregated across the three diagram benchmarks. Overall, Qwen3-VL
+achieves the strongest performance, with the 8B variant obtaining the best or near-best results across most
+metrics. Compared with earlier backbones such as InternVL3.5 and Qwen2.5-VL, Qwen3-VL produces more
+faithful and structurally consistent SVG outputs. While the 8B model generally outperforms the 4B variant,
+the margin is moderate, making the 4B model a competitive choice when computational efficiency is important.
+Training curriculum. Table 4 also reports ablation regarding training strategy. We found that the two-stage
+curriculum consistently improves structural consistency and LLM-based evaluation scores. This suggests that
+learning primitive-level generation and simple layouts first helps stabilize training before adapting to more
+complex scientific figures.
+RL Rewards. Table 5 reports ablation results for different RL reward designs. Our full reward combines four
+structural components: presence, layout, connectivity, and details. Removing any component degrades judge-
+based metrics, with the largest drops observed when removing layout or details, indicating the importance of
+spatial arrangement and fine-grained structural fidelity.
+Adding pixel-level objectives (Full+Pixel) slightly improves pixel similarity but reduces judge-based scores,
+suggesting misalignment between pixel reconstruction and structural optimization. Restricting RL to a curated
+subset of difficult samples (Hard Data) also does not improve performance, indicating that diverse training data
+benefits RL stability.
+5
+Related Work
+Tracing-based Vectorization. A line of classical works convert raster images into vector graphics by tracing
+curves to output compact vector files [6, 14, 32]. Early systems such as Potrace approximate bitmap contours
+with smooth Bézier curves and remain a strong baseline for monochrome tracing [24]. More recent tools like
+VTracer extend this paradigm with color handling and heuristic curve fitting [27]. While efficient and visually
+faithful, tracing-based methods optimize for contour accuracy rather than diagram structure: they typically
+produce many unconstrained Bézier paths instead of editable primitives (e.g., boxes, arrows, axes, text), and
+cannot enforce alignment or other domain constraints required for controllable scientific diagram generation.
+Learning-based Vector Graphics Models. Learning-based (non-LLM) approaches model vector graphics
+directly or rely on differentiable rendering to bridge raster supervision and vector outputs [8,11,15,28]. SVG-
+VAE [15] learns a latent-variable model for SVG generation with sequential decoding. DeepSVG [3] learns a
+hierarchical generative model over SVG command sequences, enabling structured synthesis and latent-space
+editing. Differentiable rasterization frameworks such as DiffVG [13] allow gradients to flow from raster losses
+to vector parameters, and Im2Vec [20] demonstrates that vector graphics can be synthesized without vector
+supervision by optimizing primitives through differentiable rendering. Related work such as LIVE [16] improves
+raster-to-vector fitting via progressive, layer-wise construction. These methods improve flexibility and learnabil-
+ity compared to classical tracers, but often struggle with semantic primitive selection and maintaining global
+structure in complex SVGs.
+LLM/VLM-based SVG Code Generation. LLM/VLM-based SVG Code Generation. Recent work
+reframes SVG generation as multimodal code synthesis using large language models (LLMs) and vision-language
+models (VLMs). StarVector [21] introduces a multimodal LLM trained to generate SVG programs from figures
+and text, emphasizing semantic primitive usage over pure curve fitting. LLM4SVG [34] improves SVG generation
+by introducing semantic tokens and better modeling command ordering to reduce ambiguity and hallucination.
+OmniSVG [36] further proposes a unified multimodal framework that tokenizes SVG commands and coordinates,
+enabling scalable end-to-end SVG generation across tasks. Related directions include VLM-based prediction
+of human-readable SVG command sequences [39], diffusion/optimization-based text-to-SVG generation [12,
+35], hybrid LLM–diffusion pipelines [30], and text-guided vector icon synthesis [31]. More recently, researchers
+have explored improving SVG generation through enhanced reasoning and learning signals: Reason-SVG [33]
+introduces a “Drawing-with-Thought” paradigm in which models generate SVG code together with explicit
+design rationales, while RLRF [23] improves generation via reinforcement learning from rendering feedback that
+compares rendered SVG outputs with the input image. These approaches enable instruction-conditioned and
+semantically structured SVG generation, but introduce new challenges in long-horizon consistency, syntactic
+validity, and evaluation.
+Datasets & Evaluation. Existing datasets [5,21,34,36,41] for SVG generation and figure-to-SVG translation
+largely focus on icons, emojis, and artistic graphic designs, offering limited coverage of scientific figures and
+diagrams. Related figure datasets such as Paper2Fig [22] contains around 100K figures scraped from arXiv,
+including architecture and methodology diagrams with embedded text, boxes, and connecting arrows. However,
+these data are primarily curated to support text-aware figure reconstruction (i.e., image autoencoding with
+improved text fidelity), rather than figure-to-SVG translation. As a result, they require substantial filtering
+and restructuring for SVG-oriented tasks and do not provide paired SVG programs. To address these gaps, we
+introduce VFig-Data, a large-scale dataset for diverse scientific figure-to-SVG conversion, and VFig-Bench,
+a unified benchmark that consolidates datasets, tasks, and metrics tailored to scientific diagram understanding
+and SVG generation. Together, they provide a foundation for training and evaluating SVG models on scientific
+figures.
+6
+Conclusion
+We proposed VFig, a family of vision–language models for complex figure-to-SVG conversion. To enable scal-
+able learning and reliable evaluation, we introduced VFig-Data (66K curated figure–SVG pairs) and VFig-
+Bench with structure-aware metrics beyond pixel similarity. Our coarse-to-fine training recipe (SFT followed
+by rendering-aware RL) improves fidelity and structural correctness across benchmarks, outperforming strong
+baselines. We will publicly release the models, data, and evaluation tools to support future work on editable
+scientific figure generation.
+7
+Acknowledgment
+This work was supported by the Qualcomm Innovation Fellowship. We thank Tribhuvanesh Orekondy, Apratim
+Bhattacharyya, Jieyu Zhang, and Yue Yang for their discussion and feedback on the project.
+References
+1. Bai, S., Cai, Y., Chen, R., Chen, K., Chen, X., Cheng, Z., Deng, L., Ding, W., Gao, C., Ge, C., Ge, W., Guo, Z.,
+Huang, Q., Huang, J., Huang, F., Hui, B., Jiang, S., Li, Z., Li, M., Li, M., Li, K., Lin, Z., Lin, J., Liu, X., Liu, J.,
+Liu, C., Liu, Y., Liu, D., Liu, S., Lu, D., Luo, R., Lv, C., Men, R., Meng, L., Ren, X., Ren, X., Song, S., Sun, Y.,
+Tang, J., Tu, J., Wan, J., Wang, P., Wang, P., Wang, Q., Wang, Y., Xie, T., Xu, Y., Xu, H., Xu, J., Yang, Z., Yang,
+M., Yang, J., Yang, A., Yu, B., Zhang, F., Zhang, H., Zhang, X., Zheng, B., Zhong, H., Zhou, J., Zhou, F., Zhou, J.,
+Zhu, Y., Zhu, K.: Qwen3-vl technical report (2025), https://arxiv.org/abs/2511.21631
+2. Bai, S., Chen, K., Liu, X., Wang, J., Ge, W., Song, S., Dang, K., Wang, P., Wang, S., Tang, J., Zhong, H., Zhu, Y.,
+Yang, M., Li, Z., Wan, J., Wang, P., Ding, W., Fu, Z., Xu, Y., Ye, J., Zhang, X., Xie, T., Cheng, Z., Zhang, H.,
+Yang, Z., Xu, H., Lin, J.: Qwen2.5-vl technical report (2025), https://arxiv.org/abs/2502.13923
+3. Carlier, A., Danelljan, M., Alahi, A., Timofte, R.: Deepsvg: A hierarchical generative network for vector graphics
+animation (2020), https://arxiv.org/abs/2007.11301
+4. Clark, C., Zhang, J., Ma, Z., Park, J.S., Salehi, M., Tripathi, R., Lee, S., Ren, Z., Kim, C.D., Yang, Y., Shao,
+V., Yang, Y., Huang, W., Gao, Z., Anderson, T., Zhang, J., Jain, J., Stoica, G., Han, W., Farhadi, A., Krishna,
+R.: Molmo2: Open weights and data for vision-language models with video understanding and grounding (2026),
+https://arxiv.org/abs/2601.10611
+5. Clouâtre, L., Demers, M.: Figr: Few-shot image generation with reptile. arXiv preprint arXiv:1901.02199 (2019)
+6. Diebel, J.R.: Bayesian Image Vectorization: the probabilistic inversion of vector image rasterization. Ph.D. thesis,
+Stanford University (2008)
+7. Google DeepMind: Gemini 3. https://deepmind.google/technologies/gemini/ (2025)
+8. Ha, D., Eck, D.: A neural representation of sketch drawings (2017), https://arxiv.org/abs/1704.03477
+9. He, K., Zhang, X., Ren, S., Sun, J.: Identity mappings in deep residual networks. In: ECCV (2016)
+10. Hu, E.J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., Chen, W.: Lora: Low-rank adaptation of
+large language models (2021), https://arxiv.org/abs/2106.09685
+11. Hu, T., Yi, R., Qian, B., Zhang, J., Rosin, P.L., Lai, Y.K.: Supersvg: Superpixel-based scalable vector graphics
+synthesis. In: CVPR (2024)
+12. Jain, A., Xie, A., Abbeel, P.: Vectorfusion: Text-to-svg by abstracting pixel-based diffusion models. In: CVPR (2023)
+13. Li, T.M., Lukáč, M., Gharbi, M., Ragan-Kelley, J.: Differentiable vector graphics rasterization for editing and learn-
+ing. In: SIGGRAPH (2020)
+14. Liao, Z., Hoppe, H., Forsyth, D., Yu, Y.: A subdivision-based representation for vector image editing. IEEE Trans-
+actions on Visualization and Computer Graphics (2012)
+15. Lopes, R.G., Ha, D., Eck, D., Shlens, J.: A learned representation for scalable vector graphics. In: ICCV (2019)
+16. Ma, X., Zhou, Y., Xu, X., Sun, B., Filev, V., Orlov, N., Fu, Y., Shi, H.: Towards layer-wise image vectorization
+(2022), https://arxiv.org/abs/2206.04655
+17. OpenAI: Introducing gpt-5.2. https://openai.com/index/introducing-gpt-5-2/ (2025)
+18. Oquab, M., Darcet, T., Moutakanni, T., Vo, H., Szafraniec, M., Khalidov, V., Fernandez, P., Haziza, D., Massa, F.,
+El-Nouby, A., Assran, M., Ballas, N., Galuba, W., Howes, R., Huang, P.Y., Li, S.W., Misra, I., Rabbat, M., Sharma,
+V., Synnaeve, G., Xu, H., Jegou, H., Mairal, J., Labatut, P., Joulin, A., Bojanowski, P.: Dinov2: Learning robust
+visual features without supervision (2024), https://arxiv.org/abs/2304.07193
+19. Radford, A., Kim, J.W., Hallacy, C., Ramesh, A., Goh, G., Agarwal, S., Sastry, G., Askell, A., Mishkin, P., Clark,
+J., Krueger, G., Sutskever, I.: Learning transferable visual models from natural language supervision (2021), https:
+//arxiv.org/abs/2103.00020
+20. Reddy, P., Gharbi, M., Lukac, M., Mitra, N.J.: Im2vec: Synthesizing vector graphics without vector supervision
+(2021), https://arxiv.org/abs/2102.02798
+21. Rodriguez, J.A., Puri, A., Agarwal, S., Laradji, I.H., Rodriguez, P., Rajeswar, S., Vazquez, D., Pal, C., Pedersoli,
+M.: Starvector: Generating scalable vector graphics code from images and text (2025), https://arxiv.org/abs/
+2312.11556
+22. Rodriguez, J.A., Vazquez, D., Laradji, I., Pedersoli, M., Rodriguez, P.: Ocr-vqgan: Taming text-within-image gener-
+ation. WACV (2023)
+23. Rodriguez, J.A., Zhang, H., Puri, A., Feizi, A., Pramanik, R., Wichmann, P., Mondal, A., Samsami, M.R., Awal, R.,
+Taslakian, P., Gella, S., Rajeswar, S., Vazquez, D., Pal, C., Pedersoli, M.: Rendering-aware reinforcement learning
+for vector graphics generation (2025), https://arxiv.org/abs/2505.20793
+24. Selinger, P.: Potrace: A polygon-based tracing algorithm. Unpublished manuscript (2003)
+25. Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., Bi, X., Zhang, H., Zhang, M., Li, Y.K., Wu, Y., Guo, D.: Deepseekmath:
+Pushing the limits of mathematical reasoning in open language models (2024), https://arxiv.org/abs/2402.03300
+26. Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A.N., Kaiser, Ł., Polosukhin, I.: Attention is
+all you need. NeurIPS (2017)
+27. Vision Cortex: Vtracer (2023), https://www.visioncortex.org/vtracer-docs
+28. Wang, Y., Lian, Z.: Deepvecfont: Synthesizing high-quality vector fonts via dual-modality learning (2021), https:
+//arxiv.org/abs/2110.06688
+29. Wang, Z., Bovik, A.C., Sheikh, H.R., Simoncelli, E.P.: Image quality assessment: from error visibility to structural
+similarity. IEEE TIP (2004)
+30. Wu, R., Su, W., Liao, J.: Chat2svg: Vector graphics generation with large language models and image diffusion
+models. In: CVPR (2025)
+31. Wu, R., Su, W., Ma, K., Liao, J.: Iconshop: Text-guided vector icon synthesis with autoregressive transformers. ACM
+TOG (2023)
+32. Xia, T., Liao, B., Yu, Y.: Patch-based image vectorization with automatic curvilinear feature alignment. ACM TOG
+(2009)
+33. Xing, X., Guan, Y., Zhang, J., Xu, D., Yu, Q.: Reason-svg: Hybrid reward rl for aha-moments in vector graphics
+generation (2025), https://arxiv.org/abs/2505.24499
+34. Xing, X., Hu, J., Liang, G., Zhang, J., Xu, D., Yu, Q.: Empowering llms to understand and generate complex vector
+graphics (2025), https://arxiv.org/abs/2412.11102
+35. Xing, X., Zhou, H., Wang, C., Zhang, J., Xu, D., Yu, Q.: Svgdreamer: Text guided svg generation with diffusion
+model. In: CVPR (2024)
+36. Yang, Y., Cheng, W., Chen, S., Zeng, X., Yin, F., Zhang, J., Wang, L., Yu, G., Ma, X., Jiang, Y.G.: Omnisvg: A
+unified scalable vector graphics generation model (2025), https://arxiv.org/abs/2504.06263
+37. Zhai, X., Mustafa, B., Kolesnikov, A., Beyer, L.: Sigmoid loss for language image pre-training (2023), https://
+arxiv.org/abs/2303.15343
+38. Zhang, R., Isola, P., Efros, A.A., Shechtman, E., Wang, O.: The unreasonable effectiveness of deep features as a
+perceptual metric. In: CVPR (2018)
+39. Zhang, T., Liu, H., Zhang, P., Cheng, Y., Wang, H.: Beyond pixels: Exploring human-readable svg generation for
+simple images with vision language models. arXiv preprint arXiv:2311.15543 (2023)
+40. Zhu, J., Wang, W., Chen, Z., Liu, Z., Ye, S., Gu, L., Tian, H., Duan, Y., Su, W., Shao, J., Gao, Z., Cui, E., Wang,
+X., Cao, Y., Liu, Y., Wei, X., Zhang, H., Wang, H., Xu, W., Li, H., Wang, J., Deng, N., Li, S., He, Y., Jiang, T.,
+Luo, J., Wang, Y., He, C., Shi, B., Zhang, X., Shao, W., He, J., Xiong, Y., Qu, W., Sun, P., Jiao, P., Lv, H., Wu,
+L., Zhang, K., Deng, H., Ge, J., Chen, K., Wang, L., Dou, M., Lu, L., Zhu, X., Lu, T., Lin, D., Qiao, Y., Dai, J.,
+Wang, W.: Internvl3: Exploring advanced training and test-time recipes for open-source multimodal models (2025),
+https://arxiv.org/abs/2504.10479
+41. Zou, B., Cai, M., Zhang, J., Lee, Y.J.: Vgbench: A comprehensive benchmark of vector graphics understanding and
+generation for large language models. In: EMNLP (2024)
+Appendix
+This appendix provides additional details and results supporting the main paper.
+– We first provide additional details on dataset construction, including image filtering, data composition,
+structural metrics for characterizing SVG complexity and semantic organization, as well as the rule-based
+evaluation protocol for programmatically generated SVG diagrams (Sec. A).
+– We then describe the experimental setup, including training and inference details (Sec. B).
+– We further present additional ablation studies for both supervised fine-tuning and reinforcement learning
+to analyze the effects of model design choices (Sec. C).
+– We also present a human evaluation of figure-to-SVG generation quality to complement the automatic
+benchmark results in the main paper (Sec. D).
+– We include additional qualitative results across multiple benchmarks (Sec. E).
+– Finally, we discuss representative failure cases and summarize the current limitations of our approach
+(Sec. F).
+A
+VFig-Data
+This section provides additional details on the construction of the VFig dataset, including: (i) figure collection
+from arXiv documents and programmatically generated diagrams; (ii) the image filtering pipeline applied to
+curate high-quality samples; (iii) the definition of the SVG Structural Complexity Metrics used to characterize
+structural properties of the dataset; and (iv) the rule-based evaluation for VFig-Data-Shapes-and-Arrows
+dataset.
+A.1
+Arxiv Data
+To complement our synthetic and model-generated sources with realistic scientific figures, we curate an in-the-
+wild corpus from two pipelines: (i) figures adapted from the Paper2Fig dataset [22], and (ii) a large-scale crawl
+of recent arXiv papers.
+For the large-scale acquisition of recent research, we developed an automated pipeline to curate scientific
+figures from arXiv papers published after January 2025. By leveraging the arXiv API, we systematically queried
+and processed a total of 259,073 documents. To ensure the collected diagrams align with the target distribution
+of our benchmark, we restricted the crawl to specific computer science and systems-oriented disciplines.
+For each selected paper, we extracted referenced figure assets from the LATEX source by identifying \includegraphics
+occurrences. We prioritized high-quality formats (PDF, PNG, JPG/JPEG) and discarded unsupported or miss-
+ing references. For figures provided as embedded PDFs, we rasterized them using PyMuPDF to ensure a unified
+image representation. Following the image-level filtering procedure described in Sec. 2.2, we retained 45k high-
+quality figures.
+A.2
+VFig-Data-Complex-Diagrams Generation
+To obtain the best model selection pipeline for SVG generation, we developed a web sandbox5 for qualitative
+comparison for all models from the Gemini, GPT, and Anthropic families. From this initial screening, we
+identified two competitive candidates for deeper evaluation: Gemini 3 Pro →Gemini 3 Pro, and Gemini 3
+Pro →GPT-5.1. In both pipelines, the first stage generates a detailed textual description of the input image,
+and the second stage converts that description into SVG code. To compare these, we conducted an internal
+human evaluation survey across 332 tasks, collecting 1088 responses from 5 annotators. Annotators identified
+the superior pipeline for a given sample or chose "both good" or "both bad" and flagged issues across four
+categories: arrows not to scale, overlapping content, missing content, and rendering failures for the winning
+inference(s). As shown in Figure 6, the most common failure modes were overlapping content and arrows not to
+scale, while outright rendering failures were rare. Based on this evaluation, the Gemini 3 Pro →Gemini 3 Pro
+pipeline was preferred in 88.7% of decisive responses, compared to 11.3% for Gemini 3 Pro →GPT-5.1, and was
+adopted as our generation backbone. All evaluated examples and results are publicly accessible.6 Representative
+examples of cases where each pipeline produced superior outputs are shown below (Figure 7 and 8).
+Fig. 6: Distribution of annotated issues across 332 evaluated samples.
+The prompts used for each stage are as follows:
+Prompt: Description Stage
+Please provide an extremely detailed description of this image. Describe every visual element, including shapes,
+colors, positions, sizes, text content, styles, patterns, gradients, shadows, borders, and any other visual charac-
+teristics. Be as thorough as possible, as this description will be used to recreate the image as an SVG.
+Prompt: SVG Generation Stage
+You are a technical SVG code generator. Your task is to convert the attached image into SVG markup that
+reconstructs all visual elements from the original image. Return only the SVG code, with no explanations,
+markdown, or additional text. The output should start with <svg> and end with </svg>. Use appropriate
+SVG elements such as path, rect, circle, and text, and specify a proper viewBox. Ensure that text
+does not overflow its container, lines do not overlap other elements, and the layout preserves sufficient
+spacing for readability. Preserve the original colors, structure, and text content, and ensure that arrows
+are drawn to scale with those in the input image.
+A.3
+VFig-Data-Shapes-and-Arrows Generation
+Each sample is generated in four sequential steps: selecting a layout, placing shapes, assigning visual styles, and
+routing connections. The completed SVG is then rasterized into a PNG, and all 10 attributes per shape and 6
+per arrow are recorded in a paired JSON metadata file for our rule-based evaluation.
+Layout Selection. Shape positions are seeded by one of 19 layout templates designed to mimic human-made
+diagrams and avoid outputs with no structure. Each template encodes a unique set of shape positions along with
+connection hints specifying which shapes should be linked. Randomized jitter is applied to all shape positions
+to avoid rigid and similar layouts and additional arrows may be generated as discussed below. For additional
+variance, with probability 0.3, two templates are combined by splitting the canvas in half and applying one to
+each side, with a small number of cross-connections added between them
+Shape Placement. The generator supports 18 shape types: 12 flat shapes (circle, rectangle, square, ellipse,
+diamond, hexagon, parallelogram, trapezoid, blob, wave-rect, cloud, text-label) and 6 pseudo-3D shapes (cylin-
+der, prism, cube, 3d-diamond, 3d-hexagon, 3d-trapezoid). Each diagram draws from a palette of 2–3 randomly
+selected types, with a bias against placing the same type consecutively to mimic human-made diagrams. Shape
+sizes are randomized within a fixed range. Candidate positions are validated using Axis-Aligned Bounding Box
+(AABB) collision detection based on bounding box to prevent shape overlap, while enforcing a minimum center-
+to-center separation between shapes. If a position fails, alternatives are tried at increasing radii; shapes that
+5 https://llmsvg.netlify.app/
+6 https://geminivsgpt.netlify.app/
+Ground Truth
+Gemini 3 → Gemini 3
+Parallel Conv 1D
+Layer
+Multi-Head
+Attention
+Multi-Head
+Attention
+Conv 1D
+width 3
+Conv 1D
+width 5
+Add & Norm
+Add & Norm
+concat.
+Feed Forward
+Feed Forward
+Conv 1D
+width 3
+Add & Norm
+Add & Norm
+Parallel Conv 1D layer
+a)
+b)
+Upper Layers of 
+IWAN
+bi-
+CARNN
+t1
+b
+t1
+f
+t2
+b
+t2
+f
+Posit
+ion
+Enco
+der
+Cros
+s
+Cont
+ext
+..
+.
+..
+.
+bi-
+CARNN
+sn
+b
+sn
+f
+..
+.
+..
+.
+tm
+b
+tm
+f
+s1
+b
+s1
+f
+s2
+b
+s2
+f
+e1
+T
+e2
+T
+em
+T
+e1
+S
+e2
+S
+en
+S
+Gram
+mar
+Semantic 
+Interpretation
+Rul
+es
+Dom
+ain
+Ontol
+ogy
+Lexi
+con
+Resolution 
+Rules
+NLP 
+Module
+Wor
+d
+Segmentat
+ion
+vali
+d
+uttran
+ces
+ZA 
+Resolution
+Discou
+rse
+Segm
+ent
+Pars
+ing
+Seman
+tic
+Interpretat
+ion
+utteran
+ces
+contai
+ned
+anaph
+ors
+Conv 1D
+width 7
+Refere
+nts
+of 
+ZAs
+Gemini 3 → GPT 5
+Parallel Conv 1D
+Layer
+Multi-Head
+Attention
+Multi-Head
+Attention
+Conv 1D
+width 3
+Conv 1D
+width 5
+Conv 1D
+width 7
+Add & Norm
+Feed Forward
+Add & Norm
+concat.
+Add & Norm
+Feed Forward
+Conv 1D
+width 3
+Add & Norm
+Parallel Conv 1D layer
+a)
+b)
+Upper Layers of IWAN
+bi-CARNN
+t 1
+b
+t 1
+f
+s
+s
+2
+2
+b
+f
+...
+...
+s
+s
+n
+n
+b
+f
+bi-CARNN
+t
+t
+2
+2
+b
+f
+...
+...
+t
+t
+b
+m
+f
+m
+Position
+Encoder
+Cross
+Context
+s 1
+b
+s 1
+f
+e 1
+T
+e 2
+T
+e m
+T
+e 1
+S
+e 2
+S
+e n
+S
+Gram
+mar
+Semantic 
+Interpretation
+Rule
+s
+Dom
+ain
+Ontol
+ogy
+Lexi
+con
+Resolution 
+Rules
+NLP 
+Module
+Wor
+d
+Segmentat
+ion
+vali
+d
+uttran
+ces
+Refere
+nts
+of 
+ZAs
+Discou
+rse
+Segm
+ent
+ZA 
+Resolution
+Pars
+ing
+utteran
+ces
+contai
+ned
+anaph
+ors
+Seman
+tic
+Interpretat
+ion
+Fig. 7: Examples where the Gemini-3-Pro →Gemini-3-Pro pipeline produced superior SVG outputs.
+cannot be placed are skipped. With probability 0.15, a flat shape is rendered as a stack of 2–4 layered copies,
+each offset and progressively darkened to suggest depth.
+Visual Style Assignment. Each shape is assigned one of 7 fill styles—solid, hatching, dots, crosshatch,
+horizontal-lines, linear gradient, or radial gradient—implemented as SVG pattern or gradient definitions, with
+parameters randomized per shape. Each diagram also samples a single border style (solid, dashed, dotted,
+or dash-dot), stroke width, and with probability 0.6, rounded corners with a randomized radius. Fill colors
+are drawn from a palette of light colors; strokes from dark colors. Arrow colors are selected per diagram (1–3
+distinct colors). Labels come from a domain-specific word bank with word-level uniqueness enforced per diagram,
+rendered in 1–2 font families selected from a set of 8.
+Connection Routing. Given n placed shapes, the number of directed edges c is drawn from a randomized
+range [n rℓ, n rh], where rℓand rh are the lower and upper connection density ratios, each sampled per diagram:
+  c \; \sim  \ ; \m a
+th c al {U} \!\le
+ft  (\lflo or n\, r_\ell \rfloor ,\; \lfloor n\, r_h \rfloor \right ), \qquad r_\ell \sim \mathcal {U}(0.4, 0.6), \quad r_h \sim \mathcal {U}(0.6, 0.8). 
+Template hints are consumed first; random pairs fill the remainder. Each ordered pair appears at most once;
+bidirectional pairs are offset sideways so both arrowheads remain visible. Each arrow independently samples a
+stroke width, arrowhead size, and line pattern (solid, dashed, or dotted), and is drawn as a straight line (60%)
+or quadratic Bezier curve (40%). Arrow endpoints attach at the exact shape boundary via ray-casting from the
+shape center: analytically for circles and ellipses, and via parametric ray segment intersection for polygons and
+3D shapes. Curved arrows use a quadratic Bezier with a perpendicularly offset control point, we ensure paths
+don’t interesect an intermediate shape to avoid confusion when running inference.
+A.4
+Image Filtering
+We provide additional details for the image filtering stage used to construct the VFig dataset. Specifically,
+we employ a classifier using Gemini-3-Flash to automatically filter figures extracted from scientific documents,
+retaining only structured diagram-style figures suitable for SVG generation. The filtering prompt is given below.
+Ground Truth
+0, 
+$
+Gemini 3 → Gemini 3
+s:
+s
+ε:
+s
+0, 
+s
+s:
+s
+s:
+ε
+ε:
+s
+1, 
+s
+a:
+s
+a:
+ε
+ε:
+s
+2, 
+s
+ε:
+s
+s:
+a
+a:
+a
+ε:
+s
+ε:
+a
+ε:
+s
+ε:
+a
+ε:
+s
+ε:
+a
+s:
+s
+a:
+s
+ε:
+a
+0, 
+a
+ε:
+a
+s:
+a
+1, 
+a
+ε:
+a
+2, 
+a
+ε:
+a
+s:
+ε
+s:
+a
+a:
+ε
+a:
+a
+INI
+T
+NEED_REPH
+RASE
+N
+o
+Has 
+span
+Ye
+s
+or 
+not
+Translat
+able
+N
+o
+CLAR
+IFY
+CONFIRM_CORR
+ECTION
+or 
+not
+Ye
+s
+CONFIRM
+_SQL
+Executa
+ble
+Ye
+s
+or 
+not
+N
+o
+INVALID_Q
+UERY
+CONFIRM_R
+ESULT
+Response 
+Template
+CONFIRM_R
+ESULT
+CONFIRM_CORR
+ECTION
+NEED_REPH
+RASE
+INVALID_Q
+UERY
+“SQL: {PRED_SQL}. 
+{NL_RESPONSE}” 
+“Sorry, {CONF_TOKENS} is confusing in our 
+scenario, do you 
+mean 
+{CORR_TOKENS
+}?” 
+“Sorry, it is a confusing question for me, 
+please rephrase your 
+question and ask 
+again.”
+“Sorry, it is an invalidate query, please check 
+the table names and 
+associated fields of 
+interest.”
+y:
+a
+y:
+s
+y:
+s
+y:
+ε
+y:
+ε
+y:
+a
+ε:
+s
+ε:
+a
+ε:
+s
+3, 
+s
+3, 
+a
+ε:
+a
+Gemini 3 → GPT 5
+ε:s
+s:s
+ε:s
+ε:s
+ε:s
+a:s
+a:ε
+1, s
+a:s
+ε:s
+y:s
+y:ε
+2, s
+y:s
+ε:s
+s:ε
+0, s
+s:s
+ε:s
+3, s
+ε:s
+ε:s
+ε:a
+0, $
+ε:a
+s:a
+ε:a
+a:a
+ε:a
+y:a
+0, a
+1, a
+2, a
+3, a
+s:ε
+a:ε
+a:a
+y:ε
+y:a
+ε:as:a
+ε:a
+ε:a
+ε:a
+INIT
+NEED_REPHRASE
+No
+Yes
+CONFIRM_CORRECTION
+Yes
+CONFIRM_SQL
+No
+CLARIFY
+Translatable
+or not
+Has span
+or not
+Yes
+CONFIRM_RESULT
+No
+INVALID_QUERY
+Executable
+or not
+Response Template
+CONFIRM_RESULT
+CONFIRM_CORRECTION
+NEED_REPHRASE
+INVALID_QUERY
+SQL: {PRED_SQL}
+. {NL_RESPONSE}
+Sorry, 
+Sorry, it is a confusing question for me, please rephrase your question and ask again.
+Sorry, it is an invalidate query, please check the table names and associated fields of interest.
+{CONF_TOKENS} is confusing in our scenario, do you mean {CORR_TOKENS}?
+ε:a
+Fig. 8: Examples where the Gemini-3-Pro →GPT-5.1 pipeline produced superior SVG outputs.
+Prompt: Figure Filtering Classifier
+You are a highly precise automated figure-filtering classifier.
+Return exactly one word from: IMAGE, PLOT, MATH, KEEP. Do not output any additional text.
+Goal. Keep only figures that are structured SVG-style diagrams used for systems, pipelines, architectures, net-
+works, or flowcharts. Filter out all other figure types (plots, tables, screenshots, photos, simulations, textures,
+memes, anatomy charts, etc.).
+Apply the following rules in order. The first matching rule determines the label.
+1) PLOT
+Return PLOT if the figure primarily presents data or results, including:
+– line, bar, or scatter plots; histograms; box or violin plots
+– heatmaps, confusion matrices, correlation matrices
+– charts with axes, ticks, legends, or color bars
+– geographic or data maps
+– tables or spreadsheet-style layouts
+2) IMAGE
+Return IMAGE if the figure is primarily illustrative or image-like content, including:
+– photographs or natural images
+– screenshots of software interfaces or terminals
+– simulation outputs or 3D-rendered scenes
+– qualitative grids of many image panels
+– textures, gradients, or raster patterns
+– memes, emojis, cartoons, or comics
+– infographic-style posters or anatomy diagrams
+Small illustrative photo insets are allowed only if the overall figure remains a structured diagram.
+3) MATH
+Return MATH if the figure is dominated by mathematical notation, including multiple equations, integrals,
+summations, matrices, or proof-like derivations.
+If the figure is a structured diagram containing only small mathematical annotations, return KEEP instead.
+4) KEEP
+Return KEEP only if the figure is primarily a structured diagram typically drawn using SVG primitives in
+research papers, including:
+– flowcharts, pipelines, block diagrams, architecture diagrams
+– diagrams composed mainly of text, boxes, arrows, and icons
+– coordinate schematics with axes or reference grids
+– diagrams containing small mathematical annotations
+– diagrams with a few small illustrative photo insets
+A.5
+SVG Structural Complexity Metrics
+To quantitatively characterize the structural properties of SVG datasets, we define a set of interpretable metrics
+that measure geometric complexity and semantic organization. These metrics are designed to correlate with
+sequence modeling difficulty while remaining simple and reproducible.
+Given an SVG file, elements are counted in a case-insensitive manner and grouped into four categories:
+(i) basic primitives (rect, circle, ellipse), (ii) connectors (line, polyline), (iii) complex shapes (path,
+polygon), and (iv) text (text).
+We denote
+  B &= \# (\text {basic primitives}), \\ K &= \#(\text {connectors}), \\ C &= \#(\text {complex shapes}), \\ T &= \#(\text {text elements}), \\ N &= B + K + C,
+(7)
+where N counts geometric elements only (excluding text). A small constant ϵ (e.g., 10−9) is used to avoid
+division by zero when necessary.
+Element Complexity (EC). Element Complexity measures the overall geometric and labeling burden of a
+figure:
+  \ mat hr m  { EC } = \log \left (1 + N + T\right ). 
+(8)
+Higher EC indicates denser figures with more drawable objects and annotations. The logarithmic scaling stabi-
+lizes the metric for large figures and reduces sensitivity to extreme outliers.
+Semantic Cleanliness (Clean). Semantic Cleanliness measures the proportion of semantic primitives and
+connectors relative to path-based tracing:
+  \ma t h r m
+ 
+{ C l e
+a n} = \frac {B + K}{N } = 1 - \frac {C}{N }. 
+(9)
+Values close to 1 indicate structured, editable SVGs composed primarily of semantic primitives and connectors,
+while lower values indicate path-dominated representations typical of tracing-based SVGs.
+Path Dominance (PD). For completeness, we also report Path Dominance:
+  \ m
+a t h r m {PD} = \frac {C}{N } = 1 - \mathrm {Clean}. 
+(10)
+PD captures the extent to which an SVG relies on complex tracing-style elements.
+Tracing-based SVGs typically exhibit higher element complexity and higher path dominance, which increases
+sequence length and reduces structural interpretability. In contrast, semantically structured SVG representa-
+tions emphasize primitives and connectors, yielding higher cleanliness and improved controllability for sequence
+modeling and editing tasks.
+A.6
+Rule-Based Benchmark for VFig-Data-Shapes-and-Arrows.
+Since our VFig-Data-Shapes-and-Arrows dataset includes structured metadata describing element attributes
+and relationships (Section 2.1), we evaluate generated SVGs directly against this ground-truth specification. For
+each sample we compute R = (RS + RA)/2, where
+RS: Shapes are matched to ground-truth metadata by label, then scored across nine visual attributes: shape
+type, fill and stroke color, fill and border style, font, aspect ratio, and relative spatial position.
+B: 24/K: 22/C: 7/T: 35/N: 53/EC: 0/Clean: 0.86/PD: 0.13
+B: 33/K: 53/C: 1/T: 11/N: 87/EC: 0/Clean: 0.99/PD: 0.01
+Fig. 9: Examples illustrating the structural complexity metrics. For each SVG diagram we report element counts
+(B, K, C, T) and the derived metrics EC, Clean, and PD. Structured diagrams typically exhibit higher cleanliness and
+lower path dominance.
+Table 6: Rule-based evaluation on VFig-Data-Shapes-and-Arrows (500 samples). All scores in [0, 1]; higher is better.
+RS and RA are shape and arrow composites after extra-element penalty; R is their mean.
+Composite
+Coverage
+Shape attributes
+Arrow attributes
+Model
+R
+RS
+RA
+Miss. Err.
+Lbl
+Typ
+FC
+FS
+SC
+BS
+Pos
+Fnt
+AR
+Src
+Dst
+Hd
+Sz
+Cv
+Col
+Ovl
+Open-source
+RL
+0.638 0.675 0.602
+0
+15
+0.870 0.650 0.750 0.370 0.750 0.790 0.860 0.260 0.800 0.650 0.670 0.790 0.680 0.650 0.710 0.650
+SFT
+0.618 0.654 0.583
+0
+24
+0.850 0.670 0.770 0.270 0.720 0.770 0.840 0.230 0.780
+0.620 0.640 0.750 0.650 0.620 0.670 0.620
+Qwen3-VL
+0.274 0.257 0.291
+0
+235
+0.430 0.330 0.110 0.160 0.100 0.390 0.420 0.000 0.390
+0.310 0.340 0.400 0.330 0.270 0.330 0.330
+OmniSVG‡
+0.000 0.000 0.000
+142
+0
+0.000 0.000 0.000 0.000 0.000 0.000 0.000 0.000 0.000
+0.000 0.000 0.000 0.000 0.000 0.000 0.000
+StarVector§
+0.000 0.000 0.000
+0
+497
+0.000 0.000 0.000 0.000 0.000 0.000 0.000 0.000 0.000
+0.000 0.000 0.000 0.000 0.000 0.000 0.000
+Closed-source
+Gemini-3-Pro 0.611 0.595 0.627
+0
+2
+0.730 0.590 0.530 0.510 0.610 0.710 0.720 0.250 0.720 0.640 0.650 0.730 0.570 0.660 0.700 0.690
+GPT 5.2
+0.409 0.459 0.358
+0
+1
+0.620 0.490 0.370 0.340 0.400 0.590 0.600 0.160 0.590
+0.400 0.410 0.450 0.360 0.260 0.420 0.370
+‡OmniSVG is evaluated on the original transparent-background SVG inputs as in the main paper. Here the inputs use white backgrounds,
+causing many outputs to be rejected as empty_image, so no file is saved.
+§ 497 of 500 StarVector outputs cannot be parsed as valid SVG; the model is therefore excluded from the main comparison.
+RA: Arrows are matched by endpoint proximity to their expected source and destination shapes, then scored
+across seven attributes: connectivity, arrowhead presence and size, curvature, and color.
+Each metric produces a score in [0, 1], where higher is better. All color comparisons use the ℓ2 distance in
+RGB space normalized by the diameter of the RGB cube, mapping any color pair to [0, 1]. We provide detailed
+definitions for each metric below.
+Shape attributes:
+Label (Lbl). Measures text-label correctness. A score of 1.0 is assigned for an exact match, with partial credit
+proportional to word overlap and 0.0 for no overlap.
+Type (Typ). Evaluates whether the generated SVG element type (e.g., rect, ellipse, path, g) matches the
+expected type. Accepted tags receive 1.0, plausible substitutes receive 0.3–0.4, and incorrect elements receive
+0.0.
+Fill color (FC). Measures fill color accuracy using normalized RGB distance. Ground-truth colors are read
+from the JSON metadata rather than the SVG directly to avoid ambiguities from blended or patterned fills.
+Fill style (FS). Evaluates the fill pattern (solid, dots, crosshatch, hatching, or gradient). The generated
+pattern is inferred from the SVG <defs> section. Exact matches score 1.0; mismatched patterned styles score
+0.5; solid vs. patterned mismatches score 0.0.
+Stroke color (SC). Border color accuracy measured using the same normalized RGB distance as fill color.
+Border style (BS). Evaluates the stroke dash pattern (solid, dashed, dotted, or dash-dot) using the stroke-dasharray
+attribute. Exact matches score 1.0; different non-solid patterns score 0.5; solid vs. non-solid mismatches score
+0.0.
+Position (Pos). Measures spatial layout using anchor-relative offsets, making the score invariant to global
+translation and scale differences between the generated and ground-truth canvases.
+Font (Fnt). Checks the font family, mapped to a class (serif, sans-serif, monospace). Exact name matches
+score 1.0, same-class matches score 0.5, and mismatches score 0.0.
+Aspect ratio (AR). Measures width-to-height ratio accuracy. Ratios within 20% of the ground truth score
+1.0, with the score decaying linearly to 0.0 at a 3× deviation.
+Arrow attributes:
+Source / destination (Src, Dst). Evaluates whether arrow endpoints connect to the correct shapes. Endpoints
+are matched to the nearest shape bounding box within 100 px, and the matched label is compared to the ground-
+truth connection. The reversed orientation is also considered and the better match kept. Binary scoring: 1.0 for
+correct, 0.0 otherwise.
+Head (Hd). Checks for the presence of an arrowhead using the marker-end attribute or a polygon sibling in
+the same group. If the ground-truth arrowhead is visually occluded by another shape, missing arrowheads are
+not penalized.
+Head size (Sz). Evaluates arrowhead size relative to stroke width. Both dimensions are normalized by stroke
+width before comparison. Scores are assigned in four tiers, ranging from 1.0 (within 30%) to 0.1 (more than
+2.5× deviation).
+Curve (Cv). Determines whether arrow curvature matches the ground truth (straight or curved) by detecting
+Bézier or arc commands in the SVG path. Binary scoring: 1.0 for a match, 0.0 otherwise.
+Color (Col). Measures arrow stroke color accuracy using normalized RGB distance, with CSS inheritance
+resolved from ancestor elements and style definitions.
+Overlap (Ovl). Penalizes arrows whose endpoints fall inside shapes they are not supposed to connect to.
+Scores are 1.0 for no violations, 0.4 for one incorrect endpoint, and 0.0 for two or more violations.
+A.7
+Standalone Rule-Based Evaluation and Benchmarks
+The evaluation in Table 6 relies on structured JSON metadata bundled with VFig-Data-Shapes-and-Arrows,
+which provides ground-truth labels, colors, and layout information directly. For real-world SVGs where no such
+metadata exists, we instead extract equivalent ground-truth attributes directly from the ground truth SVG file.
+This standalone approach is necessarily noisier, however validation on VFig-Data-Shapes-and-Arrows shows
+negligible differences from the JSON-based evaluation across all models and metrics, with mean absolute gaps
+of at most 0.003 on RS, 0.001 on RA, and 0.002 on R overall, confirming that standalone attribute extraction
+is a reliable proxy for the JSON ground truth.
+We then use this standalone rule-based evaluation to benchmark models on external datasets: arXiv figures
+(arXiv) and diagrams generated by Molmo (Molmo). The actual metrics and their weighting is unchanged,
+however we are using new methods for deriving the values from the ground truth SVG instead of using the
+JSON metadata generated with the dataset. Table 7 reports composite scores for all models evaluated on these
+benchmarks.
+It is worth noting that this rule-based approach depends on accurately extracting visual attributes from gen-
+erated SVG markup, which can both under- and over-estimate true visual quality. Models using unconventional
+but valid element structures may be penalized unfairly, while models producing invisible or malformed elements
+may receive undeserved credit. Scores are therefore best interpreted as an approximation of fidelity rather than
+an exact measure. By using supersets of valid SVG generations across all models, a variety of evaluation datasets,
+and fine-tuning detection attribute extraction algorithms to input formats, we mitigate these drawbacks.
+Across all three external benchmarks, RL is the strongest open-source model, leading on R, RS, and RA on
+all evaluation datasets, and coming close to the closed-source models on Molmo. Gemini-3-Pro and GPT-5.2
+perform on par overall. OmniSVG scores zero on all shape metrics due to output being rendered with raw paths
+instead of shape SVG elements. Qwen3-VL has high parse failure rates and poor fill and stroke scores across
+benchmarks but achieves reasonable arrow scores.
+In per-metric tables we see shape fidelity (RS) is the harder sub-task for all models. Font is a consistent weak
+point, with scores rarely exceeding 0.27, as models default to generic system fonts regardless of the ground-truth
+family. Fill style is similarly low for fine-tuned models, suggesting that training on structural accuracy comes
+at the cost of visual fidelity.
+Arrow scores (RA) are generally strong, particularly on Molmo where the top models exceed 0.80. Source
+and destination matching is reliable across models, indicating that connectivity is well learned. Head size is a
+consistent weak point, with models frequently over- or under-scaling arrowheads relative to stroke width.
+More detailed per-metric breakdowns of model performance on each dataset using this standalone evaluation
+are given in Tables 8, 9, and 10.
+Table 7: Standalone rule-based evaluation on external benchmarks. RS and RA are shape and arrow composites; R is
+their mean. Bold indicates the best score within each group (open- and closed-source) per column. ⋆Qwen3-VL excluded
+from arXiv due to failure rate > 50%.
+arXiv
+Molmo
+VFIG-Data-Shapes...
+Model
+R
+RS
+RA
+R
+RS
+RA
+R
+RS
+RA
+Open-source
+RL
+0.464 0.312 0.615
+0.580 0.353 0.806
+0.612 0.657 0.566
+Qwen3-VL
+⋆
+⋆
+⋆
+0.359
+0.219
+0.499
+0.307
+0.337
+0.277
+OmniSVG
+0.244
+0.000
+0.488
+0.354
+0.000
+0.707
+0.000
+0.000
+0.000
+Closed-source
+GPT-5.2
+0.469 0.315 0.623
+0.608 0.379 0.837
+0.649 0.697
+0.601
+Gemini-3-Pro
+0.436
+0.292
+0.581
+0.555
+0.332
+0.777
+0.618
+0.633
+0.602
+Scores are computed over the shared superset of samples for which all non-excluded models produced a valid
+generation, so that comparisons are made on identical inputs.
+Table 8: Per-metric evaluation on arXiv (superset of 321 samples). Bold indicates the best score within each group
+(open- and closed-source) per row. Qwen3-VL excluded due to failure rate > 50%.
+Closed-source
+Open-source
+Metric
+GPT-5.2 Gem.-3-Pro
+RL
+OmniSVG
+Shape attributes
+Label
+0.463
+0.469
+0.466
+0.000
+Type
+0.419
+0.432
+0.431
+0.000
+Fill Color
+0.317
+0.317
+0.318
+0.000
+Fill Style
+0.211
+0.214
+0.208
+0.000
+Stroke Color
+0.288
+0.289
+0.281
+0.000
+Border Style
+0.462
+0.473
+0.465
+0.000
+Position
+0.470
+0.478
+0.473
+0.000
+Font
+0.171
+0.202
+0.227
+0.000
+Aspect Ratio
+0.414
+0.428
+0.423
+0.000
+RS
+0.323
+0.331
+0.332
+0.000
+Arrow attributes
+Source
+0.676
+0.682
+0.683
+0.533
+Dest
+0.665
+0.663
+0.664
+0.533
+Head
+0.702
+0.700
+0.714
+0.533
+Head Size
+0.595
+0.654
+0.649
+0.533
+Curve
+0.730
+0.727
+0.730
+0.533
+Color
+0.721
+0.718
+0.723
+0.533
+Overlap
+0.737
+0.732
+0.729
+0.533
+RA
+0.637
+0.654
+0.646
+0.533
+R
+0.480
+0.492
+0.489
+0.266
+B
+Experiment Setup
+This subsection provides implementation details for training and inference. We describe the training setup for
+both supervised fine-tuning (SFT) and reinforcement learning (RL), including model initialization, optimization
+settings, and compute resources. We also present the inference configuration and evaluation protocols used in
+our experiments.
+Table 9: Per-metric evaluation on Molmo (superset of 281 samples). Bold indicates the best score within each group
+(open- and closed-source) per row.
+Closed-source
+Open-source
+Metric
+GPT-5.2 Gem.-3-Pro
+RL
+Qwen3-VL OmniSVG
+Shape attributes
+Label
+0.526
+0.488
+0.507
+0.475
+0.000
+Type
+0.489
+0.465
+0.469
+0.439
+0.000
+Fill Color
+0.428
+0.397
+0.400
+0.360
+0.000
+Fill Style
+0.413
+0.379
+0.396
+0.364
+0.000
+Stroke Color
+0.404
+0.364
+0.352
+0.278
+0.000
+Border Style
+0.533
+0.502
+0.518
+0.490
+0.000
+Position
+0.530
+0.496
+0.514
+0.473
+0.000
+Font
+0.169
+0.207
+0.258
+0.123
+0.000
+Aspect Ratio
+0.492
+0.464
+0.475
+0.422
+0.000
+RS
+0.416
+0.393
+0.395
+0.347
+0.000
+Arrow attributes
+Source
+0.874
+0.858
+0.842
+0.817
+0.737
+Dest
+0.860
+0.849
+0.826
+0.814
+0.737
+Head
+0.862
+0.854
+0.834
+0.829
+0.737
+Head Size
+0.785
+0.824
+0.808
+0.775
+0.737
+Curve
+0.884
+0.872
+0.854
+0.818
+0.737
+Color
+0.880
+0.863
+0.851
+0.820
+0.737
+Overlap
+0.894
+0.882
+0.860
+0.830
+0.737
+RA
+0.839
+0.838
+0.819
+0.795
+0.737
+R
+0.627
+0.616
+0.607
+0.571
+0.368
+B.1
+Training Setup
+We describe the training configurations for both supervised fine-tuning (SFT) and reinforcement learning (RL).
+SFT Training Configuration. Table 11 summarizes the main hyperparameters used in SFT. We adopt Qwen3-
+VL-4B-Instruct as the backbone and perform parameter-efficient fine-tuning using LoRA with rank 64 applied
+to language model layers only, while keeping the vision encoder and projector frozen. The maximum sequence
+length is set to 8192 tokens, and input images are resized to at most 262,144 pixels (512 × 512). Training is
+conducted with a learning rate of 2 × 10−5 using the cosine scheduler with a warmup ratio of 0.1. We use a
+per-device batch size of 1 with gradient accumulation of 16 and train for 3 epochs using bf16 precision.
+Across different backbones, the wall-clock training time varies depending on model size and training strategy.
+For the single-stage SFT setup, training takes approximately 3d20h for Qwen3-VL-8B, 1d03h for Qwen2.5-VL-
+3B, and 1d14h for InternVL3.5-4B, while the Qwen3-VL-4B run was trained for approximately 5 days. For the
+two-stage training strategy, stage 1 and stage 2 are trained sequentially. Specifically, Qwen3-VL-8B requires 2d9h
+for stage 1 and 2d10h for stage 2, Qwen2.5-VL-3B requires 23h and 24h respectively, and InternVL3.5-4B requires
+1d07h and 22h. The Qwen3-VL-4B stage 1 run was trained for approximately 5 days, and stage 2 requires about
+2d20h. All experiments are conducted on 5×L40S GPUs unless otherwise specified; the Qwen3-VL-4B stage 2
+run uses 8×L40S GPUs.
+RL Training Configuration. We initialize RL training from the two-stage SFT checkpoint of Qwen3-VL-
+4B-Instruct and optimize the policy using GRPO. Due to compute and time constraints, we conduct RL only
+on the Qwen3-VL-4B backbone. Similar to SFT, we apply LoRA with rank 64 to the language model layers
+while keeping the vision tower frozen. Table 12 summarizes the main hyperparameters used in RL training.
+We train on the combined RL dataset with a train batch size of 64 and validation batch size of 64, using up
+to 50 validation samples for periodic evaluation. The maximum prompt length and response length are set to
+9000 and 8500 tokens, respectively, and the rollout engine uses a maximum model length of 17,500 tokens. We
+optimize the policy with a learning rate of 9 × 10−6, cosine learning-rate decay, and a warmup ratio of 0.03 in
+bf16 precision. For policy optimization, we use a mini-batch size of 16 and a micro-batch size of 1 per GPU.
+Table 10: Per-metric evaluation on VFig-Data-Shapes-and-Arrows (superset of 182 samples). Bold indicates the
+best score within each group (open- and closed-source) per row.
+Closed-source
+Open-source
+Metric
+GPT-5.2 Gem.-3-Pro
+RL
+Qwen3-VL OmniSVG
+Shape attributes
+Label
+0.919
+0.807
+0.881
+0.908
+0.000
+Type
+0.787
+0.710
+0.695
+0.718
+0.000
+Fill Color
+0.594
+0.626
+0.812
+0.815
+0.000
+Fill Style
+0.515
+0.569
+0.377
+0.136
+0.000
+Stroke Color
+0.714
+0.692
+0.808
+0.711
+0.000
+Border Style
+0.884
+0.816
+0.853
+0.811
+0.000
+Position
+0.906
+0.837
+0.917
+0.878
+0.000
+Font
+0.266
+0.241
+0.263
+0.034
+0.000
+Aspect Ratio
+0.864
+0.784
+0.847
+0.824
+0.000
+RS
+0.708
+0.661
+0.691
+0.645
+0.000
+Arrow attributes
+Source
+0.749
+0.676
+0.652
+0.642
+0.000
+Dest
+0.781
+0.702
+0.666
+0.685
+0.000
+Head
+0.785
+0.742
+0.805
+0.664
+0.000
+Head Size
+0.322
+0.330
+0.519
+0.271
+0.000
+Curve
+0.486
+0.724
+0.711
+0.526
+0.000
+Color
+0.791
+0.769
+0.761
+0.660
+0.000
+Overlap
+0.738
+0.769
+0.686
+0.664
+0.000
+RA
+0.624
+0.628
+0.600
+0.524
+0.000
+R
+0.666
+0.645
+0.646
+0.585
+0.000
+During rollout, we sample n = 8 candidate responses for each prompt to compute group-relative advantages.
+We further apply a KL regularization term with coefficient 0.01 and an entropy bonus with coefficient 0.001 to
+stabilize optimization and encourage exploration. RL training is performed on 4×L40S GPUs for approximately
+30 hours. The reward is computed using our custom rubric-based reward function described in the main text.
+B.2
+Inference Setup
+During inference, we generate SVG code with a maximum generation length of 8192 tokens. Given an input
+figure, the model receives the prompt “Convert this figure into valid SVG code.” together with the image, and
+produces the SVG program autoregressively. For our model and baselines without prescribed decoding settings,
+we use deterministic greedy decoding (do_sample=False). For OmniSVG-4B and Starvector-8B, we follow the
+default decoding parameters recommended in their official implementations. We use greedy decoding by default
+because SVG generation is a structured program synthesis task where small token-level errors can easily break
+the XML syntax or produce invalid code. Selecting the most probable token at each step generally improves
+structural stability compared to stochastic sampling. To ensure valid outputs, we further extract the content
+between the <svg> and </svg> tags from the generated text.
+C
+Additional Ablations
+This section presents additional ablation studies for both SFT and RL training. Specifically, we analyze: (i)
+SFT design choices, including backbone selection, training curricula, and parameter-efficient fine-tuning config-
+urations; and (ii) RL design choices, including reward decomposition and SFT initialization.
+C.1
+SFT Ablation
+Tables 13 and 14 analyze the effect of backbone choice, training curriculum, and parameter-efficient fine-tuning
+configurations.
+Table 11: SFT training configuration
+Component
+Parameter
+Value
+Backbone
+Base model
+Qwen3-VL-4B-Instruct
+Finetuning method
+LoRA
+LoRA
+Rank
+64
+Target modules
+LM only
+Input
+Max sequence length
+8192
+Image max pixels
+262,144
+Training
+Learning rate
+2e-5
+Per-device batch size
+1
+Gradient accumulation
+16
+Epochs
+3
+LR scheduler
+cosine
+Warmup ratio
+0.1
+Precision
+bf16
+Table 13 provides the full per-dataset results for different SFT backbones and training curricula. While the
+main paper reports aggregated results, this table reveals several dataset-specific behaviors. From Table 13, we
+observe a consistent trend that newer Qwen3-VL backbones outperform earlier VLMs across all datasets. In
+particular, Qwen3-VL achieves the strongest results on semantic metrics such as VisualSim and VLM-Judge,
+indicating improved alignment between generated SVG programs and diagram semantics. Increasing the model
+size from 4B to 8B provides additional gains, although the improvement is moderate across most metrics.
+Two-stage training further improves structural reliability and semantic alignment on the more compositionally
+complex datasets, suggesting that separating primitive-heavy diagram pretraining from realistic figure fine-
+tuning helps the model better capture hierarchical diagram structure. Based on these observations, we adopt
+Qwen3-VL-4B with two-stage SFT as the default backbone for subsequent RL experiments.
+Table 14 examines parameter-efficient fine-tuning configurations on Qwen2.5-VL-3B. Increasing the LoRA
+rank generally improves semantic alignment metrics, with rank 64 achieving the best overall performance on
+VFig-Bench and Molmo2-Diagram, particularly in VisualSim and VLM-judge. However, lower ranks remain
+competitive on certain datasets, indicating that moderate ranks already capture much of the task adaptation.
+We further compare different SFT target modules while fixing the LoRA rank to 64. Adapting the language
+model alone consistently yields the strongest or most balanced results across datasets, outperforming or matching
+configurations that additionally tune the projector or vision encoder. These results suggest that most task-
+specific adaptation occurs in the language generation component responsible for producing structured SVG
+programs, while modifying the vision backbone or multimodal projector provides limited additional benefit in
+this setting.
+C.2
+RL Ablation
+Tables 15 and 16 provide additional ablations for RL, covering both reward design and SFT initialization.
+Table 15 reports the full per-dataset breakdown of the reward ablation results. Consistent with the main pa-
+per, the full reward achieves the strongest judge-based performance across datasets, confirming the benefit of
+jointly optimizing presence, layout, connectivity, and details. The per-dataset view further shows that the rela-
+tive importance of reward components varies across benchmarks. On VFig-Bench and SVG-Diagram, removing
+layout or details leads to clearer drops in VLM-Judge, supporting the intuition that these datasets require
+stronger spatial reasoning and fine-grained structural fidelity. Removing connectivity also hurts performance,
+although the degradation is generally smaller than removing layout or details. On Molmo2-Diagram, the differ-
+ences across reward variants are more moderate, suggesting that this benchmark is comparatively more regular
+and less sensitive to reward decomposition. We also observe the same trade-off as in the main paper: adding
+pixel-level objectives improves SSIM/LPIPS on some datasets, but does not translate into better judge-based
+scores, indicating that pixel reconstruction is not always aligned with structural correctness.
+Table 12: RL training configuration
+Component
+Parameter
+Value
+Backbone
+Base model
+Qwen3-VL-4B-Instruct
+Initialization
+Two-stage SFT checkpoint
+RL algorithm
+GRPO
+LoRA
+Rank
+64
+Alpha
+16
+Target modules
+all-linear (excluding visual modules)
+Vision tower
+frozen
+Input / Rollout
+Max prompt length
+9000
+Max response length
+8500
+Max model length
+17,500
+Rollout samples per prompt
+8
+Training
+Learning rate
+9e-6
+Train batch size
+64
+Validation batch size
+64
+Optimization mini-batch size
+16
+Micro-batch size / GPU
+1
+LR scheduler
+cosine
+Warmup ratio
+0.03
+KL loss coefficient
+0.01
+Entropy coefficient
+0.001
+Precision
+bf16
+System
+GPUs
+4×L40S
+Training time
+∼30 hours
+Table 16 further analyzes two factors under the same RL framework: the choice of SFT initialization and
+the backbone model size. In the initialization ablation, we compare RL starting from one-stage and two-stage
+SFT checkpoints of Qwen3-VL-4B. Overall, both initializations benefit from RL, while the two-stage SFT ini-
+tialization yields stronger semantic and structural performance on VFig-Bench and SVG-Diagram, achieving
+higher SSIM, VisualSim, and VLM-Judge, together with lower LPIPS. This suggests that the hierarchical train-
+ing curriculum provides a better starting point for subsequent reward optimization, especially on benchmarks
+with more complex layout and element relationships. On Molmo2-Diagram, the pattern is more mixed: the
+two-stage initialization still achieves slightly stronger VisualSim and VLM-Judge, whereas the one-stage initial-
+ization attains better SSIM, LPIPS, Clean, and Render. This indicates that RL initialized from the one-stage
+checkpoint can still produce competitive visual fidelity and code quality on Molmo2-Diagram, but the two-stage
+initialization remains preferable when prioritizing semantic alignment and judge-based structural quality.
+The model size ablation compares Qwen3-VL-4B and Qwen3-VL-8B under the same two-stage SFT initial-
+ization. Increasing the backbone size to 8B consistently improves VisualSim and VLM-Judge across all three
+datasets, and also gives the best SSIM and LPIPS on Molmo2-Diagram and SVG-Diagram. These gains suggest
+that a larger backbone improves semantic fidelity and structural alignment under RL. At the same time, the
+4B model remains competitive on several code-level metrics: it attains higher Clean scores on all three datasets,
+matches the 8B model in Render on VFig-Bench, and achieves a slightly higher Render score on SVG-Diagram.
+On VFig-Bench, the 4B model also retains slightly better SSIM and LPIPS. Taken together, these results indi-
+cate a trade-off between perceptual or semantic quality and code cleanliness: the 8B model is generally stronger
+when optimizing for visual and judge-based quality, while the 4B model remains a more efficient choice and
+can produce cleaner SVG code. This supports our use of Qwen3-VL-4B with two-stage SFT as the default
+RL setting in the main paper, as it provides a favorable balance between structural fidelity, code quality, and
+computational efficiency.
+Table 13: Ablation study for SFT across three datasets. VisualSim denotes the average cosine similarity of DINO,
+CLIP, and SigLIP embeddings. VLM-judge denotes the mean of Gemini and GPT judge score used in evaluation.
+VFig-Bench
+Molmo2-Diagram
+SVG-Diagram
+Model
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-judge↑
+Clean↑
+Render↑
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-judge↑
+Clean↑
+Render↑
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-judge↑
+Clean↑
+Render↑
+Open-source VLMs
+InternVL3.5-4B (1-stage)
+0.707
+0.438
+0.910
+0.609
+0.755
+0.821
+0.731
+0.361
+0.911
+0.685
+0.828
+0.944
+0.629
+0.396
+0.870
+0.545
+0.704
+0.550
+InternVL3.5-4B (2-stage)
+0.707
+0.433
+0.908
+0.594
+0.783
+0.718
+0.711
+0.404
+0.900
+0.648
+0.820
+0.902
+0.624
+0.392
+0.867
+0.549
+0.731
+0.750
+Qwen2.5-VL-3B (1-stage)
+0.703
+0.492
+0.901
+0.537
+0.794
+0.879
+0.752
+0.368
+0.908
+0.611
+0.847
+0.962
+0.577
+0.503
+0.815
+0.365
+0.615
+0.616
+Qwen2.5-VL-3B (2-stage)
+0.715
+0.466
+0.910
+0.580
+0.811 0.922
+0.735
+0.409
+0.891
+0.578
+0.832
+0.940
+0.576
+0.485
+0.834
+0.429
+0.736
+0.914
+Qwen3-VL-4B (1-stage)
+0.746
+0.296
+0.939
+0.738
+0.747
+0.831
+0.795
+0.216
+0.937
+0.770
+0.836
+0.940
+0.653
+0.352
+0.876
+0.534
+0.655
+0.457
+Qwen3-VL-4B (2-stage)
+0.763
+0.264
+0.951
+0.781
+0.784
+0.884
+0.783
+0.226
+0.937
+0.776
+0.828
+0.966
+0.633
+0.311
+0.907
+0.653
+0.709
+0.939
+Qwen3-VL-8B (1-stage)
+0.748
+0.302
+0.946
+0.760
+0.787
+0.884
+0.815 0.187
+0.952
+0.817
+0.850 0.978
+0.649
+0.331
+0.906
+0.617
+0.670
+0.702
+Qwen3-VL-8B (2-stage)
+0.763 0.260
+0.954
+0.806
+0.758
+0.907
+0.783
+0.220
+0.941
+0.790
+0.816
+0.964
+0.633
+0.301
+0.901
+0.657
+0.696
+0.959
+Table 14: Ablation of LoRA rank and SFT target modules on Qwen2.5-VL-3B (1-stage).
+VFig-Bench
+Molmo2-Diagram
+SVG-Diagram
+Model
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-judge↑
+Clean↑
+Render↑
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-judge↑
+Clean↑
+Render↑
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-judge↑
+Clean↑
+Render↑
+LoRA Rank Ablation (Qwen2.5-VL-3B, 1-stage, LM-only SFT)
+LoRA rank = 16
+0.708
+0.500
+0.891
+0.486
+0.764
+0.811
+0.745
+0.401
+0.893
+0.556
+0.845
+0.904
+0.586
+0.512
+0.813
+0.367
+0.694
+0.720
+LoRA rank = 32
+0.705
+0.500
+0.888
+0.502
+0.811
+0.864
+0.750
+0.389
+0.896
+0.572
+0.861
+0.950
+0.586
+0.509
+0.816
+0.360
+0.685
+0.727
+LoRA rank = 64
+0.703
+0.492
+0.901
+0.537
+0.794
+0.879 0.752 0.368
+0.908
+0.611
+0.847
+0.962
+0.577
+0.503
+0.815
+0.365
+0.615
+0.616
+SFT Target Module Ablation (Qwen2.5-VL-3B, 1-stage, LoRA rank = 64)
+LM + projector + vision encoder
+0.702
+0.483
+0.884
+0.478
+0.765
+0.700
+0.765 0.354
+0.902
+0.579
+0.850
+0.826
+0.586
+0.501
+0.815
+0.365
+0.643
+0.564
+LM + projector
+0.704
+0.508
+0.881
+0.478
+0.774
+0.849
+0.745
+0.399
+0.894
+0.562
+0.854
+0.934
+0.592
+0.530
+0.801
+0.339
+0.594
+0.714
+LM only
+0.703
+0.492
+0.901
+0.537
+0.794 0.879
+0.752
+0.368
+0.908
+0.611
+0.847
+0.962
+0.577
+0.503
+0.815
+0.365
+0.615
+0.616
+D
+Human Evaluation
+To complement the VFig-Bench results in Sec. 4, we additionally conduct a human evaluation of figure-to-
+SVG generation quality. While the main paper reports automatic metrics, including rubric-based VLM judging,
+direct human comparison offers a valuable perspective on how generation quality is perceived by human evalu-
+ators.
+Evaluation setup. We compare four models: Gemini 3 Pro, GPT-5.2, VFig, and Qwen3-VL-4B. We run
+inference on a held-out set of scientific figure images scraped from arXiv using the same scraping and filtering
+pipeline described in the main paper. These images are not included in the VFig-Data training set.
+We evaluate model outputs via pairwise human comparison. For each trial, an annotator is presented with a
+ground-truth figure alongside two SVG reconstructions produced by two randomly sampled models. The anno-
+tator is asked to judge which reconstruction more faithfully reproduces the original figure. Figure 12 illustrates
+the evaluation interface used in each trial. The available choices are:
+– A is better
+– B is better
+– Both are good (both reconstructions are acceptable)
+– Both are bad (neither reconstruction is acceptable)
+This protocol captures not only relative preference between the two outputs, but also cases where both outputs
+are acceptable or both fail to faithfully reproduce the target figure. Comparisons were conducted by the authors,
+and model identities were hidden from annotators during evaluation.
+Metrics. From the annotation results, we report three complementary summaries: (1) bootstrap-averaged
+Elo ratings, where both good and both bad outcomes are treated as ties; (2) a quality-aware summary
+reporting win rate, loss rate, both-good rate, both-bad rate, good rate (Win + Both Good), and decisive win
+rate (Win / (Win + Loss)); and (3) a pairwise comparison table reporting head-to-head outcomes for each
+model pair. Together, these metrics provide both a global ranking and a fine-grained view of human-perceived
+figure fidelity.
+Table 15: Per-dataset RL reward ablation across three datasets. While the main paper reports results averaged
+across all benchmarks, this table provides the full per-dataset breakdown.
+VFig-Bench
+Molmo2-Diagram
+SVG-Diagram
+Reward
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-judge↑
+Clean↑
+Render↑
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-judge↑
+Clean↑
+Render↑
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-judge↑
+Clean↑
+Render↑
+Full Reward
+0.776
+0.216
+0.956
+0.828
+0.856 0.952
+0.806
+0.163
+0.953
+0.850
+0.865 0.996 0.654 0.253
+0.921
+0.728
+0.805 0.980
+No Presence
+0.781
+0.214
+0.957
+0.824
+0.840
+0.892
+0.804
+0.169
+0.952
+0.844
+0.850
+0.978
+0.644
+0.266
+0.919
+0.704
+0.797
+0.975
+No Connectivity
+0.780
+0.217
+0.957
+0.825
+0.856
+0.937
+0.804
+0.168
+0.952
+0.844
+0.857
+0.988
+0.648
+0.265
+0.921
+0.712
+0.803
+0.973
+No Layout
+0.775
+0.223
+0.955
+0.820
+0.848
+0.907
+0.803
+0.175
+0.950
+0.839
+0.852
+0.978
+0.645
+0.270
+0.917
+0.697
+0.794
+0.977
+No Details
+0.777
+0.223
+0.954
+0.813
+0.845
+0.937
+0.804
+0.171
+0.951
+0.844
+0.856
+0.976
+0.647
+0.276
+0.918
+0.703
+0.797
+0.966
+Gemini + Pixel
+0.785 0.211
+0.955
+0.802
+0.835
+0.917
+0.812 0.161
+0.952
+0.836
+0.842
+0.982
+0.653
+0.261
+0.920
+0.692
+0.771
+0.966
+Hard Data
+0.777
+0.226
+0.954
+0.804
+0.844
+0.929
+0.802
+0.176
+0.949
+0.834
+0.856
+0.990
+0.640
+0.283
+0.915
+0.682
+0.778
+0.968
+Table 16: Additional ablation study for RL across three datasets. We analyze two factors under the same RL
+training framework: the effect of SFT initialization and the effect of backbone model size.
+VFig-Bench
+Molmo2-Diagram
+SVG-Diagram
+Model
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-Judge↑
+Clean↑
+Render↑
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-Judge↑
+Clean↑
+Render↑
+SSIM↑
+LPIPS↓
+VisualSim↑
+VLM-Judge↑
+Clean↑
+Render↑
+Initialization Ablation (Qwen3-VL-4B, RL from different SFT checkpoints)
+Qwen3-VL-4B (1-stage SFT) + RL
+0.768
+0.242
+0.950
+0.793
+0.843
+0.940
+0.807 0.175
+0.948
+0.817
+0.874 0.994
+0.644
+0.275
+0.915
+0.690
+0.796
+0.970
+Qwen3-VL-4B (2-stage SFT) + RL 0.778 0.212
+0.957
+0.829
+0.853 0.960
+0.800
+0.177
+0.949
+0.834
+0.855
+0.976
+0.654 0.267
+0.919
+0.705
+0.788
+0.973
+Model Size Ablation (2-stage SFT initialization + RL)
+Qwen3-VL-4B (2-stage SFT) + RL 0.778 0.212
+0.957
+0.829
+0.853 0.960
+0.800
+0.177
+0.949
+0.834
+0.855
+0.976
+0.654
+0.267
+0.919
+0.705
+0.788 0.973
+Qwen3-VL-8B (2-stage SFT) + RL
+0.774
+0.223
+0.960
+0.845
+0.819
+0.960 0.803 0.173
+0.952
+0.851
+0.842
+0.994 0.660 0.251
+0.924
+0.729
+0.749
+0.970
+Results. Results are shown in Tables 17, 18, and 19. Gemini 3 Pro achieves the strongest overall human
+preference, followed by GPT 5.2, with VFig ranking third and clearly ahead of Qwen3-VL-4B. This ordering is
+consistent across all three summaries.
+In the Elo ranking (Table 17), VFig scores 1473.8, surpassing Qwen3-VL-4B by a substantial margin, though
+it remains below GPT 5.2 and Gemini 3 Pro. In the quality-aware summary (Table 18), VFig achieves a 34.5%
+win rate and 44.4% good rate, compared to only 1.2% and 1.3% for Qwen3-VL-4B respectively.
+Pairwise comparisons (Table 19) confirm the same pattern. Against Qwen3-VL-4B, VFig wins 81.6% of
+trials versus 2.0%, indicating a clear human preference for VFig’s reconstructions. Against GPT 5.2, VFig
+wins 17.4% of trials versus 53.2%, though a 16.9% both-good rate suggests that VFig produces competitive
+reconstructions on a non-trivial subset of examples.
+These trends are consistent with the benchmark results reported in the main paper on VFig-Bench. Overall,
+the human evaluation confirms that VFig closes a substantial portion of the quality gap over smaller open-
+source baselines, while leaving room for improvement compared with the strongest proprietary systems. Figure 11
+visualizes decisive pairwise win fractions with ties excluded.
+E
+Additional Qualitative Results
+We provide additional qualitative results on all three evaluation sources in VFig-Bench, Molmo2-Diagram, and
+SVG-Diagram. Figures 13, 14, and 15 show representative examples generated by VFig on the three benchmarks,
+respectively. All examples are drawn from the test sets.
+Overall, these examples highlight both the strengths and limitations of our model. On the positive side, VFig
+preserves the global diagram structure and layout well, so the rendered outputs often appear visually similar
+to the input figures. In particular, the model is generally effective at maintaining the high-level organization of
+objects and their spatial relationships.
+On the VFig-Bench examples (Figure 13), our model significantly improves rendering success compared with
+the base Qwen3-VL-4B-Instruct. The base model frequently produces invalid or non-renderable SVG outputs,
+whereas VFig produces valid SVG programs for most inputs and generates diagrams that more closely resemble
+the original figures. In contrast, models such as StarVector-8B and OmniSVG struggle to handle these complex
+Table 17: Bootstrap-averaged Elo ratings from human pairwise evaluation. Higher is better.
+Model
+Elo Mean Elo Std
+Gemini 3 Pro
+1852.5
+36.3
+GPT 5.2
+1617.3
+35.9
+VFig (Ours)
+1473.8
+38.2
+Qwen3-VL-4B
+1056.4
+35.4
+Table 18: Quality-aware summary of human evaluation results. “Good Rate” is defined as Win + Both Good. “Decisive
+Win Rate” is computed as Win/(Win + Loss). Higher is better for Win, Both Good, Good Rate, and Decisive Win Rate;
+lower is better for Loss and Both Bad.
+Model
+N Win (%) Loss (%) Both Good (%) Both Bad (%) Good Rate (%) Decisive Win (%)
+Gemini 3 Pro 603
+81.8
+3.6
+14.1
+0.5
+95.9
+95.7
+GPT 5.2
+603
+51.6
+27.3
+15.6
+5.5
+67.2
+65.3
+VFig (Ours)
+603
+34.5
+45.9
+10.0
+9.6
+44.4
+42.9
+Qwen3-VL-4B 603
+1.2
+92.0
+0.2
+6.6
+1.3
+1.2
+scientific diagrams, often producing repetition in SVG elements, noisy primitives, or outright rendering failures.
+VFig therefore substantially improves robustness for complex figure reconstruction. At the same time, strong
+closed-source models such as Gemini3-Flash achieve very high visual fidelity on this benchmark, suggesting that
+further improvements are still possible.
+On Molmo2-Diagram (Figure 14) and SVG-Diagram (Figure 15), we observe a similar overall trend: compared
+with open-source baselines, VFig more consistently produces valid SVG outputs and better preserves the global
+structure, layout, and major element relationships of the input images. These results are notable because both
+benchmarks differ from the complex scientific figures in VFig-Bench. In particular, Molmo2-Diagram contains
+many stylized and more cartoon-like diagrams, while SVG-Diagram includes sparse geometric graphics and,
+in some cases, images that are not canonical diagrams. Despite this distribution shift, VFig still reconstructs
+visually faithful outputs in many cases and remains robust across a broad range of diagram styles.
+At the same time, the qualitative examples also highlight benchmark-specific behavior.On Molmo2-Diagram,
+VFig generally preserves high-level layout, grouping, and major visual structure well across a diverse range of
+examples, including line plots, simple object illustrations, and table-like summary graphics. On SVG-Diagram,
+it is often effective at maintaining relative positions, edge directions, and simple topology, and it can also handle
+some non-diagram graphics reasonably well. Strong closed-source models such as Gemini3-Flash still recover finer
+text, styling, and local details more accurately. We also note that StarVector-8B performs worse in our qualitative
+comparison than what may be expected from its original paper. In our evaluation, we follow the default decoding
+parameters provided in the official StarVector repository, which differ from the inference configuration described
+in the paper. This difference in decoding setup, along with possible differences in prompting, may partially
+explain the discrepancy relative to the results reported in the original work.
+F
+Failure Cases and Limitations
+Across the three benchmarks, several common failure patterns can be observed. Errors are often observed in thin
+lines, arrows, small text-like elements, and other precise local structures. The model may also fail to reproduce
+exact colors or subtle stylistic details. Figures 16, 17, and 18 present representative failure cases across the three
+benchmarks.
+Failure cases. On the VFig-Bench examples (Figure 16), failures are primarily associated with fine-grained
+geometric details. In particular, the Gemini detail metric is consistently the lowest among the four evaluation
+dimensions, indicating that local visual fidelity remains the main limitation of the model. Common errors
+include inaccurate arrowheads, distorted thin connectors, and incorrect rendering of small geometric components.
+Diagrams containing 3D shapes or perspective-like objects are especially challenging, often resulting in incorrect
+Table 19: Pairwise human evaluation results between model pairs. Rates are reported over all pairwise annotations for
+each model pair.
+Model Pair
+First Win Second Win Both Good Both Bad Decisive First Win
+Gemini 3 Pro vs GPT 5.2
+63.7
+6.0
+29.9
+0.5
+91.4
+Gemini 3 Pro vs VFig (Ours)
+82.6
+4.5
+12.4
+0.5
+94.9
+Gemini 3 Pro vs Qwen3-VL-4B
+99.0
+0.5
+0.0
+0.5
+99.5
+GPT 5.2 vs VFig (Ours)
+53.2
+17.4
+16.9
+12.4
+75.4
+GPT 5.2 vs Qwen3-VL-4B
+95.5
+1.0
+0.0
+3.5
+99.0
+VFig (Ours) vs Qwen3-VL-4B
+81.6
+2.0
+0.5
+15.9
+97.6
+geometry or missing structural elements. These results suggest that while the model captures global layout and
+object relationships well, it still struggles to reproduce precise local visual structures.
+On the Molmo2-Diagram and SVG-Diagram examples (Figure 17 and Figure 18), we observe both shared and
+benchmark-specific failure patterns. Similar to VFig-Bench, many errors remain concentrated in fine-grained
+local details, such as thin lines, arrowheads, small annotations, and other precise visual structures. Even when
+the overall layout and major object relationships are largely preserved, these local inaccuracies can noticeably
+reduce visual fidelity.
+These two benchmarks also expose a broader range of challenging inputs beyond canonical diagrams. In
+Molmo2-Diagram, failure cases often appear on more stylized examples and visually simplified graphics. In
+SVG-Diagram, the model can struggle on sparse geometric graphics as well as inputs that resemble logos, icons,
+simple object drawings, or chart-like visuals. In such cases, VFig may preserve only the coarse structure while
+simplifying shapes, missing small components, or distorting local geometry and styling. Overall, these examples
+suggest that the model’s generalization across diverse graphic styles and element types remains limited, especially
+when the inputs deviate from the structured diagram distributions emphasized during training.
+Possible causes of failure. Several factors may contribute to the failure cases discussed above. First, our
+final reward design is based on the empirical observation in the main paper that the fully VLM-based reward
+performs better than the variants we tested with additional pixel-level objectives. However, this does not imply
+that pixel-level supervision is inherently unhelpful. In our current experiments, we only explored a limited set
+of pixel-level reward variants, namely equal-weight combinations of Gemini-based reward with L2, Canny-based
+L2, and SSIM-style image similarity terms. It remains possible that different types of pixel-level rewards, or
+different weighting ratios between structural and pixel-level objectives, could better improve fine-grained visual
+fidelity without sacrificing judge-based quality.
+Second, our reward relies heavily on Gemini as a visual judge. Although Gemini-based judgment corre-
+lates well with human evaluation in our experiments, it is still an imperfect supervisory signal. Its preferences
+may not always align with human perception on every example, especially for subtle stylistic details, local
+geometry, or borderline rendering cases. Moreover, our current formulation assigns equal weights to the four
+rubric components—presence, layout, connectivity, and details. This equal-weight design is simple and effective
+in practice, but it is not necessarily the best approximation to human perceptual preferences: human judgments
+of figure quality may not correspond to a uniform average over these four aspects. Likewise, the specific judge
+prompt and rubric design may influence which errors are emphasized during training, and there may be addi-
+tional dimensions of quality not fully captured by the current decomposition. Exploring alternative component
+weights, revised judge prompts, or richer reward dimensions could therefore further improve alignment between
+reward optimization and human judgments.
+Third, our training data is primarily designed for complex diagram reconstruction rather than broad vector
+graphic generation. As a result, the data contains limited coverage of examples such as icons, sketches, simple
+object drawings, logos, and other non-canonical graphics. This mismatch is consistent with the qualitative
+failures observed on Molmo2-Diagram and SVG-Diagram, where some difficult examples fall outside the core
+distribution emphasized during training. Together, these observations suggest that further improvements may
+require both richer reward design and broader training data coverage beyond structured scientific diagrams.
+Side-by-side comparison: ground truth (left) vs. inference (right)
+Finish
+Lidar
+Measure
+Normalize
+Filter
+Module
+Internal
+Lookup
+Decoder
+Ground Truth
+Inference (generated by VFig)
+shape_0: Lidar
+Type: circle (1.00)
+Fill: #FFFFFF (0.96)
+Style: solid (1.00)
+Pos: (260,290) (0.99)
+AR: 1.00
+Composite: 0.935
+Expected: shape_0: Lidar
+shape_1: Measure
+Type: circle (1.00)
+Fill: #FFFFFF (1.00)
+Style: solid (0.00)
+Pos: (600,290) (0.98)
+AR: 1.00
+Composite: 0.804
+Expected: shape_1: Measure
+shape_2: Finish
+Type: circle (1.00)
+Fill: url(#dotPa (0.30)
+Style: dots (1.00)
+Pos: (950,250) (1.00)
+AR: 1.00
+Composite: 0.828
+Expected: shape_2: Finish
+Finish
+Lidar
+Measure
+Expected: shape_3: Filter Normalize
+Composite: 0.831
+shape_3: Filter Normalize
+Type: circle (1.00)
+Fill: url(#gridP (0.30)
+Style: crosshatch (1.00)
+Pos: (250,620) (1.00)
+AR: 1.00
+shape_4: Module
+Type: circle (1.00)
+Fill: url(#dotPa (0.30)
+Style: dots (1.00)
+Pos: (640,630) (1.00)
+AR: 1.00
+Composite: 0.849
+Expected: shape_4: Module
+shape_5: Lookup Internal
+Type: circle (1.00)
+Fill: #D0F0F8 (0.94)
+Style: solid (0.00)
+Pos: (970,640) (1.00)
+AR: 1.00
+Composite: 0.802
+Expected: shape_5: Lookup Internal
+Filter
+Normalize
+shape_6: Decoder
+Type: circle (1.00)
+Fill: url(#lineP (0.30)
+Style: hatching (0.50)
+Pos: (170,840) (0.99)
+AR: 1.00
+Composite: 0.778
+Expected: shape_6: Decoder
+Module
+Lookup
+Internal
+Decoder
+Shape attributes
+# Label
+Fill
+Style Stroke Font
+Pos
+AR
+Comp
+0 Lidar
+0.961 1.000 0.966 0.500 0.985 1.000 0.935
+1 Measure
+0.996 0.000 0.759 0.500 0.977 1.000 0.804
+2 Finish
+0.300 1.000 0.650 0.500 0.999 1.000 0.828
+3 Filter Norm. 0.300 1.000 0.684 0.500 1.000 1.000 0.831
+4 Module
+0.300 1.000 0.838 0.500 0.999 1.000 0.849
+5 Lookup Int. 0.937 0.000 0.785 0.500 1.000 1.000 0.802
+6 Decoder
+0.300 0.500 0.715 0.500 0.992 1.000 0.778
+Avg.
+0.585 0.643 0.771 0.500 0.993 1.000 0.832
+#
+Expected
+Detected
+0
+lidar->measure
+lidar->measure
+1
+lidar->filter norma
+lidar->filter norma
+2
+measure->module
+measure->module
+3
+measure->finish
+measure->finish
+4
+filter norma->module
+filter norma->module
+5
+module->lookup inter
+module->lookup inter
+6
+finish->lookup inter
+finish->lookup inter
+GT:8 Det:7 Missing:1(scored 0) Composite:0.837
+Det: lidar
+Src
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+Dst
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+Head
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+Size
+0.60
+0.60
+0.30
+1.00
+1.00
+0.60
+1.00
+Curve
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+Ovlp
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+Color
+0.97
+0.97
+0.97
+0.97
+0.97
+0.97
+0.97
+Comp
+0.94
+0.94
+0.90
+1.00
+1.00
+0.94
+1.00
+Det: measure
+Det: finish
+Lidar
+0
+Measure
+3
+Finish
+1
+6
+2
+Det: filter norma
+Det: module
+Det: lookup inter
+Filter
+Normalize
+4
+Module
+5
+Lookup
+Internal
+Det: decoder
+Decoder
+Arrow attributes
+# Expected
+Detected
+Src
+Dst Head Size Curve Ovlp Color Comp
+0 emit→obs.
+emit→obs.
+1.00 1.00 1.00 0.10 1.00 0.40 0.84 0.76
+1 hist.→dist.
+hist.→dist.
+1.00 1.00 1.00 0.10 1.00 1.00 0.84 0.85
+2 obs.→hist.
+obs.→hist.
+1.00 1.00 1.00 0.30 1.00 1.00 0.84 0.88
+3 proj.→train. proj.→train. 1.00 1.00 1.00 0.10 1.00 1.00 0.84 0.85
+4 dist.→proj.
+dist.→proj.
+1.00 1.00 1.00 0.60 1.00 1.00 0.84 0.92
+5 hist.→proj.
+hist.→proj.
+1.00 1.00 1.00 0.30 1.00 1.00 0.84 0.88
+Fig. 10: Rule-based evaluation for shapes (top) and arrows (bottom) on sample 000024.
+Fig. 11: Pairwise win fractions in human evaluation with ties excluded. Each cell (A, B) reports the fraction of decisive
+comparisons in which model A is preferred over model B, excluding “both good” and “both bad” cases. Warmer colors
+indicate stronger pairwise preference. The visualization highlights that VFig consistently outperforms Qwen3-VL-4B
+and remains competitive with stronger proprietary baselines, while Gemini 3 Pro achieves the strongest overall pairwise
+preference.
+Fig. 12: Screenshot of the human evaluation interface. Annotators are presented with a ground-truth figure and two
+anonymous SVG reconstructions side by side, and are asked to select which reconstruction more faithfully reproduces
+the original.
+Input Image
+Rasterized SVG
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 1.0  L: 0.9  C: 0.9  D: 0.8
+P: 1.0  L: 1.0  C: 1.0  D: 0.9
+P: 0.9  L: 1.0  C: 1.0  D: 0.7
+P: 1.0  L: 0.9  C: 1.0  D: 0.7
+P: 1.0  L: 0.9  C: 0.7  D: 0.8
+P: 1.0  L: 0.6  C: 0.3  D: 0.7
+Ours (VFig)
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+StarVector-8B
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: 0.1  L: 0.0  C: 0.0  D: 0.0
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+Render Failure
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+OmniSVG
+Qwen3-VL-4B-Instruct
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 1.0  L: 1.0  C: 1.0  D: 0.6
+Render Failure
+P: 1.0  L: 0.9  C: 1.0  D: 0.5
+Render Failure
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+Render Failure
+P: 0.6  L: 0.7  C: 0.9  D: 0.3
+Render Failure
+Gemini3-Flash
+P: 1.0  L: 1.0  C: 1.0  D: 0.9
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 0.6  L: 0.9  C: 1.0  D: 0.5
+P: 1.0  L: 1.0  C: 1.0  D: 0.9
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 1.0  L: 1.0  C: 1.0  D: 0.9
+Fig. 13: Additional successful SVG generation examples on VFig-Bench. Given the same input raster image,
+we compare the rendered SVG outputs produced by different methods. Our model more faithfully preserves the structure
+of the input diagram. P/L/C/D denote the Gemini judge scores for presence, layout, connectivity, and details.
+Input Image
+Rasterized SVG
+P: 1.0  L: 0.9  C: 0.8  D: 0.85
+P: 1.0  L: 0.9  C: 1.0  D: 0.9
+P: 1.0  L: 0.95  C: 1.0  D: 0.9
+P: 1.0  L: 0.9  C: 1.0  D: 0.8
+P: 0.9  L: 1.0  C: 1.0  D: 0.7
+P: 1.0  L: 0.95  C: 0.7  D: 0.8
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+Ours (VFig)
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+StarVector-8B
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.7  L: 0.8  C: 1.0  D: 0.2
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+Render Failure
+Render Failure
+Render Failure
+P: 0.05  L: 0.0  C: 0.0  D: 0.0
+OmniSVG
+Qwen3-VL-4B-Instruct
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.8  L: 0.2  C: 0.3  D: 0.2
+P: 0.85  L: 0.4  C: 0.9  D: 0.5
+Render Failure
+Render Failure
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.7  L: 0.4  C: 0.3  D: 0.4
+P: 0.4  L: 0.3  C: 0.5  D: 0.1
+Render Failure
+Gemini3-Flash
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 1.0  L: 0.95  C: 1.0  D: 0.95
+P: 1.0  L: 0.95  C: 1.0  D: 1.0
+P: 1.0  L: 0.95  C: 1.0  D: 1.0
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 1.0  L: 0.95  C: 1.0  D: 0.8
+P: 1.0  L: 0.7  C: 1.0  D: 0.8
+Fig. 14: Successful SVG generation examples on Molmo2-Diagram.
+Input Image
+Rasterized SVG
+P: 1.0  L: 0.9  C: 1.0  D: 0.95
+P: 1.0  L: 0.8  C: 1.0  D: 0.9
+P: 0.9  L: 0.9  C: 1.0  D: 0.8
+P: 1.0  L: 0.8  C: 0.5  D: 0.7
+P: 1.0  L: 0.8  C: 1.0  D: 0.6
+P: 0.9  L: 0.7  C: 0.5  D: 0.4
+P: 1.0  L: 1.0  C: 0.5  D: 0.8
+Ours (VFig)
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.8  L: 0.4  C: 1.0  D: 0.2
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+Render Failure
+Render Failure
+P: 1.0  L: 0.9  C: 1.0  D: 0.4
+Render Failure
+Render Failure
+Render Failure
+StarVector-8B
+P: 0.4  L: 0.5  C: 0.1  D: 0.0
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: 0.3  L: 0.4  C: 0.1  D: 0.0
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+Render Failure
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+OmniSVG
+Qwen3-VL-4B-Instruct
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.7  L: 0.35  C: 0.3  D: 0.25
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 1.0  L: 0.6  C: 1.0  D: 0.5
+Render Failure
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.8  L: 0.6  C: 0.4  D: 0.5
+Render Failure
+Render Failure
+Render Failure
+Gemini3-Flash
+P: 1.0  L: 0.95  C: 1.0  D: 0.95
+P: 1.0  L: 0.9  C: 1.0  D: 0.9
+P: 1.0  L: 0.85  C: 1.0  D: 0.9
+P: 1.0  L: 0.6  C: 0.8  D: 0.5
+P: 1.0  L: 0.9  C: 1.0  D: 0.9
+P: 1.0  L: 0.7  C: 1.0  D: 0.6
+P: 1.0  L: 0.9  C: 1.0  D: 0.9
+Fig. 15: Successful SVG generation examples on SVG-Diagram.
+Input Image
+P: 0.9  L: 0.7  C: 0.6  D: 0.6
+P: 0.9  L: 0.6  C: 0.7  D: 0.6
+P: 1.0  L: 0.6  C: 0.9  D: 0.6
+P: 0.8  L: 0.6  C: 0.7  D: 0.5
+P: 1.0  L: 0.7  C: 1.0  D: 0.6
+P: 0.9 L: 0.8  C: 0.7  D: 0.6
+P: 0.9  L: 0.6  C: 0.9  D: 0.4
+Ours (VFig)
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+StarVector-8B
+P: 0.1  L: 0.0  C: 0.0  D: 0.0
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.1  L: 0.1  C: 0.0  D: 0.1
+Render Failure
+OmniSVG
+Qwen3-VL-4B-Instruct
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.7  L: 0.5  C: 0.1  D: 0.2
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+P: 0.5  L: 0.2  C: 0.3  D: 0.1
+P: 0.9  L: 0.7  C: 10.1  D: 0.7
+P: 1.0  L: 1.0  C: 1.0  D: 0.5
+P: 0.9  L: 1.0  C: 1.0  D: 0.9
+P: 0.5  L: 0.6  C: 0.5  D: 0.4
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 1.0  L: 0.9  C: 1.0  D: 0.7
+P: 1.0  L: 0.6  C: 0.8  D: 0.6
+Gemini3-Flash
+Fig. 16: Failure cases of VFig on VFig-Bench.
+Input Image
+Rasterized SVG
+P: 0.8  L: 0.3  C: 0.2  D: 0.5
+P: 1.0  L: 0.4  C: 0.5  D: 0.5
+P: 1.0  L: 0.4  C: 0.5  D: 0.5
+P: 0.5  L: 0.3  C: 1.0  D: 0.2
+P: 1.0  L: 0.5  C: 0.6  D: 0.4
+P: 0.9  L: 0.5  C: 1.0  D: 0.3
+P: 1.0  L: 0.9  C: 1.0  D: 0.6
+Ours (VFig)
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 1.0  L: 0.95  C: 1.0  D: 0.8
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 1.0  L: 0.7  C: 1.0  D: 0.6
+P: N/A  L: N/A  C: N/A  D: N/A
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+StarVector-8B
+P: 0.1  L: 0.2  C: 0.0  D: 0.0
+P: 0.6  L: 0.8  C: 1.0  D: 0.3
+P: 0.4  L: 0.3  C: 0.5  D: 0.1
+P: 0.1  L: 0.2  C: 0.0  D: 0.0
+P: 0.2  L: 0.3  C: 0.1  D: 0.0
+P: 0.3  L: 0.2  C: 0.0  D: 0.0
+P: 0.0  L: 0.0  C: 1.0  D: 0.0
+OmniSVG
+Qwen3-VL-4B-Instruct
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 1.0  L: 0.6  C: 1.0  D: 0.7
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.8  L: 0.4  C: 0.2  D: 0.2
+P: 1.0  L: 0.2  C: 1.0  D: 0.2
+P: N/A  L: N/A  C: N/A  D: N/A
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Gemini3-Flash
+P: 1.0  L: 0.9  C: 1.0  D: 0.8
+P: 1.0  L: 0.7  C: 0.6  D: 0.8
+P: 1.0  L: 0.85  C: 1.0  D: 0.8
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+P: 0.9  L: 1.0  C: 1.0  D: 0.7
+P: 1.0  L: 0.75  C: 1.0  D: 1.0
+P: 1.0  L: 1.0  C: 1.0  D: 1.0
+Fig. 17: Failure cases of VFig on Molmo2-Diagram.
+Input Image
+Rasterized SVG
+P: 0.7  L: 0.6  C: 0.3  D: 0.5
+P: 0.2  L: 0.1  C: 0.0  D: 0.1
+P: 0.3  L: 0.2  C: 0.3  D: 0.4
+P: 0.8  L: 0.6  C: 1.0  D: 0.4
+P: 0.1  L: 0.5  C: 1.0  D: 0.0
+P: 1.0  L: 0.8  C: 0.4  D: 0.6
+P: 1.0  L: 0.5  C: 0.7  D: 0.6
+Ours (VFig)
+P: 1.0  L: 0.7  C: 0.5  D: 0.6
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.5  L: 0.6  C: 0.6  D: 0.2
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 0.6  L: 0.4  C: 0.9  D: 0.3
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+StarVector-8B
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: 0.1  L: 0.1  C: 0.0  D: 0.0
+P: 0.1  L: 0.1  C: 0.0  D: 0.0
+P: 0.5  L: 0.9  C: 1.0  D: 0.2
+P: 0.1  L: 0.0  C: 0.0  D: 0.0
+P: 0.0  L: 0.0  C: 0.0  D: 0.0
+P: 0.1  L: 0.0  C: 0.0  D: 0.0
+OmniSVG
+Qwen3-VL-4B-Instruct
+P: N/A  L: N/A  C: N/A  D: N/A
+P: 1.0  L: 0.3  C: 0.5  D: 0.4
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+P: N/A  L: N/A  C: N/A  D: N/A
+Render Failure
+P: 0.2  L: 0.1  C: 0.0  D: 0.1
+P: N/A  L: N/A  C: N/A  D: N/A
+Render Failure
+Render Failure
+Render Failure
+Render Failure
+Gemini3-Flash
+P: 1.0  L: 0.8  C: 1.0  D: 0.7
+P: 1.0  L: 0.9  C: 1.0  D: 0.95
+P: 0.9  L: 0.8  C: 1.0  D: 0.7
+P: 1.0  L: 1.0  C: 1.0  D: 0.4
+P: 1.0  L: 0.7  C: 1.0  D: 0.4
+P: 1.0  L: 0.8  C: 1.0  D: 0.6
+P: 1.0  L: 0.7  C: 1.0  D: 0.8
+Fig. 18: Failure cases of VFig on SVG-Diagram.

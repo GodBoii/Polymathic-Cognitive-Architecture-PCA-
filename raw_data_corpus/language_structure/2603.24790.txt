@@ -1,0 +1,1586 @@
+Local learning for stable backpropagation-free neural
+network training towards physical learning
+Yaqi Guo1, Fabian Braun1,2, Bastiaan Ketelaar2, Stephanie Tan3, Richard Norte2†⋆, and
+Siddhant Kumar1†⋆
+1Department of Materials Science and Engineering, Delft University of Technology, Mekelweg 2, Delft, 2628CD, The
+Netherlands
+2Department of Precision and Microsystems Engineering, Delft University of Technology, Mekelweg 2, Delft,
+2628CD, The Netherlands
+3Department of Intelligent Systems, Delft University of Technology, Van Mourik Broekmanweg 6, Delft 2628XE, The
+Netherlands
+†These authors jointly supervised this work.
+⋆R.A.Norte@tudelft.nl, Sid.Kumar@tudelft.nl
+ABSTRACT
+While backpropagation and automatic differentiation have driven deep learning’s success, the physical limits of chip manufactur-
+ing and rising environmental costs of deep learning motivate alternative learning paradigms such as physical neural networks.
+However, most existing physical neural networks still rely on digital computing for training, largely because backpropagation and
+automatic differentiation are difficult to realize in physical systems. We introduce FFzero, a forward-only learning framework
+enabling stable neural network training without backpropagation or automatic differentiation. FFzero combines layer-wise
+local learning, prototype-based representations, and directional-derivative-based optimization through forward evaluations
+only. We show that local learning is effective under forward-only optimization, where backpropagation fails. FFzero generalizes
+to multilayer perceptron and convolutional neural networks across classification and regression. Using a simulated photonic
+neural network as an example, we demonstrate that FFzero provides a viable path toward backpropagation-free in-situ physical
+learning.
+Introduction
+Artificial intelligence (AI) and its rapid development carry an escalating environmental cost as training
+large deep learning models incurs significant energy consumption and carbon footprints.1 Training a
+state-of-the-art transformer model with architecture optimization has been estimated to emit roughly five
+times more carbon dioxide than the full lifetime emissions of an average car including fuel use.2,3 At
+the same time, the number of parameters in state-of-the-art AI models, and consequently the compute
+required to train them, is increasing at an exponential rate, while uncertainty about the continued validity
+of Moore’s law to support this trend from the hardware side is rising as transistors approach atomic scales.4
+This over-reliance on compute scaling is beginning to push against assumptions in the von Neumann
+architecture. These machines were designed for sequential instruction fetches and data operations, which
+are not suitable for the large-scale dense linear algebra that dominates modern deep learning.5–7 GPUs
+emerged as high-throughput accelerators, but their own von Neumann bottlenecks are now reaching the
+limit with increasing compute scaling in AI.8 This highlights the need for a new computing paradigm for
+training AI models, specifically deep neural networks.
+As an alternative to von Neumann or digital computing, physical or analog computing, supported by
+neuromorphic inspirations, is making a resurgence after decades of dormancy.9–11 A physical system can
+arXiv:2603.24790v1  [cs.LG]  25 Mar 2026
+be used as a reservoir for computing or transforming signals in a fast and efficient way. For example, a
+harmonic pendulum can be thought of as a simple sine-calculator. In a similar vein, physical computing
+leverages high-dimensional, nonlinear dynamical and physical systems,12 such as mechanical,13 optome-
+chanical,14 photonic,15 electrical,16,17 electromechanical,18 and iontronic19 networks to transform input
+signals into rich nonlinear outputs.20,21 In the simplest case of reservoir computing, a fixed physical
+reservoir is appended with a trainable linear readout layer, allowing for efficient training via classical
+system identification techniques. Similar to stacking linear layers and activation functions in digital neural
+networks, these reservoirs can be daisy-chained and interleaved with linear trainable layers to create
+physical analogs of neural networks.22,23
+A longstanding challenge in the development of physical learning systems is the problem of training itself,
+and more specifically the implementation of backpropagation.24 Digital neural networks are typically
+trained by solving an optimization problem that minimizes a loss function, which is evaluated on the
+forward pass of each dataset sample through the network. At the core of neural network training is the
+backpropagation algorithm, which calculates the gradient of the loss function with respect to each trainable
+parameter using the chain rule of differentiation.25,26 Automatic differentiation enables the efficient
+computation of exact gradients by storing information going forward from inputs to outputs that can be
+reused going backwards from outputs to inputs (i.e., backpropagation).27 This process enables iterative
+weight updates via, e.g., gradient descent, progressively reducing the loss and improving the network’s
+performance. However, unlike in software digital computing, obtaining exact gradients for a physical
+system is generally not possible.28,29 This raises a question: how can physical systems be trained without
+backpropagation and, more broadly, automatic differentiation?
+Recent works have addressed this by creating a digital twin or surrogate simulation of the physical system
+and computing the gradients through that model, which is coined physics-aware training.30 However,
+small discrepancies between the physical components and their digital twin can produce errors in gradient
+calculation, which may compound across multiple layers and ultimately destabilize training, particularly in
+deep networks.30,31 More critically, the scalability of physical learning would be limited by the scalability
+of the classical computer hardware and the digital twin. Additionally, relying on a hybrid in-situ and
+in-silico approach for training is not suitable for true in-situ continual learning, where external computation
+may not be available.
+Recently, specialized physical systems have been demonstrated32,33 in which analog gradients are com-
+puted by physically propagating signals forward and backward through the system. However, these
+approaches are restricted to highly specific platforms, particularly photonic and optical systems where
+signals can propagate bidirectionally with negligible loss, and therefore do not present a general-purpose
+solution applicable to a wide range of physical systems.
+An alternative approach is to estimate gradients only from forward evaluations (also known as zeroth-
+order perturbative methods), thereby avoiding backpropagation.34 Each weight is perturbed individually
+followed by a loss evaluation, and a gradient approximated via finite differences.35 While feasible for
+small networks, this direct partial derivative estimation scales poorly for deep or wide networks with large
+number of parameters (e.g., a million-parameter model will require a million forward passes). Directional
+derivative methods36,37 further approximate the gradient by perturbing all the weights simultaneously
+in a random direction, thus requiring only two forward passes. Bandyopadhyay et al.38 applied this
+strategy to train an on-chip photonic deep neural network. However, approximating gradients with
+directional derivatives can introduce significant errors that compound across layers, destabilizing training
+and degrading performance in large networks (as later demonstrated in our work).
+Other approaches include Hebbian learning and contrastive Hebbian updates,39 equilibrium-based learn-
+2/19
+ing,40 and direct feedback alignment,41 which have all shown promise for physical computing.24,31
+However, each approach presents its own challenges:42 Hebbian and equilibrium-based learning require
+physically difficult-to-implement bidirectional systems, while direct feedback alignment exhibits limited
+competitiveness in deep and convolutional networks.
+Hinton introduced the forward-forward (FF) learning approach as an alternative to backpropagation.43
+The FF method involves two forward passes: one with positive data (correct labels) and another with
+negative data (incorrect labels). Instead of computing gradients and propagating errors backward, FF
+updates network parameters by comparing the “goodness” between these passes. Goodness is defined as
+maximizing the difference in activations between positive and negative data at each intermediate layer,
+enabling “local learning” where each layer is trained independently, bypassing the need for backpropa-
+gation across the entire network. This makes the approach particularly relevant for analog or physical
+learning systems, where black-box physical nonlinearities can be interleaved with trainable linear layers
+without requiring gradient propagation through the physical components. However, FF’s in-silico43–45 or
+physical implementations46 rely on either automatic differentiation via CPU/GPU hooks or digital twins
+to compute layer-wise local gradients, which limits its suitability for true in-situ physical learning.
+For example, Momeini et al.46 demonstrated application of FF to train physical learners comprising of
+nonlinear elements and interleaved with linear readout layers based on acoustic, microwave, and optical
+systems. While FF enabled in-situ training, it still required a digital GPU to calculate local goodness and
+train the independent linear layers. Although FF breaks global learning into local optimizations, each
+local optimization remains nonlinear and requires backpropagation and gradient descent. The reliance on
+external CPU/GPUs for training—even with the FF algorithm—undermines the goal of achieving scalable
+and true physical learning.
+To overcome these limitations, we introduce FFzero, a framework that combines forward-forward local
+learning with zeroth-order perturbative weight updates. The central hypothesis is that perturbative
+methods—even with error-prone directional derivatives—can provide competitive performance in machine
+learning tasks in the local learning setting of forward-forward training, on the basis that gradient estimation
+errors do not compound across layers. We contrast FFzero with classical global learning and show
+that the latter is not well suited to perturbative methods and therefore is not competitive or scalable
+for large networks. We evaluate FFzero on feedforward and convolutional neural network architectures
+across diverse multiclass classification and regression benchmarks. Results show that FFzero consistently
+outperforms backpropagation trained with global directional derivatives, especially for deep networks,
+underscoring its potential for truly in-situ physical learning (see Figure 1 for a schematic).
+Results
+Problem setting
+To clearly illustrate the proposed FFzero algorithm, we focus on a simple two-layer multilayer perceptron
+(MLP) network solely for explanatory purposes, while noting that the method readily generalizes to deeper
+and more complex architectures, as shown later. Consider a network given by
+z1 = W 1x
+|
+{z
+}
+linear layer #1
+,
+u = σ(z1)
+|
+{z
+}
+nonlinear activation
+,
+z2 = W 2u
+|
+{z
+}
+linear layer #2
+,
+(1)
+where x is the input signal. W 1 and W 2 are weight parameter matrices for linear layers #1 and #2, respec-
+tively, and σ(·) represents a nonlinear activation function introduced to provide greater approximation
+capacity. z1 and z2 are the outputs of the linear layers, and u is the output of the activation function. Bias
+3/19
+Figure 1. Schematic comparison of FFzero and backpropagation performance when trained with directional derivatives.
+FFzero employs a local learning strategy in which each layer is updated independently, preventing gradient-estimation errors
+from compounding across layers. In contrast, backpropagation propagates directional-derivative estimation errors globally
+across layers, causing performance to degrade with increasing model size. FFzero maintains stable performance at scale while
+remaining compatible with in-situ physical implementation.
+terms can be included in each linear layer but are omitted here for notational simplicity. For examples
+of mechanical, optical, or photonic realizations of such a network, we refer to refs.24,30,38,46 In these
+systems, data may be encoded and decoded through the amplitude, frequency, or phase of the underlying
+analog signals. A loss function L quantifies the discrepancy between predictions z2 and the ground truth
+yGT, e.g., cross-entropy loss for classification or mean squared error loss for regression. Note that we do
+not assume dim(z2) = dim(yGT) to maintain generality.
+In conventional backpropagation, the training objective is to minimize L with respect to the network
+weight parameters, represented as
+W 1,W 2 ←argmin
+W 1,W 2
+L (z2(W 1,W 2,x),yGT).
+(2)
+The optimization is performed in an iterative fashion wherein the weights are updated incrementally (with
+learning rate λ > 0) as
+W 1 ←W 1 −λ ∂L
+∂W 1
+and
+W 2 ←W 2 −λ ∂L
+∂W 2
+(3)
+until convergence over a sufficiently large dataset of (x,yGT) pairs. Evaluating partial derivatives for
+training requires backpropagation through both linear and nonlinear transformations via the chain rule
+of differentiation. This poses significant challenges for the implementation of physical in-situ training,
+since the recursive nature of gradient computation is not realized and typically requires external digital
+computation or surrogate modeling.
+4/19
+Figure 2. Schematic of FFzero algorithm, illustrated for a (a) 3-class classification problem and (b) regression problem. (a)
+Each linear layer is trained locally and independently by maximizing layer-wise goodness. The cosine similarities of the layer
+output w.r.t. the fixed prototype vectors (denoted by ξ[·]) are used to compute the goodness. Directional derivatives are used to
+perform gradient-based optimization for each layer locally. (b) In regression tasks, the antipodal prototypes represent the upper
+(y = 1) and lower (y = −1) prediction bounds, with intermediate ground-truth values encoded as interpolations between them.
+Each layer’s output is normalized onto a unit sphere and compared against the fixed antipodal vectors via cosine similarity,
+yielding layer-wise goodness for weights optimization via directional derivatives.
+5/19
+FFzero algorithm
+The core of FFzero is the use of directional-derivative–driven training34,38,47 applied to a modified
+forward-forward, layer-wise learning strategy43. This enables scalable physical learning executed entirely
+without any form of backpropagation, whether local or global. Integrating the concept of prototype-based
+learning with large-margin separation48, FFzero generalizes to both classification and regression. Without
+loss of generality, we continue the exposition using the two-layer neural network example, addressing the
+classification setting first and then the regression setting.
+Classification
+We consider the context of multi-class classification with N classes. Let each class label be one-hot encoded
+into a N-dimensional binary vector: ˆy ∈Y (N) with Y (N) = {[1,0,0...]T,[0,1,0...]T,[0,0,1...]T,...},
+wherein the location of ‘1’ in the vector identifies the class. Figure 2(a) shows an illustrative schematic of
+the classification approach using FFzero.
+The key idea of our forward-forward algorithm is to make all the linear module outputs as distinct as
+possible for each class to enable their identification later. While Hinton43 and Momeini et al.46 used
+positive and negative data with labels appended within the input signal, we introduce a simpler and more
+general approach that can be scaled to large systems.
+For the first linear layer, we define a set ξ1 of N prototype vectors48 on the unit sphere S(dim(z1)−1),
+where ξ1[ˆy] denotes the prototype associated with the class ˆy ∈Y (N). Each prototype has the same
+dimensionality as the layer output, i.e., dim(ξ1[·]) = dim(z1), and is defined to be a unit vector, ∥ξ1[·]∥=
+1. The prototypes are chosen randomly, with the constraint that they are maximally separated
+directionally (see Supplementary Information 1 for the algorithm of their generation). They are selected
+prior to training and remain fixed throughout the training process. Analogous to those of the first linear
+layer, the prototypes ξ2 of the second linear layer (and any subsequent layers, if applicable) can be
+generated similarly.
+A signal tap from each linear layer output is used to compute the goodness G of each class ˆy using the
+corresponding prototype:
+G1(W 1|ˆy,x) = ξ1[ˆy]·z1/∥z1∥
+|
+{z
+}
+class-wise goodness of linear layer #1
+and
+G2(W 2|ˆy,x) = ξ2[ˆy]·z2/∥z2∥
+|
+{z
+}
+class-wise goodness of linear layer #2
+,
+(4)
+where the goodness is simply the cosine similarity between the layer output and the prototype vector.
+Given a class label ˆy, the goodness function can be geometrically interpreted as how much the output
+of a linear layer is vectorially (mis-)aligned relative to the corresponding ξ[ˆy]. The training objective
+is to locally and independently optimize each layer’s weights such that the layer output is closest to the
+prototype of the true label yGT and simultaneously farthest away from other prototypes Y (N)\yGT. We
+formalize this layer-wise goodness maximization for classification as:
+W 1 ←argmax
+W 1
+ 
+α G1(W 1|yGT,x) −
+∑
+ˆy∈Y (N)\yGT
+G1(W 1|ˆy,x)
+!
+and
+W 2 ←argmax
+W 2
+ 
+α G2(W 2|yGT,x) −
+∑
+ˆy∈Y (N)\yGT
+G2(W 2|ˆy,x)
+!
+,
+(5)
+where α > 0 is a hyperparameter used to weigh the importance of alignment with the correct prototype
+6/19
+relative to the other prototypes. We set α = (N −1) in our experiments. In Methods section, we present a
+slightly modified version of (5) for additional training stability and efficiency.
+Notably, the optimization in (5) is local to each layer and decoupled across layers, in contrast to the joint
+optimization in (2) used in classical backpropagation. This local learning allows the nonlinear activation
+function σ to be treated as a complete black box, with no need to know or model its functional form. This
+is particularly important from a physical standpoint, as nonlinear physical systems, such as optical cavities
+or mechanical resonators, can be directly employed without constructing surrogate models or computing
+gradients. Moreover, the physical system need not operate in an element-wise manner, as is common in
+digital neural networks, and may instead couple multiple dimensions of the input signal.
+During inference, each layer votes for the class that attains the maximum class-wise goodness at that layer.
+For a network with M linear layers, the final network-level prediction is then obtained from the predictions
+of all layers using a majority voting strategy,
+y ←mode
+(
+argmax
+ˆy∈Y (N)
+Gm(W m|ˆy,x) : m = 1,2,3,...,M
+)
+.
+(6)
+The last layer prediction, y ←argmaxˆy∈Y (N) GM(W M|ˆy,x), is used as a tie-breaking strategy.
+For N-class classification, inference requires N forward passes through the network. However, because
+each forward pass can be extremely fast (e.g., operating on picosecond–nanosecond time scales in
+integrated photonic circuits49–51) and N is typically small, the resulting increase in inference cost relative
+to classical single-pass inference is negligible.
+Regression
+In a regression setting, we first consider the case of a scalar label without loss of generality. Let the label
+be ˆy ∈[−1,1], where min-max normalization has already been performed. Continuing the exposition
+using the two-layer network, we define a set of two prototype vectors per layer: ξ1 = {ξ l
+1,ξ u
+1} and
+ξ2 = {ξ l
+2,ξ u
+2} for the first and second linear layers, respectively. The prototypes are generated similarly
+to the classification setting. They are random vectors on the sphere S(dim(zm)−1) with ∥ξ l
+m∥= ∥ξ u
+m∥= 1
+and dim(ξ l
+m) = dim(ξ u
+m) = dim(zm) for m = 1,2. They are also maximally separated from each other,
+resulting in them being antipodal, i.e., ξ u
+m = −ξ l
+m. The prototypes ξ l
+m and ξ u
+m are associated with the
+lower and upper bounds of the label, i.e., ˆy = −1 and ˆy = 1, respectively. Figure 2(b) illustrates a schematic
+of the prototype vectors for regression.
+Next, we define the goodness based on hyperspherical regression loss.48 The ground truth yGT ∈[−1,1]
+is interpreted as the set of points on the sphere S(dim(zm)−1) whose cosine similarity with ξ u
+m equals yGT.
+For example, on S2, this corresponds to a circle with an axis along the ξ u
+m (see Figure 2(b)). The training
+objective is to locally and independently optimize each layer’s weights such that the output of a linear
+layer is vectorially aligned with the ground truth. Therefore, we define a layer-wise goodness as
+G1(W 1|x) = ξ u
+1 ·z1/∥z1∥
+|
+{z
+}
+regression goodness of linear layer #1
+and
+G2(W 2|x) = ξ u
+2 ·z2/∥z2∥
+|
+{z
+}
+regression goodness of linear layer #2
+(7)
+and formalize the regression problem as a layer-wise goodness optimization:
+W 1 ←argmax
+W 1
+−(G1(W 1|x)−yGT)2
+and
+W 2 ←argmax
+W 2
+−(G2(W 2|x)−yGT)2 .
+(8)
+7/19
+Similar to the classification case, the optimization in (8) is local to each layer and remains agnostic to,
+and unaffected by, the choice of black-box nonlinear activation function. While we discussed the case
+for regression with a scalar label, it can be extended to multi-dimensional labels by assigning layer-wise
+prototypes to each label dimension and summing the corresponding goodness functions in (8).
+During inference, a single forward pass yields the goodness of each layer, which serves as the prediction
+of that layer. For a network with M linear layers, the final network-level prediction is then obtained using
+the last layer prediction, y ←GM(W M|x).
+Convolutional layers
+For image-based inputs and image recognition tasks, convolutional neural networks (CNNs) are necessary.
+Consider an expository network architecture as follows:
+z1 = W 1 ⋆x
+|
+{z
+}
+convolutional layer #1
+,
+u = σ(z1)
+|
+{z
+}
+nonlinear activation
+,
+z2 = W 2 ⋆u
+|
+{z
+}
+convolutional layer #2
+,
+(9)
+where ⋆denotes the convolution operator and W 1,W 2 denote trainable convolution kernels. Bias terms
+are included in practice but omitted here for notational simplicity. Let x be of size C ×H ×W denoting
+the number of channels, height, and width of the input. z1 is the output of the first convolutional layer with
+dim(z1) = C1 ×H1 ×W1, where C1, H1, and W1 are determined by kernel size, stride length, and padding
+parameters (see Supplementary Information 5.2 for details). C1 also equals the number of kernels in the
+layer. Each output channel is the result of convolving the input with a distinct learned kernel, followed by
+bias addition and nonlinearity. u is the result of a nonlinear activation function σ(·), subsequently serving
+as input to the next convolutional layer. The output z2 follows similarly in RC2×H2×W2.
+In contrast to fully connected linear layers, the sizes of z1 and z2 can be significantly larger for convolutional
+layers, making physical implementation impractical and non-scalable (e.g., requiring extremely high-
+dimensional prototype vectors in RC1×H1×W1). To address this issue, we apply dimensionality reduction to
+z1 prior to the goodness evaluation (see Supplementary Figure 4 for a schematic). Signal taps from z1 and
+z2 are passed through linear layers with fixed, randomly chosen weights (A1 and A2, respectively) selected
+prior to training, to reduce dimensionality, i.e.,
+˜z1 = A1z1
+and
+˜z2 = A2z2,
+(10)
+where dim(˜z1) ≪(C1×H1×W1) and likewise for the second layer. The prototypes and goodness functions
+for classification (4) or regression (7) are then evaluated on low-dimensional ˜z1 and ˜z2, rather than on
+the original z1 and z2. While dimensionality reduction can be applied to the entire signal, we find that
+performing dimensionality reduction and the subsequent goodness evaluation independently on each
+channel yields better performance; this is the approach adopted in our experiments.
+Generalization to larger architectures
+While the methodology is presented using a two-layer neural network for clarity, FFzero generalizes to
+deeper architectures, including multilayer perceptrons and convolutional neural networks with arbitrary
+depth and layer dimensions. The method does not rely on architectural assumptions beyond layer-wise
+composition. The training and optimization procedure remains unchanged under these architectural
+generalizations.
+8/19
+Training
+Unlike the global optimization (2) required for backpropagation-based training—where all layers are
+trained simultaneously—the proposed FFzero framework relies only on local optimization for each linear
+layer (see (5)). However, even these layer-wise optimizations require gradient-based methods for stable
+training. To address this, we propose using a directional-derivatives-based approach to approximate
+gradients.
+Directional derivatives are ineffective for global training because gradient approximation errors accumulate
+across layers, limiting scalability to large neural networks. In contrast, our hypothesis is that for layer-wise
+local optimizations, the directional-derivative-based approach remains accurate since the errors remain
+localized and do not propagate between layers.
+Let maxω G (ω) denote a generic local goodness-based maximization for any linear or convolutional layer
+with trainable parameters ω, for either classification in (5) or regression in (8). We propose adapting
+the iterative training scheme from an exact partial-derivative–based update (computed via automatic
+differentiation):
+ω ←ω +λ ∂G (ω)
+∂ω
+(11)
+to a central-difference directional-derivative–based update as:
+ω ←ω +λ n∇vG (ω) v
+∥v∥
+|
+{z
+}
+weights update
+with
+v ∼N (0,I),
+n = dim(ω) = dim(v),
+and
+directional derivative:
+∇vG (ω) ≈lim
+ε→0
+G (ω +εv/∥v∥)−G (ω −εv/∥v∥)
+2ε
+.
+(12)
+Here, v represents the (unnormalized) direction of simultaneous perturbation for all the weights in ω.
+N (0,I) denotes the normal distribution with zero mean and identity covariance, which ensures that
+v is uniformly distributed in direction. The factor n denotes the total number of trainable parameters
+in ω. ε denotes the magnitude of the perturbation and approaches zero in its limit to ensure accurate
+approximation. For implementation purposes, the limit can be dropped under the assumption that ε ≪1.
+For a schematic illustration, see Figure 3.
+In Supplementary Information 2, we show that the expectation of the directional-derivative update
+converges to the partial-derivative update, i.e.,
+Ev
+
+n∇vG (ω) v
+∥v∥
+
+= ∂G (ω)
+∂ω
+.
+(13)
+Therefore, even though the directional derivatives may be inaccurate, over many iterations the average
+optimization trajectory converges to that obtained using partial derivatives (see Figure 3(c)). In contrast
+to partial derivatives, which would require one perturbation per trainable parameter (which could be
+in thousands to millions), directional derivatives only require two forward passes for each direction.
+Additionally, the factor n (i.e., the number of trainable parameters) in (12) emerges naturally from (13)
+and is critical to maintaining a reasonable learning rate (λ), especially when n is large. To further improve
+the accuracy and accelerate this convergence, the directional derivatives may be computed as an average
+over P > 1 directions: {vp : p = 1,2,...,P}, i.e.,
+ω ←ω +λ n
+P
+P
+∑
+p=1
+∇vpG (ω) vp
+∥vp∥.
+(14)
+9/19
+Figure 3. Schematic of directional derivative optimization in FFzero. (a) Illustration of directional derivative (DD) estimation
+on a representative goodness landscape. (b) Gradient estimation by averaging directional derivatives over multiple random
+directions. (c) Comparison of optimization trajectories obtained using DD-based updates and standard gradient ascent. While
+gradient ascent follows the true gradient direction, the expectation of the DD-based update matches the true gradient update
+(Supplementary Information 2). (d) Schematic illustration of the goodness-based DD update for a linear layer.
+P directions require 2P passes. This approach can accelerate convergence and stabilize training. The
+influence of the number of directions is presented in Supplementary Information 3. Since each forward
+pass is fast and resource-wise inexpensive, increasing the number of forward passes incurs minimal
+overhead. We note that while we employ a central difference scheme here, other order schemes are also
+possible.
+Benchmarks
+For comparison, we assess the performance of four different methods, with combinations of backpropa-
+gation (BP) vs. forward-forward (FF) training paradigms, and using automatic differentiation (AD) and
+directional derivatives (DD) as gradient calculation methods. The combinations are BP+AD (the default
+method for training modern neural networks), BP+DD, FF+AD, and FF+DD, where FF+DD corresponds
+to our proposed method FFZero. BP+AD serves as an upper-bound performance reference.
+The hyperparameters and experimental settings including learning rate, activation functions, number of
+directions for calculating directional derivatives (P), step size ε, dimension of the prototype vectors, batch
+size, training epochs, etc. in our experiments are detailed in Methods and Supplementary Information 5.
+10/19
+Performance on image classification with MLPs
+We perform image classification on the MNIST52 and FashionMNIST53 datasets using MLPs of diverse
+architectures, the results of which are summarized in Figure 4. We show the classification accuracy with
+respect to network size in terms of the number of layers (depth: 1-10) and the size of each hidden layer
+(width: 10, 50, 100), using all four combinations of training and gradient calculation methods.
+Across all three network widths, BP+DD performance decreases significantly as the number of layers
+increases, eventually reaching a level comparable to random guessing, while BP+AD remains stable. This
+behavior is expected because errors in gradient estimation via directional derivatives accumulate across
+layers, unlike automatic differentiation that computes exact gradients using computational graphs. In
+contrast, FF+DD (i.e., our proposed method FFzero) exhibits minimal degradation in accuracy as the
+network depth increases. This supports the hypothesis that local learning via the forward-forward approach
+is highly resilient to directional-derivative-based approximations than global backpropagation-based
+training.
+This observation is also reflected in (14), when the number of directions P is fixed, the error in gradient
+estimate is magnified by the number of trainable parameters n. In the layer-wise FF+DD training strategy,
+the number of trainable parameters n stays constant as the network becomes deeper. This contrasts with
+global training via backpropagation, i.e., BP+DD, where the number of trainable parameters increases
+with depth, resulting in less accurate gradient estimates.
+We note that although both BP+AD and FF+AD outperform FF+DD, the two AD-based methods are
+physically implausible. Our focus is therefore on DD-based methods, which are physically plausible. The
+AD-based results are included only for context and as baselines.
+Performance on image classification with CNNs
+Figure 5 shows classification results on the MNIST and FashionMNIST datasets using CNN architecture
+with two convolutional layers (followed by a fully-connected linear layer) and varying number of channels
+per layer. With channel-wise training, the accuracy of FF+DD shows a trend similar to that observed with
+the MLP architecture. As the number of CNN channels per layer increases (resulting in increasing number
+of parameters), the performance of FF+DD remains stable. In contrast, BP+DD is extremely sensitive to
+the errors from directional derivatives. In CNN, even with a smaller number of parameters, the models
+suffer from erroneous gradient estimations more than in the MLP case, due to the architectural design that
+extracts local structure via the convolutional kernels. This leads to models trained with BP+DD exhibiting
+near-chance performance.
+Performance on function and image regression
+Figure 6 summarizes the model performance on a series of regression tasks across multiple datasets.
+Regression performance is quantified using the coefficient of determination R2. We design two function
+regression benchmarks with 2D and 5D inputs corresponding to increasing input dimensionality:
+synthetic function 1: y(x1,x2) = sin(x1)+cos(x2) and
+synthetic function 2: y(x1,x2,x3,x4,x5) = ex1 sin(x2)+x3 cos(x4)−x5x1,
+(15)
+where y denotes the function value and x(·) represents the input values. Figure 6(a)-(b) demonstrates the
+function regression accuracy for FFzero using a MLP with hidden-layer depth of 2 and varying hidden-
+layer width. Further, we benchmark FFZero on MNIST formulated as a regression task in Figure 6(c)-(d)
+using a MLP and CNN, respectively. Concretely, each digit image corresponds to a real-valued label
+11/19
+Figure 4. Classification accuracy of MLP models across varying hidden-layer widths, with all hidden layers constrained to
+equal size. Results are shown for (a) MNIST and (b) FashionMNIST datasets using backpropagation (BP) and forward–forward
+(FF) training paradigms, each combined with either automatic differentiation (AD) or directional-derivative (DD) optimization.
+The numbers above each plot indicate the total number of parameters for the corresponding model.
+12/19
+Figure 5. Classification accuracy of CNN models across varying number of channels per convolution layer. Results are shown
+for MNIST and FashionMNIST datasets using backpropagation (BP) and forward–forward (FF) training paradigms, each
+combined with either automatic differentiation (AD) or directional-derivative (DD) optimization. The numbers above each plot
+indicate the total number of parameters for the corresponding model.
+between 0 and 9, and the model outputs a single scalar prediction. Across both synthetic and MNIST
+regression settings, FF+DD consistently outperforms BP+DD as the number of network parameters
+increases, indicating more stable scaling behavior with respect to model size.
+Example of physical implementation of FFzero
+To demonstrate the physical implementability of FFzero, we emulate a photonic neural network in
+silico. For this purpose, we use the Neurophox framework,54,55 an open-source simulation library for
+programmable photonic networks.
+We model a two-layer photonic neural network. A linear layer consists of a programmable rectangular
+Mach-Zehnder interferometer (MZI) mesh with Clements decomposition56 to perform matrix-vector
+multiplication with trainable weights. Each MZI unit cell in the mesh is parameterized by phase shifts θ ∈
+[0,π], ϕ ∈[0,2π), and γ ∈[0,2π) representing a unitary transformation. An electro-optical nonlinearity55
+is interleaved between the linear layers. We refer to the network of ref.54,55,57 for details of the MZI and
+electro-optical nonlinearity implementation and show a schematic of the network in Figure 7(a).
+We apply the FFzero framework to train the photonic linear layers for image classification following the
+layer-wise local learning strategy described previously. Within FFzero, the gradients are not propagated
+through the electro-optical nonlinearity—consistent with the FFzero principle that nonlinearities are
+treated as unknown physical transformations whose internal dynamics need not be modelled.
+At the network input, the grayscale pixel values of the image are mapped to the amplitudes of the input
+signals, with all signals being in phase. For each linear layer, the intensity at each output port is used in the
+goodness computation. The goodness is calculated based on pre-computed prototype vectors as discussed
+previously. The phase parameters {θ,ϕ,γ} for each MZI unit cells in each linear layer are optimized to
+maximize the goodness using the margin-based loss defined in (16).
+13/19
+Figure 6. Regression accuracy of MLP and CNN models. (a,b) Results are shown for regression on synthetic functions
+in (15) using MLPs across varying hidden-layer widths, with all hidden layers constrained to equal size. (c,d) Results are
+shown for regression on MNIST using MLP and CNN of varying hidden-layer widths and number of channels per convolution
+layer, respectively. For all cases, the comparison is made between backpropagation (BP) and forward–forward (FF) training
+paradigms, each combined with either automatic differentiation (AD) or directional-derivative (DD) optimization. The numbers
+above each plot indicate the total number of parameters for the corresponding model.
+We benchmark this emulation of FFzero on MNIST, where the input is a 28×28 grayscale image. The
+two linear layers therefore represent transformations in a 784×784 dimensional space. For benchmarking
+purposes, gradient tracking in the emulator can be used to enable automatic differentiation, which can be
+compared against directional-derivatives-based approaches. As baselines, we perform backpropagation
+experiments (BP+AD and BP+DD), where the intensities at the first 10 output ports are selected and a
+cross-entropy loss is applied directly. For FF+AD and FF+DD (i.e., FFzero), all output ports are retained
+for the prototype-based goodness computation.
+Fig. 7(b) summarizes classification accuracy on the MNIST test dataset. As expected, FF+DD (FFzero)
+outperforms BP+DD significantly, confirming that combining directional-derivatives-based optimization
+with layer-wise local learning mitigates the gradient-estimation errors that cause BP+DD to collapse, even
+in photonics emulation. Additional analysis of the layer embeddings extracted from the output of each
+MZI mesh in FFzero (Supplementary Information 4) indicates that the embeddings cluster around the
+prototype vectors of the corresponding classes.
+These findings support that FFzero can be adapted on contemporary photonic neural network architectures
+(e.g., those using MZIs38,58) with minimal modifications. The framework requires no knowledge of
+the nonlinearity during training, relying solely on forward evaluations of the network. This opens the
+possibility for true in-situ training of programmable photonic chips. Although demonstrated for photonics,
+FFzero is a general-purpose, backpropagation-free learning framework applicable to diverse physical
+modalities, including mechanical, electrical, and acoustic systems.
+Discussion
+With the growing interest in alternative computing paradigms such as physical and neuromorphic comput-
+ing, moving beyond backpropagation-based training remains an important objective. In this light, FFzero
+introduces a general-purpose, backpropagation-free algorithm for training neural networks. The FFzero
+approach opens possibilities for physical neural network implementations capable of performing both
+training and inference directly in hardware, unlike many existing approaches that rely on digital twins or
+14/19
+Figure 7. (a) Schematic of FFzero training applied to a two-layer (emulated) photonic neural network. (b) Test accuracy on
+MNIST using BP+AD, BP+DD, FF+AD, and FF+DD (FFzero).
+auxiliary computations executed on conventional CPUs or GPUs.
+Under the premise that automatic differentiation is physically implausible in many physical systems,
+FFzero employs directional derivatives as a zeroth-order approximation to the gradient for gradient-
+ascent-based training. At the same time, it halts the global error propagation of directional derivatives
+through chain rule by adopting a local, layer-by-layer training strategy. This results in a training procedure
+where weight updates are driven by local, forward-only passes that are physically implementable and
+computationally efficient, while remaining agnostic to the choice and knowledge of nonlinearities. This
+property is particularly attractive for physical systems such as photonic neural networks, where a forward
+pass can be executed in hundreds of picoseconds,58 enabling billions of forward passes per second with
+minimal energy consumption and latency.
+From an algorithmic perspective, FFzero is generalizable to different network architectures, supporting
+both classification and regression tasks, and accommodating diverse input modalities. It is also feasible to
+explore extensions that increase the number of classes or output dimensions without requiring relearning of
+existing prototype alignments, potentially enabling incremental or continual learning scenarios. Looking
+ahead, FFzero could potentially be adapted to train transformer-based architectures and generative models,
+offering a pathway to mitigate their current speed and energy bottlenecks.
+Although FFzero does not yet match the optimization performance and accuracy of backpropagation-based
+methods—since directional derivative estimation and local weight updates are inherently less precise
+than automatic differentiation and global backpropagation—it offers a unique trade-off. Specifically,
+FFzero sacrifices some accuracy in exchange for significantly improved physical implementability. Further
+experimental validation through hardware realizations therefore represents an important next step. Such
+implementations, among many possible physical systems, could build upon existing photonic neural
+network platforms,38,58 which employ Mach-Zehnder interferometer meshes for linear transformations
+and photonic resonators for nonlinear activation functions. Another promising direction is the adaptation
+to iontronic networks19 based on microfluidic ionic channels, which could enable in-situ learning in bionic
+applications. These extensions underscore the potential of FFzero for stable backpropagation-free physical
+learning.
+15/19
+Methods
+Classification loss
+For classification tasks, the parameters of the mth layer in an MLP, or equivalently the parameters of mth
+channel in a CNN layer, are optimized using a margin-based loss. The optimization problem is formulated
+as
+W m ←argmin
+W m
+∑
+ˆy∈Y (N)\yGT
+ReLU
+
+Gm(W m | ˆy,x)−Gm(W m | yGT,x)+q
+
+,
+(16)
+where q denotes the margin parameter. The margin value and the use of the ReLU activation are chosen
+empirically to improve training stability and enhance discriminative feature learning; both can be adjusted
+depending on the specific application.
+FFzero training strategy
+In the FFzero framework, network layers are trained sequentially and independently. When optimizing a
+given layer, all previously trained layers are kept fixed and are not updated. For a fair comparison with
+backpropagation (BP), each layer in the forward–forward (FF) setting is trained for the same number of
+epochs as in BP.
+Implementation and benchmark details
+Supplementary Information 5 provides details on the implementation and benchmarking of FFzero and
+backpropagation methods. All parameters and hyperparameters used in the experiments are listed in
+Supplementary Table 1.
+Code availability
+The codes generated during the current study are available at <link will be provided at time of publication>.
+Data availability
+The datasets generated during the current study are available at <link will be provided at time of publica-
+tion>.
+Competing interests
+The authors declare no competing interests.
+References
+1. Chen, S. How much energy will ai really consume? the good, the bad and the unknown. Nature 639,
+22–24 (2025).
+2. Strubell, E., Ganesh, A. & McCallum, A. Energy and policy considerations for deep learning in nlp.
+In Proceedings of the 57th annual meeting of the association for computational linguistics, 3645–3650
+(2019).
+16/19
+3. Gowda, S. N. et al. Watt for what: Rethinking deep learning’s energy-performance relationship. In
+European Conference on Computer Vision, 388–405 (Springer, 2024).
+4. Shalf, J. M. & Leland, R. Computing beyond moore’s law. Computer 48, 14–23 (2015).
+5. Ganguly, A., Muralidhar, R. & Singh, V. Towards energy efficient non-von neumann architectures
+for deep learning. In 20th international symposium on quality electronic design (ISQED), 335–342
+(IEEE, 2019).
+6. Heller, D. A survey of parallel algorithms in numerical linear algebra. Siam Rev. 20, 740–777 (1978).
+7. Kimovski, D. et al. Beyond von neumann in the computing continuum: Architectures, applications,
+and future directions. IEEE Internet Comput. 28, 6–16 (2023).
+8. Zidan, M. A., Strachan, J. P. & Lu, W. D. The future of electronics based on memristive systems. Nat.
+electronics 1, 22–29 (2018).
+9. Ye, J. et al. An overhead-reduced, efficient, fully analog neural-network computing hardware. Sci.
+Adv. 11, eadv7555 (2025).
+10. Seok, H. et al. Beyond von neumann architecture: Brain-inspired artificial neuromorphic devices and
+integrated computing. Adv. Electron. Mater. 10, 2300839 (2024).
+11. Mondal, I., Attri, R., Rao, T. S., Yadav, B. & Kulkarni, G. U. Recent trends in neuromorphic systems
+for non-von neumann in materia computing and cognitive functionalities. Appl. Phys. Rev. 11 (2024).
+12. Tanaka, G. et al. Recent advances in physical reservoir computing: A review. Neural Networks 115,
+100–123 (2019).
+13. Nelson, D. et al. Spectral analysis of mechanical reservoir computing with relu spring networks. In
+Smart Materials, Adaptive Structures and Intelligent Systems, vol. 88322, V001T08A004 (American
+Society of Mechanical Engineers, 2024).
+14. Kiyabu, S. et al. Optomechanical reservoir computing. Proc. Natl. Acad. Sci. 122, e2424991122
+(2025).
+15. Van der Sande, G., Brunner, D. & Soriano, M. C. Advances in photonic reservoir computing.
+Nanophotonics 6, 561–576 (2017).
+16. Taniguchi, T. et al. Reservoir computing based on spintronics technology. In Reservoir computing:
+theory, physical implementations, and applications, 331–360 (Springer, 2021).
+17. Appeltant, L. et al. Information processing using a single dynamical node as complex system. Nat.
+communications 2, 468 (2011).
+18. Guo, X., Yang, W., Xiong, X., Wang, Z. & Zou, X. Mems reservoir computing system with stiffness
+modulation for multi-scene data processing at the edge. Microsystems & Nanoeng. 10, 84 (2024).
+19. Conte, M., van Roij, R. & Dijkstra, M. Multimodal physical learning in brain-inspired iontronic
+networks, DOI: 10.48550/ARXIV.2511.04209 (2025).
+20. Yan, M. et al. Emerging opportunities and challenges for the future of reservoir computing. Nat.
+Commun. 15, 2056 (2024).
+21. Nakajima, K. Physical reservoir computing—an introductory perspective. Jpn. J. Appl. Phys. 59,
+060501 (2020).
+22. Nakajima, M., Tanaka, K. & Hashimoto, T. Scalable reservoir computing on coherent linear photonic
+processor. Commun. Phys. 4, 20 (2021).
+23. Moon, J., Wu, Y. & Lu, W. D. Hierarchical architectures in reservoir computing systems. Neuromor-
+phic Comput. Eng. 1, 014006 (2021).
+17/19
+24. Momeni, A. et al. Training of physical neural networks. Nature 645, 53–61 (2025).
+25. Rumelhart, D. E., Hinton, G. E. & Williams, R. J. Learning representations by back-propagating
+errors. nature 323, 533–536 (1986).
+26. Lillicrap, T. P., Santoro, A., Marris, L., Akerman, C. J. & Hinton, G. Backpropagation and the brain.
+Nat. Rev. Neurosci. 21, 335–346 (2020).
+27. Paszke, A. et al. Automatic differentiation in pytorch. In NIPS-W (2017).
+28. Ambrogio, S. et al. Equivalent-accuracy accelerated neural-network training using analogue memory.
+Nature 558, 60–67 (2018).
+29. Laborieux, A. & Zenke, F. Holomorphic equilibrium propagation computes exact gradients through
+finite size oscillations. Adv. neural information processing systems 35, 12950–12963 (2022).
+30. Wright, L. G. et al. Deep physical neural networks trained with backpropagation. Nature 601, 549–555
+(2022).
+31. Nakajima, M. et al. Physical deep learning with biologically inspired training method: gradient-free
+approach for physical hardware. Nat. communications 13, 7847 (2022).
+32. Pai, S. et al. Experimentally realized in situ backpropagation for deep learning in photonic neural
+networks. Science 380, 398–404 (2023).
+33. Ashtiani, F., Idjadi, M. H. & Kim, K. Integrated photonic neural network with on-chip backpropagation
+training. Nature DOI: 10.1038/s41586-026-10262-8 (2026).
+34. Baydin, A. G., Pearlmutter, B. A., Syme, D., Wood, F. & Torr, P. Gradients without backpropagation.
+arXiv:2202.08587 (2022).
+35. Larson, J., Menickelly, M. & Wild, S. M. Derivative-free optimization methods. Acta Numer. 28,
+287–404 (2019).
+36. Spall, J. C. Implementation of the simultaneous perturbation algorithm for stochastic optimization.
+IEEE Transactions on aerospace electronic systems 34, 817–823 (2002).
+37. Yin, G., Zhang, Q., Yan, H. & Boukas, E.-K. Random-direction optimization algorithms with
+applications to threshold controls. J. optimization theory applications 110, 211–233 (2001).
+38. Bandyopadhyay, S. et al. Single-chip photonic deep neural network with forward-only training. Nat.
+Photonics 18, 1335–1343 (2024).
+39. Journé, A., Rodriguez, H. G., Guo, Q. & Moraitis, T. Hebbian deep learning without feedback.
+arXiv:2209.11883 (2022).
+40. Laydevant, J., Markovi´c, D. & Grollier, J. Training an ising machine with equilibrium propagation.
+Nat. Commun. 15, 3671 (2024).
+41. Nøkland, A. Direct feedback alignment provides learning in deep neural networks. Adv. neural
+information processing systems 29 (2016).
+42. Chen, X., Liu, D., Laydevant, J. & Grollier, J. Self-contrastive forward-forward algorithm. Nat.
+Commun. 16, DOI: 10.1038/s41467-025-61037-0 (2025).
+43. Hinton, G. The forward-forward algorithm: Some preliminary investigations. arXiv:2212.13345
+(2022).
+44. Padmani, S. & Joshi, A. Function regression using the forward forward training and inferring paradigm.
+arXiv:2510.06762 (2025).
+45. Scodellaro, R., Kulkarni, A., Alves, F. & Schröter, M. Training convolutional neural networks with
+the forward–forward algorithm. Sci. Reports 15, DOI: 10.1038/s41598-025-26235-2 (2025).
+18/19
+46. Momeni, A., Rahmani, B., Malléjac, M., Del Hougne, P. & Fleury, R. Backpropagation-free training
+of deep physical neural networks. Science 382, 1297–1303 (2023).
+47. Ren, M., Kornblith, S., Liao, R. & Hinton, G.
+Scaling forward gradient with local losses.
+arXiv:2210.03310 (2022).
+48. Mettes, P., Van der Pol, E. & Snoek, C. Hyperspherical prototype networks. Adv. neural information
+processing systems 32 (2019).
+49. Shen, Y. et al. Deep learning with coherent nanophotonic circuits. Nat. photonics 11, 441–446 (2017).
+50. Tait, A. N. et al. Neuromorphic photonic networks using silicon photonic weight banks. Sci. reports
+7, 7430 (2017).
+51. Miller, D. A. Attojoule optoelectronics for low-energy information processing and communications.
+J. Light. Technol. 35, 346–396 (2017).
+52. Deng, L. The mnist database of handwritten digit images for machine learning research [best of the
+web]. IEEE signal processing magazine 29, 141–142 (2012).
+53. Xiao, H., Rasul, K. & Vollgraf, R. Fashion-mnist: a novel image dataset for benchmarking machine
+learning algorithms. arXiv:1708.07747 (2017).
+54. Pai, S., Bartlett, B., Solgaard, O. & Miller, D. A. Matrix optimization on universal unitary photonic
+devices. Phys. review applied 11, 064044 (2019).
+55. Williamson, I. A. et al. Reprogrammable electro-optic nonlinear activation functions for optical neural
+networks. IEEE J. Sel. Top. Quantum Electron. 26, 1–12 (2019).
+56. Clements, W. R., Humphreys, P. C., Metcalf, B. J., Kolthammer, W. S. & Walmsley, I. A. Optimal
+design for universal multiport interferometers. Optica 3, 1460–1465 (2016).
+57. Pai, S. et al. Parallel fault-tolerant programming of an arbitrary feedforward photonic network.
+arXiv:1909.06179 (2019).
+58. Ashtiani, F., Geers, A. J. & Aflatouni, F. An on-chip photonic deep neural network for image
+classification. Nature 606, 501–506, DOI: 10.1038/s41586-022-04714-0 (2022).
+19/19
+Local learning for stable backpropagation-free neural
+network training towards physical learning
+Supplementary Information
+Yaqi Guo1, Fabian Braun1,2, Bastiaan Ketelaar2, Stephanie Tan3, Richard Norte2†⋆, and
+Siddhant Kumar1†⋆
+1Department of Materials Science and Engineering, Delft University of Technology, Mekelweg 2, Delft, 2628CD, The
+Netherlands
+2Department of Precision and Microsystems Engineering, Delft University of Technology, Mekelweg 2, Delft,
+2628CD, The Netherlands
+3Department of Intelligent Systems, Delft University of Technology, Van Mourik Broekmanweg 6, Delft 2628XE, The
+Netherlands
+†These authors jointly supervised this work.
+⋆R.A.Norte@tudelft.nl, Sid.Kumar@tudelft.nl
+1 Generation of prototype vectors
+We generate the prototype vectors in two steps: first, we construct maximally separated vectors using a
+simplex, and then we randomly orient the simplex.
+Step 1: Generate maximally-separated vectors using a simplex
+Let c denote the number of classes and d the dimensionality of the prototype vectors. The central idea is
+to use the c vertices of a (c−1)-simplex in d dimensions (with d ≥c) as the prototype vectors. We first
+consider the case when d = c and then generalize the approach to d ≥c. Note that d ≥c is a constraint for
+the classification setting due to the one-hot encoded class labels.
+A standard (c−1)-simplex in Rc by definition is given by
+∆(c−1) = {u ∈Rc :
+c
+∑
+i=1
+ui = 1, ui ≥0 for i = 1,...,c}.
+(1)
+The vertices of ∆(c−1) can be rearranged as columns of the matrix:
+X =
+
+
+1
+0
+···
+0
+0
+1
+···
+0
+...
+...
+...
+...
+0
+0
+···
+1
+
+
+c×c
+,
+(2)
+which is the identity matrix. The centroid of the simplex is (1/c,1/c,...,1/c)T. Translating the simplex
+such that the centroid coincides with the origin yields the modified vertices:
+˜X =
+
+
+(1−1/c)
+−1/c
+···
+−1/c
+−1/c
+(1−1/c)
+···
+−1/c
+...
+...
+...
+...
+−1/c
+−1/c
+···
+(1−1/c)
+
+
+c×c
+.
+(3)
+1
+We require the prototype vectors to lie on the sphere S(c−1); therefore, the vertex locations should be
+normalized so that their distance from the origin equals one. The distance z of any vertex from the origin
+is given by
+z =
+"
+1−1
+c
+2
++
+
+−1
+c
+2
++
+
+−1
+c
+2
++···+
+
+−1
+c
+2
+|
+{z
+}
+(c−1) times
+#1/2
+=
+
+1−1
+c
+1/2
+.
+(4)
+Therefore, the prototype vectors are given by the columns of the matrix
+ˆX = 1
+z
+
+
+(1−1/c)
+−1/c
+···
+−1/c
+−1/c
+(1−1/c)
+···
+−1/c
+...
+...
+...
+...
+−1/c
+−1/c
+···
+(1−1/c)
+
+
+c×c
+.
+(5)
+We will now prove that the prototype vectors constructed from the simplex in (5) are maximally separated.
+For c ≥2, let ˆX = [ˆx1, ˆx2,..., ˆxc] denote a matrix whose c columns satisfy ˆxi ∈S(c−1) for i = 1,...,c. The
+column vectors are maximally separated if
+• ∑c
+i=1 ˆxi = 0
+and
+• ˆxi · ˆx j = ˆxi · ˆxk
+∀i, j,k = 1,...,c
+and
+i ̸= j ̸= k.
+For a detailed proof, see ref.1 (Theorem 1).
+The first condition is trivially satisfied by ˆX in (5). For the second condition, the dot product of two
+distinct column vectors yields
+ˆxi · ˆx j = 1
+z2
+"
+1−1
+c
+
+−1
+c
+
++
+
+1−1
+c
+
+−1
+c
+
++ 1
+c2 ···+ 1
+c2
+|
+{z
+}
+(c−2) times
+#
+for
+i ̸= j
+=
+c
+(c−1)
+"
+(1−c)
+c2
++ (1−c)
+c2
++ (c−2)
+c2
+#
+= −
+1
+(c−1).
+(6)
+Since the dot product is independent of the indices i and j, the second condition is also satisfied. Therefore,
+the column vectors of ˆX are maximally separated prototype vectors.
+In the more general case when d ≥c, i.e., there are more dimensions than classes, (5) can simply be
+extended by appending zeros for the additional (d −c) dimensions. Therefore, the prototype vectors are
+2/11
+given by the column vectors of
+ˆX = 1
+z
+
+
+(1−1/c)
+−1/c
+···
+−1/c
+−1/c
+(1−1/c)
+···
+−1/c
+...
+...
+...
+...
+−1/c
+−1/c
+···
+(1−1/c)
+0
+0
+···
+0
+...
+...
+...
+...
+0
+0
+···
+0
+
+
+d×c
+with
+d ≥c.
+(7)
+Step 2: Randomly orient the simplex
+The prototypes generated so far all share the same orientation. However, to avoid any unintentional bias in
+the learning process, it is beneficial to randomize the orientation of the prototypes, or equivalently, of the
+simplex. We achieve this by generating a random rotation matrix T ∈SO(d) and rotating each prototype
+as
+ˆxi ←T ˆxi
+for
+i = 1,...,c.
+(8)
+To generate rotation matrices from a uniform distribution on SO(d), we adapt the algorithm of ref.2
+(Section 5) for generating unitary matrices. Specifically, we implement a real-valued analog of the
+algorithm from ref.2 to sample orthogonal matrices, followed by a rejection step for matrices with negative
+determinant, thereby yielding random special orthogonal matrices, i.e., rotation matrices. The proposed
+algorithm for generating random rotation matrices is as follows:
+• Sample M ∈Rd×d via A ∼N (0,I).
+• Perform QR decomposition of M = QR, where Q is an orthogonal matrix and R is an upper-triangular
+matrix.
+• Construct the diagonal matrix A =
+
+
+R11
+|R11|
+0
+···
+0
+0
+R22
+|R22|
+···
+0
+...
+...
+...
+...
+0
+0
+···
+Rdd
+|Rdd|
+
+
+d×d
+.
+• If det(QA) < 0, restart from sampling M.
+• Return T = QA.
+2 Expectation of directional-derivative-based weights update
+Given the random directional perturbations applied to the weights, we now compute the expected value of
+the resulting weight update. Recall that the directional-derivative-based update is given by
+ω ←ω +λ n∇vG (ω) v
+∥v∥
+|
+{z
+}
+weights update
+with
+v ∼N (0,I)
+and
+n = dim(ω) = dim(v).
+(9)
+3/11
+The directional derivative is defined as
+∇vG (ω) = ∂G (ω)
+∂ω
+· v
+∥v∥= vT
+∥v∥
+∂G (ω)
+∂ω
+(10)
+Consider the expectation of the weights update over v and substitute (10):
+Ev
+
+n∇vG (ω) v
+∥v∥
+
+= n Ev
+ v
+∥v∥
+ vT
+∥v∥
+∂G (ω)
+∂ω
+
+= n Ev
+ vvT
+∥v∥2
+ ∂G (ω)
+∂ω
+.
+(11)
+The trace of the remaining expectation term Ev[vvT/∥v∥2] simplifies as:
+tr
+
+Ev
+ vvT
+∥v∥2
+
+= Ev
+
+tr
+ vvT
+∥v∥2
+
+= Ev
+"
+n
+∑
+j=1
+v2
+j
+∥v∥2
+#
+= Ev
+∥v∥2
+∥v∥2
+
+= 1.
+(12)
+Additionally, since the probability distribution of v is isotropic,
+Ev
+"
+n
+∑
+j=1
+v2
+j
+∥v∥2
+#
+= n Ev
+ v2
+i
+∥v∥2
+
+∀i = 1,...,n.
+(13)
+Comparing (12) and (13) yields the diagonal terms of the expectation:
+Ev
+ v2
+i
+∥v∥2
+
+= 1
+n
+∀i = 1,...,n.
+(14)
+Now, consider the off-diagonal terms of the expectation:
+Ev
+ vivj
+∥v∥2
+
+= Ev
+vi(−v j)
+∥v∥2
+
+= −Ev
+ vivj
+∥v∥2
+
+∀i, j = 1,...,n and i ̸= j,
+(15)
+where the symmetry of the distribution of v is used to obtain the middle term. Simplifying further yields:
+Ev
+ vivj
+∥v∥2
+
+= 0
+∀i, j = 1,...,n and i ̸= j,
+(16)
+Combining (14) and (16) yields
+Ev
+ vvT
+∥v∥2
+
+= 1
+nI.
+(17)
+Substituting (17) into (11) gives the expectation of the directional-derivative-based update as
+Ev
+
+n∇vG (ω) v
+∥v∥
+
+= n 1
+nI ∂G (ω)
+∂ω
+,
+(18)
+which simplifies to
+Ev
+
+n∇vG (ω) v
+∥v∥
+
+= ∂G (ω)
+∂ω
+.
+(19)
+Therefore, the expectation of the directional-derivative-based update equals the partial-derivative-based
+update.
+4/11
+Supplementary Figure 1. Classification accuracy of MLP models across varying number of sampled directions used in
+directional-derivative (DD) optimization. Results are shown for MNIST dataset with MLPs of fixed depth d = 5 and different
+hidden-layer widths: w ∈{10,50,100}, with all hidden layers constrained to equal size. The results are compared between
+backpropagation (BP) and forward–forward (FF) training paradigms, each combined with either automatic differentiation (AD)
+or directional-derivative (DD) optimization.
+3 Influence of the number of directions used in estimation of directional derivatives
+In Supplementary Figure 1, we study the impact of the number of sampled directions (P) used in directional-
+derivative (DD) estimation on optimization performance and generalization. Multilayer perceptrons
+(MLPs) are trained on the MNIST dataset with a fixed depth of d = 5 and varying hidden-layer widths
+w ∈{10,50,100}. Test accuracy is evaluated as a function of the number of directions used to approximate
+directional information during optimization.
+Across all model sizes, methods based on FF+DD show a clear improvement in test accuracy as the
+number of sampled directions increases. The gains are most significant for small numbers of directions
+and gradually saturate as more directions are added, indicating diminishing returns beyond a moderate 3-4
+number of sampled directions. In contrast, BP+DD exhibits substantially weaker sensitivity to the number
+of directions and consistently lower accuracy. These results indicate that DD-based FF estimation exploits
+directional information more effectively than DD-based BP. The observed trends are consistent across
+network widths, suggesting that the advantage of FFzero is robust with respect to model complexity.
+4 Layer embedding of photonic neural network trained on MNIST using FFzero
+We perform Principal Component Analysis (PCA) on the layer-wise intensity outputs of the photonic
+neural network after training on MNIST with FFzero. The PCA of the resulting outputs, together with the
+pre-computed prototype vectors, are shown in Fig. 2 for each layer. In both layers, the embeddings of
+the same class cluster around their corresponding prototype vector, confirming that the cosine-similarity
+objective successfully aligns the intensity outputs with the prototype vectors.
+5/11
+Supplementary Figure 2. PCA projection of the layer-wise embeddings of a two-layer photonic neural network trained with
+FFzero on MNIST. Each point represents one test sample, colored by the digit class. Stars denote the pre-computed prototype
+vectors projected into the same PCA space. After training with FFzero, data points cluster towards their corresponding prototype
+vectors in all layers.
+5 Implementation details
+5.1 Architecture of MLPs in FFzero benchmarks
+Supplementary Figure 3 schematically illustrates the architecture of the MLPs used in the FFzero bench-
+marks.
+5.2 Architecture of CNNs in FFzero benchmarks
+Supplementary Figure 4 schematically illustrates the architecture of the CNNs used in the FFzero bench-
+marks. In the following, we elaborate upon the dimensionality reduction and training strategy for CNNs in
+FFzero.
+Let the input to a convolutional layer be x ∈RCin×Hin×Win, where Cin denotes the number of input channels.
+Consider a convolutional layer with Cout filters, kernel size Kh ×Kw, stride Sh ×Sw, padding Ph ×Pw, and
+dilation Dh ×Dw. Then, the output of the layer is z ∈RCout×Hout×Wout, where the spatial dimensions are
+given by
+Hout =
+Hin +2Ph −Dh(Kh −1)−1
+Sh
++1
+
+,
+Wout =
+Win +2Pw −Dw(Kw −1)−1
+Sw
++1
+
+.
+(20)
+The output of the ith channel, with spatial size Hout ×Wout, is then reshaped into a vector u(i) ∈RHoutWout
+and passed through a dimensionality reduction layer with fixed, randomly initialized, and non-trainable
+parameters,
+˜z(i) = A(i)u(i),
+(21)
+6/11
+Supplementary Figure 3. Schematic illustration of the FFzero algorithm and architecture used for MLPs in (a) classification
+and (b) regression tasks.
+where A(i) ∈Rd×HoutWout and d ≪HoutWout. A channel-wise goodness metric is then evaluated based on
+the low-dimensional representation ˜z, and channel-wise directional derivatives are used to update the
+parameters of each channel locally and sequentially.
+In each convolution layer, predictions are obtained from channel-wise low-dimensional representations.
+For classification tasks, the prediction is obtained by computing a channel-wise goodness score based on
+the similarity between the reduced feature representations and the corresponding prototype vectors. These
+goodness scores are accumulated across all output channels, and the class associated with the maximum
+aggregated goodness is selected as the layer-wide prediction. For regression tasks, the prediction is
+computed by averaging the similarity scores over all output channels. In both cases, feature representations
+are normalized prior to similarity evaluation, ensuring that the goodness measure corresponds to cosine
+similarity.
+5.3 Data generation for synthetic function regression tasks
+Synthetic regression datasets are generated from prescribed analytical functions (see (15) in main article)
+for benchmarking. For each case, a total of 12,000 input samples are drawn independently from a uniform
+distribution on [−1,1]d, where d denotes the input dimension. The dataset is randomly permuted and split
+into 10,000 training samples and 2,000 test samples. To emulate measurement noise, zero-mean Gaussian
+noise with a standard deviation equal to 5% of the standard deviation of the clean training outputs is added
+to the training targets only. The outputs are subsequently normalized to the interval [−1,1] according to
+˜y = 2
+y−ymin
+ymax −ymin
+−1,
+where ymin and ymax denote the minimum and maximum values of the noisy training targets, respectively.
+The same normalization is applied to the test targets. See Supplementary Table 1 for the parameters used
+in dataset generation and the model architecture.
+7/11
+Supplementary Figure 4. Schematic illustration of the FFzero algorithm and architecture used for CNNs in (a) classification
+and (b) regression tasks. Within each convolution layer, feature maps from individual channels are reshaped and projected to a
+lower-dimensional space via fixed random linear mappings. The reduced representations are compared with fixed prototype
+vectors using cosine similarity, and a channel-wise goodness is computed to update the corresponding channel parameters
+through DD.
+8/11
+5.4 Parameters and hyperparameters used in experiments.
+The parameters and hyperparameters used in the classification and regression tasks are listed in Supple-
+mentary Table 1.
+References
+1. Kasarla, T. et al. Maximum class separation as inductive bias in one matrix. In Koyejo, S. et al. (eds.)
+Advances in Neural Information Processing Systems, vol. 35, 19553–19566 (Curran Associates, Inc.,
+2022).
+2. Mezzadri, F. How to generate random matrices from the classical compact groups. arXiv DOI:
+10.48550/ARXIV.MATH-PH/0609050 (2006).
+9/11
+Supplementary Table 1. List of parameters and hyperparameters used in experiments.
+Parameter
+Notation
+Value
+MLP for MNIST classification, MNIST regression,
+and FashionMNIST classification:
+Size of training dataset
+-
+50000
+Size of test dataset
+-
+10000
+Batch size
+-
+256
+Number of training epochs
+-
+100
+Learning rate
+λ
+0.001
+Step size in DD
+ε
+0.001
+Number of directions in DD
+P
+1
+Input dimension
+-
+784
+Output dimension
+-
+10∗or 1∗∗
+Hidden layer dimension
+-
+{10,50,100}
+Number of hidden layers
+-
+{1,2,3,4,5,6,7,8,9,10}
+Dropout
+-
+0
+Activation function
+-
+ReLU
+Margin loss in classification tasks
+q
+0.3
+Loss function in BP
+-
+Cross-entropy loss∗or MSE loss∗∗
+CNN for MNIST classification and regression:
+Size of training dataset
+-
+50000
+Size of test dataset
+-
+10000
+Batch size
+-
+256
+Number of training epochs
+-
+100
+Learning rate
+λ
+0.001
+Step size in DD
+ε
+0.001
+Number of directions in DD
+P
+1
+Input dimension
+-
+28×28
+Output dimension
+-
+10∗or 1∗∗
+Number of hidden convolution layers
+-
+2
+Number of channels in each hidden layer
+-
+{4,8,12,16,20,24,28,32}
+Padding size
+-
+2
+Kernel size of each channel
+-
+6×6
+Kernel stride
+-
+1
+Pooling size
+-
+2×2
+Pooling stride
+-
+2
+Dropout
+-
+0
+Dimension of prototype vectors of each channel
+-
+10
+Output dimension of fully connected layer
+-
+10∗or 1∗∗
+Dropout of fully connected layer
+-
+0
+Activation function
+-
+ReLU
+Margin loss in classification tasks
+q
+0.3
+Loss function in BP
+-
+Cross-entropy loss∗or MSE loss∗∗
+∗Classification tasks.
+∗∗Regression tasks.
+10/11
+Supplementary Table 1. (continued) List of parameters and hyperparameters used in experiments.
+Parameter
+Notation
+Value
+CNN for FashionMNIST classification:
+Size of training dataset
+-
+50000
+Size of test dataset
+-
+10000
+Number of training epochs
+-
+100
+Learning rate
+λ
+0.001
+Step size in DD
+ε
+0.001
+Number of directions in DD
+P
+1
+Input dimension
+-
+28×28
+Output dimension
+-
+10
+Number of hidden convolution layers
+-
+2
+Number of channels in each hidden layer
+-
+{8,16,24,32,40,48,56,64}
+Padding size
+-
+2
+Kernel size of each channel
+-
+6×6
+Kernel stride
+-
+1
+Pooling size
+-
+2×2
+Pooling stride
+-
+2
+Dropout of each convolution layer
+-
+0.1
+Dimension of prototype vectors of each channel
+-
+10
+Output dimension of fully connected layers
+-
+{100,10}
+Dropout of fully connected layers
+-
+{0.1,0.}
+Activation function
+-
+ReLU
+Margin loss
+q
+0.3
+Loss function in BP
+-
+Cross-entropy loss
+MLP for synthetic function regression tasks:
+Size of training dataset
+-
+10000
+Size of test dataset
+-
+2000
+Batch size
+-
+256
+Number of training epochs
+-
+100
+Learning rate
+λ
+0.001
+Step size in DD
+ε
+0.001
+Number of directions in DD
+P
+1
+Input range
+-
+[−1,1]
+Input dimension
+-
+2a or 5b
+Output dimension
+-
+1
+Number of hidden layers
+-
+2
+Hidden layer dimension
+{10,20,30,40,50,60,70,80,90,100}a
+-
+or
+{20,40,60,80,100,120,140,160,180,200}b
+Loss function in BP
+-
+MSE loss
+Photonic emulation:
+Size of training dataset
+-
+60000
+Size of test dataset
+-
+10000
+Batch size
+-
+128
+Number of training epochs
+-
+100
+Learning rate
+λ
+0.001
+Step size in DD
+ε
+0.001
+Number of directions in DD
+P
+1
+MZI dimension
+-
+784×784
+Number of MZI layers
+-
+2
+Loss function in FF
+-
+Eq. (5) in main article
+Loss function in BP
+-
+Cross-entropy loss
+a Function 1.
+b Function 2.
+11/11

@@ -1,0 +1,1355 @@
+Surrogates, Spikes, and Sparsity: Performance
+Analysis and Characterization of SNN
+Hyperparameters on Hardware
+Ilkin Aliyev, Jesus Lopez, and Tosiron Adegbija
+Department of Electrical and Computer Engineering
+The University of Arizona, Tucson, AZ, USA
+Email: {ilkina, jlopezramos, tosiron}@arizona.edu
+Abstract—Spiking Neural Networks (SNNs) offer inherent
+advantages for low-power inference through sparse, event-driven
+computation. However, the theoretical energy benefits of SNNs
+are often decoupled from real-world hardware performance
+due to the opaque relationship between training-time choices
+and inference-time sparsity. While prior work has focused on
+weight pruning and model compression, the role of training
+hyperparameters—specifically surrogate gradient functions and
+neuron model configurations—in shaping hardware-level activa-
+tion sparsity remains underexplored.
+This paper presents a comprehensive workload characteriza-
+tion study quantifying the sensitivity of hardware latency to
+SNN hyperparameters. We decouple the impact of surrogate
+gradient functions (e.g., Fast Sigmoid, Spike Rate Escape) and
+neuron models (LIF, Lapicque) on classification accuracy and
+inference efficiency across three event-based vision datasets:
+DVS128-Gesture, N-MNIST, and DVS-CIFAR10. Our analysis
+reveals that standard accuracy metrics are poor predictors of
+hardware efficiency. For instance, while Fast Sigmoid achieves
+the highest accuracy on DVS-CIFAR10, the Spike Rate Escape
+reduces inference latency by up to 12.2% on DVS128-Gesture
+with minimal accuracy trade-offs. Furthermore, we demonstrate
+that neuron model selection is as critical as parameter tuning;
+transitioning from LIF to Lapicque neurons yields up to a 28%
+latency reduction. We validate our analysis on a custom cycle-
+accurate FPGA-based SNN instrumentation platform, and our
+characterization demonstrates that sparsity-aware hyperparam-
+eter selection can improve accuracy by 9.1% and latency by over
+2× compared to baselines. These findings establish a methodology
+for predicting hardware behavior from training parameters,
+motivating the inclusion of sparsity-sensitivity in future SNN
+performance analysis. The RTL code and other reproducibility
+artifacts are available at https://zenodo.org/records/18893738.
+I. INTRODUCTION
+Spiking Neural Networks (SNNs) have garnered significant
+attention as a biologically plausible and energy-efficient al-
+ternative to traditional Artificial Neural Networks (ANNs).
+Unlike ANNs, which process information using dense and
+power-intensive matrix multiplications, SNNs leverage sparse
+event-driven computations where neurons activate only when
+a membrane potential threshold is reached. This paradigm
+promises efficient temporal information encoding and reduced
+energy consumption, making SNNs highly attractive for neu-
+romorphic hardware and edge AI applications [1]–[4].
+However, a critical gap remains between the theoretical
+benefits of SNNs and their performance on hardware. While
+the efficiency of SNNs is predicated on activation sparsity [5],
+[6], this sparsity is not a static property of the network; it is
+dynamically shaped by training-time hyperparameters that are
+often selected solely for classification accuracy. Consequently,
+widespread adoption is hindered not only by the challenge of
+training non-differentiable spikes [7] but also by the opacity
+of how algorithmic choices—specifically, surrogate gradient
+functions and neuron models—impact downstream inference
+latency and efficiency. This gap is particularly critical for
+event-based workloads, where temporal sparsity is intrinsic
+to the input modality rather than an artifact of encoding.
+While weight pruning has been extensively characterized [8],
+[9], the hardware sensitivity of SNNs to activation-governing
+hyperparameters remains an underexplored domain.
+The primary source of this disconnect lies in the surro-
+gate gradient function used to approximate non-differentiable
+spikes during backpropagation. These functions are mathe-
+matical abstractions necessary for learning, yet they subtly
+dictate the spiking intensity (i.e., firing rate) of the trained
+model. Different approximations, such as Fast Sigmoid or
+Arctangent, impose varying gradients that result in distinct
+sparsity profiles. Recent work [10] has begun to examine these
+functions, but a systematic characterization of their hardware
+implications, and how they trade off accuracy for latency
+across different workloads, is lacking [1], [11].
+Furthermore, the choice of the neuron model itself (e.g.,
+Leaky Integrate-and-Fire vs. Lapicque) and its internal param-
+eters (decay β, threshold θ) introduces another layer of com-
+plexity. Current methodologies often rely on fixed or heuristic-
+based configurations, neglecting the workload-dependent na-
+ture of optimal activation dynamics. This is particularly crucial
+for event-based vision workloads (e.g., DVS gestures), where
+temporal sparsity is the primary driver of efficiency. Without
+a rigorous characterization of these factors, SNNs risk being
+deployed with “accuracy-optimized” configurations that are
+computationally sub-optimal on real hardware.
+This paper presents a systematic workload characteriza-
+tion study investigating the interplay between training-time
+hyperparameters and inference-time hardware performance.
+arXiv:2603.24891v1  [cs.AR]  26 Mar 2026
+U[t −1]
+Isyn[t]
+Bit-Shift
+β · U
+Add
+Compare
+U > θ
+Spike / No Spike
+LIF Neuron
+Low Arithmetic Intensity
+(3 ops/update)
+U[t −1]
+Isyn[t]
+Multiply
+U · (1−T
+RC )
+Multiply
+I ·
+T
+RC
+Add
+Compare
+U > θ
+Spike / No Spike
+Lapicque Neuron
+High Arithmetic Intensity
+(4 ops/update, 2× MUL)
+LIF:
+Lapicque:
+5 updates (frequent)
+2 updates (sparser activations)
+Time
+Lapicque has higher per-update cost (2× multiply), but triggers fewer updates due to sparser activations →lower total latency.
+Fig. 1: Hardware dataflow comparison between the LIF and Lapicque neuron models. LIF uses bit-shifts for decay (3
+ops/update); Lapicque requires explicit multiplications for RC constants (4 ops + 2× MUL). Despite higher per-update cost,
+Lapicque’s temporal dynamics suppress total spike events, yielding lower system-level latency.
+We move beyond simple accuracy metrics to quantify the
+latency and sparsity sensitivity of SNNs on a cycle-accurate
+hardware platform. The key contributions are:
+• Characterization of surrogate gradient impact: We
+isolate and evaluate four distinct surrogate gradient
+functions—Fast Sigmoid (FS),
+Arctangent
+(ATAN),
+Spike Rate Escape (SRE),
+and
+Stochastic Spike Operator (SSO)—
+quantifying
+their
+non-trivial
+trade-offs
+between
+classification accuracy and hardware activation sparsity.
+• Analysis of neuron model sensitivity: We characterize
+the performance implications of neuron model selection,
+contrasting the standard Leaky Integrate-and-Fire (LIF)
+model with the biologically grounded Lapicque (LAP)
+model. We demonstrate that switching neuron models can
+yield up to a 28% reduction in latency through improved
+sparsity dynamics, a factor often overlooked in software-
+centric optimizations.
+• Workload-specific sparsity profiling: We focus on
+three dynamic event-based datasets: DVS128-Gesture, N-
+MNIST, and DVS-CIFAR10. Our analysis reveals that,
+unlike static image workloads, these event streams ex-
+hibit unique sparsity characteristics that require distinct
+hyperparameter configurations to maximize efficiency.
+• Hardware-in-the-loop validation: To ensure our charac-
+terization reflects real-world constraints, we validate our
+findings on a custom sparsity-aware FPGA instrumenta-
+tion platform. We show that our methodology identifies
+configurations that achieve 9.1% higher accuracy and
+over 2× lower latency compared to prior hardware base-
+lines [1], [12], proving that training-time hyperparameters
+are a first-order determinant of hardware performance.
+II. BACKGROUND
+A. Spiking Neuron Models as Hardware Workloads
+Spiking Neural Networks (SNNs) fundamentally differ from
+ANNs by introducing stateful temporal dynamics. From a
+hardware perspective, this shifts the computational bottleneck
+from dense matrix multiplication to state updates and sparse
+event processing. The complexity of the workload is governed
+by the specific neuron model employed. We analyze two
+distinct models:
+Leaky Integrate-and-Fire (LIF): The LIF model is the
+standard for hardware-efficient SNNs due to its low arithmetic
+intensity [13]. The membrane potential uj[t] of neuron j ac-
+cumulates input from presynaptic spikes si[t] ∈{0, 1}, scaled
+by synaptic weights wij, and decays by a factor β ∈(0, 1):
+uj[t + 1] = βuj[t] +
+X
+i
+wijsi[t] −sj[t]θ
+(1)
+where θ is the firing threshold and the term sj[t]θ resets
+the membrane upon spike emission. This formulation requires
+only simple accumulation and shifting (if β is a power of two),
+making it attractive for digital logic.
+Lapicque (LAP): The Lapicque model [14] introduces higher
+biological fidelity by modeling the membrane as an RC
+circuit. The potential decays exponentially with a time constant
+τ = RC. While the LIF model often abstracts this decay
+using a fixed parameter β, the LAP model retains explicit
+control over R and C, offering a more biologically plausible
+and tunable formulation. Its discrete formulation is:
+uj[t+1] =
+
+1 −T
+RC
+
+uj[t]+
+X
+i
+wijsi[t]
+ T
+C
+
+−sj[t]θ (2)
+In our framework, we map the decay parameters to an
+equivalent capacitance:
+C = −
+1
+ln(β)
+(3)
+Figure 1 contrasts the hardware dataflow of these two mod-
+els, highlighting the increased arithmetic intensity (specifically
+the requirement for multipliers) introduced by the biological
+fidelity of the Lapicque formulation. While LAP implies
+higher arithmetic complexity (potentially requiring multipliers
+or lookup tables for the RC constants) compared to a simplified
+LIF, it offers distinct temporal dynamics that may lead to
+increased sparsity. A key question of this study is whether the
+increased per-operation cost of the LAP model is offset by the
+reduced total operations (increased sparsity) during inference.
+B. Surrogate Gradients and Sparsity Determinism
+Backpropagation in SNNs presents a fundamental challenge
+due to the non-differentiability of the spiking function. Since
+neurons output discrete binary values (spike or no spike),
+conventional gradient-based optimization fails to compute
+meaningful updates. To circumvent this, surrogate gradient
+techniques approximate the derivative of the non-differentiable
+spike function using smooth functions [7]. While these func-
+tions are only active during training, they deterministically
+shape the weight distribution and firing thresholds, thereby
+informing the sparsity profile observed during hardware infer-
+ence.
+1) Common Surrogate Functions: Surrogate functions are
+commonly used during training (implemented, for example, in
+PyTorch’s autograd module) to enable gradient-based training
+of SNNs. The general form of the surrogate gradient approx-
+imation is:
+∂S
+∂U ≈f(U, Uthr, α)
+(4)
+where U is the membrane potential, Uthr is the firing
+threshold, and α is a tunable derivative scaling factor that
+controls the sharpness of the function. We characterize four
+surrogates (Table I) with distinct gradient behaviors:
+• Fast Sigmoid (FS): A smooth, S-shaped approximation
+of a step function centered around the middle point. It is
+simple and fast to compute, making it efficient for large-
+scale training.
+• Arctangent (ATAN): Similar in shape to the Fast Sig-
+moid but slightly more computationally demanding. It
+uses an arctangent form that also produces a smooth
+transition but involves more arithmetic operations.
+• Spike Rate Escape (SRE): An exponentially decaying
+function that reacts strongly to how close the membrane
+potential is to the firing threshold. It is highly sensitive
+and useful for modeling rapid changes near the spiking
+point.
+• Stochastic Spike Operator (SSO): A surrogate with
+stochastic sub-threshold gradients. The forward pass uses
+the standard Heaviside step function, while the backward
+pass returns a gradient of 1 above threshold and samples
+uniform random noise (scaled by variance σ2) below
+threshold. This stochastic formulation mitigates the dead
+neuron problem by providing non-zero gradient updates
+even when neurons are below threshold.
+Figure 2 visualizes the derivative profiles of these functions,
+illustrating how the scaling factor α modulates the gradient
+support and sharpness around the firing threshold (U −Uthr).
+2) Hardware Implications of Surrogate Selection:
+The
+choice of surrogate function significantly impacts both train-
+ing convergence and computational efficiency. Functions with
+sharp slopes (high α values) provide better gradient approxi-
+mation but can lead to unstable updates. Conversely, smoother
+functions facilitate stable training but may reduce accuracy by
+underestimating gradients.
+Additionally, our empirical studies show that different
+datasets exhibit varying sensitivities to surrogate functions.
+For example, event-based vision datasets, such as DVS128-
+Gesture, often benefit from functions that emphasize temporal
+dynamics, whereas static datasets may require more stable
+approximations. Thus, selecting an appropriate surrogate func-
+tion in combination with optimal neuron model parameters
+can yield significant improvements in accuracy and efficiency.
+Characterizing this software-to-hardware link is a primary
+contribution of this work.
+C. Prior Work on SNN Accelerators and Activation Sparsity
+Recent efforts in neuromorphic hardware design have ex-
+plored custom accelerator architectures for SNNs, with a
+growing emphasis on exploiting activation sparsity to im-
+prove energy efficiency and throughput. Prior work primarily
+falls into two categories: (1) hardware designs focused on
+architectural innovations for event-driven processing and (2)
+techniques to harness or enhance activation sparsity in the
+context of inference.
+Sommer et al. [12] proposed an FPGA-based SNN ac-
+celerator that implemented sparse convolution via a cluster
+of 9 processing elements (PEs), each responsible for one
+filter coefficient addition per clock cycle. To support parallel
+neuron updates and reduce memory bottlenecks, the design
+introduced a technique called “memory interlacing,” enabling
+concurrent access to distributed membrane potential storage.
+The architecture supported output channel-wise parallelism by
+instantiating multiple PE clusters, each targeting a subset of
+−2
+0
+2
+0
+0.5
+1
+U −Uthr
+Gradient Magnitude
+k = 1
+k = 2.5
+k = 5
+(a) Fast Sigmoid (FS)
+−2
+0
+2
+0
+0.1
+0.2
+0.3
+0.4
+U −Uthr
+α = 1
+α = 2.5
+α = 5
+(b) Arctangent (ATAN)
+−2
+0
+2
+0
+2
+4
+U −Uthr
+Gradient Magnitude
+β = 1
+β = 2.5
+β = 5
+(c) Spike Rate Escape (SRE)
+−2
+0
+2
+0
+0.5
+1
+x ≥0
+straight-through gradient (= 1)
+x < 0
+stochastic gradient
+U −Uthr
+(d) Stochastic Spike Operator (SSO)
+Fig. 2: Visualization of the derivative profiles ( ∂S
+∂U ) for different surrogate functions plotted against the membrane potential’s
+proximity to the firing threshold (U −Uthr). Fast Sigmoid (a) maintains meaningful gradient support in the tails as k increases.
+Arctangent (b) exhibits similar behavior with Cauchy-like tails that preserve gradient flow farther from the threshold. Spike
+Rate Escape (c) exhibits exponential decay, leading to vanishing gradients (gradient ≈0) for neurons far from the threshold
+(assuming β = k). The Stochastic Spike Operator (d) uses a constant gradient of 1 above threshold and injects uniform
+noise below threshold, enabling gradient flow through sub-threshold neurons. These mathematical properties explain the sharp
+accuracy degradation (“cliffs”) observed in our experimental characterization (Section IV).
+output channels. Although this approach effectively leveraged
+spatial sparsity, it relied on parallel filter coefficient processing,
+increasing the complexity of memory scheduling and data
+movement. In contrast, our architecture avoids this dimension
+of parallelism to simplify memory management and achieve
+better control over neuron-specific sparsity dynamics, particu-
+larly under hyperparameter-optimized workloads.
+On the ASIC front, Di Mauro et al. [16] presented a
+Network-on-Chip (NoC)-based architecture for mapping full
+convolutional layers onto a custom chip. Their design featured
+PEs capable of processing 16 neurons in parallel and employed
+packet-switched routing to handle spike events between layers.
+This flexible routing strategy allowed the accelerator to han-
+dle irregular and asynchronous dataflows common in event-
+based processing. However, the inclusion of custom packet
+encoding/decoding logic and routing control introduced sig-
+nificant latency overhead and additional hardware complexity.
+While their NoC-based approach was effective in adapting to
+dynamic workloads, it did not directly address the impact
+of training-time hyperparameters on activation sparsity or
+inference efficiency.
+Other recent studies have proposed hardware designs that
+selectively activate computation paths based on dynamic spike
+activity, demonstrating tangible gains in performance-per-
+watt by leveraging temporal sparsity [1], [9], [17]. More
+recent work has expanded this scope to include dual spar-
+sity—activations and weights—by leveraging advanced prun-
+ing, quantization, and dataflow optimization techniques.
+For example, FireFly-S [18] presents a reconfigurable SNN
+accelerator that exploits both activation and weight sparsity
+via gradient rewiring and 4-bit quantization. It achieves over
+85% weight sparsity while maintaining accuracy across bench-
+marks like MNIST, DVS-Gesture, and CIFAR-10. Similarly,
+Prosperity [19] introduces a method called Product Sparsity,
+which enables computation reuse by detecting redundant inner
+product operations in sparse matrices. Applied to models like
+SpikeBERT, it reduces computation by up to 90% and sig-
+nificantly lowers energy consumption. In another work, LoAS
+TABLE I: Overview of surrogate approximation functions as implemented in snnTorch [15]. All functions are written in
+threshold-centered form with x = U −Uthr.
+Surrogate Function
+Backward Pass Formula
+Key Characteristics
+Fast Sigmoid (FS)
+∂S
+∂U ≈
+1
+(1 + k|x|)2
+Default snnTorch surrogate; computationally cheap with a sharp
+peak at threshold and quadratic heavy-tail decay. Parameter k
+(“slope”) controls sharpness (larger k →narrower peak).
+Arctangent (ATAN)
+∂S
+∂U ≈1
+π ·
+1
+1 +
+ πx α
+2
+2
+Smooth, symmetric gradient with Cauchy-like tails; tends to
+preserve gradient flow farther from threshold than FS. Param-
+eter α controls sharpness.
+Spike Rate Escape (SRE)
+∂S
+∂U ≈k exp
+ −β |x + (Uthr −1)|
+
+Escape-rate (Boltzmann-like) exponential surrogate as imple-
+mented in snnTorch: centered at U = 1. If Uthr = 1 (common
+default), this simplifies to ∂S
+∂U ≈ke−β|x|. Parameters: k sets
+peak scale; β controls decay with distance from threshold.
+Stochastic Spike Operator (SSO)
+∂S
+∂U ≈
+(
+1
+x ≥0
+(U(−0.5, 0.5) + µ) σ2
+x < 0
+Stochastic
+sub-threshold
+gradients:
+above
+threshold
+uses
+straight-through gradient 1; below threshold samples a uniform
+random value (shifted by mean µ) scaled by variance term
+σ2. Intended to mitigate “dead” neurons by injecting stochastic
+gradient signal when U < Uthr.
+[20] proposes a fully temporal-parallel dataflow architecture
+tailored for dual-sparse SNNs. It minimizes inter-timestep data
+movement and accelerates sequential processing, leading to
+substantial improvements in both speed and energy compared
+to earlier designs.
+The gap we address: While these works demonstrate impres-
+sive efficiency gains, they largely treat activation sparsity as
+an emergent, fixed property of the trained model or a result of
+post-training compression (quantization/pruning). They do not
+systematically explore how the training process—specifically
+the choice of surrogate gradients and neuron mechanics—
+can be tuned to fundamentally alter the workload’s sparsity
+characteristics before it is implemented in hardware. Our work
+complements these architectural advances by establishing a
+methodology to optimize the input workload density, providing
+a sparsity-first model generation strategy that can leverage any
+of the aforementioned accelerator backends.
+III. WORKLOAD CHARACTERIZATION METHODOLOGY
+This work employs a hardware-in-the-loop characteriza-
+tion methodology to quantify the sensitivity of SNN infer-
+ence performance to training-time hyperparameters (the RTL
+can be found at https://zenodo.org/records/18893738). The
+methodology bridges the abstraction gap between algorithmic
+choices (surrogates, neuron models) and physical execution
+metrics (latency, active cycles). We utilize a two-phase design
+space exploration (DSE) strategy validated on a cycle-accurate
+FPGA instrumentation platform. This section details the hard-
+ware measurement setup, the hyperparameter search space, and
+the sparsity quantification metrics.
+A. Hardware Instrumentation Platform Architecture
+To obtain precise, cycle-accurate measurements of inference
+latency and dynamic power, we employ a custom Parametric
+Sparsity-Aware Convolution Engine [21]. Unlike general-
+purpose baselines, this platform serves as a specialized in-
+strumentation tool designed to model the fine-grained, data-
+Algorithmic DSE (Software)
+Hardware Characterization
+Input: Dataset + VGG9 SNN
+Surrogate Search
+Sweep α, fixed Neuron
+Neuron Search
+Sweep β, θ, Select LIF/LAP
+Output: Model Checkpoints
+Instrumentation Interface
+Quantization (4-bit) →Weight Mapping →FPGA Load
+Measurement: Run Inference
+Log Active Cycles (Latency) & Spike Counts
+Analysis: Pareto Plot
+Accuracy (Y-axis) vs. Latency (X-axis)
+Iterate
+Fig. 3: Overview of our design space exploration workflow.
+dependent sparsity characteristics of neuromorphic workloads.
+The architecture employs an event-driven processing paradigm
+where computational latency is directly proportional to input
+activation density.
+As illustrated in Figure 4, the architecture is decoupled into
+an Event Control Unit (ECU) and parallel Neural Cores (NCs)
+connected through a programmable, event-based pipeline. The
+ECU implements a priority encoder to detect active spikes
+and dispatch target addresses, effectively skipping zero-valued
+activations in hardware. The NCs support configurable neuron
+models (LIF, LAP) via modular activation logic, allowing us
+Spike trains
+Controller
+Address
+gen
+PENC
+Spike events
+Event control unit
+LUT
+FF
+RAM
+Accumulator
+Filter weights
+Activation
+Neural cores
+Memory
+(membrane
+potential
+and weights)
+Spike trains
+Fig. 4: Dataflow of the hardware instrumentation platform (Parametric Sparsity-Aware Convolution Engine). The design features
+an Event Control Unit (ECU) that dynamically schedules only active neurons, and Neural Cores (NCs) with configurable
+accumulation logic. This event-driven architecture allows for precise isolation of latency reductions caused by algorithmic
+sparsity tuning.
+to vary the arithmetic intensity of the neuron update without
+altering the underlying dataflow. This setup allows us to isolate
+the impact of workload density on latency, providing a ground-
+truth measurement of how hyperparameter choices translate to
+hardware performance.
+1) Event-driven execution model: The core mechanism
+linking algorithmic sparsity to hardware latency is the ECU.
+Unlike systolic arrays that process dense matrices, the ECU
+utilizes a Priority Encoder (PENC) to dynamically scan input
+spike trains.
+Sparsity-to-latency translation: The PENC identifies non-
+zero indices in a single cycle and filters out inactive neurons.
+This allows the hardware to “skip” cycles proportional to the
+sparsity induced by the surrogate gradient function.
+Address generation: An Address Generation Unit (AGU)
+computes target neuron indices only for active spikes. This
+creates a variable-latency datapath where the execution time
+of a layer is defined by:
+Tlayer ≈1
+P × (CovHD + Nactive × Taccum)
+(5)
+where CovHD is the constant control overhead, Nactive is
+the number of non-zero events (determined by the surrogate),
+Taccum is the accumulation time, and P is the parallelization
+factor. This mechanism ensures that our latency measurements
+are sensitive to even minor changes in training-time sparsity.
+2) Configurable neural cores: To isolate the performance
+impact of neuron model selection (e.g., LIF vs. LAP), the
+neural cores (NCs) feature a modular Activation Unit.
+Model agnostic datapath: The accumulation logic is de-
+coupled from the neuron state update rules. This allows us
+to instantiate different neuron models (Eq. 1 and 2) within
+the same physical pipeline, ensuring that reported latency
+differences are due to the model’s arithmetic intensity and
+temporal dynamics, not architectural disparities.
+Precision and storage: Filter weights are stored in flip-
+flops (FFs) for immediate access, while membrane potentials
+utilize Block RAMs (BRAMs). Weights are quantized to 4-bit
+integers, and membrane potentials use fixed-point representa-
+tion. To minimize overhead, the activation unit employs an
+optimized comparator that inspects the most significant bits
+(MSB) for threshold crossing, balancing decision accuracy
+with logic depth.
+Memory bandwidth: The event-driven execution model min-
+imizes bandwidth pressure by only reading/writing membrane
+potentials for active neurons receiving spike events, and only
+fetching weights when the corresponding input channel is ac-
+tive. This sparsity-proportional memory access pattern ensures
+that the bandwidth requirements scale with activity density
+rather than the network size, reinforcing the efficiency gains
+from hyperparameter-induced sparsity.
+3) Workload distribution: The architecture employs an out-
+put channel-wise parallelization strategy. Each NC processes a
+spatial chunk of the Output Feature Map (OFM), eliminating
+data hazards. The effective computational workload W for a
+convolutional layer is modeled as:
+WCONV = F × Cout ×
+M
+X
+i=1
+Si
+(6)
+where F is the kernel size, Cout is the number of output
+channels, and Si is the spike count of input channel i.
+Throughout this work, “latency” refers to the measured
+active clock cycles on our cycle-accurate FPGA platform,
+converted to wall-clock time at the operating frequency. The
+analytical model in Eq. 5 accurately tracks these physical
+measurements across all surrogate and neuron model sweeps
+presented in Section IV, confirming that inference time scales
+linearly with activity density as predicted by the event-driven
+execution model.
+4) Generalizability: While we validate our work on a
+specific FPGA platform, our methodology is architecture-
+agnostic. The core insight—that latency tracks activity density
+via event-skipping (Eq. 5) and the workload model (Eq. 6)—
+generalizes to any event-driven accelerator that conditionally
+schedules computation on spike events.
+B. Design Space Exploration Framework
+We implement an automated DSE pipeline using the Optuna
+framework [22] to traverse the hyperparameter space. The
+exploration is divided into two phases to decouple the effects
+of gradient approximation from neuron dynamics.
+Phase 1: Surrogate gradient sensitivity analysis: We first
+characterize the impact of gradient sharpness on the resulting
+model sparsity. We sweep the slope parameter α ∈[1, 48]
+across four surrogate functions (FS, ATAN, SRE, SSO). For
+each candidate, we conduct 40 independent trials (200 epochs
+each) to identify the configurations that maximize accuracy.
+The top-performing candidates are then profiled on the hard-
+ware platform to map the relationship between gradient slope
+α and inference latency.
+DSE overhead: This exploration is performed offline as a
+one-time profiling step; deployment uses a single selected
+configuration with no runtime overhead. The total training
+cost is approximately 40 × 200 = 8,000 epochs per surrogate
+function. However, as shown in Fig. 6, evaluating only the
+top-2 slope configurations per surrogate captures the majority
+of Pareto-relevant insights, reducing the effective hardware
+profiling to 8 configurations per dataset. This demonstrates
+that a lightweight subset of the full DSE suffices to identify
+near-optimal accuracy-latency trade-offs.
+Phase 2: Neuron model exploration: In the second phase,
+we evaluate the hardware cost-benefit trade-off of neuron
+complexity. We expand the search space to include both LIF
+and LAP models. We discretize the leak factor β ∈[0.1, 1.0]
+and firing threshold θ
+∈
+[0.1, 2.0] with a step size of
+0.2. This discretization allows sufficient resolution to capture
+performance variation while controlling the total number of
+experiments. The optimal configuration for each dataset is
+determined based on the joint accuracy and sparsity profile,
+with a follow-up hardware evaluation to validate its effect
+on inference efficiency. This phase specifically investigates
+whether the increased arithmetic complexity of the LAP model
+is amortized by the potential reduction in total spike events.
+C. Network Architecture
+We utilize a VGG9-based [23] convolutional SNN adapted
+for event-based input streams. The topology is defined as:
+64C3-28C3-MP2-48C3-54C3-MP2
+-120C3-126C3-140C3-MP2-216-200
+where XCY denotes X filters of size Y × Y and MPZ
+denotes a Z × Z max-pooling layer. We apply 4-bit integer
+quantization to all weights to align with the constraints of
+edge neuromorphic hardware. Training is performed using
+snnTorch with cosine annealing schedules [24].
+D. Workload Density Modeling
+To quantify the “workload” processed by the hardware, we
+measure the Activity Density A, defined as the average spike
+rate per neuron per timestep. This metric is the inverse of
+sparsity (1 −Sparsity) and is calculated as:
+A =
+1
+T · N
+T
+X
+t=1
+L
+X
+i=1
+Si[t]
+where T is the number of timesteps, N is the total neuron
+count across all layers, L is the number of layers, and Si[t] is
+the spike count in layer i at time t. By correlating A with the
+measured hardware latency, we can rigorously evaluate how
+effectively different surrogate functions suppress unnecessary
+computation.
+E. Evaluation Setup
+Following
+the
+algorithmic
+exploration,
+top-performing
+model configurations are synthesized and deployed on the
+FPGA instrumentation platform, implemented in SystemVer-
+ilog and mapped to a Xilinx Kintex Ultrascale+ platform.
+Each configuration is evaluated for classification accuracy,
+average inference latency, and power, enabling us to assess
+the end-to-end impact of hyperparameter choices on system-
+level performance.
+IV. CHARACTERIZATION RESULTS AND ANALYSIS
+This section characterizes the sensitivity of hardware in-
+ference metrics to training-time hyperparameter selection.
+We focus on quantifying the trade-offs between classifica-
+tion accuracy and inference latency across three event-based
+benchmarks: DVS-Gesture, DVS-CIFAR10, and N-MNIST. Our
+analysis isolates the impact of the two primary variables: the
+surrogate gradient function (which dictates learning dynamics)
+and the neuron model (which dictates temporal dynamics).
+A. Sensitivity of Accuracy to Gradient Approximation
+Fig.
+5
+plots
+the
+classification
+accuracy
+sensitivity
+to
+the
+surrogate
+derivative
+scaling
+factor
+α
+of
+four
+surrogate
+gradient
+functions:
+Fast Sigmoid (FS),
+Arctangent (ATAN), Spike Rate Escape (SRE),
+and
+Stochastic Spike Operator (SSO).
+The
+choice of surrogate fundamentally alters the stability profile
+of the training process.
+High-performance stability (FS): The Fast Sigmoid
+(FS) function demonstrates superior robustness. It maintains
+peak accuracy (> 90% on N-MNIST/DVS-Gesture) across
+the widest range of slopes, establishing it as a safe default
+for maximizing classification performance in general-purpose
+SNNs.
+Volatile degradation (SRE): The Spike Rate Escape
+(SRE) exhibits a cliff-like degradation profile. This is most
+visible in N-MNIST (Fig. 5c) and DVS-CIFAR10 (Fig. 5b),
+where SRE accuracy collapses from >90% to <20% with
+only minor increases in slope. This exponential gradient for-
+mulation is highly aggressive, suppressing spiking activity so
+rapidly that it risks vanishing gradients if the slope is not
+carefully bounded.
+Low-fidelity
+stability
+(SSO): While the Stochastic
+Spike Operator (SSO) appears stable (exhibiting a flat
+(a) DVS-Gesture
+(b) DVS-CIFAR10
+(c) N-MNIST
+Fig. 5: Accuracy trends for surrogate gradient functions across three datasets. Each plot shows classification accuracy as
+a function of the derivative scaling factor (slope) α for four surrogate functions: Fast Sigmoid, Arctangent, SRE, and
+SSO. For each surrogate, representative top-performing α values were selected from 40 Optuna trials per candidate configuration
+(each trained for up to 200 epochs with early stopping).
+slope response), it consistently fails to converge to competitive
+accuracy levels (stalling at <50% on DVS-Gesture and <30%
+on DVS-CIFAR). Unlike FS, which is stable and accurate,
+SSO achieves stability only by failing to capture the fine-
+grained temporal dynamics required for these tasks. Con-
+sequently, we treat it as a sub-optimal candidate for high-
+performance inference.
+B. Latency Characterization of Surrogate Functions
+To isolate the algorithmic impact of surrogate functions,
+the latency values in this section are measured on a baseline
+hardware configuration with minimal parallelism (P = 1).
+System-level optimizations and resource scaling are applied
+in Section IV-D to demonstrate peak realizable performance.
+Figure 6 correlates the chosen surrogate function with the
+measured inference latency on our hardware instrumentation
+platform. For each surrogate, we evaluate the top two slope
+configurations obtained from the accuracy-based exploration
+and represent their corresponding latency range using a box
+plot. The red line traces the latency associated with the
+best-accuracy slope setting for each surrogate. Percentage
+labels indicate the accuracy achieved at that slope setting.
+This analysis reveals a critical disconnect between software
+accuracy and hardware efficiency.
+The sparsity-latency mechanism: Lower latency is driven by
+the Priority Encoder (PENC) skipping zero-activations. The
+results indicate that surrogates with sharp, exponential tails
+(like SRE) act as aggressive noise gates, suppressing spikes
+near the threshold more effectively than smooth sigmoidal
+functions
+Looking at the DVS-Gesture dataset as a case study, the
+aggressive suppression behavior of SRE, which was a liability
+for accuracy stability (Section IV-A), becomes a massive asset
+for latency. By operating with a low scaling factor, SRE
+achieves the global minimum latency of ∼92 ms (Fig. 6a),
+providing a 12.2% speedup over the accuracy-optimal FS
+baseline (∼105 ms). This identifies SRE as a Pareto-optimal
+choice for latency-critical applications where a 3.4% accu-
+racy trade-off is acceptable. For edge-deployed neuromorphic
+systems processing high-frequency event streams, a 12.2%
+latency reduction can represent the difference between meeting
+or missing real-time constraints. Importantly, since surrogate
+selection is an offline training decision, this efficiency gain in-
+curs zero runtime cost. SRE is thus particularly valuable when
+latency is paramount and the workload tolerates aggressive
+spike suppression.
+Dataset sensitivity: This behavior is workload-dependent. On
+DVS-CIFAR10 (Fig. 6b) and N-MNIST (Fig. 6c), SRE fails to
+find a sweet spot. It yields higher latency than FS (∼33 ms vs.
+∼26 ms for DVS-CIFAR10) while simultaneously suffering
+from lower accuracy. This suggests that for object recognition
+tasks (unlike gesture recognition), the aggressive pruning of
+SRE removes information critical for classification before it
+removes redundancy, making FS the dominant choice for both
+metrics.
+C. Neuronal Model: Arithmetic Intensity vs. Sparsity
+Figure 7 visualizes the design space exploration of neuron
+models, plotting the Pareto frontier of accuracy vs. latency.
+Each point in the plot corresponds to a specific neuron model
+(LIF–blue markers or LAP–yellow markers) and its associated
+parameters (β, θ). This experiment tests a fundamental hard-
+ware hypothesis: Does the increased arithmetic intensity of
+complex neuron models (Lapicque) pay off in reduced event
+rates?
+Counterintuitively, the LAP model, which requires more
+complex state updates (Eq. 2), consistently yields lower system
+latency than the simpler LIF model. In DVS-Gesture (Fig. 7a),
+the LAP configurations cluster in the top-left quadrant (high
+accuracy, low latency), whereas LIF configurations are scat-
+tered with significantly higher latency tails (> 60 ms). The
+optimal LAP configuration reduces latency to ∼5.8 ms com-
+pared to the best LIF result under the evaluated settings. On
+(a) DVS-Gesture
+(b) DVS-CIFAR10
+(c) N-MNIST
+Fig. 6: Hardware inference latency across surrogate functions for three datasets. Each box represents the latency range
+for the top two slope configurations (best accuracy) of a surrogate. The red line connects the latency of the best-accuracy slope
+per surrogate. Accuracy values (blue) are annotated for the best configuration. Lower latency combined with higher accuracy
+indicates better efficiency.
+(a)
+(b)
+(c)
+Fig. 7: Pareto analysis of neuron configurations across datasets. Each plot shows accuracy versus latency for different (β, θ)
+parameter pairs using either LIF (blue markers) or LAP (yellow markers). Optimal configurations appear toward the upper-left
+(high accuracy, low latency). LAP consistently yields lower latency and often competitive or superior accuracy compared to
+LIF.
+N-MNIST (Fig. 7c), LAP provides a substantial 28% latency
+reduction at comparable (∼96.5%) accuracy.
+Analysis: This validates that, within our training and hard-
+ware framework, the LAP model’s explicit modeling of RC
+constants can lead to more efficient temporal encoding and
+reduced event activity (i.e., fewer spikes) compared to LIF.
+As illustrated in Fig. 1, LIF requires only 3 operations per
+update (accumulate, shift-based decay, compare), while LAP
+requires 4 operations, including 2 explicit multiplications for
+the RC constants. Despite this ∼33% higher per-update arith-
+metic cost, LAP suppresses total spike events so effectively
+that it amortizes the additional computation. On N-MNIST,
+for example, the 28% latency reduction implies that LAP
+reduces total neuron updates by more than enough to offset
+its per-update overhead. From a hardware perspective, this
+validates the use of biologically plausible models in efficiency-
+constrained digital accelerators. The cost of complex update
+logic is compensated by the reduction in total accumulated
+events.
+D. Benchmarking Against Previous Work
+To contextualize our characterization, we benchmark our
+hyperparameter-tuned VGG9 models against prior ASIC and
+FPGA implementations. Specifically, we benchmark the op-
+timized configurations against two notable works: an ASIC-
+based accelerator from [16] and an FPGA implementation
+from [25]. This comparison helps validate that improvements
+derived from surrogate and neuron model tuning translate into
+meaningful system-level gains in latency and accuracy, even
+when deployed on more resource-intensive networks.
+Table II summarizes the accuracy, inference latency, power
+consumption, and clock frequency (FMax) for each design on
+the N-MNIST and DVS-Gesture datasets. We exclude DVS-
+CIFAR10 from this comparison due to the absence of publicly
+available hardware benchmarks for this dataset. Our models
+are built on a VGG9-based architecture (net3), selected using
+Optuna and significantly larger than those used in prior studies
+(net1 and net2).
+Note that Table II is not intended as an apples-to-apples
+architectural comparison, as the platforms, network depths,
+TABLE II: Benchmarking tuned configurations against previous work. Note: Our VGG9 network is significantly deeper (9
+layers) than the 2–4 layer baselines, yet achieves competitive latency. EDP = Energy-Delay Product.
+Dataset
+Study
+Net
+Acc.
+Latency
+Power
+EDP
+FMax
+[%]
+[ms]
+[W]
+[mJ·ms]
+[MHz]
+NMNIST
+ASIC [16]
+net1
+97.8
+3.8-12.5
+0.011
+0.16–1.72
+400
+TW
+net3
+96.4
+5.9
+0.31
+10.8
+100
+DVS
+ASIC [16]
+net1
+92.4
+7.1-23.2
+0.011
+0.55–5.92
+400
+Gesture
+FPGA [25]
+net2
+86.3
+0.46
+0.42
+0.09
+100
+TW
+net3
+95.4
+11.2
+1.35
+169.3
+100
+TW*
+net3
+95.4
+5.8
+2.19
+73.7
+100
+net1: MP4-2C3-MP2-32C3-MP2-FC512-FC11.
+net2: MP4-32C3-MP2-32C3-MP2-FC512-FC256-FC11.
+net3: A VGG9 variant (Section III-C) customized for event datasets using Optuna.
+TW: This Work. TW*: This Work with scaled up resources.
+and design goals differ substantially. Rather, it demonstrates a
+key performance insight that through sparsity-aware hyperpa-
+rameter tuning alone, a deeper VGG9 network on FPGA can
+match or exceed the latency of untuned, shallower models on
+custom ASICs. This highlights that training-time hyperparam-
+eters are a first-order determinant of hardware performance,
+complementary to architectural optimizations.
+Latency competitiveness: Despite using a significantly larger
+network (VGG9 vs. shallow CNNs in prior work) and run-
+ning on a low-frequency FPGA fabric (100 MHz), our opti-
+mized configurations achieve latencies competitive with cus-
+tom ASICs (400 MHz). On N-MNIST, our tuned configu-
+ration (surrogate=FS, neuron=LAP, β = 0.11, θ = 1.35)
+achieves an inference latency of 5.9 ms, rivaling the 3.8–12.5
+ms range of the ASIC in [16]. On DVS-Gesture, our scaled
+design (TW*) achieves 5.8 ms, a 2× improvement over the
+untuned baseline (TW) and faster than the reported 7.1 ms of
+the ASIC.
+Accuracy-power trade-off: Our approach prioritizes algorith-
+mic robustness, achieving 95.4% accuracy on DVS-Gesture
+compared to 86.3%. While this necessitates a larger model and
+consequently higher power consumption (2.19 W on FPGA
+vs. mW-range on ASIC), the results demonstrate that sparsity-
+aware tuning is a first-order optimization vector. These results
+indicate that carefully tuned SNN configurations can signif-
+icantly improve latency on FPGA-based implementations, in
+some cases approaching the performance range reported for
+custom neuromorphic ASIC systems.
+Energy-delay product analysis: To provide a more holistic
+efficiency metric, we report Energy-Delay Product (EDP) in
+Table II. While the absolute EDP of our FPGA implementation
+exceeds the mW-range ASICs due to the underlying substrate,
+our sparsity-aware tuning achieves a 2.3× reduction in EDP
+(from 169 mJ·ms to 74 mJ·ms) when scaling resources on
+the same platform. This relative improvement is platform-
+independent: the sparsity-driven latency gains translate directly
+into proportional energy savings. On custom silicon operating
+at mW-level power, these same algorithmic optimizations
+would yield substantial absolute EDP reductions, reinforcing
+that hyperparameter tuning is orthogonal to—and composable
+with—platform-level optimizations.
+These comparisons reinforce the broader message of this
+work: by systematically tuning training-time hyperparameters
+such as surrogate gradient functions and neuron parameters,
+we can produce SNN models that achieve competitive or supe-
+rior accuracy while yielding favorable hardware performance.
+This demonstrates the tangible benefits of algorithm–hardware
+co-design in the deployment of SNNs on real-world neuromor-
+phic platforms.
+V. CONCLUSION
+This work presented a systematic workload characterization
+quantifying the impact of training-time hyperparameters on the
+physical execution efficiency of Spiking Neural Networks. By
+bridging the abstraction gap between algorithmic definitions
+(surrogate gradients, neuron models) and hardware metrics
+(latency, activity density), we demonstrated that software-
+centric design choices have profound, often non-intuitive con-
+sequences for neuromorphic deployment.
+Our analysis yielded three critical insights. First, surrogate
+gradient functions are not merely convergence tools but are
+deterministic predictors of hardware sparsity. Specifically, we
+identified that functions with exponential tails (e.g., Spike Rate
+Escape) can aggressively suppress latency-inducing noise in
+dynamic workloads like DVS-Gesture, provided their stability
+cliffs are carefully navigated. Second, we challenged the
+assumption that simpler neuron models yield faster hardware.
+Our results show that the Lapicque model, despite its higher
+arithmetic intensity, amortizes its computational cost by encod-
+ing information more sparsely, reducing system-level latency
+by up to 28% compared to standard LIF models. Third, we
+validated that these gains are realizable on general-purpose
+FPGA fabrics, where our sparsity-aware tuning allowed a
+VGG9-based SNN to match the latency of custom ASICs
+while maintaining higher accuracy.
+These findings suggest that the current SNN design
+paradigm, which often decouples training accuracy from in-
+ference efficiency, is insufficient. We conclude that activation
+sparsity should be treated as a tunable hyperparameter rather
+than a fixed emergent property. Our future work will focus
+on integrating these hardware-derived sparsity cost functions
+directly into the training loss loop, moving from hardware-
+in-the-loop evaluation to hardware-aware loss formulation,
+ultimately enabling the automated discovery of the optimal
+Pareto frontier for edge neuromorphic intelligence.
+ACKNOWLEDGMENT
+This work was partially supported by NSF Grants 1844952
+and 2425567.
+REFERENCES
+[1] R. Yin, A. Moitra, A. Bhattacharjee, Y. Kim, and P. Panda, “Sata:
+Sparsity-aware training accelerator for spiking neural networks,” IEEE
+Transactions on Computer-Aided Design of Integrated Circuits and
+Systems, 2022.
+[2] M. Davies, A. Wild, G. Orchard, Y. Sandamirskaya, G. A. F. Guerra,
+P. Joshi, P. Plank, and S. R. Risbud, “Advancing neuromorphic com-
+puting with loihi: A survey of results and outlook,” Proceedings of the
+IEEE, vol. 109, no. 5, pp. 911–934, 2021.
+[3] G. Zhang, L. Feng, F. Zhou, Z. Yang, Q. Zhang, A. Saleh, P. K.
+Donta, and C. K. Dehury, “Spiking neural networks in intelligent edge
+computing,” IEEE Consumer Electronics Magazine, 2024.
+[4] Y. Liu, Z. Qin, and G. Y. Li, “Energy-efficient distributed spiking neural
+network for wireless edge intelligence,” IEEE Transactions on Wireless
+Communications, 2024.
+[5] M. Bouvier, A. Valentian, T. Mesquida, F. Rummens, M. Reyboz,
+E. Vianello, and E. Beigne, “Spiking neural networks hardware im-
+plementations and challenges: A survey,” ACM Journal on Emerging
+Technologies in Computing Systems (JETC), vol. 15, no. 2, pp. 1–35,
+2019.
+[6] J. D. Nunes, M. Carvalho, D. Carneiro, and J. S. Cardoso, “Spiking
+neural networks: A survey,” IEEE access, vol. 10, pp. 60 738–60 764,
+2022.
+[7] E. O. Neftci, H. Mostafa, and F. Zenke, “Surrogate gradient learning
+in spiking neural networks: Bringing the power of gradient-based opti-
+mization to spiking neural networks,” IEEE Signal Processing Magazine,
+vol. 36, no. 6, pp. 51–63, 2019.
+[8] R. Yin, Y. Kim, Y. Li, A. Moitra, N. Satpute, A. Hambitzer, and P. Panda,
+“Workload-balanced pruning for sparse spiking neural networks,” IEEE
+Transactions on Emerging Topics in Computational Intelligence, 2024.
+[9] Z. Wang, Y. Zhong, X. Cui, Y. Kuang, and Y. Wang, “A spiking neural
+network accelerator based on ping-pong architecture with sparse spike
+and weight,” in 2023 IEEE International Symposium on Circuits and
+Systems (ISCAS).
+IEEE, 2023, pp. 1–5.
+[10] I. Aliyev and T. Adegbija, “Fine-tuning surrogate gradient learning for
+optimal hardware performance in spiking neural networks,” in 2024
+Design, Automation & Test in Europe Conference & Exhibition (DATE).
+IEEE, 2024, pp. 1–2.
+[11] S. B. Shrestha and G. Orchard, “Slayer: Spike layer error reassignment
+in time,” Advances in neural information processing systems, vol. 31,
+2018.
+[12] J. Sommer, M. A. ¨Ozkan, O. Keszocze, and J. Teich, “Efficient hardware
+acceleration of sparsely active convolutional spiking neural networks,”
+IEEE Transactions on Computer-Aided Design of Integrated Circuits
+and Systems, vol. 41, no. 11, pp. 3767–3778, 2022.
+[13] W. Gerstner, W. M. Kistler, R. Naud, and L. Paninski, Neuronal
+dynamics: From single neurons to networks and models of cognition.
+Cambridge University Press, 2014.
+[14] N. Brunel and M. C. Van Rossum, “Lapicque’s 1907 paper: from frogs
+to integrate-and-fire,” Biological cybernetics, vol. 97, no. 5, pp. 337–339,
+2007.
+[15] J. K. Eshraghian, M. Ward, E. O. Neftci, X. Wang, G. Lenz, G. Dwivedi,
+M. Bennamoun, D. S. Jeong, and W. D. Lu, “Training spiking neural
+networks using lessons from deep learning,” Proceedings of the IEEE,
+2023.
+[16] A. Di Mauro, A. S. Prasad, Z. Huang, M. Spallanzani, F. Conti, and
+L. Benini, “Sne: an energy-proportional digital accelerator for sparse
+event-based convolutions,” in 2022 Design, Automation & Test in Europe
+Conference & Exhibition (DATE).
+IEEE, 2022, pp. 825–830.
+[17] A. J. Leigh, M. Heidarpur, and M. Mirhassani, “Selective input sparsity
+in spiking neural networks for pattern classification,” in 2022 IEEE
+International Symposium on Circuits and Systems (ISCAS). IEEE, 2022,
+pp. 799–803.
+[18] T. Li, J. Li, G. Shen, D. Zhao, Q. Zhang, and Y. Zeng, “Firefly-s:
+Exploiting dual-side sparsity for spiking neural networks acceleration
+with reconfigurable spatial architecture,” IEEE Transactions on Circuits
+and Systems I: Regular Papers, 2024.
+[19] C. Wei, C. Guo, F. Cheng, S. Li, H. Yang, H. Li, Y. Chen et al.,
+“Prosperity: Accelerating spiking neural networks via product sparsity,”
+arXiv preprint arXiv:2503.03379, 2025.
+[20] R. Yin, Y. Kim, D. Wu, and P. Panda, “Loas: Fully temporal-
+parallel dataflow for dual-sparse spiking neural networks,” in 2024 57th
+IEEE/ACM International Symposium on Microarchitecture (MICRO).
+IEEE, 2024, pp. 1107–1121.
+[21] I.
+Aliyev
+and
+T.
+Adegbija,
+“Pulse:
+Parametric
+hardware
+units
+for low-power sparsity-aware convolution engine,” arXiv preprint
+arXiv:2402.06210, 2024.
+[22] T. Akiba, S. Sano, T. Yanase, T. Ohta, and M. Koyama, “Optuna: A
+next-generation hyperparameter optimization framework,” in The 25th
+ACM SIGKDD International Conference on Knowledge Discovery &
+Data Mining, 2019, pp. 2623–2631.
+[23] K. Simonyan and A. Zisserman, “Very deep convolutional networks for
+large-scale image recognition,” arXiv preprint arXiv:1409.1556, 2014.
+[24] I. Loshchilov and F. Hutter, “Sgdr: Stochastic gradient descent with
+warm restarts,” arXiv preprint arXiv:1608.03983, 2016.
+[25] H. Liu, Y. Chen, Z. Zeng, M. Zhang, and H. Qu, “A low power and
+low latency fpga-based spiking neural network accelerator,” in 2023
+International Joint Conference on Neural Networks (IJCNN).
+IEEE,
+2023, pp. 1–8.
+APPENDIX
+A. Abstract
+This appendix describes the artifact that contains the soft-
+ware and hardware implementations used to produce the
+results reported in our paper on SNN hyperparameter char-
+acterization. The artifact includes: (1) Python training scripts
+for spiking neural networks with configurable surrogate gra-
+dient functions (Fast Sigmoid, Arctangent, Spike Rate Es-
+cape, Stochastic Spike Operator) and neuron models (LIF,
+Lapicque); (2) a cycle-accurate FPGA instrumentation plat-
+form implemented in SystemVerilog for measuring inference
+latency and spike counts; and (3) weight extraction utilities
+for deploying trained models to hardware. The artifact en-
+ables reproduction of all key results, including accuracy vs.
+slope curves (Figure 5), latency characterization (Figure 6),
+Pareto analysis of neuron configurations (Figure 7), and the
+benchmark comparisons in Table II.
+B. Artifact Check-list (Meta-information)
+• Algorithm: Surrogate gradient descent for SNNs; Design space
+exploration with Optuna
+• Program: Python training scripts, SystemVerilog RTL for
+FPGA simulation
+• Compilation: Python 3.11, PyTorch 2.2.2; Xilinx Vivado
+2023.2
+• Model: VGG9-based convolutional SNN (4-bit quantized
+weights)
+• Data set: DVS128-Gesture, N-MNIST, DVS-CIFAR10 (via
+tonic library)
+• Run-time environment: Windows 11, CUDA 12.8
+• Hardware: NVIDIA GPU for training RTX 4090; Xilinx
+Kintex UltraScale+ FPGA xcvu9p-flga2104-2L-e for
+hardware validation
+• Metrics: Classification accuracy (%), inference latency (ms),
+spike counts, Energy-Delay Product (mJ·ms)
+• Output:
+Trained
+model
+checkpoints,
+extracted
+weights,
+cycles_and_spikes.txt with latency measurements
+• Experiments: Surrogate sweep (4 functions × slope range),
+neuron model sweep (LIF/LAP × β/θ grid), hardware profiling
+• How much disk space required (approximately)?: ≥100 GB
+• How much time is needed to prepare workflow (approxi-
+mately)?: 1–2 hours (environment setup, dataset download)
+• How much time is needed to complete experiments (ap-
+proximately)?: ∼48 hours for full DSE; ∼20 minutes
+for hardware simulation per configuration
+• Publicly available?: Yes
+• Code licenses (if publicly available)?: MIT License
+• Data licenses (if publicly available)?: DVS-Gesture (CC BY
+4.0), N-MNIST (see IBM license), DVS-CIFAR10 (see original
+license)
+• Workflow automation framework used?: Optuna for hyper-
+parameter optimization
+• Archived
+(provide
+DOI)?:
+https://zenodo.org/records/
+18893738
+C. Description
+1) How to Access: The artifact is publicly available at:
+https://github.com/githubofaliyev/SNN-DSE/tree/ISPASS26
+An archived version with DOI is available at:
+https://zenodo.org/records/18893738
+2) Hardware Dependencies:
+• Training: NVIDIA GPU with CUDA 12.8 support (tested
+on RTX 4090).
+• Hardware simulation: Xilinx Kintex UltraScale+ FPGA
+(xcvu9p-flga2104-2L-e).
+• Hardware requirements:
+– Disk space: ≥100 GB (datasets: 15 GB, Vivado:
+70 GB, CUDA/Python: 10 GB, working files: 5 GB)
+– GPU memory: ≥8 GB VRAM (16 GB recom-
+mended)
+– System RAM: ≥16 GB (32 GB recommended for
+Vivado synthesis)
+3) Software Dependencies:
+• Python 3.11
+• PyTorch 2.2.2 with CUDA 12.8
+• snnTorch 0.7.0
+• Brevitas 0.10.2 (for quantization-aware training)
+• tonic (for DVS event-based datasets)
+• Optuna (for hyperparameter optimization)
+• Xilinx Vivado 2023.2 (for hardware simulation)
+All
+Python
+dependencies
+are
+listed
+in
+Scripts/requirements.txt.
+4) Data Sets: The following event-based datasets are used
+(automatically downloaded via tonic):
+• DVS128-Gesture:
+11
+gesture
+classes,
+2
+channels,
+128×128 resolution
+• N-MNIST: 10 digit classes, 2 channels, 34×34 resolution
+• DVS-CIFAR10: 10 object classes, 2 channels, 128×128
+resolution
+5) Models: VGG9-based convolutional SNN architecture:
+64C3-28C3-MP2-48C3-54C3-MP2-120C3-126C3
+-140C3-MP2-FC216-FC200
+Weights are quantized to 4-bit integers for hardware deploy-
+ment.
+D. Installation
+1) Clone the repository:
+git clone https://github.com/
+githubofaliyev/SNN-DSE.git
+cd SNN-DSE
+git checkout ISPASS26
+2) Create and activate a Python environment:
+conda create -n snn-dse python=3.11
+conda activate snn-dse
+3) Install Python dependencies:
+pip install -r Scripts/requirements.txt
+4) (For hardware simulation) Install Xilinx Vivado and
+ensure it is in your PATH.
+E. Experiment Workflow
+The workflow consists of three phases:
+1) Phase 1: Training with Surrogate/Neuron Sweeps:
+1) Edit Scripts/Configs.py to set the desired con-
+figurations.
+E.g.,
+config = {
+"beta": 0.15, # Decay rate
+"threshold": 0.5, # Threshold
+"slope": 1.0,
+# Scaling factor (alpha)
+"surrogate_type": "fast_sigmoid",
+# "fast_sigmoid", "atan",
+# "spike_rate_escape", "SSO"
+"neuron_type": "lif",
+# "lif" or "lapicque"
+...
+}
+2) Run training:
+cd Scripts
+python Training.py
+3) To reproduce the full DSE (Figures 5–7), sweep over:
+• Surrogate
+functions:
+fast_sigmoid,
+atan,
+spike_rate_escape, SSO
+• Slope α ∈[1, 48]
+• Neuron types: lif, lapicque
+• β ∈[0.1, 1.0], θ ∈[0.1, 2.0] with step 0.2
+2) Phase 2: Weight Extraction:
+1) Edit Scripts/Extract.py to specify the trained
+model path and dataset.
+2) Run extraction:
+python Extract.py
+3) Copy
+the
+generated
+‘include
+line
+into
+Hardware/ispass_sim/top_wrapper.sv.
+3) Phase 3: Hardware Simulation:
+1) Open the project in Vivado.
+2) Add -d SIM to xsim.compile.xvlog.more_options
+in simulation settings.
+3) Run behavioral simulation.
+4) Simulation completes when fc_2_spk_RAM_loaded
+triggers.
+5) Results are written to cycles_and_spikes.txt.
+F. Evaluation and Expected Results
+1) Key Claims to Verify:
+1) Figure 5 (Accuracy vs. Slope): Fast Sigmoid maintains
+>90% accuracy across a wide slope range on N-MNIST
+and DVS-Gesture; SRE exhibits cliff-like degradation.
+2) Figure
+6
+(Latency
+Characterization): On DVS-
+Gesture, SRE achieves 12.2% lower latency than FS
+(∼92 ms vs. ∼105 ms at P=1).
+3) Figure 7 (Pareto Analysis): Lapicque configurations
+cluster in the high-accuracy, low-latency quadrant; LAP
+provides up to 28% latency reduction on N-MNIST.
+4) Table II (Benchmarking): Tuned VGG9 on FPGA
+achieves 5.9 ms latency on N-MNIST (comparable to
+ASIC range of 3.8–12.5 ms) and 95.4% accuracy on
+DVS-Gesture.
+2) Expected
+Output
+Format:
+Sample:
+https:
+//github.com/githubofaliyev/SNN-DSE/blob/ISPASS26/
+Hardware/cycles and spikes sample.txt
+G. Experiment Customization
+• New
+surrogate
+functions: Add to Net.py using
+snnTorch’s surrogate module.
+• Different network architectures: Modify Net.py and
+update extraction in Extract.py.
+• New datasets: Add dataset class to Datasets.py
+following the existing patterns.
+• Hardware parallelism: Adjust the parallelization factor
+P in the RTL configuration.
+H. Notes
+The full DSE involves ∼8,000 training epochs per surrogate
+function. For quick validation, we recommend testing a subset
+of configurations (e.g., top-2 slopes per surrogate as shown in
+Figure 6).

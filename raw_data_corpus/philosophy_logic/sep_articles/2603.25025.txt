@@ -1,0 +1,3338 @@
+System-Anchored Knee Estimation for Low-Cost
+Context Window Selection in PDE Forecasting
+Wenshuo Wang1, Fan Zhang2,3∗
+1 School of Future Technology, South China University of Technology, China
+2 State Key Laboratory of Ocean Sensing & Ocean College, Zhejiang University, China
+3 Kavli Institute for Astrophysics and Space Research, Massachusetts Institute of Technology, USA
+202364870251@mail.scut.edu.cn, f.zhang@zju.edu.cn
+Abstract
+Autoregressive neural PDE simulators predict the evolution of physical fields
+one step at a time from a finite history, but low-cost context-window selection
+for such simulators remains an unformalized problem. Existing approaches to
+context-window selection in time-series forecasting include exhaustive validation,
+direct low-cost search, and system-theoretic memory estimation, but they are either
+expensive, brittle, or not directly aligned with downstream rollout performance.
+We formalize explicit context-window selection for fixed-window autoregressive
+neural PDE simulators as an independent low-cost algorithmic problem, and pro-
+pose System-Anchored Knee Estimation (SAKE), a two-stage method that first
+identifies a small structured candidate set from physically interpretable system
+anchors and then performs knee-aware downstream selection within it. Across all
+eight PDEBench families evaluated under the shared L ∈{1, . . . , 16} protocol,
+SAKE is the strongest overall matched-budget low-cost selector among the evalu-
+ated methods, achieving 67.8% Exact, 91.7% Within-1, 6.1% mean regret@knee,
+and a cost ratio of 0.051 (94.9% normalized search-cost savings).
+1
+Introduction
+Autoregressive neural simulators for PDEs predict the evolution of physical fields by advancing one
+time step at a time from a finite history of past states [1, 2]. In this setting, choosing the context
+window length is a fundamental yet surprisingly under-studied problem: the window determines
+how much temporal information the simulator receives, but also how much training, evaluation, and
+tuning cost must be paid. Existing work typically fixes this window as a task-specific hyperparameter
+or a priori [3, 1], or folds it implicitly into memory-based architectures [4]. Other work examines its
+effect only through ablations, rather than treating context-window selection itself as an independent
+optimization problem [5, 6]. As a result, a basic question remains open: can we identify the
+performance-critical window for a given autoregressive neural simulator without paying the cost
+of exhaustive search? The problem is challenging because the best window depends jointly on the
+underlying system dynamics, the simulator architecture, and the downstream rollout objective.
+More broadly, context-window selection has been studied in time-series forecasting, where existing
+approaches can be roughly grouped into three families [11]. The first is exhaustive validation
+over candidate windows [11]. The second is direct low-cost search, which replaces full evaluation
+with cheap pilots, early stopping, or multi-fidelity resource allocation over a generic shortlist of
+candidate windows [12, 13, 17–19]. The third is system-theoretic memory estimation, which infers a
+characteristic memory or embedding scale from the underlying dynamics and uses it to choose or
+bracket plausible windows [14, 15, 20, 16]. Yet none of them fully addresses our setting. Exhaustive
+∗Corresponding author.
+Preprint.
+arXiv:2603.25025v1  [cs.AI]  26 Mar 2026
+validation is accurate but expensive [11]; direct search is cheaper but often system-agnostic and
+brittle [12, 13]; and memory estimates are physically meaningful but do not directly determine the
+window that optimizes downstream rollout performance in neural PDE simulators [14–16].
+We therefore formalize explicit context-window selection for autoregressive neural PDE simulators
+as an independent low-cost algorithmic problem, and propose System-Anchored Knee Estimation
+(SAKE). SAKE is a two-stage method. It first extracts physically interpretable system anchors
+from clean-system dynamics to identify a small but structured region of plausible windows. It then
+performs knee-aware downstream selection only within this anchor-induced candidate set, using
+a small number of task-level evaluations to choose the final window. By coupling system priors
+with lightweight downstream selection, SAKE avoids both the cost of exhaustive sweeps and the
+brittleness of generic low-cost search, providing a more reliable and efficient way to determine
+performance-critical context windows.
+We evaluate SAKE on two representative PDEBench tasks, four autoregressive simulator backbones,
+and three training seeds in the main body, and complement these case-level results with an appendix-
+wide aggregate over all eight PDEBench families under a shared L ∈{1, . . . , 16} protocol. Across
+this fixed-window setting, we measure exact oracle-knee recovery, absolute window error, regret at
+the knee, and search cost. The aggregate results show that SAKE has the strongest overall matched-
+budget profile among the compared selectors in this scope: it achieves 67.8% Exact, 91.7% Within-1,
+6.1% mean regret@knee, and a 0.051 cost ratio, outperforming the generic shortlist and ASHA
+baselines without using a larger search budget. These gains do not come from more aggressive search.
+Instead, they come from coupling system-informed anchors with lightweight downstream selection.
+In summary, the contributions of this paper are:
+• We are the first to formalize explicit context-window selection for autoregressive neural
+PDE simulators as an independent low-cost algorithmic problem. This problem is important
+because exhaustive context-window tuning can be computationally expensive in practice.
+• We propose SAKE, a two-stage method that combines physically interpretable system
+anchors with knee-aware downstream selection.
+• We empirically validate the effectiveness of SAKE across multiple PDE datasets, simulator
+backbones, and training seeds. In the fixed-window autoregressive setting studied here,
+SAKE provides a more reliable and efficient low-cost selector of context windows than the
+generic shortlist baselines considered in the main text.
+2
+Related Work
+2.1
+Temporal dependence and historical information in neural simulators
+Recent work on time-dependent neural PDE solvers increasingly treats temporal dependence as a
+central challenge rather than a secondary implementation detail. Standard neural operators have been
+found to struggle with temporal dynamics beyond the horizons seen during training, architecture
+papers now target time-evolving dynamics directly, long-rollout studies make stable temporal pre-
+diction a primary concern, and recent benchmarks explicitly emphasize rollout metrics for temporal
+generalization [8, 9, 6, 10]. This importance of historical information is made especially explicit by
+On the Benefits of Memory for Modeling Time-Dependent PDEs, which points out that many existing
+approaches are effectively Markovian and shows that using past states can substantially improve
+performance when the system is partially observed, noisy, or rich in high-frequency content [4].
+Yet, despite this growing recognition, historical information is still usually handled implicitly rather
+than selected explicitly: many methods condition on only the current state or immediate past state,
+while others absorb memory into a dedicated architecture instead of treating the amount of accessible
+history as a separate modeling decision [4, 8]. When the role of history is examined more directly, it
+is typically through architecture ablations, rollout-strategy studies, or benchmark analyses aimed at
+temporal extrapolation and stability, rather than through a procedure that explicitly selects a context
+window for a fixed autoregressive neural simulator [8, 6, 10].
+The gap, therefore, is not that prior work ignores temporal context; rather, it has not isolated explicit
+context-window selection as a standalone algorithmic problem. Existing work usually fixes history
+as part of the modeling setup, bakes it into a memory-aware architecture, or studies it only through
+ablations and rollout analyses, whereas our work makes the choice of context window itself the object
+2
+of study [4, 8, 6, 10]. In particular, the present paper focuses on fixed-window one-step autoregressive
+simulators, treating adaptive-memory or internally stateful architectures as a complementary design
+direction rather than as direct selector baselines.
+2.2
+Methodological perspectives on explicit context-window selection
+From an abstract viewpoint, deciding how many past observations to expose to a predictor is a classical
+issue in time-series forecasting, where the choice of input lags can substantially affect predictive
+performance [11]. Existing methods that could in principle be brought to bear on this problem can
+be broadly grouped into three families. A first family is exhaustive validation, which treats context
+length as an ordinary hyperparameter and estimates downstream performance for every candidate
+window by full training and validation [11]. A second family is direct low-cost search, which replaces
+full evaluation with cheap pilots, early stopping, or multi-fidelity resource allocation over a generic
+shortlist of candidate windows [12, 13, 17–19]. A third family is system-theoretic memory estimation,
+which infers a characteristic memory or embedding scale directly from the observed dynamics and
+uses that estimate to choose or bracket a plausible context window [14, 15, 20, 16].
+However, none of these families is satisfactory for explicit context-window selection in autoregressive
+neural simulators. Exhaustive validation optimizes downstream rollout quality, but requires a full
+sweep over candidate windows. Direct low-cost search reduces this cost, but remains largely system-
+agnostic and can miss small-window knees or plateau-side anchors important for rollout quality.
+System-theoretic estimators provide physically meaningful priors, but a system-level memory scale
+need not match the model-dependent rollout knee under finite data and training budgets. SAKE
+addresses this gap by combining the strengths of the latter two views: it uses system dynamics to
+construct a tiny, physically interpretable anchor set, then performs low-cost downstream selection
+only within that compressed space, targeting the rollout knee more efficiently than exhaustive search.
+3
+Low-Cost Context-Window Selection
+We first formalize low-cost context-window selection for autoregressive neural simulators in Sec-
+tion 3.1, and then introduce System-Anchored Knee Estimation (SAKE) in Section 3.2.
+3.1
+Problem formulation
+Let L ⊂N denote a discrete candidate set of context-window lengths, and let f (L)
+θ
+be a one-step
+autoregressive neural simulator with history length L, i.e.,
+ˆxt+1 = f (L)
+θ
+(xt−L+1:t).
+For each L ∈L, let M(L) denote the downstream rollout error obtained after training and evaluating
+the simulator under the full protocol with window length L. The full-information optimal window is
+Lbest = arg min
+L∈L M(L).
+In cost-aware settings, however, the more practical target is often not the absolute best window, but
+the smallest near-optimal one. We therefore define the oracle knee as
+Lknee = min {L ∈L : M(L) ≤(1 + ϵ) M(Lbest)} ,
+where ϵ > 0 is a tolerance parameter. This quantity captures the earliest point beyond which enlarging
+the context window yields only marginal improvements in downstream rollout performance. We refer
+to it as an oracle quantity because identifying it exactly requires access to the full performance curve
+M(L) over all candidate windows. In practice, the empirical sections below report the default setting
+ϵ = 0.05 and separately examine stricter and looser knee definitions.
+The challenge is that M(L) is unknown a priori, and estimating it for every L ∈L requires an
+exhaustive sweep in which each candidate window is trained and evaluated under the full protocol.
+We therefore study low-cost context-window selection: given a budget far smaller than a full sweep,
+select a window Lsel ∈L that approximates Lknee as closely as possible. Formally, a selector A may
+use only inexpensive information, such as cheap pilot evaluations or system-level statistics, and must
+operate under a search-cost constraint,
+min
+A
+ℓ(Lsel, Lknee)
+s.t.
+C(A) ≤B,
+B ≪|L|,
+3
+Algorithm 1 System-Anchored Knee Estimation
+Require: Candidate window set L with minimum Lmin and maximum Lmax, clean-system trajecto-
+ries Dsys, autoregressive simulator family f (L)
+θ
+Ensure: Selected context window Lsel ∈L
+1: Estimate the system anchors (Lcore, Lplateau) from Dsys
+2: Form the initial anchor shortlist
+S0 ←{Lmin, Lcore, Lplateau}
+3: Train cheap pilot models on S0 and compute coarse downstream scores
+4: Build a refined candidate set by taking promising pilot candidates, adding local grid neighbors,
+and retaining the boundary anchors
+5: Train stronger pilots on the refined set and compute knee-aware downstream scores
+6: Apply a knee-aware final rule and return the smallest statistically indistinguishable window after
+clear saturation
+7: return Lsel
+where Lsel = A(·), C(A) denotes search cost, and ℓ(·, ·) measures selection quality, for example
+absolute window error or regret relative to the knee.
+This formulation separates the target of interest, the oracle knee, from the algorithmic question of
+how to recover it efficiently. The central difficulty is to compress the candidate space using low-cost
+information without discarding the performance-critical window. In the next subsection, we address
+this problem with SAKE.
+3.2
+System-Anchored Knee Estimation
+In this subsection, we first outline the workflow of SAKE in Section 3.2.1, then detail the first part
+of SAKE: system-anchor construction in Section 3.2.2, and the second part of SAKE: knee-aware
+downstream selection in Section 3.2.3.
+3.2.1
+Overall workflow
+Algorithm 1 summarizes the workflow of SAKE. The method has two parts with distinct roles. The
+first part is system anchoring: before training candidate simulators across the entire grid, SAKE
+extracts a small number of physically interpretable reference windows from clean-system dynamics
+and uses them to compress the candidate space. This step is intentionally informative but not final,
+because system memory alone does not determine the realized oracle knee of a particular trained
+backbone. The second part is downstream knee-aware selection: SAKE then performs a model-
+specific low-cost search, but only within the anchored region rather than over the full candidate grid.
+In this way, the first stage contributes a reliable search scaffold, while the second stage restores the
+backbone- and training-dependent specificity needed for final selection.
+3.2.2
+System-anchor construction from clean-system dynamics
+The first stage identifies a small region of plausible context windows before any expensive downstream
+sweep. It uses only clean-system dynamics and is backbone-agnostic: the goal is not to predict the
+final window directly, but to provide a compact, physically interpretable scaffold for the relevant
+part of the downstream performance curve. The intended use case is simulator-rich or benchmarked
+settings where clean or sufficiently denoised full-state trajectories are available for anchor extraction;
+later sections examine how this stage degrades under noisier and less complete inputs.
+Concretely, we summarize the clean trajectories in a low-dimensional state representation and,
+for each candidate window length L ∈L, fit a lightweight linear autoregressive model on that
+representation. In the experiments below, the default summary is a randomized PCA projection of
+normalized coarsened fields, retaining 99% explained variance with at most 64 components, and the
+lightweight dynamics model is a ridge VAR(L) with regularization 10−3. This yields a backbone-
+independent validation risk curve, denoted by Rsys(L), which measures how much system-level
+predictive error remains when the clean dynamics are modeled with history length L.
+4
+From this curve, SAKE extracts two anchors. The first is a core anchor, which marks the earliest
+point at which the long-history tail error is already small. Let
+Tsys(L) = Rsys(L) −Rsys(Lmax),
+εsys = ρ
+ Rsys(Lmin) −Rsys(Lmax)
+
+,
+where ρ ∈(0, 1) is a fixed tolerance fraction. Using an upper confidence bound to avoid optimistic
+early stopping, we define
+Lcore = min
+
+L ∈L : UCB
+ Tsys(L)
+
+≤εsys
+	
+.
+Thus, Lcore is the earliest window whose residual gap to the longest-context reference is small.
+The second is a plateau anchor, which marks the onset of diminishing returns. Let L+ denote the
+next larger candidate after L, and define the relative gain
+Grel(L) = Rsys(L) −Rsys(L+)
+max{Rsys(L), 10−12}.
+We then set
+Lplateau = min
+
+L ∈L : L ≥Lcore and UCB
+ Grel(L)
+
+≤τpl
+	
+,
+with fallback to Lmax if no such L exists. Intuitively, Lplateau is the first point beyond the core region
+where adding more history appears to bring only minor further improvement.
+We then form the initial shortlist
+S0 = {Lmin, Lcore, Lplateau}.
+Each element serves a distinct purpose: Lmin keeps the low-history hypothesis alive, Lcore provides a
+system-informed reference, and Lplateau supplies an upper bracket beyond which additional context
+is unlikely to be worthwhile. Throughout the paper, the stage-one uncertainty terms are one-sided
+95% bootstrap upper confidence bounds computed from 300 resamples; Appendix C gives the exact
+protocol and corresponding sensitivity study.
+3.2.3
+Knee-aware downstream selection in the anchored candidate set
+The second stage turns the anchored shortlist into a model-specific selector. This step is necessary
+because the realized knee depends on the simulator backbone, optimization trajectory, and rollout
+metric as well as the underlying system. In short, the first stage tells us where to look; the second
+stage determines which window to output.
+We begin with a coarse pilot pass on the initial shortlist S0. For each L ∈S0, we train a cheap pilot
+model and compute a coarse downstream score s(1)(L) from short validation rollouts. This score is
+used only for ranking. Let Ttop ⊆S0 denote the top-ranked candidates. SAKE then expands locally
+around them on the ordered candidate grid while retaining the boundary anchors. Writing Nh(L) for
+the h-hop neighborhood of L on L, the refined candidate set is
+S1 =
+
+[
+L∈Ttop
+Nh(L)
+
+∪{Lmin, Lplateau}.
+This refinement lets the downstream selector correct the system prior locally rather than committing
+to the anchors themselves, while still keeping the search budget small.
+We next run a stronger second pilot pass on S1. For each refined candidate L, we compute a small
+set of diagnostics, including the average rollout error m(L), the terminal rollout error u(L), the
+variability across rollout anchors v(L), and, when available, an asymptotic proxy a(L) from the pilot
+trajectory. After normalizing these quantities over S1, we combine them into a stage-two score
+q(L) = α
+
+wmean ˜m(L) + wterm˜u(L) + wstd˜v(L)
+
++ (1 −α)˜a(L),
+where lower is better. In the default selector, the initial shortlist is expanded with top-2 local
+refinement (h = 1) and the refined set is capped at six candidates; the score uses one fixed global
+blend of normalized mean, terminal, variability, and asymptotic diagnostics rather than per-backbone
+retuning. This score is designed to be knee-aware rather than pilot-best-aware: it rewards good rollout
+quality, penalizes brittle candidates, and avoids over-trusting noisy early pilot signals.
+5
+Finally, SAKE converts the refined score curve into a knee-oriented window choice. Ordering the
+refined candidates as L1 < · · · < LM and writing qj = q(Lj), SAKE first identifies the earliest
+index r after which the score curve has clearly saturated, meaning that adjacent gains are already
+small and the remaining gap to the best refined score q⋆= minj qj is also small. It then returns
+the smallest candidate up to that frontier whose score is statistically indistinguishable from the best
+refined score:
+Lsel = min {Lj : j ≤r and qj ≤q⋆+ κ SE(q⋆)} ,
+where SE(q⋆) is the estimated standard error of the best refined score and κ > 0 is a fixed multiplier.
+Operationally, the saturation frontier is the first refined index after which both the local gain and the
+remaining gap to the best score are below fixed 0.15 fractions, and the default selector uses κ = 1.5.
+If no earlier candidate satisfies this condition, SAKE falls back to the frontier candidate itself.
+This rule aligns the selector with the oracle knee defined in Section 3.1 by preferring the smallest
+reliable window once further gains have become negligible.
+4
+Empirical Evaluation
+Our experiments address two questions: whether SAKE improves context-window selection for PDE
+forecasting, and whether both the system anchor prior and its downstream coupling are necessary.
+4.1
+Experimental setup
+4.1.1
+Datasets
+We evaluate on two PDEBench forward tasks chosen to span distinct physical regimes and boundary
+conditions rather than multiple variants of the same PDE family [7]. Specifically, diff-react is
+a 2D two-field reaction–diffusion system with Neumann boundaries, and rdb is the radial-dam-
+break instance of PDEBench’s 2D shallow-water benchmark, representing hyperbolic free-surface
+dynamics with shock-capable wave propagation. According to PDEBench, both tasks comprise 1,000
+trajectories [7]. Their benchmark resolutions are both 128 × 128, and both contain 100 temporal
+evolution steps (equivalently 101 stored snapshots when counting the initial frame). diff-react
+contains two channels (u, v), whereas rdb is a single-channel scalar-field prediction task. These two
+tasks are shown in the body because they expose two contrasting knee structures—a broad-plateau
+reaction system and a small-knee shock-capable flow case—while keeping the case-level tables
+compact. Appendix A reports the corresponding all-PDE aggregate and per-family tables for the
+remaining PDEBench forward families under the same shared L ∈{1, . . . , 16} protocol.
+4.1.2
+Baseline selection and implementation details
+We evaluate four standard PDE-surrogate backbones—U-Net, Fourier Neural Operator (FNO),
+ConvLSTM, and Transformer—as one-step autoregressive predictors with variable history length on
+a shared candidate grid L ∈L = {1, . . . , 16}. The body reports representative case-level tables on
+the two main PDEBench tasks, while Appendix B summarizes the four architectures under the shared
+training protocol used throughout the paper.
+Following Section 2.2, the body reports representative baselines from the three most relevant method
+families. For exhaustive validation methods, we report full-sweep oracle-best and oracle-knee as
+unattainable reference targets. For direct low-cost search methods, we use Direct-4-Shortlist (D4-
+Shortlist), which applies the same downstream pilot budget and local selection rule to a generic
+uniformly spaced four-point shortlist without any system prior, and Direct-3-Shortlist (D3-Shortlist),
+which serves as a lighter generic-search reference in the representative case tables. For system-
+theoretic memory estimators, we use System-core, which directly returns Lcore from the clean-system
+memory estimate. Appendix A additionally reports ASHA [13] as a stronger generic multi-fidelity
+baseline in the all-PDE aggregate under the same shared L ∈{1, . . . , 16} protocol.
+All experiments were conducted on a server with four NVIDIA A100 (80GB) GPUs, using PyTorch
+2.1 and CUDA 12.0. Across all backbones, we use Adam (lr = 3 × 10−4, weight_decay = 0),
+automatic mixed precision, batch size 16, gradient clipping with max_norm = 0.5, normalized-
+space output clamping to [−10, 10], residual (∆-prediction) training, and a trajectory-level 0.8/0.1/0.1
+train/validation/test split, corresponding to 800/100/100 trajectories per dataset. Pilot runs always
+6
+subsample from the fixed 800/100 training/validation partitions and keep the same 100-trajectory test
+partition untouched. The full-protocol oracle runs use a 32-step training rollout horizon, scheduled
+sampling with final probability 0.50, 20 training epochs, and rollout-based checkpoint selection every
+epoch using a short validation rollout horizon of 8 on up to 8 validation trajectories; all aggregate
+results are averaged over three training seeds {0, 1, 2}.
+The selector itself uses one fixed set of stage-wise budgets and decision thresholds across datasets
+and backbones; Appendix C records these settings and the matched-budget relationship between
+SAKE and the direct-search baselines. Appendices D, E, and F report robustness to noisy or proxy
+anchors, alternative state summaries, and moderate changes in the fixed thresholds, bootstrap size,
+and knee tolerance.
+4.1.3
+Experiment procedure and metrics
+Effectiveness: For each dataset–backbone–seed case, we run each selector to obtain a recommended
+window Lsel, and separately run a full sweep over the candidate set L = {1, . . . , 16} to construct
+the oracle reference. Let M(L) denote the full-protocol rollout relative L2 of the model trained with
+window length L. We define
+Lbest = arg min
+L∈L M(L),
+Lknee = min{L ∈L : M(L) ≤1.05 M(Lbest)},
+where Lbest is the metric-optimal window under the full protocol and Lknee is the smallest window
+within 5% of that optimum. Given Lsel, we report Exact = ⊮[Lsel = Lknee], Within-1 = ⊮[|Lsel −
+Lknee| ≤1], mean absolute window error |∆L| = |Lsel −Lknee|, and the rollout regrets
+Regretknee = M(Lsel) −M(Lknee)
+M(Lknee)
+,
+Regretbest = M(Lsel) −M(Lbest)
+M(Lbest)
+.
+To quantify computation, we record the full-sweep-equivalent training cost of every pilot-evaluated
+window. If a candidate window L is trained for Epilot
+L
+epochs using N pilot
+L
+training pairs, while a full
+run uses Efull epochs and N full
+L
+training pairs, then its normalized cost is
+c(L) = Epilot
+L
+Efull · N pilot
+L
+N full
+L
+.
+Let Seval be the set of candidate windows actually trained by the selector. The total selector cost is
+Csel = P
+L∈Seval c(L), while the full sweep has cost Cfull = |L|. We therefore report
+CostRatio = Csel
+Cfull
+,
+Saving = 1 −CostRatio.
+Because all methods share the same hardware, optimizer, and backbone training protocol, this full-
+sweep-equivalent cost is a protocol-normalized measure of selector work, but not a substitute for
+realized runtime. Appendix G therefore also reports selector wall-clock time and GPU-hours, which
+follow the same qualitative ranking while making the practical savings explicit. Unless otherwise
+stated, all knee-based metrics use ϵ = 5%; Appendix F reports the same evaluations for stricter and
+looser knee tolerances. All aggregate results are averaged over three training seeds.
+Necessity: The ablation study asks whether SAKE requires both a system-derived anchor prior and
+a downstream low-cost selector. For each case, the clean-system estimator first returns Lcore and
+Lplateau, from which SAKE forms the initial anchor set S0 = {1, Lcore, Lplateau}. After the cheap
+coarse pilot, the method expands to a refined candidate set S1 for stage-two evaluation. We then
+report system-band coverage ⊮[Lknee ∈[Lcore, Lplateau]], initial coverage ⊮[Lknee ∈S0], and final
+coverage ⊮[Lknee ∈S1], together with the mean number of unique evaluated windows and the same
+cost ratio defined above. These metrics test, respectively, whether the system prior brackets the oracle
+knee, whether the initial anchors preserve it, and whether the downstream selector can recover it
+without reverting to exhaustive search.
+4.2
+Main results
+4.2.1
+Effectiveness of System-Anchored Knee Estimation
+We first examine the complete case-level selection results. Table 1 reports the selected window Lsel
+for all baselines together with the oracle references on both datasets. This view is important because
+7
+Table 1: Complete full-oracle case-level selection results under the three-seed protocol. Panels (a)–(b)
+report the selected window Lsel for all baselines together with the oracle references. Bold indicates
+an exact match to the oracle knee.
+(a) DiffReact: selected window Lsel
+Backbone
+System-core
+D3-Shortlist
+D4-Shortlist
+SAKE
+Oracle knee
+Oracle best
+ConvLSTM
+3
+3
+2
+2
+2
+2
+FNO
+3
+2
+2
+2
+2
+2
+Transformer
+3
+1
+2
+1
+1
+3
+U-Net
+3
+5
+5
+4
+5
+5
+(b) RDB: selected window Lsel
+Backbone
+System-core
+D3-Shortlist
+D4-Shortlist
+SAKE
+Oracle knee
+Oracle best
+ConvLSTM
+2
+4
+4
+4
+5
+5
+FNO
+2
+4
+4
+4
+4
+4
+Transformer
+2
+5
+5
+5
+5
+5
+U-Net
+2
+2
+3
+1
+1
+2
+Table 2: Complete full-oracle case-level Regretknee results under the three-seed protocol (%, lower
+is better). Bold indicates the lowest regret in the row. Negative regret is possible because Lknee is the
+smallest near-optimal window rather than the metric minimizer.
+(c) DiffReact: Regretknee (%)
+Backbone
+System-core
+D3-Shortlist
+D4-Shortlist
+SAKE
+ConvLSTM
+43.3
+43.3
+0.0
+0.0
+FNO
+4.6
+0.0
+0.0
+0.0
+Transformer
+-0.8
+0.0
+0.4
+0.0
+U-Net
+23.3
+0.0
+0.0
+6.7
+(d) RDB: Regretknee (%)
+Backbone
+System-core
+D3-Shortlist
+D4-Shortlist
+SAKE
+ConvLSTM
+169.0
+47.2
+47.2
+47.2
+FNO
+113.8
+0.0
+0.0
+0.0
+Transformer
+45.0
+0.0
+0.0
+0.0
+U-Net
+-0.9
+-0.9
+36.4
+0.0
+SAKE aims not merely to improve an average score, but to place the search on the right part of the
+window-length axis before the final low-cost selector is applied.
+The selected-window table already shows the main pattern. Across the eight dataset–backbone
+settings, SAKE exactly matches the oracle knee in 6/8 cases, compared with 5/8 for both Direct-3-
+Shortlist and Direct-4-Shortlist, and 0/8 for System-core. Its mean absolute window error is also
+the smallest at 0.25, versus 0.375 for Direct-3-Shortlist, 0.50 for Direct-4-Shortlist, and 1.875 for
+System-core. More importantly, these gains are not obtained by dominating every row. On DiffReact,
+the three low-cost search methods are competitive but fail in different places: Direct-3-Shortlist
+misses ConvLSTM, Direct-4-Shortlist misses Transformer, and SAKE misses U-Net by one window.
+On RDB, however, the advantage of the system prior becomes much clearer: SAKE exactly recovers
+the difficult small-knee U-Net case (Lknee = 1), while the generic direct baselines over-select it, and
+all three low-cost methods share the same remaining miss on ConvLSTM. This is the behavior we
+want from SAKE: not row-wise dominance, but a better-placed candidate space that avoids the most
+consequential generic-search failures.
+Discrete agreement with Lknee is only part of the story, since a slightly larger window can still yield
+nearly identical rollout quality. Table 2 therefore reports the corresponding Regretknee, which is the
+more important metric for judging whether a miss is harmful.
+The regret table makes two points clear. First, SAKE has the best overall regret profile among the
+evaluated matched-budget low-cost selectors in the main experiment: its mean Regretknee over the
+eight dataset–backbone settings is 6.7%, compared with 11.2% for Direct-3-Shortlist and 10.5%
+for Direct-4-Shortlist. Second, this advantage comes from removing large generic-search mistakes
+rather than from uniformly winning every case. For example, Direct-3-Shortlist remains essentially
+harmless on RDB/U-Net despite missing the exact knee, because L = 2 is slightly better than the
+smallest near-optimal knee in rollout quality. Conversely, SAKE avoids the large-regret failures
+that drive up the direct baselines, most notably Direct-3-Shortlist on DiffReact/ConvLSTM and
+Direct-4-Shortlist on RDB/U-Net, while tying them on the easy cases. The one failure mode that
+remains unsolved for all low-cost selectors is RDB/ConvLSTM, where every method selects L = 4
+and incurs the same 47.2% regret. Thus, the value of SAKE is not that it solves every difficult row,
+but that it makes the search substantially more reliable in the cases where a generic shortlist is most
+brittle. Across all eight PDEBench families evaluated under the shared L ∈{1, . . . , 16} protocol,
+the aggregate summary in Appendix A shows the same ordering: SAKE attains 67.8% Exact, 91.7%
+Within-1, 6.1% mean Regretknee, 5.3 mean unique L evaluations, and a 0.051 cost ratio.
+Together, the two representative case-level tables support the main claim of this subsection: System-
+Anchored Knee Estimation improves low-cost context-window selection for PDE forecasting, and
+the appendix-wide aggregate shows that this advantage persists beyond the two main-text PDEs.
+8
+Dataset
+Lcore
+Lplateau
+System band
+Knee-in-band coverage
+Covered oracle-knee models
+DiffReact
+3
+6
+[3, 4, 5, 6]
+25.0%
+UNet
+RDB
+2
+6
+[2, 3, 4, 5, 6]
+75.0%
+ConvLSTM, FNO, Transformer
+Table 3: Dataset-level outputs of the system anchor estimator. Its role is to provide anchors and
+brackets for the downstream selector, rather than to directly serve as the final recommender.
+4.2.2
+Necessity of components of System-Anchored Knee Estimation
+We now ask whether the gain of SAKE truly requires both of its components: a system-derived
+anchor prior and a downstream low-cost selector. Table 3 summarizes what the system stage provides
+before any model-specific search is performed.
+The system-derived prior is necessary, but not sufficient by itself. Table 3 shows that the system
+stage does capture meaningful structure: on both datasets it produces a small, interpretable band
+that already contains a nontrivial fraction of oracle knees. At the same time, this band is clearly
+incomplete, especially on DiffReact where its coverage is only 25.0%. This explains why System-core
+is not competitive as a final selector. In Table 1, it never exactly matches the oracle knee, and in
+Table 2 it frequently incurs large regret. Thus, the system estimator should not be viewed as a direct
+predictor of the final window length; its role is to provide a physically meaningful scaffold for the
+downstream search.
+The downstream low-cost selector is also necessary, but a generic downstream selector alone is not
+enough. Relative to the direct-search baselines, SAKE yields the smallest mean absolute window
+error in Table 1 and the best overall regret profile in Table 2. This gain does not come from searching
+more aggressively: SAKE still avoids some of the most consequential generic-search failures, most
+notably the small-knee RDB/U-Net case. This shows that a strong low-cost selector operating on a
+generic shortlist is still brittle when the candidate space is poorly placed; the system prior is what
+makes the downstream search focus on the right part of the window-length axis.
+Taken together, these results show that the two components play distinct and complementary roles.
+The system stage alone provides useful but incomplete structure, while the downstream selector alone
+provides flexibility but remains prone to generic-search errors. SAKE is effective because it couples
+the two: the system-derived anchors compress the search into a small and meaningful candidate
+space, and the downstream selector resolves the remaining model-dependent trade-off near the oracle
+knee. This is precisely the combination needed to make low-cost context-window selection both
+reliable and efficient.
+5
+Discussion
+This paper formalizes explicit context-window selection for autoregressive neural PDE simulators as
+an independent low-cost algorithmic problem and introduces SAKE, a two-stage method combining
+system-derived anchors with knee-aware downstream selection. Across the evaluated fixed-window
+autoregressive regime, SAKE delivers the strongest matched-budget selection profile among the
+compared methods, with more reliable oracle-knee recovery, lower downstream regret, and lower
+selector cost than generic shortlist baselines. The main body focuses on two representative case-
+level tables, while Appendix A reports aggregate L ∈{1, . . . , 16} results over all eight PDEBench
+families and per-family tables for the remaining six tasks; the other appendices cover noisy or partially
+observed anchor inputs, proxy anchors without a separate clean pool, alternative state summaries,
+alternative knee tolerances, and practical timing measurements. We view this as important for two
+reasons. First, context window is a consequential design choice, yet it is often treated only as a
+fixed modeling setting or tuning detail. Second, in neural PDE simulation, selecting the window
+is expensive because each candidate may require substantial retraining and rollout evaluation. By
+making this problem explicit and showing it can be solved much more efficiently, our results suggest
+that context-window selection should be treated as a first-class algorithmic component rather than a
+routine hyperparameter sweep.
+The study nevertheless remains deliberately scoped to fixed-window one-step autoregressive simula-
+tors rather than adaptive-memory or internally stateful architectures. The anchor stage is most reliable
+when at least a usable full-state or proxy state summary can be extracted, although the degradation
+9
+studies suggest that this failure mode is usually gradual rather than catastrophic. Finally, the shared
+hard case RDB/ConvLSTM indicates that some rollout knees remain difficult to localize even with a
+system prior, especially when pilot and full-training behavior diverge. SAKE should therefore be
+read as a fixed-rule, system-aware selector for a controlled but practically important regime, and as
+complementary to architectural remedies that internalize memory rather than select it explicitly.
+References
+[1] McCabe, M., et al. (2024). Multiple physics pretraining for spatiotemporal surrogate models. Advances in
+Neural Information Processing Systems, 37, 119301–119335.
+[2] Hao, Z., et al. (2024). DPOT: Auto-regressive denoising operator transformer for large-scale PDE pre-
+training. arXiv preprint arXiv:2403.03542.
+[3] Li, Z., et al. (2020). Fourier neural operator for parametric partial differential equations. arXiv preprint
+arXiv:2010.08895.
+[4] Ruiz, R. B., et al. (2024). On the benefits of memory for modeling time-dependent PDEs. arXiv preprint
+arXiv:2409.02313.
+[5] Tran, A., et al. (2021). Factorized Fourier neural operators. arXiv preprint arXiv:2111.13802.
+[6] Lippe, P., et al. (2023). PDE-refiner: Achieving accurate long rollouts with neural PDE solvers. Advances
+in Neural Information Processing Systems, 36, 67398–67433.
+[7] Takamoto, M., Praditia, T., Leiteritz, R., MacKinlay, D., Alesiani, F., Pflüger, D., & Niepert, M. (2022).
+PDEBench: An Extensive Benchmark for Scientific Machine Learning. In Advances in Neural Information
+Processing Systems, Vol. 35, pp. 1596–1611.
+[8] Diab, W., & Al Kobaisi, M. (2025). Temporal Neural Operator for Modeling Time-Dependent Physical
+Phenomena. Scientific Reports, 15(1), 32791.
+[9] Zhang, X., et al. (2024). SineNet: Learning Temporal Dynamics in Time-Dependent Partial Differential
+Equations. arXiv preprint arXiv:2403.19507.
+[10] Koehler, F., et al. (2024). APEBench: A Benchmark for Autoregressive Neural Emulators of PDEs. In
+Advances in Neural Information Processing Systems, Vol. 37, pp. 120252–120310.
+[11] Leites, J., Cerqueira, V., & Soares, C. (2024). Lag Selection for Univariate Time Series Forecasting using
+Deep Learning: An Empirical Study. In EPIA Conference on Artificial Intelligence. Cham: Springer Nature
+Switzerland.
+[12] Li, L., Jamieson, K., DeSalvo, G., Rostamizadeh, A., & Talwalkar, A. (2018). Hyperband: A Novel
+Bandit-Based Approach to Hyperparameter Optimization. Journal of Machine Learning Research, 18(185),
+1–52.
+[13] Li, Liam, et al. A system for massively parallel hyperparameter tuning. Proceedings of machine learning
+and systems 2 (2020): 230–246.
+[14] Takens, F. (2006). Detecting Strange Attractors in Turbulence. In Dynamical Systems and Turbulence,
+Warwick 1980: Proceedings of a Symposium Held at the University of Warwick 1979/80. Berlin, Heidelberg:
+Springer Berlin Heidelberg.
+[15] Fraser, Andrew M., and Harry L. Swinney. Independent coordinates for strange attractors from mutual
+information. Physical review A 33.2 (1986): 1134.
+[16] Cao, Liangyue. Practical method for determining the minimum embedding dimension of a scalar time
+series. Physica D: Nonlinear Phenomena 110.1–2 (1997): 43–50.
+[17] Snoek, Jasper, Hugo Larochelle, and Ryan P. Adams. Practical bayesian optimization of machine learning
+algorithms. Advances in neural information processing systems 25 (2012).
+[18] Kandasamy, Kirthevasan, et al. Multi-fidelity bayesian optimisation with continuous approximations.
+International conference on machine learning. PMLR, 2017.
+[19] Falkner, Stefan, Aaron Klein, and Frank Hutter. BOHB: Robust and efficient hyperparameter optimization
+at scale. International conference on machine learning. PMLR, 2018.
+10
+[20] Kennel, Matthew B., Reggie Brown, and Henry DI Abarbanel. Determining embedding dimension for
+phase-space reconstruction using a geometrical construction. Physical review A 45.6 (1992): 3403.
+[21] Diab, W., & Al Kobaisi, M. (2025). Temporal Neural Operator for Modeling Time-Dependent Physical
+Phenomena. Scientific Reports, 15(1), 32791.
+11
+Contents of Appendices
+A
+Broader PDEBench Coverage Beyond the Representative Main-Text Pair . . . . . . . . . . . . . . . . . . . . . . . . . . 13
+B
+Backbone Architectures and Shared Training Protocol . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 13
+C
+Implementation Details and Hyperparameters of System-Anchored Knee Estimation . . . . . . . . . . . . . . . . 14
+D
+Anchor Robustness Under Noisy and Partially Observed Trajectories . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 14
+E
+Anchor Proxies Without a Separate Clean-System Pool . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .14
+F
+Sensitivity to Selector Hyperparameters and Knee Tolerance . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+G
+Practical Timing: Wall-Clock and GPU-Hours . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+H
+Detailed Clarification of Large Language Models Usage . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+12
+Component
+Setting used in this appendix
+Candidate grid
+L = {1, . . . , 16}, matching the shared main protocol
+Additional PDEBench families
+1D advection, 1D Burgers, 1D diffusion–sorption, 2D Darcy flow, 2D incompressible Navier–Stokes, 2D compressible Navier–Stokes
+Backbones / seeds
+Same four one-step autoregressive backbones and same three-seed protocol as the main paper
+Methods
+System-core, Direct-4-Shortlist, ASHA, and SAKE under matched downstream budgets
+Oracle construction
+Full sweep over {1, . . . , 16} for each dataset–backbone–seed case
+Reported metrics
+Exact, Within-1, mean |∆L|, Regretknee, Regretbest, mean unique L evaluations, and cost ratio
+Table 4: Protocol for the broader PDEBench extension. The representative main-text pair is kept for
+compact case-wise discussion, while this appendix tests whether the same matched-budget ordering
+survives on the full PDE family suite under the shared main protocol.
+Method
+Exact
+Within-1
+Mean Regretknee
+Mean unique L eval.
+Cost ratio
+System-core
+12.5%
+40.6%
+28.0%
+0.0
+0.000
+Direct-4-Shortlist
+50.0%
+84.4%
+9.4%
+7.3
+0.072
+ASHA
+57.3%
+88.0%
+8.0%
+9.6
+0.092
+SAKE
+67.8%
+91.7%
+6.1%
+5.3
+0.051
+Table 5: Overall aggregate effectiveness across all eight PDEBench families evaluated under the
+shared L = {1, . . . , 16} protocol. The representative main-text pair is included in this aggregate; the
+per-family tables below report only the six additional families not shown in the body.
+A
+Broader PDEBench Coverage Beyond the Representative Main-Text Pair
+This appendix broadens the matched-budget evaluation beyond the two representative tasks shown in the body.
+The purpose is not to replace the case-level narrative of DiffReact and RDB, but to test whether the same selector
+ordering persists across the full PDE suite, which includes those two main-text tasks together with additional
+advection-dominated transport, stiff transport–reaction, heterogeneous elliptic, and Navier–Stokes-type families.
+A.1
+Protocol
+A.2
+Per-family result tables for the six additional families
+A.2.1
+Advection: 1D advection-dominated transport
+A.2.2
+Burgers: 1D viscous Burgers dynamics
+A.2.3
+DiffusionSorption: 1D diffusion–sorption with slow–fast transport
+A.2.4
+Darcy: 2D Darcy flow with heterogeneous coefficients
+A.2.5
+IncompNS: 2D incompressible Navier–Stokes
+A.2.6
+CompNS: 2D compressible Navier–Stokes
+Taken together, Table 5 and Tables 6–17 show not row-wise dominance on every family, but stability of the
+aggregate ordering. SAKE remains the strongest overall matched-budget selector across the full PDE suite;
+ASHA is the closest generic baseline; Direct-4-Shortlist remains competitive on easier later-knee cases but more
+brittle on earlier-knee or broader-plateau systems; and System-core stays informative but insufficient as a final
+recommender. In particular, the gap widens on the stiff and Navier–Stokes-like families, where the anchored
+compression matters more than on the simplest transport cases.
+B
+Backbone Architectures and Shared Training Protocol
+This appendix records the backbone-side implementation choices referred to in Section 4.1.2. The main
+comparison is meant to isolate context-window selection rather than backbone-specific training recipes, so
+all four backbones are instantiated as one-step autoregressive predictors under the same data split, optimizer,
+early-stopping rule, and rollout metric. Table 18 summarizes the architecture fields for each backbone, and
+Table 19 records the shared training and evaluation protocol used throughout the main experiments.
+The backbone appendix supports a simple interpretive point: the four model families differ in inductive bias, but
+they are compared under a common autoregressive pipeline. This keeps the selection results in Section 4.1.2
+directly comparable across backbones rather than confounded by incompatible training setups.
+13
+Method
+Exact
+Within-1
+Mean |∆L|
+Mean Regretknee
+Mean Regretbest
+Mean unique L eval.
+Cost ratio
+System-core
+25.0%
+58.3%
+1.25
+17.6%
+18.1%
+0.0
+0.000
+Direct-4-Shortlist
+58.3%
+91.7%
+0.50
+5.8%
+6.4%
+7.1
+0.070
+ASHA
+66.7%
+100.0%
+0.42
+4.9%
+5.5%
+9.2
+0.089
+SAKE
+75.0%
+100.0%
+0.25
+3.8%
+4.4%
+5.0
+0.048
+Table 6: Aggregate effectiveness on the additional PDEBench family Advection.
+Backbone
+System-core
+D4-Shortlist
+ASHA
+SAKE
+Oracle knee
+Oracle best
+ConvLSTM
+4
+4
+4
+4
+4
+5
+FNO
+4
+5
+5
+5
+5
+6
+Transformer
+4
+4
+4
+3
+3
+4
+U-Net
+5
+6
+6
+6
+6
+7
+Table 7: Case-level selected windows on the additional PDEBench family Advection.
+C
+Implementation Details and Hyperparameters of System-Anchored Knee
+Estimation
+This appendix records the stage-wise settings used by System-Anchored Knee Estimation and the matched-
+budget relationship to the direct-search baselines. The main text emphasizes the two-stage logic of the method
+rather than every implementation constant. The purpose of this appendix is therefore twofold: first, to specify
+the concrete settings behind the selector; second, to make clear that the main comparison is not driven by
+per-backbone retuning or by giving SAKE a larger downstream budget than the direct baselines.
+Taken together, Tables 20–22 make the comparison explicit: SAKE is not granted a larger search budget or a
+separate per-backbone tuning process. They also fix the exact generic-shortlist constructions used by the direct
+baselines, so the comparison is attributable to candidate placement and knee-aware coupling rather than to
+unreported baseline choices or extra downstream computation.
+D
+Anchor Robustness Under Noisy and Partially Observed Trajectories
+This appendix probes the clean-system assumption by changing only the trajectories used in stage one. The
+downstream pilot budgets, final decision rule, datasets, backbones, and oracle evaluation protocol are kept fixed;
+only the source used to estimate Lcore and Lplateau is altered.
+D.1
+Perturbation protocol
+The robustness tables show that the anchor stage degrades gradually rather than catastrophically once ideal clean
+trajectories are removed. Mild-to-moderate corruption moves the anchors and selected windows only modestly,
+same-data full-state estimation stays close to the clean reference, and the main failure mode under harsher
+masking or noise is a delayed or widened anchor band rather than erratic selector behavior. The aggregate
+diagnostics average over all seed-level runs, whereas the case-level tables report the modal per-case summary;
+small nonzero mean anchor shifts can therefore remain even when the displayed modal case entry matches the
+clean reference. Even in these harsher settings, SAKE remains substantially stronger than returning the raw
+system anchor alone.
+E
+Anchor Proxies Without a Separate Clean-System Pool
+Appendix D changes the stage-one input quality while keeping the representation and anchor-extraction recipe
+fixed. The purpose of the present appendix is different: it studies settings in which a separate clean-system
+pool is unavailable and the low-dimensional summary itself must be chosen from imperfect or compressed
+observations.
+E.1
+Protocol
+Tables 29–33 show that stage one remains usable well beyond the ideal clean-system setting, but with an
+interpretable degradation order. Same-data full-state stays closest to the clean reference; mild downsampling and
+14
+Method
+Exact
+Within-1
+Mean |∆L|
+Mean Regretknee
+Mean Regretbest
+Mean unique L eval.
+Cost ratio
+System-core
+16.7%
+50.0%
+1.58
+24.5%
+25.1%
+0.0
+0.000
+Direct-4-Shortlist
+50.0%
+83.3%
+0.67
+8.9%
+9.6%
+7.2
+0.071
+ASHA
+58.3%
+91.7%
+0.58
+7.4%
+8.1%
+9.3
+0.090
+SAKE
+66.7%
+91.7%
+0.42
+5.8%
+6.5%
+5.2
+0.050
+Table 8: Aggregate effectiveness on the additional PDEBench family Burgers.
+Backbone
+System-core
+D4-Shortlist
+ASHA
+SAKE
+Oracle knee
+Oracle best
+ConvLSTM
+3
+5
+4
+4
+4
+5
+FNO
+4
+5
+5
+5
+5
+6
+Transformer
+4
+4
+4
+4
+4
+5
+U-Net
+4
+4
+4
+3
+3
+4
+Table 9: Case-level selected windows on the additional PDEBench family Burgers.
+learned latent summaries remain nearly as stable; same-data noisy proxies and sparse probes introduce a clearer
+rightward drift; heavier masking is the most brittle observation condition; and random projection is the least
+stable representation of those tested. Across these settings, SAKE remains markedly stronger than returning the
+raw anchor alone and stays competitive with the clean-independent direct baselines even when the anchor source
+becomes imperfect.
+F
+Sensitivity to Selector Hyperparameters and Knee Tolerance
+This appendix studies two distinct types of sensitivity. The first concerns the fixed selector constants that define
+the anchor and final-decision heuristics. The second concerns the oracle-knee tolerance ϵ, which changes the
+target that the selector is asked to recover.
+The sensitivity analysis shows that the selector is not tuned to a knife-edge. Moderate changes in ρ, τpl, κ, and
+B move the anchor locations and selected windows only gradually, producing the observed conservative-versus-
+aggressive trade-off between coverage and cost without changing the overall ranking. Changing ϵ predictably
+moves the oracle knee itself leftward as the tolerance is relaxed, but the relative ranking between the principal
+selectors remains similar across practically relevant tolerances.
+G
+Practical Timing: Wall-Clock and GPU-Hours
+This appendix complements the normalized selector-cost metric from the main text with realized runtime
+measurements. The goal is not to replace the protocol-normalized cost ratio, but to show how closely it tracks
+end-to-end timing under the shared implementation.
+The timing tables verify that the normalized selector-cost metric used in the main text does not hide qualitatively
+different runtime behavior. SAKE remains the fastest matched-budget selector in both wall-clock time and
+GPU-hours, and the gap between normalized cost and realized runtime is modest. The stage-wise breakdown
+shows why: the stage-1 anchor overhead is smaller than the stage-2 search time that it avoids, so the practical
+runtime savings follow the same ordering as the normalized cost.
+H
+Detailed Clarification of Large Language Models Usage
+We declare that LLMs were employed exclusively to assist with the writing and presentation aspects of this
+paper. Specifically, we utilized LLMs for: (i) verification and refinement of technical terminology to ensure
+precise usage of domain-specific vocabulary; (ii) grammatical error detection and correction to enhance the
+clarity and readability of the manuscript; (iii) translation assistance from the authors’ native language to English,
+as we are non-native English speakers, to ensure accurate and fluent expression of scientific concepts; and (iv)
+improvement of sentence structure and flow while maintaining the original scientific content and meaning. We
+emphasize that LLMs were not used for research ideation, experimental design, data analysis, or any form of
+content generation that would constitute intellectual contribution to the scientific findings presented in this work.
+All scientific insights, methodological decisions, and analytical conclusions are the original work of the authors.
+The use of LLMs was limited to linguistic and presentational enhancement only, serving a role analogous to
+professional editing services.
+15
+Method
+Exact
+Within-1
+Mean |∆L|
+Mean Regretknee
+Mean Regretbest
+Mean unique L eval.
+Cost ratio
+System-core
+8.3%
+33.3%
+2.08
+31.8%
+32.4%
+0.0
+0.000
+Direct-4-Shortlist
+41.7%
+83.3%
+0.92
+10.9%
+11.7%
+7.1
+0.070
+ASHA
+50.0%
+83.3%
+0.75
+8.8%
+9.6%
+9.5
+0.092
+SAKE
+75.0%
+91.7%
+0.42
+5.6%
+6.3%
+5.1
+0.049
+Table 10: Aggregate effectiveness on the additional PDEBench family DiffusionSorption.
+Backbone
+System-core
+D4-Shortlist
+ASHA
+SAKE
+Oracle knee
+Oracle best
+ConvLSTM
+2
+3
+3
+3
+3
+4
+FNO
+4
+6
+5
+5
+5
+6
+Transformer
+4
+5
+5
+4
+4
+5
+U-Net
+3
+4
+3
+3
+2
+4
+Table 11: Case-level selected windows on the additional PDEBench family DiffusionSorption.
+Method
+Exact
+Within-1
+Mean |∆L|
+Mean Regretknee
+Mean Regretbest
+Mean unique L eval.
+Cost ratio
+System-core
+16.7%
+41.7%
+1.67
+23.4%
+24.0%
+0.0
+0.000
+Direct-4-Shortlist
+50.0%
+83.3%
+0.75
+9.1%
+9.8%
+7.3
+0.072
+ASHA
+58.3%
+91.7%
+0.58
+7.8%
+8.5%
+9.4
+0.091
+SAKE
+66.7%
+91.7%
+0.42
+6.3%
+7.0%
+5.3
+0.051
+Table 12: Aggregate effectiveness on the additional PDEBench family Darcy.
+Backbone
+System-core
+D4-Shortlist
+ASHA
+SAKE
+Oracle knee
+Oracle best
+ConvLSTM
+4
+4
+4
+4
+4
+5
+FNO
+4
+3
+3
+3
+3
+4
+Transformer
+4
+6
+5
+5
+5
+6
+U-Net
+4
+4
+4
+3
+3
+5
+Table 13: Case-level selected windows on the additional PDEBench family Darcy.
+Method
+Exact
+Within-1
+Mean |∆L|
+Mean Regretknee
+Mean Regretbest
+Mean unique L eval.
+Cost ratio
+System-core
+8.3%
+33.3%
+2.17
+32.7%
+33.4%
+0.0
+0.000
+Direct-4-Shortlist
+50.0%
+83.3%
+0.83
+10.8%
+11.5%
+7.4
+0.073
+ASHA
+58.3%
+83.3%
+0.67
+9.3%
+10.1%
+9.7
+0.094
+SAKE
+66.7%
+91.7%
+0.50
+7.1%
+7.9%
+5.4
+0.052
+Table 14: Aggregate effectiveness on the additional PDEBench family IncompNS.
+Backbone
+System-core
+D4-Shortlist
+ASHA
+SAKE
+Oracle knee
+Oracle best
+ConvLSTM
+4
+6
+6
+5
+5
+6
+FNO
+4
+6
+6
+6
+6
+7
+Transformer
+4
+5
+4
+4
+4
+6
+U-Net
+4
+4
+4
+3
+3
+5
+Table 15: Case-level selected windows on the additional PDEBench family IncompNS.
+Method
+Exact
+Within-1
+Mean |∆L|
+Mean Regretknee
+Mean Regretbest
+Mean unique L eval.
+Cost ratio
+System-core
+8.3%
+33.3%
+2.33
+36.8%
+37.5%
+0.0
+0.000
+Direct-4-Shortlist
+41.7%
+75.0%
+1.00
+12.1%
+12.9%
+7.6
+0.074
+ASHA
+50.0%
+75.0%
+0.83
+10.6%
+11.4%
+9.9
+0.096
+SAKE
+58.3%
+83.3%
+0.67
+8.4%
+9.2%
+5.6
+0.054
+Table 16: Aggregate effectiveness on the additional PDEBench family CompNS.
+16
+Backbone
+System-core
+D4-Shortlist
+ASHA
+SAKE
+Oracle knee
+Oracle best
+ConvLSTM
+4
+7
+6
+6
+5
+7
+FNO
+4
+6
+6
+6
+6
+7
+Transformer
+4
+5
+5
+4
+4
+6
+U-Net
+4
+4
+4
+3
+3
+5
+Table 17: Case-level selected windows on the additional PDEBench family CompNS.
+Backbone
+Input/context encoding
+Core spatiotemporal block
+Output head
+Key hyperparameters
+Trainable parameters (DiffReact / RDB)
+U-Net
+causal temporal encoder over the full history
+TemporalEncoder + 2D U-Net
+C-channel next-step field decoder
+temporal hidden 32, temporal layers 2, kernel 3, max context 8; U-Net base 32, depth 3
+1,946,212 / 1,945,826
+FNO
+causal temporal encoder over the full history
+TemporalEncoder + 2D FNO
+C-channel spectral decoder
+temporal hidden 32, temporal layers 2, kernel 3, max context 8; width 48, modes 16, depth 4
+4,751,460 / 4,751,298
+ConvLSTM
+raw frame sequence warm-up over the full history
+1-layer ConvLSTM with hidden-state recurrence
+1 × 1 conv to next-step field
+hidden channels 64, layers 1, kernel 3
+152,450 / 150,081
+Transformer
+per-patch causal tokenization of the full history
+patchwise Transformer encoder
+linear patch reconstruction to field space
+patch size 8, dmodel = 96, heads 4, depth 2
+939,936 / 927,584
+Table 18: Backbone-specific architecture fields for the four one-step autoregressive simulators used
+in the main experiments. Trainable-parameter counts are exact for the default code instantiations at
+resolution 128 × 128, reported as DiffReact / RDB because the two datasets have different channel
+counts. The purpose of this table is to make the backbone implementations explicit while keeping the
+selector comparison itself on a shared footing.
+Item
+Setting used in the main experiments
+Datasets
+DiffReact, RDB
+Candidate windows
+shared candidate grid L = {1, . . . , 16} for the main-text and appendix evaluations
+Training seeds
+{0, 1, 2}
+Split
+trajectory-level 0.8/0.1/0.1 train/validation/test split
+Optimizer
+Adam
+Learning rate
+3 × 10−4
+Weight decay
+0
+Batch size
+16
+Mixed precision
+yes
+Gradient clipping
+max_norm = 0.5
+Output stabilization
+normalized-space clamping to [−10, 10]
+Prediction target
+residual (∆-prediction) training
+Scheduled sampling
+final probability 0.50
+Training rollout horizon
+32 steps
+Full-oracle epochs
+20
+Full-oracle early stopping
+disabled (patience = 0)
+Checkpoint selection
+rollout metric, evaluated every epoch with validation rollout horizon 8 on up to 8 validation trajectories
+Hardware
+4 × NVIDIA A100 (80GB), PyTorch 2.1, CUDA 12.0
+Table 19: Shared training and evaluation protocol for all four backbones. These settings are held
+fixed so that differences in the main results reflect selector behavior rather than incompatible model
+pipelines.
+Stage-1 component
+Symbol / object
+Role in the method
+Setting used in the main experiments
+System representation
+PCA projector
+clean-system state summary
+randomized PCA on flattened normalized coarsened fields; 800 samples, 99% variance target, max 64 components
+Lightweight dynamics model
+ridge VAR(L)
+low-cost system-risk estimation
+one-step linear autoregressive model with ridge 10−3 fit for each L ∈L on the shared {1, . . . , 16} grid used throughout the paper
+Long-history reference
+Lmax
+tail-risk reference window
+16 under the shared main protocol
+Tail tolerance fraction
+ρ
+defines Lcore
+0.05
+Plateau threshold
+τpl
+defines Lplateau
+relative-gain threshold 0.05
+Uncertainty estimate
+bootstrap UCB
+confidence control for anchor extraction
+300 bootstrap resamples, confidence level 1 −α with α = 0.05
+Initial anchor set
+S0
+{1, Lcore, Lplateau}
+deduplicated anchor shortlist on the active discrete grid; instantiated on the shared {1, . . . , 16} grid throughout the paper
+Table 20: Stage-1 settings for system-anchor construction. The reported fields specify how the
+clean-system estimator is instantiated before any downstream simulator pilots are run.
+Stage-2 component
+Symbol / object
+Role in the method
+Setting used in the main experiments
+Coarse pilot budget
+stage-1 pilots
+first-pass ranking over S0
+2 epochs; max 1024 train pairs; 8 train trajectories, 4 validation trajectories; rollout horizons 8/4 (train/val) with max 4 validation rollout trajectories
+Top-candidate count
+top-k
+number of refined seeds
+k = 2
+Neighborhood radius
+h
+local grid expansion around promising candidates
+h = 1 hop on the ordered window grid
+Refined candidate set
+S1
+stage-two evaluation set
+union of top-2 neighborhoods, capped at 6 candidates, with smallest and largest anchors retained
+Stronger pilot budget
+stage-2 pilots
+second-pass evaluation budget
+6 epochs; max 4096 train pairs; 24 train trajectories, 16 validation trajectories; rollout horizons 32/16 (train/val) with max 8 validation rollout trajectories
+Rollout anchors
+Aeval
+multi-anchor validation used in stage two
+4 rollout anchors per candidate
+Stage-two diagnostics
+q(L) terms
+mean / terminal / variability / asymptotic terms
+SAKE: normalized mean + terminal + std penalty blended with asymptotic rollout; direct baselines: normalized terminal + worst-anchor score
+Score weights
+fixed weights
+fixed combination weights in the refined score
+SAKE (wmean, wterm, wworst, wstd, α) = (0.75, 0.25, 0, 0.20, 0.25); Directs (0, 0.25, 0.75, 0, 1.0)
+Saturation thresholds
+frontier rule
+knee-aware frontier criteria
+local-adjacent fraction 0.15, remaining-gain fraction 0.15, consecutive-small count 1
+One-standard-error multiplier
+κ
+smallest reliable-window rule
+1.5 for SAKE; 1.0 for Direct-3-Shortlist and Direct-4-Shortlist
+Table 21: Stage-2 settings for knee-aware downstream selection. The key point is that these settings
+are fixed globally and used to compare SAKE against the direct-search baselines under matched
+downstream budgets.
+17
+Method
+Initial candidate construction
+Uses system anchors?
+Downstream budget / final rule
+System-core
+clean-system estimate only
+yes
+none / direct return of Lcore
+Direct-3-Shortlist
+uniformly spaced 3-point shortlist
+no
+initial shortlist {Lmin, round(0.5(Lmin + Lmax)), Lmax} on the active discrete grid
+Direct-4-Shortlist
+uniformly spaced 4-point shortlist
+no
+initial shortlist formed from the two internal equally spaced grid quantiles on the active discrete grid
+SAKE
+S0 = {1, Lcore, Lplateau}
+yes
+same pilot family with knee-aware final rule
+Table 22: Selector-side comparison setup. The direct baselines share the same downstream pilot
+family and local decision rule, while SAKE differs by replacing the generic shortlist with a system-
+anchored one.
+Condition
+Anchor-source definition
+Clean full-state
+reference anchor input
+Gaussian noise σ = 0.01
+same trajectories with additive mild observation noise
+Gaussian noise σ = 0.05
+same trajectories with moderate observation noise
+Gaussian noise σ = 0.10
+same trajectories with heavy observation noise
+Downsample ×2
+anchor extraction from half-resolution trajectories
+Downsample ×4
+anchor extraction from quarter-resolution trajectories
+Random mask 10%
+anchor extraction from partially observed trajectories with light masking
+Random mask 25%
+anchor extraction from partially observed trajectories with heavier masking
+Same-data full-state
+anchors estimated from the training split rather than a separate clean-system pool
+Same-data noisy
+anchors estimated from the noisy training split without separate clean-system access
+Table 23: Anchor-source conditions used to test robustness of the clean-system stage. The downstream
+selector is unchanged across rows.
+Anchor condition
+Mean |∆Lcore|
+Mean |∆Lplateau|
+Knee-in-band
+Knee in S0
+Knee in S1
+Mean active-set size
+Clean full-state
+0.00
+0.00
+50.0%
+25.0%
+95.8%
+4.0
+Gaussian noise σ = 0.01
+0.04
+0.13
+50.0%
+25.0%
+95.8%
+4.1
+Gaussian noise σ = 0.05
+0.08
+0.50
+45.8%
+25.0%
+91.7%
+4.3
+Gaussian noise σ = 0.10
+0.46
+1.58
+37.5%
+20.8%
+79.2%
+4.7
+Downsample ×2
+0.13
+0.38
+47.9%
+25.0%
+95.8%
+4.1
+Downsample ×4
+0.38
+1.50
+41.7%
+20.8%
+83.3%
+4.6
+Random mask 10%
+0.08
+0.54
+45.8%
+25.0%
+91.7%
+4.3
+Random mask 25%
+0.04
+1.50
+37.5%
+20.8%
+79.2%
+4.8
+Same-data full-state
+0.00
+0.13
+50.0%
+25.0%
+95.8%
+4.0
+Same-data noisy
+0.08
+0.75
+41.7%
+20.8%
+83.3%
+4.5
+Table 24: Aggregate anchor diagnostics relative to the clean full-state reference. These results show
+how quickly anchor quality degrades and whether the downstream refinement still recovers a useful
+candidate band.
+Anchor condition
+Method
+Exact
+Within-1
+Mean |∆L|
+Mean Regretknee
+Cost ratio
+Clean full-state
+System-core
+0.0%
+37.5%
+1.88
+49.7%
+0.000
+Clean full-state
+SAKE
+75.0%
+100.0%
+0.25
+6.7%
+0.043
+Gaussian noise σ = 0.01
+System-core
+0.0%
+29.2%
+1.96
+53.8%
+0.000
+Gaussian noise σ = 0.01
+SAKE
+70.8%
+95.8%
+0.29
+7.5%
+0.043
+Gaussian noise σ = 0.05
+System-core
+0.0%
+25.0%
+2.04
+58.6%
+0.000
+Gaussian noise σ = 0.05
+SAKE
+66.7%
+95.8%
+0.38
+8.9%
+0.044
+Gaussian noise σ = 0.10
+System-core
+0.0%
+16.7%
+2.33
+69.4%
+0.000
+Gaussian noise σ = 0.10
+SAKE
+54.2%
+83.3%
+0.63
+13.8%
+0.046
+Downsample ×2
+System-core
+0.0%
+33.3%
+1.92
+52.2%
+0.000
+Downsample ×2
+SAKE
+70.8%
+95.8%
+0.33
+7.9%
+0.043
+Downsample ×4
+System-core
+0.0%
+20.8%
+2.21
+65.7%
+0.000
+Downsample ×4
+SAKE
+58.3%
+87.5%
+0.54
+12.1%
+0.045
+Random mask 10%
+System-core
+0.0%
+29.2%
+2.00
+56.0%
+0.000
+Random mask 10%
+SAKE
+66.7%
+91.7%
+0.42
+9.6%
+0.044
+Random mask 25%
+System-core
+0.0%
+16.7%
+2.29
+67.8%
+0.000
+Random mask 25%
+SAKE
+54.2%
+83.3%
+0.67
+14.7%
+0.046
+Same-data full-state
+System-core
+0.0%
+37.5%
+1.88
+50.8%
+0.000
+Same-data full-state
+SAKE
+70.8%
+95.8%
+0.29
+7.1%
+0.043
+Same-data noisy
+System-core
+0.0%
+20.8%
+2.17
+63.1%
+0.000
+Same-data noisy
+SAKE
+62.5%
+87.5%
+0.50
+11.9%
+0.045
+Table 25: Aggregate downstream-selection quality under noisy, partial, and same-data anchor estima-
+tion.
+18
+Dataset
+Backbone
+Clean
+Noise 0.05
+Downsample x4
+Mask 25%
+Same-data noisy
+Lcore
+Lplateau
+Lcore
+Lplateau
+Lcore
+Lplateau
+Lcore
+Lplateau
+Lcore
+Lplateau
+DiffReact
+ConvLSTM
+3
+6
+3
+6
+3
+7
+3
+7
+3
+7
+DiffReact
+FNO
+3
+6
+3
+6
+3
+7
+3
+7
+3
+6
+DiffReact
+Transformer
+3
+6
+3
+6
+3
+7
+3
+7
+3
+7
+DiffReact
+U-Net
+3
+6
+3
+7
+4
+8
+3
+8
+3
+7
+RDB
+ConvLSTM
+2
+6
+2
+7
+2
+8
+2
+8
+2
+7
+RDB
+FNO
+2
+6
+2
+7
+3
+8
+2
+8
+2
+7
+RDB
+Transformer
+2
+6
+2
+7
+3
+8
+2
+8
+2
+7
+RDB
+U-Net
+2
+6
+2
+6
+2
+7
+2
+7
+2
+6
+Table 26: Case-level anchor pairs under representative robustness conditions. Each entry reports the
+modal anchor pair across the three training seeds for that dataset–backbone–condition tuple.
+Dataset
+Backbone
+Clean
+Noise 0.05
+Downsample x4
+Mask 25%
+Same-data noisy
+DiffReact
+ConvLSTM
+2
+2
+3
+3
+2
+DiffReact
+FNO
+2
+2
+3
+2
+2
+DiffReact
+Transformer
+1
+1
+2
+2
+1
+DiffReact
+U-Net
+4
+4
+5
+5
+5
+RDB
+ConvLSTM
+4
+4
+5
+5
+4
+RDB
+FNO
+4
+4
+5
+5
+4
+RDB
+Transformer
+5
+5
+6
+6
+5
+RDB
+U-Net
+1
+1
+2
+2
+1
+Table 27: Case-level SAKE selections under representative robustness conditions. Each entry reports
+the modal selected window across the three training seeds for that dataset–backbone–condition tuple.
+Component
+Setting used in this appendix
+Anchor-source conditions
+same-data full-state, same-data noisy, spatial downsampled observations, sparse probe observations, masked observations, and learned-latent summaries
+Representation families
+randomized PCA, randomized SVD, random Gaussian projection, and convolutional autoencoder latent summaries
+Primary selector comparison
+System-core and SAKE under the same matched downstream budgets as the main paper
+Reference direct baselines
+Direct-4-Shortlist and ASHA, reported once as clean-independent search references
+Reported anchor metrics
+mean |∆Lcore|, mean |∆Lplateau|, knee-in-band coverage, knee-in-shortlist coverage, and final active-set coverage
+Reported selection metrics
+Exact, Within-1, mean |∆L|, Regretknee, mean unique L evaluations, and cost ratio
+Table 28: Protocol for the proxy-anchor appendix. The goal is to quantify how stage one behaves
+when clean-system trajectories or a single preferred state summary are unavailable.
+Anchor source
+Mean |∆Lcore|
+Mean |∆Lplateau|
+Knee-in-band coverage
+Knee-in-shortlist coverage
+Final active-set coverage
+Same-data full-state
+0.00
+0.13
+50.0%
+25.0%
+95.8%
+Same-data noisy
+0.08
+0.75
+41.7%
+20.8%
+83.3%
+Downsample ×2
+0.13
+0.38
+47.9%
+25.0%
+95.8%
+Sparse probes (16 × 16)
+0.42
+1.04
+41.7%
+20.8%
+87.5%
+Random mask 25%
+0.04
+1.50
+37.5%
+20.8%
+79.2%
+Learned latent summary
+0.17
+0.54
+45.8%
+25.0%
+91.7%
+Table 29: Aggregate anchor-quality diagnostics when stage one is instantiated without a separate
+clean-system pool.
+Anchor source
+Method
+Exact
+Within-1
+Mean |∆L|
+Mean Regretknee
+Mean unique L eval.
+Cost ratio
+Same-data full-state
+System-core
+0.0%
+37.5%
+1.88
+50.8%
+0.0
+0.000
+Same-data full-state
+SAKE
+70.8%
+95.8%
+0.29
+7.1%
+4.0
+0.043
+Same-data noisy
+System-core
+0.0%
+20.8%
+2.17
+63.1%
+0.0
+0.000
+Same-data noisy
+SAKE
+62.5%
+87.5%
+0.50
+11.9%
+4.5
+0.045
+Downsample ×2
+System-core
+0.0%
+33.3%
+1.92
+52.2%
+0.0
+0.000
+Downsample ×2
+SAKE
+70.8%
+95.8%
+0.33
+7.9%
+4.1
+0.043
+Sparse probes (16 × 16)
+System-core
+0.0%
+25.0%
+2.08
+58.9%
+0.0
+0.000
+Sparse probes (16 × 16)
+SAKE
+58.3%
+87.5%
+0.54
+11.6%
+4.4
+0.045
+Random mask 25%
+System-core
+0.0%
+16.7%
+2.29
+67.8%
+0.0
+0.000
+Random mask 25%
+SAKE
+54.2%
+83.3%
+0.67
+14.7%
+4.8
+0.046
+Learned latent summary
+System-core
+0.0%
+29.2%
+2.00
+55.4%
+0.0
+0.000
+Learned latent summary
+SAKE
+66.7%
+91.7%
+0.42
+9.4%
+4.3
+0.044
+Table 30: Aggregate selector quality under proxy-anchor extraction. Direct-4-Shortlist and ASHA
+are unchanged by these anchor-source choices and are therefore used only as fixed clean-independent
+references rather than repeated in every row.
+19
+Representation
+Mean |∆Lcore|
+Mean |∆Lplateau|
+Exact
+Within-1
+Mean Regretknee
+Cost ratio
+Randomized PCA
+0.00
+0.13
+70.8%
+95.8%
+7.1%
+0.043
+Randomized SVD
+0.04
+0.17
+70.8%
+95.8%
+7.3%
+0.043
+Random projection
+0.33
+0.83
+54.2%
+83.3%
+13.9%
+0.045
+Autoencoder latent
+0.13
+0.29
+66.7%
+91.7%
+8.0%
+0.044
+Table 31: Representation sensitivity under full-state proxy extraction.
+Representation
+Mean |∆Lcore|
+Mean |∆Lplateau|
+Exact
+Within-1
+Mean Regretknee
+Cost ratio
+Randomized PCA
+0.08
+0.75
+62.5%
+87.5%
+11.9%
+0.045
+Randomized SVD
+0.13
+0.79
+62.5%
+87.5%
+12.1%
+0.045
+Random projection
+0.46
+1.25
+45.8%
+75.0%
+17.2%
+0.046
+Autoencoder latent
+0.17
+0.67
+58.3%
+87.5%
+12.0%
+0.045
+Table 32: Representation sensitivity under the same-data noisy proxy condition.
+Dataset
+Backbone
+Same-data full-state
+Same-data noisy
+Sparse probes
+Learned latent
+Oracle knee
+DiffReact
+ConvLSTM
+2
+2
+3
+2
+2
+DiffReact
+FNO
+2
+2
+2
+2
+2
+DiffReact
+Transformer
+1
+1
+2
+1
+1
+DiffReact
+U-Net
+4
+5
+5
+4
+5
+RDB
+ConvLSTM
+4
+4
+5
+4
+5
+RDB
+FNO
+4
+4
+5
+4
+4
+RDB
+Transformer
+5
+5
+6
+5
+5
+RDB
+U-Net
+1
+1
+2
+1
+1
+Table 33: Case-level SAKE selections under representative proxy-anchor conditions.
+Quantity
+Symbol
+Values
+Interpretation
+Tail tolerance fraction
+ρ
+{0.02, 0.05, 0.10}
+controls how early the long-history tail is treated as effectively closed
+Plateau threshold
+τpl
+{0.02, 0.05, 0.10}
+controls how early diminishing returns are declared
+One-standard-error multiplier
+κ
+{1.0, 1.5, 2.0}
+controls the smallest-reliable-window rule in stage two
+Bootstrap resamples
+B
+{100, 300, 500}
+controls the stability of the UCB estimates used by stage one
+Knee tolerance
+ϵ
+{2%, 5%, 10%, 15%}
+changes the oracle target itself rather than only the selector rule
+Table 34: Parameter sweeps used for the sensitivity analysis.
+Quantity
+Value
+Mean Lcore
+Mean Lplateau
+Knee-in-band
+Mean unique L eval.
+Exact
+Within-1
+Mean |∆L|
+Mean Regretknee
+Cost ratio
+ρ
+0.02
+2.8
+6.1
+58.3%
+4.8
+75.0%
+100.0%
+0.25
+6.5%
+0.046
+ρ
+0.05
+2.5
+6.0
+50.0%
+4.4
+75.0%
+100.0%
+0.25
+6.7%
+0.043
+ρ
+0.10
+2.1
+5.8
+41.7%
+4.0
+70.8%
+95.8%
+0.33
+7.4%
+0.039
+τpl
+0.02
+2.5
+6.4
+54.2%
+4.9
+75.0%
+100.0%
+0.25
+6.4%
+0.047
+τpl
+0.05
+2.5
+6.0
+50.0%
+4.4
+75.0%
+100.0%
+0.25
+6.7%
+0.043
+τpl
+0.10
+2.5
+5.4
+41.7%
+4.0
+70.8%
+95.8%
+0.33
+7.6%
+0.039
+κ
+1.0
+2.5
+6.0
+50.0%
+4.4
+66.7%
+100.0%
+0.33
+7.1%
+0.043
+κ
+1.5
+2.5
+6.0
+50.0%
+4.4
+75.0%
+100.0%
+0.25
+6.7%
+0.043
+κ
+2.0
+2.5
+6.0
+50.0%
+4.4
+70.8%
+100.0%
+0.29
+6.9%
+0.043
+B
+100
+2.6
+6.0
+47.9%
+4.6
+70.8%
+95.8%
+0.33
+7.5%
+0.044
+B
+300
+2.5
+6.0
+50.0%
+4.4
+75.0%
+100.0%
+0.25
+6.7%
+0.043
+B
+500
+2.5
+6.0
+50.0%
+4.4
+75.0%
+100.0%
+0.25
+6.6%
+0.043
+Table 35: Aggregate sensitivity of SAKE to the fixed selector constants.
+20
+Dataset
+Backbone
+ϵ = 2%
+ϵ = 5%
+ϵ = 10%
+ϵ = 15%
+DiffReact
+ConvLSTM
+2
+2
+2
+2
+DiffReact
+FNO
+2
+2
+1
+1
+DiffReact
+Transformer
+1
+1
+1
+1
+DiffReact
+U-Net
+6
+5
+4
+3
+RDB
+ConvLSTM
+6
+5
+4
+4
+RDB
+FNO
+4
+4
+3
+3
+RDB
+Transformer
+5
+5
+5
+4
+RDB
+U-Net
+1
+1
+1
+1
+Table 36: Case-level oracle-knee locations under alternative near-optimality tolerances.
+ϵ
+Method
+Exact
+Within-1
+Mean |∆L|
+Mean Regretknee
+Mean Regretbest
+Cost ratio
+2%
+System-core
+0.0%
+29.2%
+2.04
+58.2%
+58.6%
+0.000
+2%
+Direct-4-Shortlist
+50.0%
+79.2%
+0.71
+13.4%
+13.9%
+0.058
+2%
+SAKE
+62.5%
+91.7%
+0.42
+8.6%
+9.1%
+0.043
+5%
+System-core
+0.0%
+37.5%
+1.88
+49.7%
+49.9%
+0.000
+5%
+Direct-4-Shortlist
+62.5%
+87.5%
+0.50
+10.5%
+10.8%
+0.058
+5%
+SAKE
+75.0%
+100.0%
+0.25
+6.7%
+7.0%
+0.043
+10%
+System-core
+0.0%
+25.0%
+2.08
+56.8%
+57.2%
+0.000
+10%
+Direct-4-Shortlist
+50.0%
+79.2%
+0.79
+14.2%
+14.7%
+0.058
+10%
+SAKE
+70.8%
+95.8%
+0.38
+7.5%
+8.0%
+0.043
+15%
+System-core
+0.0%
+20.8%
+2.21
+61.9%
+62.3%
+0.000
+15%
+Direct-4-Shortlist
+45.8%
+75.0%
+0.92
+17.0%
+17.5%
+0.058
+15%
+SAKE
+70.8%
+95.8%
+0.33
+7.2%
+7.7%
+0.043
+Table 37: Selector performance under alternative oracle-knee tolerances.
+Quantity
+Definition in this appendix
+Selector wall-clock
+End-to-end elapsed time for one selector run, including all pilot training and validation passes
+Selector GPU-hours
+Sum over all GPUs used by a selector run, measured over the same pilot and validation work
+Full-sweep wall-clock ratio
+Selector wall-clock divided by the elapsed time of the corresponding exhaustive sweep
+Queueing / scheduling
+Excluded; all measurements assume dedicated local execution on the shared A100 server
+Table 38: Timing definitions used in this appendix.
+Method
+Mean selector wall-clock (h)
+Mean selector GPU-hours
+Full-sweep wall-clock ratio
+Mean unique L eval.
+Cost ratio
+Direct-3-Shortlist
+1.04
+4.16
+0.069
+5.8
+0.057
+Direct-4-Shortlist
+1.08
+4.31
+0.071
+5.9
+0.058
+ASHA
+1.23
+4.94
+0.081
+6.0
+0.065
+BO-MF
+1.28
+5.12
+0.084
+6.0
+0.068
+BOHB-style
+1.25
+5.00
+0.082
+6.0
+0.067
+SAKE
+0.86
+3.43
+0.057
+4.4
+0.043
+Full sweep
+15.14
+60.55
+1.000
+6.0
+1.000
+Table 39: Overall timing summary across the shared A100 environment.
+21
+Dataset
+Backbone
+Method
+Wall-clock (h)
+GPU-hours
+Cost ratio
+DiffReact
+ConvLSTM
+Direct-4-Shortlist
+0.62
+2.48
+0.054
+DiffReact
+ConvLSTM
+ASHA
+0.70
+2.78
+0.061
+DiffReact
+ConvLSTM
+BO-MF
+0.72
+2.90
+0.064
+DiffReact
+ConvLSTM
+BOHB-style
+0.70
+2.82
+0.063
+DiffReact
+ConvLSTM
+SAKE
+0.52
+2.07
+0.041
+DiffReact
+ConvLSTM
+Full sweep
+9.40
+37.60
+1.000
+DiffReact
+FNO
+Direct-4-Shortlist
+1.29
+5.16
+0.057
+DiffReact
+FNO
+ASHA
+1.48
+5.91
+0.064
+DiffReact
+FNO
+BO-MF
+1.53
+6.13
+0.067
+DiffReact
+FNO
+BOHB-style
+1.50
+5.98
+0.066
+DiffReact
+FNO
+SAKE
+1.05
+4.19
+0.043
+DiffReact
+FNO
+Full sweep
+18.70
+74.80
+1.000
+DiffReact
+Transformer
+Direct-4-Shortlist
+0.97
+3.89
+0.056
+DiffReact
+Transformer
+ASHA
+1.12
+4.46
+0.063
+DiffReact
+Transformer
+BO-MF
+1.16
+4.63
+0.066
+DiffReact
+Transformer
+BOHB-style
+1.13
+4.52
+0.065
+DiffReact
+Transformer
+SAKE
+0.79
+3.15
+0.042
+DiffReact
+Transformer
+Full sweep
+14.30
+57.20
+1.000
+DiffReact
+U-Net
+Direct-4-Shortlist
+1.12
+4.49
+0.058
+DiffReact
+U-Net
+ASHA
+1.26
+5.06
+0.066
+DiffReact
+U-Net
+BO-MF
+1.31
+5.25
+0.068
+DiffReact
+U-Net
+BOHB-style
+1.28
+5.12
+0.067
+DiffReact
+U-Net
+SAKE
+0.87
+3.48
+0.042
+DiffReact
+U-Net
+Full sweep
+15.80
+63.20
+1.000
+RDB
+ConvLSTM
+Direct-4-Shortlist
+0.72
+2.87
+0.059
+RDB
+ConvLSTM
+ASHA
+0.84
+3.35
+0.066
+RDB
+ConvLSTM
+BO-MF
+0.86
+3.43
+0.069
+RDB
+ConvLSTM
+BOHB-style
+0.85
+3.39
+0.068
+RDB
+ConvLSTM
+SAKE
+0.62
+2.46
+0.045
+RDB
+ConvLSTM
+Full sweep
+10.10
+40.40
+1.000
+RDB
+FNO
+Direct-4-Shortlist
+1.41
+5.64
+0.058
+RDB
+FNO
+ASHA
+1.63
+6.51
+0.065
+RDB
+FNO
+BO-MF
+1.69
+6.74
+0.068
+RDB
+FNO
+BOHB-style
+1.65
+6.59
+0.067
+RDB
+FNO
+SAKE
+1.14
+4.55
+0.043
+RDB
+FNO
+Full sweep
+19.60
+78.40
+1.000
+RDB
+Transformer
+Direct-4-Shortlist
+1.05
+4.20
+0.057
+RDB
+Transformer
+ASHA
+1.22
+4.86
+0.064
+RDB
+Transformer
+BO-MF
+1.26
+5.04
+0.067
+RDB
+Transformer
+BOHB-style
+1.23
+4.92
+0.066
+RDB
+Transformer
+SAKE
+0.85
+3.42
+0.043
+RDB
+Transformer
+Full sweep
+15.00
+60.00
+1.000
+RDB
+U-Net
+Direct-4-Shortlist
+1.44
+5.75
+0.064
+RDB
+U-Net
+ASHA
+1.64
+6.55
+0.072
+RDB
+U-Net
+BO-MF
+1.71
+6.84
+0.074
+RDB
+U-Net
+BOHB-style
+1.66
+6.62
+0.073
+RDB
+U-Net
+SAKE
+1.04
+4.15
+0.046
+RDB
+U-Net
+Full sweep
+18.20
+72.80
+1.000
+Table 40: Case-level realized timing for the principal search baselines and the exhaustive reference.
+22
+Method
+Stage-1 wall-clock
+Stage-2 wall-clock
+Validation overhead
+Total wall-clock
+Total GPU-hours
+Direct-3-Shortlist
+0.10
+0.79
+0.15
+1.04
+4.16
+Direct-4-Shortlist
+0.12
+0.80
+0.16
+1.08
+4.31
+ASHA
+0.18
+0.89
+0.16
+1.23
+4.94
+BO-MF
+0.21
+0.91
+0.16
+1.28
+5.12
+BOHB-style
+0.20
+0.88
+0.17
+1.25
+5.00
+SAKE
+0.16
+0.54
+0.16
+0.86
+3.43
+Table 41: Stage-wise timing breakdown for the low-cost selectors.
+23
+NeurIPS Paper Checklist
+1. Claims
+Question: Do the main claims made in the abstract and introduction accurately reflect the paper’s
+contributions and scope?
+Answer: [Yes]
+Justification: The abstract and introduction make scoped empirical claims about SAKE in the fixed-
+window autoregressive setting, and these are supported by Sections 3.2, 4.1–4.1.3, the main empirical
+results, Appendix A, and the Discussion.
+Guidelines:
+• The answer [N/A] means that the abstract and introduction do not include the claims made in the
+paper.
+• The abstract and/or introduction should clearly state the claims made, including the contributions
+made in the paper and important assumptions and limitations. A [No] or [N/A] answer to this
+question will not be perceived well by the reviewers.
+• The claims made should match theoretical and experimental results, and reflect how much the
+results can be expected to generalize to other settings.
+• It is fine to include aspirational goals as motivation as long as it is clear that these goals are not
+attained by the paper.
+2. Limitations
+Question: Does the paper discuss the limitations of the work performed by the authors?
+Answer: [Yes]
+Justification: The Discussion explicitly states the main limitations, including the focus on fixed-
+window one-step autoregressive simulators, dependence on usable full-state or proxy summaries,
+and remaining hard cases; Appendix D, Appendix E, Appendix F, and Appendix G further probe
+robustness, scope, and cost.
+Guidelines:
+• The answer [N/A] means that the paper has no limitation while the answer [No] means that the
+paper has limitations, but those are not discussed in the paper.
+• The authors are encouraged to create a separate “Limitations” section in their paper.
+• The paper should point out any strong assumptions and how robust the results are to violations of
+these assumptions (e.g., independence assumptions, noiseless settings, model well-specification,
+asymptotic approximations only holding locally). The authors should reflect on how these
+assumptions might be violated in practice and what the implications would be.
+• The authors should reflect on the scope of the claims made, e.g., if the approach was only tested
+on a few datasets or with a few runs. In general, empirical results often depend on implicit
+assumptions, which should be articulated.
+• The authors should reflect on the factors that influence the performance of the approach. For
+example, a facial recognition algorithm may perform poorly when image resolution is low or
+images are taken in low lighting. Or a speech-to-text system might not be used reliably to provide
+closed captions for online lectures because it fails to handle technical jargon.
+• The authors should discuss the computational efficiency of the proposed algorithms and how
+they scale with dataset size.
+• If applicable, the authors should discuss possible limitations of their approach to address problems
+of privacy and fairness.
+• While the authors might fear that complete honesty about limitations might be used by reviewers
+as grounds for rejection, a worse outcome might be that reviewers discover limitations that
+aren’t acknowledged in the paper. The authors should use their best judgment and recognize
+that individual actions in favor of transparency play an important role in developing norms that
+preserve the integrity of the community. Reviewers will be specifically instructed to not penalize
+honesty concerning limitations.
+3. Theory assumptions and proofs
+Question: For each theoretical result, does the paper provide the full set of assumptions and a complete
+(and correct) proof?
+Answer: [N/A]
+Justification: The paper is primarily methodological and empirical: it formalizes the problem and
+specifies SAKE in Section 3, but it does not present theorem-level theoretical results that require
+formal proofs.
+24
+Guidelines:
+• The answer [N/A] means that the paper does not include theoretical results.
+• All the theorems, formulas, and proofs in the paper should be numbered and cross-referenced.
+• All assumptions should be clearly stated or referenced in the statement of any theorems.
+• The proofs can either appear in the main paper or the supplemental material, but if they appear in
+the supplemental material, the authors are encouraged to provide a short proof sketch to provide
+intuition.
+• Inversely, any informal proof provided in the core of the paper should be complemented by
+formal proofs provided in appendix or supplemental material.
+• Theorems and Lemmas that the proof relies upon should be properly referenced.
+4. Experimental result reproducibility
+Question: Does the paper fully disclose all the information needed to reproduce the main experimental
+results of the paper to the extent that it affects the main claims and/or conclusions of the paper
+(regardless of whether the code and data are provided or not)?
+Answer: [Yes]
+Justification: The paper specifies the candidate grid, datasets, splits, backbones, pilot/full-training
+protocol, metrics, selector hyperparameters, and compute/timing protocol in Sections 4.1–4.1.3,
+Appendix B, Appendix C, and Appendix G, which together disclose the information needed to
+reproduce the main empirical claims.
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• If the paper includes experiments, a [No] answer to this question will not be perceived well by
+the reviewers: Making the paper reproducible is important, regardless of whether the code and
+data are provided or not.
+• If the contribution is a dataset and/or model, the authors should describe the steps taken to make
+their results reproducible or verifiable.
+• Depending on the contribution, reproducibility can be accomplished in various ways. For
+example, if the contribution is a novel architecture, describing the architecture fully might suffice,
+or if the contribution is a specific model and empirical evaluation, it may be necessary to either
+make it possible for others to replicate the model with the same dataset, or provide access to
+the model. In general. releasing code and data is often one good way to accomplish this, but
+reproducibility can also be provided via detailed instructions for how to replicate the results,
+access to a hosted model (e.g., in the case of a large language model), releasing of a model
+checkpoint, or other means that are appropriate to the research performed.
+• While NeurIPS does not require releasing code, the conference does require all submissions
+to provide some reasonable avenue for reproducibility, which may depend on the nature of the
+contribution. For example
+(a) If the contribution is primarily a new algorithm, the paper should make it clear how to
+reproduce that algorithm.
+(b) If the contribution is primarily a new model architecture, the paper should describe the
+architecture clearly and fully.
+(c) If the contribution is a new model (e.g., a large language model), then there should either be
+a way to access this model for reproducing the results or a way to reproduce the model (e.g.,
+with an open-source dataset or instructions for how to construct the dataset).
+(d) We recognize that reproducibility may be tricky in some cases, in which case authors are
+welcome to describe the particular way they provide for reproducibility. In the case of
+closed-source models, it may be that access to the model is limited in some way (e.g.,
+to registered users), but it should be possible for other researchers to have some path to
+reproducing or verifying the results.
+5. Open access to data and code
+Question: Does the paper provide open access to the data and code, with sufficient instructions to
+faithfully reproduce the main experimental results, as described in supplemental material?
+Answer: [No]
+Justification: The paper uses public PDEBench data, but the manuscript and provided supplemental
+material do not themselves include an anonymized code release and reproduction package with explicit
+run instructions for the full experimental suite.
+Guidelines:
+• The answer [N/A] means that paper does not include experiments requiring code.
+25
+• Please see the NeurIPS code and data submission guidelines (https://neurips.cc/public/
+guides/CodeSubmissionPolicy) for more details.
+• While we encourage the release of code and data, we understand that this might not be possible,
+so [No] is an acceptable answer. Papers cannot be rejected simply for not including code, unless
+this is central to the contribution (e.g., for a new open-source benchmark).
+• The instructions should contain the exact command and environment needed to run to reproduce
+the results. See the NeurIPS code and data submission guidelines (https://neurips.cc/
+public/guides/CodeSubmissionPolicy) for more details.
+• The authors should provide instructions on data access and preparation, including how to access
+the raw data, preprocessed data, intermediate data, and generated data, etc.
+• The authors should provide scripts to reproduce all experimental results for the new proposed
+method and baselines. If only a subset of experiments are reproducible, they should state which
+ones are omitted from the script and why.
+• At submission time, to preserve anonymity, the authors should release anonymized versions (if
+applicable).
+• Providing as much information as possible in supplemental material (appended to the paper) is
+recommended, but including URLs to data and code is permitted.
+6. Experimental setting/details
+Question: Does the paper specify all the training and test details (e.g., data splits, hyperparameters,
+how they were chosen, type of optimizer) necessary to understand the results?
+Answer: [Yes]
+Justification: Section 4.1 specifies the datasets, baselines, hardware/software stack, optimizer, batch
+size, rollout horizons, train/validation/test split, and seed protocol, while Appendix B and Appendix C
+provide the architecture fields and selector hyperparameters.
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• The experimental setting should be presented in the core of the paper to a level of detail that is
+necessary to appreciate the results and make sense of them.
+• The full details can be provided either with the code, in appendix, or as supplemental material.
+7. Experiment statistical significance
+Question: Does the paper report error bars suitably and correctly defined or other appropriate informa-
+tion about the statistical significance of the experiments?
+Answer: [No]
+Justification: The paper averages over three training seeds and reports detailed case-wise and aggregate
+tables, but it does not provide explicit error bars, confidence intervals, or formal hypothesis tests for
+the main experimental comparisons.
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• The authors should answer [Yes] if the results are accompanied by error bars, confidence intervals,
+or statistical significance tests, at least for the experiments that support the main claims of the
+paper.
+• The factors of variability that the error bars are capturing should be clearly stated (for example,
+train/test split, initialization, random drawing of some parameter, or overall run with given
+experimental conditions).
+• The method for calculating the error bars should be explained (closed form formula, call to a
+library function, bootstrap, etc.)
+• The assumptions made should be given (e.g., Normally distributed errors).
+• It should be clear whether the error bar is the standard deviation or the standard error of the
+mean.
+• It is OK to report 1-sigma error bars, but one should state it. The authors should preferably report
+a 2-sigma error bar than state that they have a 96% CI, if the hypothesis of Normality of errors is
+not verified.
+• For asymmetric distributions, the authors should be careful not to show in tables or figures
+symmetric error bars that would yield results that are out of range (e.g., negative error rates).
+• If error bars are reported in tables or plots, the authors should explain in the text how they were
+calculated and reference the corresponding figures or tables in the text.
+8. Experiments compute resources
+26
+Question: For each experiment, does the paper provide sufficient information on the computer
+resources (type of compute workers, memory, time of execution) needed to reproduce the experiments?
+Answer: [Yes]
+Justification: Section 4.1.2 reports the compute environment (4 NVIDIA A100 80GB GPUs, PyTorch
+2.1, CUDA 12.0), and Appendix G gives overall and case-level wall-clock time and GPU-hour
+measurements for the reported experiments.
+Guidelines:
+• The answer [N/A] means that the paper does not include experiments.
+• The paper should indicate the type of compute workers CPU or GPU, internal cluster, or cloud
+provider, including relevant memory and storage.
+• The paper should provide the amount of compute required for each of the individual experimental
+runs as well as estimate the total compute.
+• The paper should disclose whether the full research project required more compute than the
+experiments reported in the paper (e.g., preliminary or failed experiments that didn’t make it into
+the paper).
+9. Code of ethics
+Question: Does the research conducted in the paper conform, in every respect, with the NeurIPS Code
+of Ethics https://neurips.cc/public/EthicsGuidelines?
+Answer: [Yes]
+Justification: The work studies numerical PDE forecasting on public benchmark scientific data and
+standard model families, and it does not involve human subjects, personally identifiable information,
+or deceptive deployment; we are not aware of any aspect that departs from the NeurIPS Code of Ethics.
+Guidelines:
+• The answer [N/A] means that the authors have not reviewed the NeurIPS Code of Ethics.
+• If the authors answer [No], they should explain the special circumstances that require a deviation
+from the Code of Ethics.
+• The authors should make sure to preserve anonymity (e.g., if there is a special consideration due
+to laws or regulations in their jurisdiction).
+10. Broader impacts
+Question: Does the paper discuss both potential positive societal impacts and negative societal impacts
+of the work performed?
+Answer: [No]
+Justification: The paper is a foundational methodological study for scientific machine learning, and
+while likely impacts include more efficient simulator selection workflows, the manuscript does not
+include an explicit discussion of both positive and negative societal impacts.
+Guidelines:
+• The answer [N/A] means that there is no societal impact of the work performed.
+• If the authors answer [N/A] or [No], they should explain why their work has no societal impact
+or why the paper does not address societal impact.
+• Examples of negative societal impacts include potential malicious or unintended uses (e.g.,
+disinformation, generating fake profiles, surveillance), fairness considerations (e.g., deploy-
+ment of technologies that could make decisions that unfairly impact specific groups), privacy
+considerations, and security considerations.
+• The conference expects that many papers will be foundational research and not tied to particular
+applications, let alone deployments. However, if there is a direct path to any negative applications,
+the authors should point it out. For example, it is legitimate to point out that an improvement in
+the quality of generative models could be used to generate Deepfakes for disinformation. On the
+other hand, it is not needed to point out that a generic algorithm for optimizing neural networks
+could enable people to train models that generate Deepfakes faster.
+• The authors should consider possible harms that could arise when the technology is being used
+as intended and functioning correctly, harms that could arise when the technology is being used
+as intended but gives incorrect results, and harms following from (intentional or unintentional)
+misuse of the technology.
+• If there are negative societal impacts, the authors could also discuss possible mitigation strategies
+(e.g., gated release of models, providing defenses in addition to attacks, mechanisms for monitor-
+ing misuse, mechanisms to monitor how a system learns from feedback over time, improving the
+efficiency and accessibility of ML).
+27
+11. Safeguards
+Question: Does the paper describe safeguards that have been put in place for responsible release of
+data or models that have a high risk for misuse (e.g., pre-trained language models, image generators,
+or scraped datasets)?
+Answer: [N/A]
+Justification: The paper does not release high-risk generative models, scraped web data, or other assets
+with an obvious misuse profile; it studies PDE forecasting on public scientific benchmark data.
+Guidelines:
+• The answer [N/A] means that the paper poses no such risks.
+• Released models that have a high risk for misuse or dual-use should be released with necessary
+safeguards to allow for controlled use of the model, for example by requiring that users adhere to
+usage guidelines or restrictions to access the model or implementing safety filters.
+• Datasets that have been scraped from the Internet could pose safety risks. The authors should
+describe how they avoided releasing unsafe images.
+• We recognize that providing effective safeguards is challenging, and many papers do not require
+this, but we encourage authors to take this into account and make a best faith effort.
+12. Licenses for existing assets
+Question: Are the creators or original owners of assets (e.g., code, data, models), used in the paper,
+properly credited and are the license and terms of use explicitly mentioned and properly respected?
+Answer: [No]
+Justification: The paper credits existing assets such as PDEBench and prior methods via citations, but
+it does not explicitly state the licenses and terms of use for the dataset and software dependencies in
+the manuscript.
+Guidelines:
+• The answer [N/A] means that the paper does not use existing assets.
+• The authors should cite the original paper that produced the code package or dataset.
+• The authors should state which version of the asset is used and, if possible, include a URL.
+• The name of the license (e.g., CC-BY 4.0) should be included for each asset.
+• For scraped data from a particular source (e.g., website), the copyright and terms of service of
+that source should be provided.
+• If assets are released, the license, copyright information, and terms of use in the package should
+be provided. For popular datasets, paperswithcode.com/datasets has curated licenses for
+some datasets. Their licensing guide can help determine the license of a dataset.
+• For existing datasets that are re-packaged, both the original license and the license of the derived
+asset (if it has changed) should be provided.
+• If this information is not available online, the authors are encouraged to reach out to the asset’s
+creators.
+13. New assets
+Question: Are new assets introduced in the paper well documented and is the documentation provided
+alongside the assets?
+Answer: [N/A]
+Justification: The paper introduces a method and empirical evaluation, but it does not claim the release
+of a new dataset, model checkpoint, or documented software package in the submission materials.
+Guidelines:
+• The answer [N/A] means that the paper does not release new assets.
+• Researchers should communicate the details of the dataset/code/model as part of their sub-
+missions via structured templates. This includes details about training, license, limitations,
+etc.
+• The paper should discuss whether and how consent was obtained from people whose asset is
+used.
+• At submission time, remember to anonymize your assets (if applicable). You can either create an
+anonymized URL or include an anonymized zip file.
+14. Crowdsourcing and research with human subjects
+Question: For crowdsourcing experiments and research with human subjects, does the paper include
+the full text of instructions given to participants and screenshots, if applicable, as well as details about
+compensation (if any)?
+28
+Answer: [N/A]
+Justification: The work does not involve crowdsourcing or research with human subjects.
+Guidelines:
+• The answer [N/A] means that the paper does not involve crowdsourcing nor research with human
+subjects.
+• Including this information in the supplemental material is fine, but if the main contribution of the
+paper involves human subjects, then as much detail as possible should be included in the main
+paper.
+• According to the NeurIPS Code of Ethics, workers involved in data collection, curation, or other
+labor should be paid at least the minimum wage in the country of the data collector.
+15. Institutional review board (IRB) approvals or equivalent for research with human subjects
+Question: Does the paper describe potential risks incurred by study participants, whether such
+risks were disclosed to the subjects, and whether Institutional Review Board (IRB) approvals (or an
+equivalent approval/review based on the requirements of your country or institution) were obtained?
+Answer: [N/A]
+Justification: The work does not involve crowdsourcing or research with human subjects, so IRB
+approval is not applicable.
+Guidelines:
+• The answer [N/A] means that the paper does not involve crowdsourcing nor research with human
+subjects.
+• Depending on the country in which research is conducted, IRB approval (or equivalent) may be
+required for any human subjects research. If you obtained IRB approval, you should clearly state
+this in the paper.
+• We recognize that the procedures for this may vary significantly between institutions and
+locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the guidelines for
+their institution.
+• For initial submissions, do not include any information that would break anonymity (if applica-
+ble), such as the institution conducting the review.
+16. Declaration of LLM usage
+Question: Does the paper describe the usage of LLMs if it is an important, original, or non-standard
+component of the core methods in this research? Note that if the LLM is used only for writing, editing,
+or formatting purposes and does not impact the core methodology, scientific rigor, or originality of the
+research, declaration is not required.
+Answer: [N/A]
+Justification: Appendix H states that LLMs were used only for writing and presentation assistance and
+not as part of the core methodology, so this question is not applicable to the scientific content of the
+paper.
+Guidelines:
+• The answer [N/A] means that the core method development in this research does not involve
+LLMs as any important, original, or non-standard components.
+• Please refer to our LLM policy in the NeurIPS handbook for what should or should not be
+described.
+29

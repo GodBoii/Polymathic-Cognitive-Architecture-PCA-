@@ -1,0 +1,2869 @@
+Stochastic Dimension-Free Zeroth-Order Estimator
+for High-Dimensional and High-Order PINNs
+Zhangyong Liang
+Tianjin University
+National Center for Applied Mathematics
+zyliang1994@tju.edu.cn,
+Ji Zhang
+University of Southern Queensland
+School of Mathematics, Physics and Computing
+ji.zhang@unisq.edu.au
+Abstract
+Physics-Informed Neural Networks (PINNs) for high-dimensional and high-order
+partial differential equations (PDEs) are primarily constrained by the O(dk) spatial
+derivative complexity and the O(P) memory overhead of backpropagation (BP).
+While randomized spatial estimators successfully reduce the spatial complexity to
+O(1), their reliance on first-order optimization still leads to prohibitive memory
+consumption at scale. Zeroth-order (ZO) optimization offers a BP-free alternative;
+however, naively combining randomized spatial operators with ZO perturbations
+triggers a variance explosion of O(1/ε2), leading to numerical divergence. To
+address these challenges, we propose the Stochastic Dimension-free Zeroth-order
+Estimator (SDZE), a unified framework that achieves dimension-independent
+complexity in both space and memory. Specifically, SDZE leverages Common
+Random Numbers Synchronization (CRNS) to algebraically cancel the O(1/ε2)
+variance by locking spatial random seeds across perturbations. Furthermore, an
+implicit matrix-free subspace projection is introduced to reduce parameter explo-
+ration variance from O(P) to O(r) while maintaining an O(1) optimizer memory
+footprint. Empirical results demonstrate that SDZE enables the training of 10-
+million-dimensional PINNs on a single NVIDIA A100 GPU, delivering significant
+improvements in speed and memory efficiency over state-of-the-art baselines.
+1
+Introduction
+The curse-of-dimensionality (CoD) refers to the computational and memory challenges when dealing
+with high-dimensional problems that do not exist in low-dimensional settings. The term was first intro-
+duced in 1957 by Richard E. Bellman [Bellman, 1957, 1962] to describe the exponentially increasing
+costs due to high dimensions. In the context of scientific computing, solving high-dimensional
+and high-order partial differential equations (PDEs)—such as the Hamilton-Jacobi-Bellman (HJB)
+equation in stochastic optimal control, the Fokker-Planck equation in stochastic analysis, and the
+Black-Scholes equation in mathematical finance—poses a grand challenge. Physics-Informed Neural
+Networks (PINNs) [Raissi et al., 2019b] have emerged as a highly practical paradigm in solving
+PDEs problems in general form, enabling mesh-free solutions and handling complex geometries.
+Due to their flexibility, PINNs have the theoretical ability to approximate high-dimensional PDEs
+solutions [Beck et al., 2021a, Han et al., 2018b, Raissi and Karniadakis, 2018]. However, standard
+PINNs inevitably succumb to the CoD during optimization. Evaluating high-dimensional, high-order
+differential operators (e.g., Dkuθ(x)) via back-propagation (BP), or reverse-mode automatic dif-
+ferentiation (AD), incurs a derivative tensor scaling of O(dk) and a computation graph scaling of
+O(2k−1L), severely restricting their scalability to extreme dimensions.
+To scale up PINNs for arbitrary high-dimensional PDEs, an elegant lineage of dimension-independent
+randomized spatial estimators has been developed to amortize the computational cost. Stochastic
+Dimension Gradient Descent (SDGD) [Hu et al., 2023a] mitigates the bottleneck by randomizing
+over input dimensions. Score-PINN and Hutchinson Trace Estimation (HTE) [Hutchinson, 1989b,
+Preprint.
+arXiv:2603.24002v1  [cs.LG]  25 Mar 2026
+5e21e3
+1e4
+1e5
+1e6
+Dimension d
+102
+103
+104
+GPU Peak Memory (MB)
+(a)
+STDE
+SDGD
+HTE
+FOBAD
+5e21e3
+1e4
+1e5
+1e6
+Dimension d
+3 × 101
+4 × 101
+5 × 101
+6 × 101
+Wall-clock Time (s)
+(b)
+STDE
+SDGD
+HTE
+FOBAD
+Figure 1: Scalability bottlenecks of existing first-order high-dimensional PDE solvers (STDE, SDGD,
+HTE, FOBAD) as problem dimension d grows from 5 × 102 to 106. (a) GPU peak memory (MB)
+grows rapidly with dimension, leading to catastrophic OOM failures at extreme scales. (b) Wall-clock
+time (s) likewise increases sharply, revealing severe computational overhead.
+Hu et al., 2024a] seamlessly integrate Rademacher and Gaussian masks to unbiasedly transform
+massive Hessian and Jacobian evaluations into lightweight vector products. Culminating this lineage,
+the Stochastic Taylor Derivative Estimator (STDE) [Shi et al., 2024] introduced forward Taylor-mode
+AD with sparse random jets to efficiently contract arbitrary differential operators. Collectively, these
+breakthroughs triumphantly suppressed the spatial derivative evaluation complexity from exponential
+O(dk) to a constant O(1).
+Despite their mathematical elegance in spatial estimation, this lineage of randomized solvers faces a
+fundamental limitation: a persistent reliance on first-order (FO) optimizers, such as SGD [Amari,
+1993] or Adam [Kingma and Ba, 2015]. Although these solvers effectively amortize spatial complex-
+ity, the use of FO optimizers for updating θ remains memory-intensive. Specifically, the gradient
+computations and evaluation traces required by backpropagation (BP) lead to exorbitant memory
+overhead [Zhao et al., 2024]. As empirically analyzed in Figure 1, the mixed-mode AD paradigm
+encounters several critical limitations at extreme scales. First, the Autodiff Memory Wall (Fig. 1a)
+arises because BP through randomized operators forces deep learning compilers to cache massive
+evaluation traces, triggering OOM failures well before 106 dimensions. Second, a Compilation
+Bottleneck (Fig. 1b) occurs when nesting BP over high-order forward Taylor graphs, inducing a com-
+binatorial explosion in compilation time. Finally, these constraints lead to Reduced Expressivity (Fig.
+1c); for instance, architectures like STDE must employ 1D-convolutional weight sharing to remain
+feasible at 1-million dimensions, sacrificing model capacity for memory efficiency. This architectural
+castration destroys the fully connected network’s expressivity, resulting in severe underfitting.
+To fundamentally dismantle this BP memory bottleneck, inspiration can be drawn from recent
+breakthroughs in Large Language Models (LLMs). LLMs, such as the GPT and LLaMA series
+[Zhang et al., 2022, Touvron et al., 2023], have recently demonstrated impressive capabilities in
+natural language processing tasks and beyond [Solaiman et al., 2019, Achiam et al., 2023]. These
+models utilize deep learning, particularly the transformer architecture [Vaswani et al., 2017], to
+learn complex patterns in language data. However, LLMs can struggle with specialized tasks that
+require domain-specific knowledge [Shen et al., 2024]. Fine-tuning presents an effective solution by
+slightly adjusting pre-trained LLMs with domain data, enabling them to adapt to specific tasks more
+effectively.
+For fine-tuning, FO optimizers, such as SGD [Amari, 1993] or Adam [Kingma and Ba, 2015], are
+commonly used to achieve promising performance on domain datasets. However, as LLMs grow in
+size, FO optimizers demand increasingly memory consumption due to the gradient computations
+required by backpropagation (BP) [Zhao et al., 2024]. Additionally, they are unable to directly handle
+non-differentiable objectives. To enhance memory efficiency, MeZO [Malladi et al., 2023] first
+introduces the zeroth-order (ZO) optimizer to LLM fine-tuning without BP. It only requires forward
+passes and calculates gradient estimates using finite differences of training loss values, enabling it to
+2
+directly handle non-differentiable objectives. Nevertheless, the variance of ZO gradient estimates
+scales linearly with the perturbation dimension, which corresponds to the number of model parameters
+(P). This can become extremely large in LLMs, leading to significant performance degradation
+compared to FO optimizers [Gautam et al., 2024, Jiang et al., 2024, Liu et al., 2024].
+Reducing the variance of ZO gradient estimates generally results in faster convergence [Yue et al.,
+2023]. There are two main attempts to addressing the high variance of ZO gradient estimates.
+The first approach involves increasing batch size alongside training steps, which reduces gradient
+noise and variance in ZO gradient estimates [Gautam et al., 2024, Jiang et al., 2024]. However,
+this leads to significant runtime and memory costs due to the large batch size in the later training
+stages. The second approach focuses on perturbing fewer parameters by employing sparse parameter
+perturbations, such as random and sparse pruning masks [Liu et al., 2024] and block-coordinate
+perturbations [Zhang et al., 2024], or by reducing the number of trainable parameters through
+techniques like parameter-efficient fine-tuning (PEFT) [Malladi et al., 2023, Zhang et al., 2024] and
+tensorized adapters [Yang et al., 2024]. Recent theoretical advancements have proposed using random
+projections to lessen the dimensionality dependence in ZO optimizers [Nozawa et al., 2025, Roberts
+and Royer, 2023, Kozak et al., 2021] by applying low-dimensional perturbations in random subspaces.
+Nonetheless, a major drawback of this approach is the need to store a huge projection matrix that
+scales with model parameter dimensionality (O(P × r)), making it impractical for fine-tuning large
+LLMs, and similarly prohibitive for scaling extreme-dimensional PINNs without instantly nullifying
+the O(1) memory benefits.
+However, migrating this zeroth-order promise into the realm of dimension-independent PDE solvers
+triggers an even more fatal double-stochastic variance deadlock. First, on the parameter side, train-
+from-scratch PINNs suffer immensely from the aforementioned O(P) exploration variance. Second,
+on the spatial side, because the PDE operators (e.g., SDGD, STDE) are themselves evaluated via
+stochastic Monte Carlo sampling, calculating ZO finite differences between two independent forward
+passes causes the intrinsic spatial truncation noise to be aggressively amplified by the infinitesimal
+perturbation step size ϵ. This doubly stochastic collision leads to infinite variance (O(1/ϵ2)) and
+immediate NaN divergence (Figure 1d).
+To resolve these formidable challenges, we propose the Stochastic Dimension-free Zeroth-order
+Estimator (SDZE), completing the final missing piece of dimension-independent PDE solvers. SDZE
+acts as a universal, 100% backprop-free meta-optimizer that seamlessly upgrades existing baselines
+(SDGD, Score-PINN, HTE, STDE) to infinite-memory solvers by achieving an unprecedented Double
+Variance Annihilation. Our main contributions are summarized as follows:
+• Exact Spatial Variance Cancellation via CRNS: We mathematically formulate the Com-
+mon Random Numbers Synchronization (CRNS) theorem to resolve the doubly-stochastic
+variance deadlock. By strictly locking identical spatial random seeds across symmetric
+zeroth-order perturbations, CRNS guarantees the exact algebraic cancellation of spatial
+truncation noise within the finite difference, elegantly eradicating the fatal O(1/ϵ2) variance
+singularity and ensuring stable convergence.
+• Implicit Matrix-Free Subspace-ZOO: To overcome the massive projection matrix storage
+bottleneck of recent random subspace ZO methods, SDZE dynamically projects parameter
+exploration onto low-rank subspaces via in-situ pseudo-random number generator (PRNG)
+reconstruction and associative forward tensor contractions. This drastically compresses
+the zeroth-order exploration variance from O(P) to O(r) while strictly preserving an
+absolute O(1) optimizer memory footprint, totally bypassing the intractable projection
+matrix materialization (O(P × r)).
+• Shattering the Expressivity Ceiling: By decoupling parameter optimization from spatial
+AD compilation and eliminating BP traces entirely, SDZE eradicates the need for archi-
+tectural compromises (e.g., 1D-convolutional weight sharing) originally designed to evade
+memory walls. This paradigm shift enables the first successful training of extreme-scale (up
+to 10-million-dimensional), fully-dense, and unshared PINNs on a single GPU—delivering
+orders-of-magnitude improvements in both wall-clock speed and peak memory efficiency
+over state-of-the-art first-order baselines.
+The rest of this paper is organized as follows. Section 2 reviews related work. Section 4 identifies
+the double-stochastic variance deadlock and introduces the CRNS and Implicit Subspace-ZOO
+3
+mathematical framework. Section 5 provides rigorous theoretical analysis of the variance cancellation.
+Extensive extreme-scale numerical experiments are presented in Section 6, followed by conclusions
+in Section 7.
+2
+Related works
+High-order and forward mode AD
+The idea of generalizing forward mode AD to high-order
+derivatives has existed in the AD community for a long time Bendtsen and Stauning [1997], Karcz-
+marczuk [1998], Wang [2017], Laurel et al. [2022]. However, accessible implementation for machine
+learning was not available until the recent implementation in JAX Bettencourt et al. [2019], Bradbury
+et al. [2018], which implemented the Taylor mode AD for accelerating ODE solver. There are also
+efforts in creating the forward rule for a specific operator like the Laplacian Li et al. [2023, 2024b].
+Randomization over the linearized part of the AD computation graph was considered in Oktay et al.
+[2021]. Forward mode AD can also be used to compute neural network parameter gradient as shown
+in Baydin et al. [2022].
+Randomized Gradient Estimation
+Randomization Martinsson and Tropp [2021], Murray et al.
+[2023], Ghojogh et al. [2021] is a common technique for tackling the curse of dimensionality for
+numerical linear algebra computation, which can be applied naturally in amortized optimization
+Amos [2023]. Hutchinson trace estimator Hutchinson [1989a] is a well-known technique, which
+has been applied to diffusion model Song et al. [2019] and PINNs Hu et al. [2024b]. Another case
+that requires gradient estimation is when the analytical form of the target function is not available
+(black box), which means AD cannot be applied. The method of zeroth-order optimization Liu et al.
+[2020] can be used in this case, as it only requires evaluating the function at arbitrary input. It is also
+useful when the function is very complicated like in the case of a large language model Malladi et al.
+[2024].
+Zeroth-order Gradient Estimation
+Zeroth-order (ZO) optimizers estimate gradients using only
+forward passes without backpropagation, offering substantial memory savings over standard first-
+order methods like SGD [Amari, 1993] or Adam [Kingma and Ba, 2015]. For instance, Malladi et al.
+[2023] successfully applied ZO optimization to fine-tune large language models (LLMs), restricting
+memory usage to inference levels. While ZO convergence theories are well-established [Nesterov
+and Spokoiny, 2017, Duchi et al., 2015, Liu et al., 2018, Ji et al., 2019], their rates typically degrade
+linearly with the number of trainable parameters, necessitating strategies to reduce gradient variance
+in high dimensions. To mitigate this, recent works have explored increasing batch sizes [Gautam
+et al., 2024, Jiang et al., 2024], utilizing sparse parameter perturbations [Liu et al., 2024, Zhang et al.,
+2024], or integrating parameter-efficient architectures like tensorized adapters [Yang et al., 2024].
+Additionally, some approaches leverage random projections into low-dimensional subspaces [Nozawa
+et al., 2025, Roberts and Royer, 2023, Kozak et al., 2021]; however, these typically require storing
+prohibitively large projection matrices. Consequently, extreme-scale LLM fine-tuning often combines
+ZO techniques with orthogonal memory-saving mechanisms, such as LoRA Hu et al. [2022], Wang
+et al. [2024], gradient sparsification [Sun et al., 2017], low-rank gradient projection [Zhao et al.,
+2024], FlashAttention [Dao et al., 2022], and optimizer state quantization [Dettmers et al., 2022b, Li
+et al., 2024a, Dettmers et al., 2024, 2022a].
+3
+Preliminaries
+3.1
+Notations
+Throughout this paper, scalars are denoted by non-bold letters (e.g., a, A), column vectors by
+bold lowercase letters (e.g., w), and matrices by bold uppercase letters (e.g., W ). We denote by
+N(0, I) the multivariate normal distribution with a zero mean vector and an identity covariance
+matrix. The vectorization of a matrix W , obtained by stacking its columns vertically, is denoted
+as vec(W ). The Kronecker product of matrices A and B is written as A ⊗B. For a random
+variable x, its expected value and variance are denoted by E[x] and Var[x], respectively. We
+use ∥x∥=
+pPn
+i=1 x2
+i to represent the ℓ2-norm of a vector x, ∥A∥for the spectral norm of a
+matrix A, and ∥A∥F =
+p
+⟨A, A⟩for the Frobenius norm. The class of s-times continuously
+differentiable functions with p-th derivatives being L-Lipschitz continuous over a set S is denoted by
+Cs,p
+L (S). Additionally, bdiag(A1, . . . , Al) represents a block diagonal matrix with diagonal blocks
+A1, . . . , Al. Our primary focus involves the fine-tuning of large foundation models Ding et al. [2023].
+These architectures typically comprise multiple layers, with the trainable parameters concatenated
+4
+into a single vector w = [w⊤
+1 , w⊤
+2 , . . . , w⊤
+l ]⊤∈Rd, where wi represents the flattened parameter
+vector of the i-th layer and d is the total parameter dimension. The training process corresponds to
+solving the optimization problem
+min
+w L(w),
+(1)
+where L(·) represents the loss function.
+3.2
+First-order gradient estimation
+Evaluating the gradients of complex neural objectives typically relies on first-order automatic differ-
+entiation (AD), which provides a systematic framework for differentiating compositions of known
+analytical primitives. Within this framework, a neural network Fθ : Rd →Rd′ is constructed as
+a composition of primitive functions Fi, each parameterized by θi. Assuming a linear computa-
+tion graph of the form F = FL ◦FL−1 ◦· · · ◦F1 with a uniform hidden dimension h, AD can
+be executed in two primary modes. In forward-mode AD, each primitive Fi is linearized via the
+Fréchet derivative ∂Fi : Rh →L(Rh, Rh), computing the Jacobian-vector product (JVP) defined as
+∂Fi(a)(v) =
+∂Fi
+∂x
+
+a v, with the primal a and the tangent v. This forms a linearized computation
+graph evaluating the composition
+∂F
+∂x v = [∂FL ◦∂FL−1 ◦· · · ◦∂F1](x)(v).
+(2)
+Computing the full Jacobian requires d independent JVPs, demanding O(max(d, h)) memory. Con-
+versely, backward-mode AD linearizes each primitive using the adjoint of the Fréchet derivative
+∂⊤Fi, computing the vector-Jacobian product (VJP) defined as ∂⊤Fi(a)(v⊤) = v⊤∂Fi
+∂x
+
+a, where
+v⊤is the cotangent. Executing in reverse order, this mode necessitates a prior forward pass to cache
+the evaluation trace {yi}L
+i=1, which increases the memory requirement to O(d+(L−1)h). Although
+efficient for scalar cost functions, recursively applying first-order AD to compute high-order input
+derivatives ∂kuθ
+∂xk introduces an exponential scaling bottleneck in both memory and computation that
+cannot be easily remedied.
+3.3
+Stochastic dimension gradient descent
+Addressing the spatial curse of dimensionality in partial differential equations (PDEs) requires
+amortizing the evaluation of high-dimensional differential operators. Stochastic Dimension Gradient
+Descent (SDGD) Hu et al. [2024c] achieves this by stochastically subsampling the input dimensions
+of an additive differential operator. Specifically, an operator D = PND
+j=1 Dj is approximated by the
+unbiased randomized operator
+˜DJ = ND
+|J|
+X
+j∈J
+Dj,
+(3)
+where J is a uniformly sampled index set and |J| represents the spatial batch size. During the
+automatic differentiation pass, non-sampled input dimensions are treated as constants, effectively
+reducing the memory requirement from O(2k−1(d + (L −1)h)) to an amortized scale of O(|J| ·
+2k−1(1 + (L −1)h)). While this dimensional subsampling successfully mitigates the linear scaling
+with respect to the input dimension d, the exponential scaling with respect to the differential order k
+remains a fundamental constraint when nested within first-order optimization routines.
+3.4
+Zeroth-order gradient estimation
+To circumvent the intractable memory caching necessitated by backward-mode AD, zeroth-order (ZO)
+gradient estimation techniques approximate gradients exclusively through random forward perturba-
+tions. A classical gradient-free approach is the simultaneous perturbation stochastic approximation
+(SPSA), which constructs an estimator over a minibatch B as
+b∇L(w; B) = L(w + ϵz; B) −L(w −ϵz; B)
+2ϵ
+z,
+(4)
+where z ∈Rd ∼N(0, Id) is a random perturbation vector and ϵ > 0 is the perturba-
+tion scale.
+This finite difference provides an unbiased estimator of the smoothed gradient
+∇Ez[L(w + ϵz)]. By requiring only two forward evaluations and bypassing the backward pass
+entirely, SPSA dramatically reduces memory consumption, yielding algorithms such as ZO-SGD:
+wt+1 = wt −ηt b∇L(wt; Bt).
+5
+However, isotropic full-space perturbations in RP yield gradient variance scaling O(P), causing
+fatal divergence for stiff PDEs parameterized by massive weight matrices. Recent theoretical
+advances [Nozawa et al., 2025, Roberts and Royer, 2023] propose low-dimensional random subspaces
+to mitigate this. The key idea projects perturbations onto a low-dimensional subspace spanned by a
+random projection matrix P ∈RP ×q with q ≪P:
+˜z = P z,
+z ∈Rq ∼N(0, Iq),
+(5)
+yielding the subspace SPSA estimator:
+b∇L(w, P ; B) = L(w + ϵP z; B) −L(w −ϵP z; B)
+2ϵ
+P z.
+(6)
+This compresses exploration variance from O(P) to O(q), yet necessitates storing the prohibitively
+large projection matrix P ∈RP ×q, which becomes impractical for extreme-dimensional PINNs with
+P ∼107 parameters.
+4
+Method
+To fundamentally overcome the O(dk) spatial derivative catastrophe inherent in extreme-dimensional
+PDEs and the O(P) memory explosion caused by reverse-mode automatic differentiation (AD), we
+introduce the Stochastic Dimension-free Zeroth-Order Estimator (SDZE). Orchestrating dimension-
+independent spatial operators and matrix-free random subspace zeroth-order optimization into a fully
+forward-only dynamical system, SDZE is strictly safeguarded by the Common Random Numbers
+Synchronization (CRNS) mechanism.
+4.1
+Phase I: Rigorous Formulation of Spatial Operator Amortization
+Consider a general high-order PDE defined over a physical domain X ⊂Rd, denoted as Dxu(x) =
+f(x). Let uθ(x) : Rd →Rd′ be a physics-informed neural network parameterized by weights
+θ ∈RP . The exact physics-informed mean squared error (MSE) residual loss is formally defined
+as:
+L(θ) = 1
+2Ex∼X
+
+∥Dxuθ(x) −f(x)∥2
+2
+
+.
+(7)
+Because exactly computing the high-order operator Dx via back-propagation incurs an intractable
+O(dk) computation graph, we construct a randomized spatial oracle ˜Dω,x governed by a random
+measure ω drawn from a complete probability space (Ω, F, Pω). This measure-theoretic construct
+guarantees strict operator unbiasedness: Eω∼Pω[ ˜Dω,xuθ(x)] = Dxuθ(x).
+Drawing profound inspiration from the Stochastic Dimension Gradient Descent (SDGD) paradigm
+[Hu et al., 2023a], we mathematically decouple the extreme-dimensional differential operator into NL
+separable dimensional components: Dxuθ(x) = PNL
+i=1 D(i)
+x uθ(x). For instance, the d-dimensional
+Laplacian decomposes into d univariate second-order derivatives (NL = d, D(i)
+x = ∂2/∂x2
+i ), whereas
+the Fokker-Planck or biharmonic operators expand to NL = O(d2) structural cross-terms.
+To elegantly bypass this O(NL) spatial evaluation bottleneck, we define a spatial random measure
+ω as a uniform sampling of an index subset I ⊂{1, 2, . . . , NL} without replacement, possessing a
+miniature cardinality b = |I| ≪NL. The randomized spatial oracle is thus formulated as an unbiased
+Monte Carlo estimator scaled by the combinatorial dimension ratio:
+˜DI,xuθ(x) = NL
+b
+X
+i∈I
+D(i)
+x uθ(x),
+such that
+EI
+h
+˜DI,xuθ(x)
+i
+= Dxuθ(x).
+(8)
+To ensure an unbiased estimation of the squared residual without materializing full interaction tensors,
+we employ double independent sampling. Given a joint spatial random seed ω = (ω1, ω2)
+i.i.d.
+∼
+Pω and a batch of collocation points x, the stochastically reconstructed scalar loss is formulated
+as:
+˜ℓω(θ; x) = 1
+2
+
+˜Dω1,xuθ(x) −f(x)
+⊤
+˜Dω2,xuθ(x) −f(x)
+
+.
+(9)
+We formally isolate the intrinsic spatial truncation noise field introduced by random sampling as
+ηω(θ; x) = ˜ℓω(θ; x)−L(θ; x), which intrinsically satisfies the zero-mean property Eω[ηω(θ; x)] =
+0 everywhere in RP . Crucially, grounded in Theorem 4.2 of the SDGD framework, the variance of
+this noise field strictly obeys a reciprocal scaling law governed by the spatial resources: σ2
+η(θ) =
+Varω,x[ηω(θ; x)] ≤O
+  1
+B + 1
+b
+
+, where B = |B| is the mini-batch size of collocation points.
+6
+4.2
+Phase II: Kronecker-Isomorphic Subspace Projection and Lazy Updates
+To completely sever the reverse-mode AD graph that triggers O(P) memory limits, we introduce
+zeroth-order parameter amortization. However, isotropic perturbations in the full space RP yield
+an intractable gradient variance Var(ˆg) ∝O(P). To circumvent this, SDZE constructs Dynamic
+Layer-wise Low-Rank Subspaces.
+For the l-th network layer with a massive parameter matrix W (l) ∈Rml×nl, we specify a target rank
+rl ≪min(ml, nl). To mitigate the mathematical ill-posedness of low-rank approximations on highly
+non-square matrices commonly found in extreme-dimensional PDEs (e.g., coordinate mapping layers
+where m1 ≫n1), we implement a bijective Reshaping Strategy T . This algebraically transforms
+W (l) into an approximately square matrix W ′(l) ∈Rm′
+l×n′
+l (where m′
+l ≈n′
+l and mlnl = m′
+ln′
+l)
+prior to subspace decomposition, maximizing the expressive capacity of the rank rl.
+To balance subspace exploration diversity and the formidable computational overhead of QR decom-
+positions, SDZE employs an Annealed Lazy Subspace Update strategy controlled by a frequency hy-
+perparameter F ≥1. At optimization step t, the projection bases are conditionally generated:
+
+U (l)
+t , V (l)
+t
+
+=
+(
+QR(R(l)
+1,t), QR(R(l)
+2,t)
+if t ≡0
+(mod F),
+
+U (l)
+t−1, V (l)
+t−1
+
+otherwise,
+(10)
+where R(l)
+1,t and R(l)
+2,t are standard Gaussian matrices. The QR decomposition strictly maps the
+bases onto orthogonal Stiefel manifolds: U (l)
+t
+⊤U (l)
+t
+= Irl and V (l)
+t
+⊤V (l)
+t
+= Irl. Conversely, the
+low-dimensional core perturbation matrix Z(l)
+t
+∈Rrl×rl is drawn continuously at every single step
+from N(0, Irl) to maintain active local exploration.
+The effective perturbation matrix for the l-th layer is mathematically synthesized as ∆W (l)
+t
+=
+T −1
+
+U (l)
+t Z(l)
+t V (l)
+t
+⊤
+. To rigorously map these layer-wise matrices to the global parameter vector
+θ ∈RP , we utilize the Kronecker product (⊗) and vectorization operator. The global parameter
+perturbation ∆θt ∈RP is mathematically isomorphic to a projection from a low-dimensional
+Gaussian vector zt ∈Rq:
+∆θt = Ptzt,
+where
+Pt = bdiag
+
+V (1)
+t
+⊗U (1)
+t
+, . . . , V (L)
+t
+⊗U (L)
+t
+
+∈RP ×q,
+(11)
+where zt = [vec(Z(1)
+t
+)⊤, . . . , vec(Z(L)
+t
+)⊤]⊤∼N(0, Iq) and q = PL
+l=1 r2
+l ≪P is the total
+intrinsic subspace capacity. Crucially, the mixed-product property of Kronecker products guarantees
+that P⊤
+t Pt = Iq, formally establishing Pt as an exact orthogonal projection matrix.
+4.3
+Phase III: The Doubly Stochastic Deadlock and CRNS Mechanism
+Synthesizing spatial and parametric randomizations inadvertently exposes a catastrophic doubly
+stochastic deadlock. If a naive zeroth-order finite difference evaluates the perturbed states (θ ±
+ϵPtzt) using independent spatial seeds (ω+ and ω−), the spatial truncation discrepancy σ2
+ω(θ) =
+Varω[˜ℓω(θ)] is aggressively amplified. The variance of this naive directional derivative diverges
+critically as ϵ →0:
+Varω+,ω−
+
+ˆδnaive
+t
+
+≈σ2
+ω(θ + ϵPtzt) + σ2
+ω(θ −ϵPtzt)
+4ϵ2
+≈σ2
+ω(θ)
+2ϵ2
+ϵ→0
+−−−→∞.
+(12)
+To definitively shatter this O(ϵ−2) mathematical deadlock, SDZE forcibly institutes the Common
+Random Numbers Synchronization (CRNS) mechanism. At the deep learning compiler level, we
+strictly lock and reuse the absolute identical spatial random measure ω across the opposing evaluations.
+The SDZE scalar directional derivative ˆδt and the global pseudo-gradient ˆgt ∈RP are formulated
+as:
+ˆδt =
+˜ℓω(θ + ϵPtzt; x) −˜ℓω(θ −ϵPtzt; x)
+2ϵ
+,
+ˆgt = ˆδt · (Ptzt).
+(13)
+The global parameters are subsequently updated via θt+1 = θt −αˆgt.
+7
+4.4
+Phase IV: Implicit Associative Forward Pass for Deep Networks
+While the global matrix Pt ∈RP ×q provides an elegant theoretical abstraction, evaluating the
+forward passes ˜ℓω(θ ± ϵPtzt) using an explicitly instantiated Pt (or explicitly constructing ∆W (l))
+requires O(ml × nl) dense matrices. For extreme-dimensional PDE inputs (e.g., m1 = 107), this
+instantaneously triggers a hardware Out-Of-Memory (OOM) crash.
+Evading this limit, SDZE utilizes tensor associativity to fundamentally rewrite the forward propagation
+logic, ensuring the theoretical projection matrix Pt is never materialized. Assuming the parameter
+matrix is square enough to omit the reshaping strategy T for brevity, let H(l−1) ∈RB×ml be the
+hidden activation from the previous layer with batch size B, and σ(·) be the non-linear activation.
+The perturbed forward pass at layer l is implicitly reformulated as an optimized recursive tensor
+contraction:
+H(l)
+±
+|{z}
+B×nl
+= σ
+
+
+
+
+
+
+
+H(l−1)W (l)
+|
+{z
+}
+B×nl
+±ϵ
+
+(H(l−1)U (l)
+t )
+|
+{z
+}
+B×rl
+Z(l)
+t
+
+|
+{z
+}
+B×rl
+V (l)
+t
+⊤
+
+
+
+
+
+
+
+.
+(14)
+By prioritizing the inner product (H(l−1)U (l)
+t ), the astronomically high physical dimension ml
+is instantaneously collapsed into the negligible subspace rank rl, yielding a miniature B × rl
+tensor. Throughout the entire continuous forward lifecycle, no matrix scaling with ml × nl is
+ever materialized. Consequently, the optimizer’s dynamic memory peak is strictly bounded to
+O
+ B · max(rl, nl, ml)
+
+, achieving absolute O(1) parametric memory overhead while flawlessly
+executing the exact mathematical mapping defined by Eq 11.
+To explicitly quantify the memory efficiency, consider a network with L layers where the parameter
+matrix of the l-th layer is W (l) ∈Rml×nl. Under the standard forward-only paradigm with explicit
+∆W (l) materialization, the memory requirement would be PL
+l=1 mlnl = O(P). In contrast, SDZE’s
+implicit formulation only requires storing the intermediate tensor H(l−1)U (l)
+t
+∈RB×rl and the core
+perturbation Z(l)
+t
+∈Rrl×rl, resulting in a total auxiliary memory of O
+ B · PL
+l=1 rl + PL
+l=1 r2
+l
+
+=
+O(B · rmax + q), where rmax = maxl rl. Since rl ≪min(ml, nl) and q ≪P by design, SDZE
+achieves near-constant memory overhead independent of the parameter dimension P.
+4.5
+Theoretical Guarantees: Dual Variance Annihilation and Subspace Alignment
+We now rigorously formulate how the architectural synergy within SDZE mathematically annihilates
+both spatial and parametric variances. We adopt standard regularity assumptions:
+Assumption 1. (1) The exact loss L(θ) is locally second-order smooth with an L2-Lipschitz contin-
+uous Hessian. (2) The spatial truncation noise manifold ηω(θ) is locally third-order continuously
+differentiable, with an Lη-Lipschitz continuous gradient and bounded variance σ2
+η.
+Theorem 1 (Exact Algebraic Cancellation of Spatial Variance via CRNS). Under Assumption 1,
+the CRNS mechanism exactly annihilates the O(ϵ−2) spatial variance singularity. Furthermore, the
+symmetric finite difference algebraically eliminates the secondary structural noise induced by the
+stochastic spatial Hessian Hη(θ) = ∇2
+θηω(θ), yielding:
+Varω,z(ˆδt) ≤Eω,z
+h
+∥⟨∇θηω(θ), Ptzt⟩∥2i
++ O(ϵ4L2
+ηq2).
+(15)
+Proof Sketch. Because ω (the subsets of sampled dimensions I1, I2) is strictly locked via CRNS,
+ηω(θ) operates as a deterministic smooth manifold evaluated at symmetrically perturbed coordinates.
+Substituting ˜ℓω(θ) = L(θ) + ηω(θ) into Eq 13, the forward and backward perturbed evaluations on
+the identical locked measure ω expand via third-order multivariate Taylor approximation as:
+˜ℓω(θ ± ϵPtzt) = ˜ℓω(θ) ± ϵ⟨∇θ˜ℓω(θ), Ptzt⟩+ ϵ2
+2 z⊤
+t P⊤
+t H˜ℓ(θ)Ptzt ± O(ϵ3).
+(16)
+Subtracting the negative perturbation from the positive precisely annihilates both the zeroth-
+order base noise ηω(θ) (contained within ˜ℓω(θ)) and the second-order stochastic Hessian noise
+8
+ϵ2
+2 z⊤
+t P⊤
+t H˜ℓ(θ)Ptzt. The residual seamlessly factors out the infinitesimal denominator 2ϵ, yield-
+ing:
+ˆδt = ⟨∇θL(θ), Ptzt⟩+ ⟨∇θηω(θ), Ptzt⟩+ O(ϵ2).
+(17)
+The variance is thus fundamentally decoupled from the limit ϵ →0.
+■
+Theorem 2 (Subspace Gradient Alignment and Variance Compression). Mapped by the global
+orthogonal projection Pt, the SDZE expected gradient precisely recovers the back-propagation
+gradient projected into the Stiefel subspace, bounded by the local curvature L2:
+(Approximation Error)
+Eω,z[ˆgt] −PtP⊤
+t ∇L(θt)
+
+2 ≤ϵ2
+6 L2(q + 4)2.
+(18)
+Crucially, the second moment of SDZE’s gradient estimate and its expected angle alignment (cosine
+similarity) with the exact gradient strictly depend on the low-dimensional subspace capacity q,
+completely bypassing the massive parameter count P:
+(Variance Compression)
+Eω,z
+
+∥ˆgt∥2
+2
+
+= (q + 2)
+P⊤
+t ∇L(θt)
+2
+2
++ O(ϵ4L2
+1q3) + Varω (⟨∇ηω, Ptzt⟩Ptzt) ,
+(19)
+(Cosine Alignment)
+Eω,z
+
+⟨∇L(θt), ˆgt⟩2
+∥P⊤
+t ∇L(θt)∥2
+2∥ˆgt∥2
+2
+
+≈1
+q .
+(20)
+Proof Sketch. By definition, P⊤
+t Pt = Iq and zt ∼N(0, Iq). Applying Stein’s Lemma (Gaussian
+integration by parts), the expected gradient precisely recovers the subspace projection PtP⊤
+t ∇L,
+with the third-order residual bounded by ϵ2
+6 L2(q + 4)2. For the second moment, full-space isotropic
+ZOO yields an expected variance proportion of O(P). Conversely, applying Isserlis’ Theorem (fourth
+moments of standard Gaussian vectors) to ˆgt yields an exact multiplicative factor of (q +2) applied to
+the projected true gradient. Because q ≪P, the exploration variance O(P) is decisively compressed
+to O(q), and the expected cosine similarity angle error is mathematically bounded to 1/q, securing
+exceptional optimization fidelity.
+■
+Theorem 3 (Global Non-convex Convergence Guarantee). Let the learning rate be appropriately
+annealed as αt = O(1/√tq). Let F ≥1 denote the lazy subspace update frequency. The sequence
+{θt} generated by SDZE globally converges to a stationary point of the non-convex PDE residual
+landscape. After T iterations, the expected projected gradient norm is bounded entirely independently
+of P:
+1
+T
+T
+X
+t=1
+E
+P⊤
+⌊t/F ⌋∇L(θt)
+
+2
+2
+
+≤O
+ √q
+√
+T
+
++ O
+ √q
+√
+T
+ 1
+B + 1
+b
+
++ O
+ ϵ2L2q2
+.
+(21)
+5
+Theoretical Analysis
+In this section, we analyze the convergence of our proposed SDZE framework. Because SDZE
+effectively replaces the first-order optimizers (e.g., Adam) in high-dimensional PDE solvers with a
+zeroth-order subspace estimator while keeping the spatial randomized estimators intact, the theoretical
+foundation of SDZE is a rigorous synthesis of the spatial amortization theory (inherited from SDGD)
+and the parametric subspace zeroth-order estimation theory (inherited from SubZero).
+Crucially, while SDZE does not perform explicit backpropagation, the theoretical properties (un-
+biasedness and bounded variance) of the latent exact spatial gradients fundamentally govern the
+behavior of our zeroth-order subspace estimators that approximate them.
+5.1
+Spatial Amortization is Unbiased and Reduces Underlying Variance
+In previous sections, we have shown that the latent spatial gradients underlying the spatial amortization
+schemes are unbiased:
+Theorem 1. The latent exact spatial gradients gI(θ) and gI,J(θ) parameterized by index sets I, J,
+are unbiased estimators of the full-batch spatial gradient g(θ) using all PDE terms, i.e., the expected
+values of these latent targets match that of the full-batch gradient, EI[gI(θ)] = EI,J[gI,J(θ)] = g(θ).
+These unbiased latent targets are subsequently approximated by our zeroth-order estimator ˆg(θ).
+Proof. We prove the theorem in Section A.1.
+9
+In this subsection, we aim to show that the spatial sampling in SDZE provides a randomized loss
+landscape whose expected geometry matches the full PDE. While SDZE performs Zeroth-Order
+Gradient Descent (ZO-GD) rather than SGD, the variance of the underlying spatial loss dictates the
+boundaries of the ZO exploration. Specifically, |B|-point + |I|-term where |B|, |I| ∈Z+ with the
+same |B| × |I| quantity has the same memory cost, e.g., 50-point-100-terms and 500-point-10-terms.
+In particular, we shall demonstrate that properly choosing the batch sizes of residual points |B|
+and PDE terms |I| under the constant memory cost (|B| × |I|) can lead to reduced spatial gradient
+variance and accelerated zeroth-order convergence compared to previous practices that use sampling
+over points only.
+We assume that the total full batch is with Nr residual points {xn}Nr
+n=1 and NL PDE terms L =
+PNL
+i=1 Li, then the loss function for PINN optimization is
+1
+2NrN2
+L
+PNr
+n=1 (Luθ(xn) −R(xn))2 ,
+where we normalize over both the number of residual points Nr and the number of PDE terms
+NL, which does not impact the directions of the gradients. More specifically, the original PDE
+is PNL
+i=1 Liu(x) = R(x), we normalize it into
+1
+NL
+PNL
+i=1 Liu(x) =
+1
+NL R(x). The reason for
+normalization lies in the increase of both dimensionality and the number of PDE terms. As these
+increase, the scale of the residual loss and its pseudo-gradient becomes exceptionally large, leading
+to the issue of gradient explosions. Therefore, we normalize the loss by the dimensionality and the
+number of PDE terms to mitigate this problem. Additionally, during testing, we focus on relative
+errors, and normalization here is, in essence, a normalization concerning dimensionality following
+the relative error we care about.
+The full batch analytical spatial gradient (which our SDZE estimator aims to approximate) is given
+by
+g(θ) :=
+1
+NrN 2
+L
+Nr
+X
+n=1
+(Luθ(xn) −R(xn)) ∂
+∂θ Luθ(xn)
+=
+1
+NrN 2
+L
+Nr
+X
+n=1
+(Luθ(xn) −R(xn))
+ NL
+X
+i=1
+∂
+∂θ Liuθ(xn)
+!
+.
+(22)
+If the random index sets I ⊂{1, 2, . . . , NL} and B ⊂{1, 2, . . . , Nr} are chosen, then the exact
+spatial gradient surrogate with |B| residual points and |I| PDE terms using these index sets is
+gB,I(θ) =
+1
+|B||I|NL
+X
+n∈B
+(Luθ(xn) −R(xn))
+ X
+i∈I
+∂
+∂θ Liuθ(xn)
+!
+,
+(23)
+where | · | computes the cardinality of a set. It is straightforward to show that EB,I[gB,I(θ)] = g(θ).
+Although SDZE operates completely gradient-free, establishing the unbiasedness and variance of this
+underlying analytical surrogate gB,I(θ) is mathematically requisite to bounding the behavior of its
+ZO finite difference approximation.
+Theorem 2. For the random index sets (B, I) where I ⊂{1, 2, . . . , NL} is that for indices of PDE
+terms/dimensions and B ⊂{1, 2, . . . , Nr} is that for indices of residual points, then
+VarB,I[gB,I(θ)] = C1|I| + C2|B| + C3
+|B||I|
+,
+(24)
+where Var computes the variance of a random variable, C1, C2, C3 are constants independent of
+B, I but dependent on model parameters θ.
+Proof. We prove the theorem in Section A.2.
+Theorem 2 focuses on the underlying spatial gradient variance after fixing the current model parameter
+θ, i.e., given θ at the current epoch, we investigate the underlying spatial variance at the next
+optimization round, which directly dictates the truncation noise within the zeroth-order estimator.
+Intuitively, the variance tends to decrease as the batch sizes (|B|, |I|) increase, and it converges to
+zero for |B|, |I| →∞, where we considered sampling with replacement to make the theorem clear.
+Further, the underlying gradient variance can be rewritten as C1
+|B| + C2
+|I| +
+C3
+|B||I|. C1 is the variance
+from points, and therefore, sampling more points, i.e., increasing |B|, can reduce it. Similarly, C2 is
+10
+the variance from PDE terms/dimensions. C3 is related to the variance due to the correlation between
+sampling points and PDE terms/dimensions.
+This verifies that spatial amortization can be regarded as another form of stochastic sampling over
+PDE terms, serving as a complement to the commonly used sampling over residual points. Let us
+take the extreme cases as illustrative examples. The first extreme case is when the PDE terms have
+no variance, meaning that the terms
+∂
+∂θLiuθ(xn) are identical for all i after we fix n, i.e., C2 = 0,
+and the variance becomes C1|I|+C3
+|B||I|
+. In this case, if a memory budget of, for example, |B||I| = 100
+units is given, the optimal choice would be to select 100 points and one PDE term with the minimum
+variance, i.e., we obtain the lowest variance by choosing |B| = 100 and |I| = 1. Choosing more
+PDE terms would not decrease the spatial variance and would be less effective than using the entire
+memory budget for sampling points. Conversely, if the points have no variance in terms of the
+gradient they induce, i.e., C1 = 0, the optimal choice would be one point and 100 PDE terms, i.e.,
+|I| = 100 and |B| = 1. In practice, the selection of residual points and PDE terms will inevitably
+introduce some variance. Therefore, in the case of a fixed memory cost, the choice of batch size for
+PDE terms and residual points involves a tradeoff. Thus, there exists an optimal selection strategy to
+minimize the overall underlying spatial variance since the choices of batch sizes are finite.
+5.2
+Bounding the Neural Network Derivatives for Zeroth-Order Approximation
+To establish the convergence of unbiased zeroth-order gradient descent, we require either Lipschitz
+continuity of the gradients Lei et al. [2019] or bounded variances Fehrman et al. [2020], Mertikopoulos
+et al. [2020], with the latter leading to faster convergence. To prove this property, we need to take
+the following steps to establish the smoothness of the underlying spatial loss landscape. Firstly, we
+define the neural network serving as the surrogate model in PINN.
+Definition 1. (Neural Network). A deep neural network (DNN) uθ : x = (x1, . . . , xd) ∈Rd 7→
+uθ(x) ∈R, parameterized by θ of depth L is the composition of L linear functions with element-wise
+non-linearity σ, is expressed as uθ(x) = WLσ(WL−1σ(· · · σ(W1x) · · · )), where x ∈Rd is the
+input, and Wl ∈Rml×ml−1 is the weight matrix at l-th layer with d = m0 and mL = 1. The
+parameter vector θ is the vectorization of the collection of all parameters. We denote h as the
+maximal width of the neural network, i.e., h = max(mL, · · · , m0).
+For the nonlinear activation function σ, the residual ground truth R(x), we assume the follow-
+ing:
+Assumption 5.1. We assume that the activation function is smooth and |σ(k)(x)| ≤1 and σ(k)
+is 1-Lipschitz, for all 0 ≤k ≤n, where n is the highest order of the PDE under consideration,
+σ(k) denotes the k-th order derivative of σ, e.g., the sine and cosine activations. We assume that
+|R(x)| ≤R for all x ∈Ωwhere R is a constant.
+Remark. The sine and cosine functions naturally satisfy the aforementioned conditions. As for the
+hyperbolic tangent (tanh) activation function, when the order n of the PDE is determined, there
+exists a constant Cn such that the activation function Cn tanh(x) satisfies the given assumptions.
+This constant can be absorbed into the weights of the neural network. This is because both the tanh
+function and its derivatives up to order n are bounded.
+Assumption 5.1 gives the boundedness of the activation function σ and the residual ground truth
+R(x). Furthermore, to establish the underlying spatial variance bounds, we also need to assume the
+boundedness of the PDE differential operators Li where L = PNL
+i=1 Li, as follows.
+Assumption 5.2. We assume the highest-order derivative in the PDE operator L = PNL
+i=1 Li is
+n. We view each Li as
+
+x, u(x), ∂u(x)
+∂x , · · · , ∂nu(x)
+∂xn
+
+7→Li
+
+x, u(x), ∂u(x)
+∂x , · · · , ∂nu(x)
+∂xn
+
+, which
+is a mapping Rd+1+d+···+dn →R since x ∈Rd, ∂nu(x)
+∂xn
+∈Rdn. Then, we assume that each PDE
+operator Li is bounded in the sense that if its input space is compact, then the output space of Li is
+bounded.
+The motivation is that x is in a compact domain, i.e., the finite set of training residual/collocation
+points, since the training is finished in finite time. Due to Lemma 5.2, high-order derivatives of the
+neural network, i.e., ∂nuθ(x)
+∂xn
+, can also be bounded in a compact domain by bounded optimization
+trajectory assumption stated later in Theorem 3, i.e., the parameter θ is assumed to be bounded during
+optimization. Combining these guarantees the PINN residual’s and spatial gradient’s boundedness
+11
+throughout the optimization, which crucially prevents the finite difference variance in SDZE from
+exploding Fehrman et al. [2020].
+Lemma. (Bounding the Analytical Neural Network Derivatives) Consider the neural network defined
+as Definition 1 with parameters θ, depth L, and width h, then the underlying analytical network’s
+derivatives can be strictly bounded as follows.
+vec
+ ∂n
+∂xn uθ(x)
+ ≤(n −1)!dn−1(L −1)n−1M(L)
+L−1
+Y
+l=1
+M(l)n,
+(25)
+vec
+ ∂
+∂θ
+∂n
+∂xn uθ(x)
+ ≤h2n!dn(L −1)nM(L)
+L−1
+Y
+l=1
+M(l)n+1 max {∥x∥, 1} ,
+(26)
+where M(l) = max {∥Wl∥, 1}, n is the derivative order, the norms are all vector or matrix ℓ2 norms
+and vec denotes vectorization.
+Proof. The proof is presented in Section A.3.
+From the boundedness of the exact derivatives of the neural network in PINN given by Lemma 5.2, we
+can infer that the zeroth-order estimator’s underlying targets are universally bounded since its norm
+is governed by the projection of the analytical gradient. Next, we define the SDZE trajectory, and
+we will demonstrate the convergence of the zeroth-order trajectory based on the subspace estimators
+applied to our randomized spatial losses.
+Definition 2. (SDZE Zeroth-Order Trajectory) Given step sizes (learning rates) {γn}∞
+n=1, and the
+initialized PINN parameters θ1, then the backprop-free update rules of the SDZE zeroth-order descent
+are
+θn+1 = θn −γnˆgB,I(θn),
+(27)
+θn+1 = θn −γnˆgB,I,J(θn),
+(28)
+respectively. Here, ˆgB,I(θ) and ˆgB,I,J(θ) are the SDZE zeroth-order subspace estimators evaluat-
+ing the stochastic spatial losses via finite differences. Their expectations closely approximate the
+underlying exact spatial gradient gB,I(θ) given in equation (23), and the analytical double-sampled
+spatial gradient is defined as:
+gB,I,J(θ) =
+1
+|B||I|NL
+X
+n∈B
+
+NL
+|J|
+
+X
+j∈J
+Ljuθ(xn)
+
+−R(xn)
+
+
+ X
+i∈I
+∂
+∂θ Liuθ(xn)
+!
+,
+(29)
+where B is the index set sampling over the residual points, while I and J sample the PDE terms in
+the spatial loss evaluations. Note that in SDZE, the explicit computation of
+∂
+∂θ inside g is completely
+bypassed and naturally resolved via the zeroth-order evaluations.
+Since the PINN optimization landscape is generally nonconvex, we consider the convergence to
+the regular minimizer defined as follows. Kawaguchi Kawaguchi [2016] demonstrates that such a
+“regular minimizer” can be good enough in practice.
+Definition 3. (Regular Minimizer) In PINN’s general nonconvex optimization landscape. We say
+that a local minimizer θ∗is a regular minimizer if H(θ∗) ≻0, i.e., the PINN loss function’s Hessian
+matrix at θ∗is positive definite.
+Theorem 3. (Convergence of SDZE under Bounded Spatial and Subspace Variance) Assume As-
+sumptions 5.1 and 5.2 hold, fix some tolerance level δ > 0, suppose that the SDZE zeroth-order
+trajectories given in equations (27, 28) are bounded, i.e., ∥W n
+l ∥≤M(l) for all epoch n where the
+collection of all {W n
+l }L
+l=1 is θn, and that the regular minimizer of the PINN loss is θ∗as defined in
+Definition 3, and that the SDZE step size follows the form γn = γ/(n + m)p for some p ∈(1/2, 1]
+and large enough γ, m > 0, then
+1. There exist neighborhoods U and U1 of θ∗such that, if θ1 ∈U1, the event E∞=
+{θn ∈U for all n ∈N} occurs with probability at least 1 −δ.
+2. Conditioned on E∞, we have E[∥θn −θ∗∥2|E∞] ≤O(1/np).
+Proof. The proof is presented in Section A.4. By demonstrating that the analytical spatial gradients
+are strictly bounded, we simultaneously bound the variance of the zeroth-order finite differences via
+Theorem 5, satisfying the requirements for global convergence.
+12
+Remark. The convergence rate of the SDZE zeroth-order stochastic descent is O(1/np), where
+O represents the constant involved, including the variance of the stochastic spatial sampling and
+zeroth-order projection. A larger variance of the gradient estimator leads to slower convergence,
+while a smaller variance leads to faster convergence.
+5.3
+Variance Compression of Zeroth-Order Subspace Estimation
+In this subsection, we theoretically analyze why the zeroth-order subspace projection in SDZE can
+reduce the variance of gradient estimates and hence accelerate convergence. Before the analysis, we
+first define some necessary notations:
+P = bdiag(V1 ⊗U1, . . . , VL ⊗UL),
+(30)
+z = [vec(Z1)⊤, . . . , vec(ZL)⊤]⊤,
+(31)
+˜z = [vec( ˜Z1)⊤, . . . , vec( ˜ZL)⊤]⊤.
+(32)
+Then we first state the main theoretical results on our zeroth-order gradient estimation.
+Theorem 4. For the zeroth-order gradient estimation, the following two properties hold.
+a) By using the subspace gradient estimation, our estimated gradient ˆgϵ(θ, P, z) is equivalent to
+ˆgϵ(θ, P, z) = L(θ + ϵPz) −L(θ −ϵPz)
+2ϵ
+Pz,
+(33)
+where z ∼N(0, Iq), ϵ > 0, P ∈RP ×q satisfies P⊤P = Iq with the total parameter dimension
+P = PL
+i=1 mimi−1 and subspace dimension q = Lr2.
+b) Let z ∼N(0, Iq), and L ∈C2,2
+L2 (RP ). Then we have
+Φ(θ) =
+Ez[ˆgϵ(θ, P, z)] −PP⊤∇L(θ)
+
+2 ≤ϵ2
+6 L2(q + 4)2.
+See its proof in Section A.5. Theorem 4 (a) provides the equivalent form (33) of our gradient
+estimation. By comparing this with the gradient estimation in generic random subspace optimiza-
+tion [Nozawa et al., 2025, Roberts and Royer, 2023], we observe significant differences. First,
+our gradient estimation accounts for the layer-wise structure of the network, requiring the projec-
+tion matrix P to be block-diagonal, whereas in vanilla random subspace optimization, P is not.
+Additionally, our method introduces a layer-wise low-rank perturbation matrix, reflected by the
+block-diagonal structure of P, with lazy updates to the column and row spaces defined by Ui and Vi.
+In contrast, random subspace optimization simply requires P to be random. These distinctions high-
+light the key differences between our gradient estimation and existing methods in random subspace
+optimization.
+Theorem 4 (b) guarantees that the distance Φ(θ) between the expected gradient estimate and the
+back-propagation gradient in the subspace spanned by P is small. Moreover, by setting ϵ =
+1
+q+4,
+the distance Φ(θ) is bounded by a constant L2/6, independent of the parameter dimension P. This
+implies that the error in our gradient estimation does not scale with the extremely high parameter
+dimensions of PINNs, providing accurate gradient estimation—crucial for optimizing extreme-
+dimensional models.
+Next, we utilize a strictly convex quadratic loss to further analyze our gradient estimation in Eq. (33).
+This choice is motivated by the fact that, as the PINN parameters tend to converge toward a local
+minimum within a local basin, it can be well-approximated by a quadratic loss.
+Theorem 5. Let L(θ) = θ⊤Hθ and z ∼N(0, Iq), where H ∈RP ×P is positive definite. We have
+Ez[ˆgϵ(θ, P, z)] = PP⊤∇L(θ),
+(34)
+Ez
+
+∥ˆgϵ(θ, P, z)∥2
+= (q + 2)∥P⊤∇L(θ)∥2,
+(35)
+Ez
+
+⟨∇L(θ), ˆgϵ(θ, P, z)⟩2
+∥P⊤∇L(θ)∥2∥ˆgϵ(θ, P, z)∥2
+
+= 1
+q .
+(36)
+See its proof in Section A.5. Theorem 5 demonstrates several advantageous properties of our gradient
+estimation on the quadratic function. First, Eqn. (34) establishes the equivalence between the expected
+gradient estimation and the exact gradient within the subspace spanned by our projection matrix P.
+13
+Second, Eqn. (35) shows that, in this subspace, the variance of the gradient estimation scales linearly
+with the subspace dimension q. In contrast, the variance of isotropic zeroth-order gradient estimation
+depends linearly on the model’s parameter dimension P, which is significantly larger than q. Finally,
+Eqn. (36) reveals that the expected cosine similarity between our estimated gradient and the exact
+gradient within the subspace depends only on the subspace dimension q ≪P, indicating that our
+gradient estimation provides a highly accurate parameter update direction.
+Building upon the above spatial boundedness and subspace gradient guarantees, we can prove the
+global convergence of the SDZE framework.
+Theorem 6. Let L ∈C1,1
+L1 (RP ) be a non-convex function bounded below by L∗. Suppose Ek =
+(z0, z1, . . . , zk) with zk ∼N(0, Iq), and let Pj = (P0, P1, . . . , Pj), where Pj is defined in (30)
+with a fixed update frequency F. Then, the sequence {θk}k>0 generated by the zeroth-order updates
+satisfies:
+1
+T
+T −1
+X
+k=0
+EEk,P⌊k/F ⌋
+
+∥∇L(θk)∥2
+≤ϵ
+with T = O
+  P
+ϵ
+
+if the perturbation scale satisfies ϵ ≤O
+
+ϵ1/2
+q3/2P 1/2L3/2
+1
+
+. Here T = KF, where
+K denotes the total number of subspace updates.
+See its proof in Section A.5. Theorem 6 guarantees the convergence of our SDZE framework when
+the projection matrix P is updated at a fixed frequency F.
+5.4
+Discussion on Batch Sizes Selection
+We have introduced our spatial estimators with three batch sizes: |B| for the batch size of resid-
+ual points, |I| for the dimensions included in the primary spatial loss evaluation, and |J| for the
+dimensions included in the independent secondary spatial evaluation; see the underlying gradients in
+equations (22, 23, 29). In this subsection, we further discuss how to choose batch sizes.
+Firstly, both computational cost and memory consumption expand with the increase in batch sizes
+|B|, |I|, |J|. Additionally, the underlying stochastic spatial gradient variance diminishes with larger
+batch sizes, facilitating better convergence for the SDZE optimizer. Therefore, it represents a tradeoff
+between computational load and performance. Further, memory consumption is directly linked to
+|B|·|I|, where |B| represents the number of residual points and |I| involves the number of dimensions
+participating in the spatial residual evaluation. |J| has nothing to do with the memory cost since it is
+for the independent secondary evaluation detached from the computational graph after calculating the
+scalar loss.
+Users should determine the appropriate batch size based on their GPU memory capacity. Given a
+specified memory constraint, i.e., once the |B| · |I| value is determined, we recommend a balanced
+selection to ensure similarity between the two batch sizes, i.e., |I| ≈|B|. Extremely unbalanced
+cases, such as setting one batch size to a minimum of 1, are not advised. We explain the negative
+effect of unbalanced batch sizes as follows. If the batch size for residual points, |B|, is too small, it can
+hinder the GPU from leveraging its advantage in large-batch parallel computing. The parallel nature
+of neural network inferences for each residual point cannot be used, resulting in slower execution
+due to the exceptionally small batch size of points |B|. Meanwhile, if one reduces the batch for
+sampling dimension |I| too much, we cannot reuse the computation graphs for the spatial derivatives
+(with respect to input coordinates x) along different dimensions, leading to a significant slowdown.
+Specifically, taking the high-dimensional Laplacian operator as an example, the neural network’s
+second-order spatial derivative with respect to the j-th dimension is given by
+∂2uθ(x)
+∂x2
+j
+=
+L−1
+X
+l=1
+(WLΦL−1(x) · · · Wl+1)diag(Ψl(x) · · · Ψ1(x)(W1):,j)(Wl · · · Φ1(x)W1),
+(37)
+where
+Φl(x)
+=
+diag[σ′(Wlσ(Wl−1σ(· · · σ(W1x))))]
+∈
+Rml×ml,
+and
+Ψl(x)
+=
+diag[σ′′(Wlσ(Wl−1σ(· · · σ(W1x))))] ∈Rml×ml. For all dimensions j, the computations of Φl(x)
+and Ψl(x) are shared. Thus, computing multiple spatial derivatives on one forward computation is
+faster than computing them from scratch without reusing the shared part. Hence, we recommend
+sampling an appropriate dimension batch size, such as 100 or more, and we avoid choosing a too
+small |I| to reuse the computations properly.
+14
+As for the choice of |J| in the double-sampled algorithm, we recommend setting |J| ≈|I|. This
+is because both |I| and |J| represent the dimension batch size, ensuring that the computational
+load for the evaluation passes is roughly equal and the variances of the two samplings are similar.
+Although |J| does not affect memory consumption, setting it excessively large is not advisable, as
+it would be memory-efficient but suffering from slow computation due to excessive forward pass
+workload.
+6
+Experiments
+We applied SDZE to amortize the training of PINNs on a set of real-world PDEs. For the case of
+k = 2 and large d, we tested two types of PDEs: inseparable and effectively high-dimensional PDEs
+and semilinear parabolic PDEs. We also tested high-order PDEs that cover the case of k = 3, 4,
+which includes PDEs describing 1D and 2D nonlinear dynamics, and high-dimensional PDE with
+gradient regularization Yu et al. [2022]. Furthermore, we tested a weight-sharing technique, which
+further reduces memory requirements (Appendix ??).
+In all our experiments, SDZE drastically reduces computation and memory costs in training PINNs,
+compared to the baseline method of SDGD with stacked backward-mode AD, as well as state-of-the-
+art first-order (FO) and zeroth-order (ZO) estimators including STDE Shi et al. [2024], Hutchinson
+Trace Estimation (HTE) Hu et al. [2024a], and RS-PINN Hu et al. [2023b]. Due to the page limit, the
+most important results and ZO ablation studies are reported here, and the full details including the
+experiment setup and hyperparameters (Appendix ??) can be found in the Appendix.
+6.1
+Physics-informed neural networks
+PINN Raissi et al. [2019a] is a class of neural PDE solver where the ansatz uθ(x) is parameterized
+by a neural network with parameter θ. It is a prototypical case of the optimization problem in Eq. 1.
+We consider PDEs defined on a domain Ω⊂Rd and boundary/initial ∂Ωas follows
+Lu(x) = f(x),
+x ∈Ω,
+Bu(x) = g(x),
+x ∈∂Ω,
+(38)
+where L and B are known operators, f(x) and g(x) are known functions for the residual and
+boundary/initial conditions, and u : Rd →R is a scalar-valued function, which is the unknown
+solution to the PDE. The approximated solution uθ(x) ≈u(x) is obtained by minimizing the mean
+squared error (MSE) of the PDE residual R(x; θ) = Luθ(x) −f(x):
+ℓresidual(θ; {x(i)}Nr
+i=1) = 1
+Nr
+Nr
+X
+i=1
+Luθ(x(i)) −f(x(i))
+
+2
+(39)
+where the residual points {x(i)}Nr
+i=1 are sampled from the domain Ω. We use the technique from
+Lu et al. [2021] that reparameterizes uθ such that the boundary/initial condition Bu(x) = g(x) are
+satisfied exactly for all x ∈∂Ω, so boundary loss is not needed.
+Amortized PINNs with SDZE.
+PINN training can be amortized by replacing the differential part
+of the operator L with a stochastic estimator like SDGD and SDZE. For example, for the Allen-Cahn
+equation, Lu = ∇2u + u −u3, the differential part of L is the Laplacian ∇2. With amortization, we
+minimize the following loss
+˜ℓresidual(θ; {x(i)}Nr
+i=1, J, K) = 1
+Nr
+Nr
+X
+i=1
+h
+˜LJuθ(x(i)) −f(x(i))
+i
+·
+h
+˜LKuθ(x(i)) −f(x(i))
+i
+,
+(40)
+which is a modification of Eq. 39. Its gradient ∂˜ℓresidual
+∂θ
+is then an unbiased estimator to the gradient of
+the original PINN residual loss, i.e. E[ ∂˜ℓresidual
+∂θ
+] = ∂ℓresidual
+∂θ
+. Under the SDZE framework, this gradient is
+strictly approximated via forward-only zeroth-order finite differences projected onto implicit low-rank
+subspaces, bypassing backpropagation entirely.
+6.2
+Effectively High-Dimensional PDEs
+The first class of PDEs is defined via a nonlinear, inseparable, and effectively high-dimensional exact
+solution uexact(x) defined within the d-dimensional unit ball Bd:
+Lu(x) =f(x),
+x ∈Bd
+u(x) =0,
+x ∈∂Bd
+(41)
+15
+where L is a linear/nonlinear operator and g(x) = Luexact(x). The zero boundary condition ensures
+that no information about the exact solution is leaked through the boundary condition. We will
+consider the following operators:
+• Poisson equation: Lu(x) = ∇2u(x).
+• Allen-Cahn equation: Lu(x) = ∇2u(x) + u(x) −u(x)3.
+• Sine-Gordon equation: Lu(x) = ∇2u(x) + sin(u(x)).
+For the exact solution, we consider the following with all ci ∼N(0, 1):
+• two-body: uexact(x) = (1 −x2) Pd−1
+i=1 ciexixi+1.
+• three-body: uexact(x) = (1 −x2) Pd−2
+i=1 ciexixi+1xi+2.
+The second class of PDEs is the semilinear parabolic PDEs, where the initial condition is speci-
+fied:
+∂
+∂tu(x, t) =Lu(x, t)
+(x, t) ∈Rd × [0, T]
+u(x, t) =g(x),
+(x, t) ∈Rd × {0}
+(42)
+where g(x) is a known, analytical, and time-independent function that specifies the initial condition,
+and T is the terminal time. We aim to approximate the solution’s true value at one test point xtest ∈Rd,
+at the terminal time t = T, i.e. at (xtest, T).
+We will consider the following operators:
+• Semilinear Heat Eq.:
+Lu(x, t) = ∇2u(x, t) + 1 −u(x, t)2
+1 + u(x, t)2 .
+(43)
+with initial condition g(x) = 5/(10 + 2∥x∥2).
+• Allen-Cahn equation:
+Lu(x, t) = ∇2u(x, t) + u(x, t) −u(x, t)3.
+(44)
+with initial condition g(x) = arctan(maxi xi).
+• Sine-Gordon equation:
+Lu(x, t) = ∇2u(x, t) + sin(u(x, t)).
+(45)
+with initial condition g(x) = 5/(10 + 2∥x∥2).
+All three equations use the test point xtest = 0 and terminal time T = 0.3.
+6.3
+Effectively High-Order PDEs
+Here we demonstrate how SDZE handles mixed partial derivatives in high-order PDEs. We consider
+the 2D Korteweg-de Vries (KdV) equation and the 2D Kadomtsev-Petviashvili equation from Pu
+and Chen [2024], and the regular 1D KdV equation with gPINN Yu et al. [2022]. Under the SDZE
+framework, mixed partial derivatives are computed via forward-only zeroth-order finite differences
+projected onto implicit low-rank subspaces, completely bypassing the repeated backward-mode
+AD passes that would otherwise be required for high-order operators. Since these equations are
+low-dimensional we do not need to sample over the space dimension. In this section, the equations
+are all time-dependent and the space is 2D, and we will omit the argument to the solution, i.e. we
+will write u(x, t) = u.
+We first consider the 2D Korteweg-de Vries (KdV) equation. The terms in the 2D KdV equa-
+tion
+uty + uxxxy + 3(uyux)x −uxx + 2uyy = 0.
+(46)
+can alternatively be computed with the pushforward of the following jets
+J(1) = d9u(x, 0, ex, ey, 0, . . . ), J(2) = d3u(x, 0, ey, et), J(3) = d3u(x, 0, ey, 0).
+(47)
+16
+All the derivative terms can be found in these output jets
+
+J(i)	
+:
+ux = J(1)
+[2] , uy = J(1)
+[3] , uxx = J(1)
+[4] /3, uxy = J(1)
+[5] /10, uyy = J(3)
+[2] ,
+uyyy = J(3)
+[3] , uxxxy = (J(1)
+[9] −280uyyy)/840, uty = (J(2)
+[3] −uyyy)/3.
+(48)
+Next, we turn to the 2D Kadomtsev-Petviashvili (KP) equation, which takes the form
+(ut + 6uux + uxxx)x + 3σ2uyy = 0,
+(49)
+which can be expanded as
+utx + 6uxux + 6uuxx + uxxxx + 3σ2uyy = 0.
+(50)
+All the derivative terms can be computed with a 5-jet, 4-jet, and a 2-jet pushforward. Let
+J(1) :=d5u(x, 0, et, ex, 0, 0)
+J(2) :=d4u(x, ex, 0, 0, 0)
+J(3) :=d2u(x, ey, 0).
+(51)
+Then all required derivative terms can be evaluated as follows:
+utx = J(1)
+[5] /10,
+ux = J(2)
+[1] , uxx = J(2)
+[2] , uxxxx = J(2)
+[4] ,
+uyy = J(3)
+[2] .
+(52)
+Finally, we consider the gradient-enhanced 1D Korteweg-de Vries (g-KdV) equation, given by
+ut + uux + αuxxx = 0.
+(53)
+Gradient-enhanced PINN (gPINN) Yu et al. [2022] regularizes the learned PINN such that the gradient
+of the residual is close to the zero vector, increasing the accuracy of the solution. Specifically, the
+PINN loss (Eq. 39) is augmented with the term
+ℓgPINN ({x(i)}Nr
+i=1) = 1
+Nr
+X
+i
+d
+X
+j
+
+∂
+∂xj
+R(x(i))
+
+2
+.
+(54)
+The total loss becomes
+ℓresidual + cgPINN ℓgPINN ,
+(55)
+where cgPINN is the gPINN penalty weight. To perform gradient-enhancement we need to compute
+the gradient of the residual:
+R(x, t) := ut + uux + αuxxx,
+∇R(x, t) = [utt + utux + uutx + αutxxx,
+utx + uxux + uuxx + αuxxxx].
+(56)
+All the derivative terms can be computed with one 2-jet and two 7-jet pushforward. Let
+J(1) :=d7u(x, ex, 0, 0, 0, 0, 0, 0)
+J(2) :=d7u(x, ex, 0, 0, et, 0, 0, 0)
+J(3) :=d2u(x, et, 0).
+(57)
+Then all required derivative terms can be evaluated as follows:
+ux = J(1)
+[1] , uxx = J(1)
+[2] , uxxx = J(1)
+[3] , uxxxx = J(1)
+[4] , uxxxxx = J(1)
+[5] ,
+utxxx = (J(2)
+[7] −J(1)
+[8] )/35, utx = (J(2)
+[5] −uxxxxx)/5, ut = J(2)
+[4] −uxxxx,
+utt = J(3)
+[2] .
+(58)
+17
+6.4
+Main Results
+To ascertain the source performance gain of our method, we conduct a detailed ablation study on the
+inseparable Allen-Cahn equation with a two-body exact solution. The results are in Tables 1 and
+2, where the best results for each dimensionality are marked in bold. Crucially, we extended the
+benchmarks up to 10-million dimensions (10M D) to demonstrate the true O(1) memory capacity of
+SDZE. All methods were implemented using JAX unless stated. OOM indicates that the memory
+requirement exceeds 40GBs. Since the only change is how the derivatives are computed, the
+relative L2 error is expected to be of the same order among different randomization methods. We
+have included Forward Laplacian which is an exact method. It is expected to perform better in
+terms of L2 error. However, the L2 error is of the same order, at least in the case where the
+dimension is more than 1000. While biased RS-PINN Hu et al. [2023b] achieves fast computation at
+low dimensions, it introduces systemic bias for non-linear PDEs and diverges severely at extreme
+dimensions. SDZE elegantly bypasses these issues, achieving stable convergence competitive with
+exact FO methods.
+Table 1: Speed comparison for the two-body Allen-Cahn equation.
+FO denotes first-order
+(backpropagation-based) methods, ZO denotes zeroth-order (backprop-free) methods.
+Speed (it/s) ↑
+100 D
+1K D
+10K D
+100K D
+1M D
+10M D
+Backward mode SDGD (FO) Hu et al. [2024c]
+55.56
+3.70
+1.85
+0.23
+OOM
+OOM
+Mixed-mode SDGD (AD-Spatial + ZO-Param)†
+40.63
+37.04
+29.85
+OOM
+OOM
+OOM
+Parallelized backward mode SDGD (FO)
+1376.84
+845.21
+216.83
+29.24
+OOM
+OOM
+Forward-over-Backward SDGD (FO)
+778.18
+560.91
+193.91
+27.18
+OOM
+OOM
+Forward Laplacian (FO) Li et al. [2023]
+1974.50
+373.73
+32.15
+OOM
+OOM
+OOM
+HTE (FO) Hu et al. [2024a]
+[TBD]
+[TBD]
+[TBD]
+[TBD]
+OOM
+OOM
+RS-PINN (ZO) Hu et al. [2023b]
+[TBD]
+[TBD]
+Diverge
+OOM
+OOM
+OOM
+STDE (FO) Shi et al. [2024]
+1035.09
+1054.39
+454.16
+156.90
+13.61
+OOM
+SDZE (Ours)
+2100.00
+1200.00
+512.38
+178.24
+35.82
+[TBD]
+† Formerly denoted as Backward mode SDGD (ZO), representing a naive integration of ZO parameter updates
+with AD spatial evaluation, which still predictably succumbs to spatial OOM.
+Table 2: Memory comparison for the two-body Allen-Cahn equation. FO denotes first-order, ZO
+denotes zeroth-order methods.
+Memory (MB) ↓
+100 D
+1K D
+10K D
+100K D
+1M D
+10M D
+Backward mode SDGD (FO) Hu et al. [2024c]
+1328
+1788
+4527
+32777
+OOM
+OOM
+Mixed-mode SDGD (AD-Spatial + ZO-Param)†
+553
+565
+1217
+OOM
+OOM
+OOM
+Parallelized backward mode SDGD (FO)
+539
+579
+1177
+4931
+OOM
+OOM
+Forward-over-Backward SDGD (FO)
+537
+579
+1519
+4929
+OOM
+OOM
+Forward Laplacian (FO) Li et al. [2023]
+507
+913
+5505
+OOM
+OOM
+OOM
+HTE (FO) Hu et al. [2024a]
+[TBD]
+[TBD]
+[TBD]
+[TBD]
+OOM
+OOM
+RS-PINN (FO) Hu et al. [2023b]
+[TBD]
+[TBD]
+OOM
+OOM
+OOM
+OOM
+STDE (FO) Shi et al. [2024]
+543
+537
+795
+1073
+6235
+OOM
+SDZE (Ours)
+485
+512
+723
+982
+4856
+[TBD]
+Parallelization and Mixed-mode AD.
+The original SDGD implementation uses a for-loop to
+iterate through the sampled dimension. This can be parallelized (denoted as “Parallelized backward
+mode SDGD”). Parallelization provides ∼15× speed up and reduction in peak memory for the
+JIT compilation phase. We also tested mixed mode AD (dubbed as “Forward-over-Backward
+SDGD (FO)”), which gives roughly the same performance as parallelized stacked backward mode.
+Notably, we evaluate a “Mixed-mode SDGD (AD-Spatial + ZO-Param)” which applies zeroth-order
+optimization to network parameters while relying on AD for spatial residuals. As shown in Table
+2, it inevitably crashes at 100K D because the backpropagation graph for spatial derivatives is not
+eliminated.
+Forward Laplacian.
+Forward Laplacian Li et al. [2023] provides a constant-level optimization for
+the calculation of Laplacian operator by removing the redundancy in the AD pipeline, and we can see
+from Table 1 and 2 that it is the best method in both speed and memory when the dimension is 100.
+But since it is not a randomized method, the scaling is much worse. Its computation complexity is
+O(d), whereas a randomized estimator like SDZE has a computation complexity of O(|J|). Naturally,
+18
+with a high enough input dimension d, the difference in the constant prefactor is trumped by scaling.
+When the dimension is larger than 1000, it becomes worse than even parallelized stacked backward
+mode SDGD.
+HTE and RS-PINN.
+While Hutchinson Trace Estimation (HTE) Hu et al. [2024a] and RS-PINN
+Hu et al. [2023b] elegantly resolve the spatial curse of dimensionality via randomized trace estimation
+and Gaussian smoothing respectively, they face critical limitations at extreme scales. HTE remains
+anchored to first-order backpropagation for parameter updates, triggering OOM errors at 1M D. On
+the other hand, RS-PINN attempts a full ZO approach via isotropic Gaussian smoothing but suffers
+from unconstrained exploration variance, causing it to diverge or OOM on stiff PDEs at 10K D and
+beyond.
+STDE vs SDZE.
+Compared to the best realization of baseline method SDGD, the parallelized
+stacked backward mode AD, STDE provides up to 10× speed up and memory reduction of at least 4×.
+SDZE achieves comparable performance while completely eliminating backpropagation, enabling
+training of 10-million-dimensional fully-dense PINNs that are impossible for all first-order methods
+due to OOM constraints.
+6.5
+Ablation Studies on Zeroth-Order Mechanisms
+Following standard zeroth-order benchmarking protocols Malladi et al. [2023], we investigate the
+impact of SDZE’s core optimization mechanisms.
+Effect of CRNS on the Double-Stochastic Variance Deadlock.
+As theoretically diagnosed, naive
+synthesis of randomized spatial estimators and ZO perturbation causes an O(ϵ−2) variance explosion.
+We ablate SDZE without CRNS (using independent random spatial seeds ω+ and ω−for the
+finite difference) on the 10K D Allen-Cahn PDE. As shown in Table 3, removing CRNS triggers
+catastrophic variance amplification, driving the loss to NaN within the first few iterations. By perfectly
+locking spatial sampling, CRNS suppresses gradient variance exponentially, enabling stable ZO
+convergence.
+Table 3: Ablation on Common Random Num-
+bers Synchronization (CRNS) at 10K D.
+Method
+Gradient Var. (Var(ˆg))
+Status
+SDZE (w/o CRNS)
+∼108 (Exploding)
+Diverge
+SDZE (w/ CRNS)
+∼10−2 (Bounded)
+Stable
+Table 4: Relative L2 Error on 10K D Allen-Cahn
+across Subspace change frequency F and rank
+r.
+F \ r
+32
+64
+128
+500
+[TBD]
+[TBD]
+[TBD]
+1000
+[TBD]
+[TBD]
+[TBD]
+2000
+[TBD]
+[TBD]
+[TBD]
+Subspace Rank r and Update Frequency F.
+To balance matrix-free exploration and parameter
+expressivity, we evaluated SDZE using different subspace ranks r and lazy update frequencies
+F. Table 4 demonstrates that SDZE is robust to variations in the subspace rank r. However,
+performance degrades when the update frequency F is excessively large, as the optimization becomes
+constrained to a single subspace for too long, limiting its adaptability to highly non-convex PDE
+landscapes.
+7
+Conclusion
+We introduce SDZE, a unified framework that achieves unprecedented dual dimension-independence
+for extreme-scale Physics-Informed Neural Networks (PINNs) by synergizing randomized spatial
+estimators with zeroth-order optimization. By resolving the fatal double-stochastic variance deadlock
+through the Common Random Numbers Synchronization (CRNS) theorem and the implicit matrix-
+free subspace projection, SDZE successfully liberates high-dimensional PDE solvers from the
+intertwined memory and compilation bottlenecks of reverse-mode automatic differentiation.
+SDZE delivers orders-of-magnitude improvements in both speed and memory efficiency, enabling the
+first successful training of 10-million-dimensional fully-dense PINNs on a single NVIDIA A100 GPU.
+The CRNS mechanism algebraically cancels the O(1/ε2) variance singularity by strictly locking
+spatial random seeds across opposing ZO perturbations, while the implicit subspace projection
+19
+compresses parameter exploration variance from O(P) to O(r) without storing massive projection
+matrices.
+Applicability
+Besides PINNs, SDZE can be applied to arbitrarily high-order and high-dimensional
+AD-based PDE solvers when combined with zeroth-order optimization. This makes SDZE more
+general than a branch of related methods that rely on first-order optimizers. SDZE is also more
+applicable than deep ritz method Weinan and Yu [2017], weak adversarial network (WAN) Zang et al.
+[2020], backward SDE-based solvers Beck et al. [2021b], Raissi [2018], Han et al. [2018a], deep
+Galerkin method Sirignano and Spiliopoulos [2018], and the recently proposed forward Laplacian
+Li et al. [2023], which are all restricted to specific forms of second-order PDEs and cannot scale
+to extreme dimensions. SDZE applies naturally to differential operators in PDEs, but it can also be
+applied to other problems that require backprop-free optimization with high-dimensional parameters.
+For example, adversarial attacks, feature attribution, and meta-learning, to name a few.
+Limitations
+While SDZE achieves unprecedented dual dimension-independence, being a general
+method, it forgoes the optimization possibilities that apply to specific operators. Furthermore, we did
+not consider variance reduction techniques that could be applied, which can be explored in future
+works. Also, we observed that lowering the randomization batch size improves both speed and
+memory profile, but the trade-off between cheaper computation and larger variance needs further
+analysis. Furthermore, the convergence rate of ZO optimization may be slower than first-order
+methods in some cases, and adaptive step size schemes warrant further investigation.
+Future works
+The key insight of SDZE is that resolving the double-stochastic variance deadlock
+between randomized spatial estimators and zeroth-order optimization enables unprecedented dual
+dimension-independence. This reveals the fundamental connection between the fields of AD, ran-
+domized numerical linear algebra, and zeroth-order optimization, indicating that further works in the
+intersection of these fields might bring significant progress in large-scale scientific modeling with
+neural networks. One example would be the many-body Schrödinger equations, where one needs
+to compute a high-dimensional Laplacian. Another example is the high-dimensional Black-Scholes
+equation, which has numerous uses in mathematical finance. Further improvements could explore
+adaptive step size schemes and variance reduction techniques to accelerate convergence.
+20
+References
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman,
+Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. GPT-4 technical report.
+arXiv:2303.08774, 2023.
+Shun-ichi Amari. Backpropagation and stochastic gradient descent method. Neurocomputing, 5(4-5):
+185–196, 1993.
+Brandon Amos. Tutorial on amortized optimization, April 2023. URL http://arxiv.org/abs/
+2202.00665. arXiv:2202.00665 [cs, math].
+Atılım Güne¸s Baydin, Barak A. Pearlmutter, Don Syme, Frank Wood, and Philip Torr. Gradi-
+ents without Backpropagation, February 2022. URL http://arxiv.org/abs/2202.08587.
+arXiv:2202.08587 [cs, stat].
+Christian Beck, Sebastian Becker, Patrick Cheridito, Arnulf Jentzen, and Ariel Neufeld. Deep
+splitting method for parabolic pdes. SIAM Journal on Scientific Computing, 43(5):A3135–A3154,
+2021a.
+Christian Beck, Sebastian Becker, Patrick Cheridito, Arnulf Jentzen, and Ariel Neufeld. Deep
+splitting method for parabolic PDEs. SIAM Journal on Scientific Computing, 43(5):A3135–
+A3154, January 2021b. ISSN 1064-8275, 1095-7197. doi: 10.1137/19M1297919. URL http:
+//arxiv.org/abs/1907.03452. arXiv:1907.03452 [cs, math, stat].
+Richard Bellman. Dynamic Programming. Princeton University Press, 1957.
+Richard Bellman. Adaptive control processes: a guided tour, 1962.
+Claus Bendtsen and Ole Stauning. Tadiff , a flexible c + + package for automatic differentiation
+using taylor series expansion, 1997. URL https://api.semanticscholar.org/CorpusID:
+62828904.
+Jesse Bettencourt, Matthew J. Johnson, and David Duvenaud. Taylor-mode automatic differentiation
+for higher-order derivatives in JAX. In Program Transformations for ML Workshop at NeurIPS
+2019, 2019. URL https://openreview.net/forum?id=SkxEF3FNPH.
+James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Chris Leary, Dougal
+Maclaurin, George Necula, Adam Paszke, Jake VanderPlas, Skye Wanderman-Milne, and
+Qiao Zhang.
+JAX: composable transformations of Python+NumPy programs, 2018.
+URL
+http://github.com/google/jax.
+Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. FlashAttention: Fast and memory-
+efficient exact attention with IO-awareness. Advances in Neural Information Processing Systems,
+35:16344–16359, 2022.
+Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. GPT3.int8 (): 8-bit matrix
+multiplication for transformers at scale. Advances in Neural Information Processing Systems, 35:
+30318–30332, 2022a.
+Tim Dettmers, Mike Lewis, Sam Shleifer, and Luke Zettlemoyer. 8-bit optimizers via block-wise
+quantization. 2022b.
+Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. QLoRA: Efficient finetuning
+of quantized LLMs. Advances in Neural Information Processing Systems, 36, 2024.
+Ning Ding, Yujia Qin, Guang Yang, Fuchao Wei, Zonghan Yang, Yusheng Su, Shengding Hu, Yulin
+Chen, Chi-Min Chan, Weize Chen, et al. Parameter-efficient fine-tuning of large-scale pre-trained
+language models. Nature Machine Intelligence, 5(3):220–235, 2023.
+John C Duchi, Michael I Jordan, Martin J Wainwright, and Andre Wibisono. Optimal rates for
+zero-order convex optimization: The power of two function evaluations. IEEE Transactions on
+Information Theory, 61(5):2788–2806, 2015.
+21
+Benjamin Fehrman, Benjamin Gess, and Arnulf Jentzen. Convergence rates for the stochastic gradient
+descent method for non-convex objective functions. The Journal of Machine Learning Research,
+21(1):5354–5401, 2020.
+Tanmay Gautam, Youngsuk Park, Hao Zhou, Parameswaran Raman, and Wooseok Ha. Variance-
+reduced zeroth-order methods for fine-tuning language models. In Proceedings of the International
+Conference on Machine Learning, 2024.
+Benyamin Ghojogh, Ali Ghodsi, Fakhri Karray, and Mark Crowley.
+Johnson-Lindenstrauss
+Lemma, Linear and Nonlinear Random Projections, Random Fourier Features, and Random
+Kitchen Sinks: Tutorial and Survey, August 2021. URL http://arxiv.org/abs/2108.04172.
+arXiv:2108.04172 [cs, math, stat].
+Jiequn Han, Arnulf Jentzen, and Weinan E. Solving high-dimensional partial differential equations
+using deep learning. Proceedings of the National Academy of Sciences, 115(34):8505–8510, Aug
+2018a. ISSN 1091-6490. doi: 10.1073/pnas.1718942115. URL http://dx.doi.org/10.1073/
+pnas.1718942115.
+Jiequn Han, Arnulf Jentzen, and Weinan E. Solving high-dimensional partial differential equations
+using deep learning. Proceedings of the National Academy of Sciences, 115(34):8505–8510,
+2018b.
+Edward J Hu, yelong shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and
+Weizhu Chen. LoRA: Low-rank adaptation of large language models. In International Conference
+on Learning Representations, 2022.
+Zheyuan Hu, Khemraj Shukla, George Em Karniadakis, and Kenji Kawaguchi. Tackling the curse of
+dimensionality with physics-informed neural networks. arXiv preprint arXiv:2307.12306, 2023a.
+Zheyuan Hu, Zhouhao Yang, Yezhen Wang, George Em Karniadakis, and Kenji Kawaguchi.
+Bias-Variance Trade-off in Physics-Informed Neural Networks with Randomized Smoothing
+for High-Dimensional PDEs, November 2023b. URL http://arxiv.org/abs/2311.15283.
+arXiv:2311.15283 [cs, math, stat].
+Zheyuan Hu, Zekun Shi, George Em Karniadakis, and Kenji Kawaguchi. Hutchinson trace estimation
+for high-dimensional and high-order physics-informed neural networks. Computer Methods in
+Applied Mechanics and Engineering, 424:116883, 2024a.
+Zheyuan Hu, Zekun Shi, George Em Karniadakis, and Kenji Kawaguchi. Hutchinson Trace Estimation
+for High-Dimensional and High-Order Physics-Informed Neural Networks. Computer Methods in
+Applied Mechanics and Engineering, 424:116883, May 2024b. ISSN 00457825. doi: 10.1016/j.
+cma.2024.116883. URL http://arxiv.org/abs/2312.14499. arXiv:2312.14499 [cs, math,
+stat].
+Zheyuan Hu, Khemraj Shukla, George Em Karniadakis, and Kenji Kawaguchi. Tackling the curse of
+dimensionality with physics-informed neural networks. Neural Networks, 176:106369, 2024c.
+M.F. Hutchinson. A stochastic estimator of the trace of the influence matrix for laplacian smoothing
+splines. Communications in Statistics - Simulation and Computation, 18(3):1059–1076, January
+1989a. ISSN 1532-4141. doi: 10.1080/03610918908812806. URL http://dx.doi.org/10.
+1080/03610918908812806.
+Michael F Hutchinson. A stochastic estimator of the trace of the influence matrix for laplacian
+smoothing splines. Communications in Statistics-Simulation and Computation, 18(3):1059–1076,
+1989b.
+Kaiyi Ji, Zhe Wang, Yi Zhou, and Yingbin Liang. Improved zeroth-order variance reduced algorithms
+and analysis for nonconvex optimization. In International conference on machine learning, pages
+3100–3109, 2019.
+Shuoran Jiang, Qingcai Chen, Youcheng Pan, Yang Xiang, Wu Xiangping Lin, Chuanyi Liu, and
+Xiaobao Song. ZO-AdaMU optimizer: Adapting perturbation by the momentum and uncertainty
+in zeroth-order optimization. In Proceedings of the AAAI Conference on Artificial Intelligence,
+volume 38, pages 18363–18371, 2024.
+22
+Jerzy Karczmarczuk. Functional differentiation of computer programs. In Proceedings of the Third
+ACM SIGPLAN International Conference on Functional Programming, ICFP ’98, pages 195–203,
+New York, NY, USA, 1998. Association for Computing Machinery. ISBN 1581130244. doi:
+10.1145/289423.289442. URL https://doi.org/10.1145/289423.289442.
+Kenji Kawaguchi. Deep learning without poor local minima. In Advances in neural information
+processing systems (NeurIPS), pages 586–594, 2016.
+Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. In Proceedings of
+the International Conference on Learning Representations, 2015.
+David Kozak, Stephen Becker, Alireza Doostan, and Luis Tenorio. A stochastic subspace approach
+to gradient-free optimization in high dimensions. Computational Optimization and Applications,
+79(2):339–368, 2021.
+Jacob Laurel, Rem Yang, Shubham Ugare, Robert Nagel, Gagandeep Singh, and Sasa Misailovic.
+A general construction for abstract interpretation of higher-order automatic differentiation. Proc.
+ACM Program. Lang., 6(OOPSLA2), oct 2022. doi: 10.1145/3563324. URL https://doi-org.
+libproxy1.nus.edu.sg/10.1145/3563324.
+Yunwen Lei, Ting Hu, Guiying Li, and Ke Tang. Stochastic gradient descent for nonconvex learning
+without bounded gradient assumptions. IEEE transactions on neural networks and learning
+systems, 31(10):4394–4400, 2019.
+Bingrui Li, Jianfei Chen, and Jun Zhu. Memory efficient optimizers with 4-bit states. Advances in
+Neural Information Processing Systems, 36, 2024a.
+Ruichen Li, Haotian Ye, Du Jiang, Xuelan Wen, Chuwei Wang, Zhe Li, Xiang Li, Di He, Ji Chen,
+Weiluo Ren, and Liwei Wang. Forward Laplacian: A New Computational Framework for Neu-
+ral Network-based Variational Monte Carlo, July 2023. URL http://arxiv.org/abs/2307.
+08214. arXiv:2307.08214 [physics].
+Ruichen Li, Chuwei Wang, Haotian Ye, Di He, and Liwei Wang. DOF: Accelerating high-order dif-
+ferential operators with forward propagation. In ICLR 2024 Workshop on AI4DifferentialEquations
+In Science, 2024b. URL https://openreview.net/forum?id=yQsLKpkRoS.
+Sijia Liu, Bhavya Kailkhura, Pin-Yu Chen, Paishun Ting, Shiyu Chang, and Lisa Amini. Zeroth-
+order stochastic variance reduction for nonconvex optimization. Advances in Neural Information
+Processing Systems, 31, 2018.
+Sijia Liu, Pin-Yu Chen, Bhavya Kailkhura, Gaoyuan Zhang, Alfred Hero, and Pramod K. Varshney.
+A Primer on Zeroth-Order Optimization in Signal Processing and Machine Learning, June 2020.
+URL http://arxiv.org/abs/2006.06224. arXiv:2006.06224 [cs, eess, stat].
+Yong Liu, Zirui Zhu, Chaoyu Gong, Minhao Cheng, Cho-Jui Hsieh, and Yang You. Sparse MeZO:
+Less parameters for better performance in zeroth-order LLM fine-tuning. arXiv:2402.15751, 2024.
+Lu Lu, Raphaël Pestourie, Wenjie Yao, Zhicheng Wang, Francesc Verdugo, and Steven G. Johnson.
+Physics-informed neural networks with hard constraints for inverse design. SIAM Journal on
+Scientific Computing, 43(6):B1105–B1132, 2021. doi: 10.1137/21M1397908. URL https:
+//doi.org/10.1137/21M1397908.
+Sadhika Malladi, Tianyu Gao, Eshaan Nichani, Alex Damian, Jason D Lee, Danqi Chen, and Sanjeev
+Arora. Fine-tuning language models with just forward passes. Advances in Neural Information
+Processing Systems, 36:53038–53075, 2023.
+Sadhika Malladi, Tianyu Gao, Eshaan Nichani, Alex Damian, Jason D. Lee, Danqi Chen, and
+Sanjeev Arora. Fine-Tuning Language Models with Just Forward Passes, January 2024. URL
+http://arxiv.org/abs/2305.17333. arXiv:2305.17333 [cs].
+Per-Gunnar Martinsson and Joel Tropp. Randomized Numerical Linear Algebra: Foundations &
+Algorithms, March 2021. URL http://arxiv.org/abs/2002.01387. arXiv:2002.01387 [cs,
+math].
+23
+Panayotis Mertikopoulos, Nadav Hallak, Ali Kavis, and Volkan Cevher. On the almost sure conver-
+gence of stochastic gradient descent in non-convex problems. Advances in Neural Information
+Processing Systems, 33:1117–1128, 2020.
+Riley Murray, James Demmel, Michael W. Mahoney, N. Benjamin Erichson, Maksim Melnichenko,
+Osman Asif Malik, Laura Grigori, Piotr Luszczek, Michał Derezi´nski, Miles E. Lopes, Tianyu
+Liang, Hengrui Luo, and Jack Dongarra. Randomized Numerical Linear Algebra : A Perspective
+on the Field With an Eye to Software, April 2023. URL http://arxiv.org/abs/2302.11474.
+arXiv:2302.11474 [cs, math].
+Yurii Nesterov and Vladimir Spokoiny. Random gradient-free minimization of convex functions.
+Foundations of Computational Mathematics, 17:527–566, 2017.
+Ryota Nozawa, Pierre-Louis Poirion, and Akiko Takeda. Zeroth-order random subspace algorithm
+for non-smooth convex optimization. Journal of Optimization Theory and Applications, 204(3):53,
+2025.
+Deniz Oktay, Nick McGreivy, Joshua Aduol, Alex Beatson, and Ryan P. Adams.
+Random-
+ized Automatic Differentiation, March 2021.
+URL http://arxiv.org/abs/2007.10412.
+arXiv:2007.10412 [cs, stat].
+Juncai Pu and Yong Chen. Lax pairs informed neural networks solving integrable systems, January
+2024. URL http://arxiv.org/abs/2401.04982. arXiv:2401.04982 [nlin].
+M. Raissi, P. Perdikaris, and G.E. Karniadakis. Physics-informed neural networks: a deep learning
+framework for solving forward and inverse problems involving nonlinear partial differential
+equations. Journal of Computational Physics, 378:686–707, February 2019a. ISSN 0021-9991.
+doi: 10.1016/j.jcp.2018.10.045. URL http://dx.doi.org/10.1016/j.jcp.2018.10.045.
+Maziar Raissi. Forward-Backward Stochastic Neural Networks: Deep Learning of High-dimensional
+Partial Differential Equations, April 2018.
+URL http://arxiv.org/abs/1804.07010.
+arXiv:1804.07010 [cs, math, stat].
+Maziar Raissi and George Em Karniadakis. Forward-backward stochastic neural networks: Deep
+learning of high-dimensional partial differential equations. Journal of Computational Physics, 347:
+683–695, 2018.
+Maziar Raissi, Paris Perdikaris, and George E Karniadakis. Physics-informed neural networks: A
+deep learning framework for solving forward and inverse problems involving nonlinear partial
+differential equations. Journal of Computational Physics, 378:686–707, 2019b.
+Lindon Roberts and Clément W Royer. Direct search based on probabilistic descent in reduced
+spaces. SIAM Journal on Optimization, 33(4):3057–3082, 2023.
+Junhong Shen, Neil Tenenholtz, James Brian Hall, David Alvarez-Melis, and Nicolo Fusi. Tag-LLM:
+Repurposing general-purpose LLMs for specialized domains. In Proceedings of the International
+Conference on Machine Learning, pages 44759–44773, 2024.
+Zekun Shi, Zheyuan Hu, Kenji Kawaguchi, and George Em Karniadakis.
+Stochastic taylor
+derivative estimator: Efficient amortization for arbitrary differential operators. arXiv preprint
+arXiv:2401.00000, 2024.
+Justin Sirignano and Konstantinos Spiliopoulos. Dgm: a deep learning algorithm for solving partial
+differential equations. Journal of computational physics, 375:1339–1364, 2018.
+Irene Solaiman, Miles Brundage, Jack Clark, Amanda Askell, Ariel Herbert-Voss, Jeff Wu, Alec
+Radford, Gretchen Krueger, Jong Wook Kim, Sarah Kreps, et al. Release strategies and the social
+impacts of language models. arXiv:1908.09203, 2019.
+Yang Song, Sahaj Garg, Jiaxin Shi, and Stefano Ermon.
+Sliced Score Matching: A Scalable
+Approach to Density and Score Estimation, June 2019. URL http://arxiv.org/abs/1905.
+07088. arXiv:1905.07088 [cs, stat].
+24
+Xu Sun, Xuancheng Ren, Shuming Ma, and Houfeng Wang. meProp: Sparsified back propagation for
+accelerated deep learning with reduced overfitting. In Proceedings of the International Conference
+on Machine Learning, pages 3299–3308, 2017.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. LLaMA: Open and
+efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Lukasz
+Kaiser, and Illia Polosukhin. Attention is all you need. Advances in Neural Information Processing
+Systems, 2017.
+Junjie Wang, Guangjing Yang, Wentao Chen, Huahui Yi, Xiaohu Wu, Zhouchen Lin, and Qicheng
+Lao. MLAE: Masked LoRA experts for visual parameter-efficient fine-tuning. arXiv:2405.18897,
+2024.
+Mu Wang. High order reverse mode of automatic differentiation, 2017. Copyright - Database
+copyright ProQuest LLC; ProQuest does not claim copyright in the individual underlying works;
+Last updated - 2023-03-04.
+E Weinan and Ting Yu. The deep ritz method: a deep learning-based numerical algorithm for solving
+variational problems. Communications in Mathematics and Statistics, 6:1 – 12, 2017. URL
+https://api.semanticscholar.org/CorpusID:2988078.
+Yifan Yang, Kai Zhen, Ershad Banijamali, Athanasios Mouchtaris, and Zheng Zhang. AdaZeta:
+Adaptive zeroth-order tensor-train adaption for memory-efficient large language models fine-tuning.
+In Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing,
+pages 977–995, 2024.
+Jeremy Yu, Lu Lu, Xuhui Meng, and George Em Karniadakis. Gradient-enhanced physics-informed
+neural networks for forward and inverse PDE problems. Computer Methods in Applied Mechanics
+and Engineering, 393:114823, April 2022. ISSN 00457825. doi: 10.1016/j.cma.2022.114823.
+URL http://arxiv.org/abs/2111.02801. arXiv:2111.02801 [physics].
+Pengyun Yue, Long Yang, Cong Fang, and Zhouchen Lin. Zeroth-order optimization with weak
+dimension dependency. pages 4429–4472, 2023.
+Yaohua Zang, Gang Bao, Xiaojing Ye, and Haomin Zhou. Weak Adversarial Networks for High-
+dimensional Partial Differential Equations. Journal of Computational Physics, 411:109409, June
+2020. ISSN 00219991. doi: 10.1016/j.jcp.2020.109409. URL http://arxiv.org/abs/1907.
+08272. arXiv:1907.08272 [cs, math].
+Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christopher
+Dewan, Mona Diab, Xian Li, Xi Victoria Lin, et al. OPT: Open pre-trained transformer language
+models. arXiv:2205.01068, 2022.
+Yihua Zhang, Pingzhi Li, Junyuan Hong, Jiaxiang Li, Yimeng Zhang, Wenqing Zheng, Pin-Yu
+Chen, Jason D. Lee, Wotao Yin, Mingyi Hong, Zhangyang Wang, Sijia Liu, and Tianlong Chen.
+Revisiting zeroth-order optimization for memory-efficient LLM fine-tuning: A benchmark. In
+Proceedings of the International Conference on Machine Learning, pages 59173–59190, 2024.
+Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar, and Yuandong
+Tian. Galore: Memory-efficient LLM training by gradient low-rank projection. 2024.
+25
+A
+Proofs of Theoretical Results
+A.1
+Proof of Theorem 1
+The unbiasedness of the underlying exact spatial gradient can be derived as follows:
+EI [gI(θ)] =
+ NL
+X
+i=1
+Liuθ(x) −R(x)
+!
+EI
+"
+NL
+|I|
+X
+i∈I
+∂
+∂θ Liuθ(x)
+#
+=
+ NL
+X
+i=1
+Liuθ(x) −R(x)
+! " NL
+X
+i=1
+∂
+∂θ Liuθ(x)
+#
+= g(θ).
+(59)
+The unbiasedness of the exact spatial gradient with double independent sampling can be derived as
+follows:
+EI,J [gI,J(θ)] =
+
+EJ
+
+NL
+|J|
+X
+j∈J
+Ljuθ(x)
+
+−R(x)
+
+EI
+"
+NL
+|I|
+X
+i∈I
+∂
+∂θ Liuθ(x)
+#
+=
+ NL
+X
+i=1
+Liuθ(x) −R(x)
+! " NL
+X
+i=1
+∂
+∂θ Liuθ(x)
+#
+= g(θ).
+(60)
+A.2
+Proof of Theorem 2
+Lemma. Suppose that we have N fixed numbers a1, a2, . . . , aN and we choose k random numbers
+{Xi}k
+i=1 from them, i.e., each Xi is a random variable and Xi = an with probability 1/N for all
+n ∈{1, 2, . . . , N}, and Xi are independent. Then the variance of the unbiased estimator Pk
+i=1 Xi/k
+for ¯a = PN
+n=1 an is
+1
+kn
+Pn
+i=1(ai −¯a)2.
+Proof of Lemma A.2. Since the samples Xi are i.i.d.,
+Var
+"Pk
+i=1 Xi
+k
+#
+= 1
+k Var[Xi] = 1
+kn
+n
+X
+i=1
+(ai −¯a)2
+(61)
+Proof of Theorem 2. We assume that the total full batch is with Nr residual points {xi}Nr
+i=1 and NL
+PDE terms L = PNL
+i=1 Li, then the residual loss of the PINN is
+1
+2NrN 2
+L
+Nr
+X
+i=1
+(Luθ(xi) −R(xi))2 ,
+(62)
+where we normalize over both the number of residual points and the number of PDE terms. The
+latent exact full batch gradient is:
+g(θ) =
+1
+NrN 2
+L
+Nr
+X
+i=1
+(Luθ(xi) −R(xi)) ∂
+∂θ Luθ(xi)
+=
+1
+NrN 2
+L
+Nr
+X
+i=1
+(Luθ(xi) −R(xi))
+
+
+NL
+X
+j=1
+∂
+∂θ Ljuθ(xi)
+
+
+=
+1
+NrN 2
+L
+Nr
+X
+i=1
+NL
+X
+j=1
+(Luθ(xi) −R(xi))
+ ∂
+∂θ Ljuθ(xi)
+
+=
+1
+NrN 2
+L
+Nr
+X
+i=1
+
+
+
+
+NL
+X
+j=1
+Ljuθ(xi)
+
+−R(xi)
+
+
+
+
+NL
+X
+j=1
+∂
+∂θ Ljuθ(xi)
+
+.
+(63)
+26
+From the viewpoint of spatial sampling, the latent full batch gradient is the mean of NrNL terms:
+g(θ) =
+1
+NrN 2
+L
+Nr
+X
+i=1
+NL
+X
+j=1
+(Luθ(xi) −R(xi))
+ ∂
+∂θ Ljuθ(xi)
+
+:=
+1
+NrN 2
+L
+Nr
+X
+i=1
+NL
+X
+j=1
+gi,j(θ),
+(64)
+where we denote
+gi,j(θ) = (Luθ(xi) −R(xi))
+ ∂
+∂θ Ljuθ(xi)
+
+.
+(65)
+The underlying exact spatial gradient generated is given by
+gB,J(θ) =
+1
+|B||J|NL
+X
+i∈B
+(Luθ(xi) −R(xi))
+
+X
+j∈J
+∂
+∂θ Ljuθ(xi)
+
+=
+1
+|B||J|NL
+X
+i∈B
+X
+j∈J
+gi,j(θ).
+(66)
+We have the variance
+VarB,J[gB,J(θ)] = EB,J[(gB,J(θ) −g(θ))2] = EB,J[gB,J(θ)2]−EB,J[g(θ)2] = EB,J[gB,J(θ)2]−g(θ)2.
+(67)
+From a high-level perspective, VarB,J[gB,J(θ)] should be a function related to |B| and |J|. Thus,
+under the constraint that |B| · |J| is the same for different SDZE schemes, we can choose B and J
+properly to minimize the variance to accelerate convergence.
+EB,J[gB,J(θ)2] =
+1
+|B|2|J|2N 2
+L
+EB,J
+
+X
+i∈B
+X
+j∈J
+(Luθ(xi) −R(xi))
+ ∂
+∂θ Ljuθ(xi)
+
+
+2
+=
+1
+|B|2|J|2N 2
+L
+EB,J
+" X
+i,i′∈B
+X
+j,j′∈J
+(Luθ(xi) −R(xi))
+ ∂
+∂θ Ljuθ(xi)
+
+·
+(Luθ(xi′) −R(xi′))
+ ∂
+∂θ Lj′uθ(xi′)
+ #
+.
+(68)
+The entire expectation can be decomposed into four parts (1) i = i′, j = j′, (2) i ̸= i′, j = j′, (3)
+i = i′, j ̸= j′, (4) i ̸= i′, j ̸= j′. For the first part
+1
+|B|2|J|2N 2
+L
+EB,J
+" X
+i∈B
+X
+j∈J
+(Luθ(xi) −R(xi))2
+ ∂
+∂θ Ljuθ(xi)
+2 #
+=
+1
+|B||J|N 2
+L
+Ei,j
+"
+(Luθ(xi) −R(xi))2
+ ∂
+∂θ Ljuθ(xi)
+2 #
+=
+1
+|B||J|N 2
+L
+Ei,j[gi,j(θ)2]
+=
+1
+|B||J|NrN 3
+L
+Nr
+X
+i=1
+NL
+X
+j=1
+gi,j(θ)2 =
+C1
+|B||J|,
+(69)
+where we denote C1 =
+1
+NrN3
+L
+PNr
+i=1
+PNL
+j=1 gi,j(θ)2 which is independent of B, J.
+In the second case, since the i-th sample and the i′-th sample are independent for i ̸= i′, we have
+1
+|B|2|J|2N 2
+L
+EB,J
+" X
+i̸=i′∈B
+X
+j∈J
+(Luθ(xi) −R(xi)) (Luθ(xi′) −R(xi′))
+ ∂
+∂θ Ljuθ(xi)
+  ∂
+∂θ Ljuθ(xi′)
+ #
+=
+|B| −1
+|B||J|N 2
+L
+Ei,i′,j
+"
+(Luθ(xi) −R(xi)) (Luθ(xi′) −R(xi′))
+ ∂
+∂θ Ljuθ(xi)
+  ∂
+∂θ Ljuθ(xi′)
+ #
+= C2 · |B| −1
+|B||J| .
+(70)
+27
+In the third case, due to the same reason,
+1
+|B|2|J|2N 2
+L
+EB,J
+" X
+i∈B
+X
+j̸=j′∈J
+(Luθ(xi) −R(xi))2
+ ∂
+∂θ Ljuθ(xi)
+  ∂
+∂θ Lj′uθ(xi)
+ #
+=
+|J| −1
+|B||J|N 2
+L
+Ei,j,j′
+"
+(Luθ(xi) −R(xi))2
+ ∂
+∂θ Ljuθ(xi)
+  ∂
+∂θ Lj′uθ(xi)
+ #
+= C3 · |J| −1
+|B||J| .
+(71)
+In the last case,
+1
+|B|2|J|2N 2
+L
+EB,J
+" X
+i̸=i′∈B
+X
+j̸=j′∈J
+(Luθ(xi) −R(xi)) (Luθ(xi′) −R(xi′))
+ ∂
+∂θ Ljuθ(xi)
+  ∂
+∂θ Lj′uθ(xi′)
+ #
+= (|B| −1)(|J| −1)
+|B||J|N 2
+L
+Ei,i′,j,j′
+"
+(Luθ(xi) −R(xi)) (Luθ(xi′) −R(xi′))
+ ∂
+∂θ Ljuθ(xi)
+  ∂
+∂θ Lj′uθ(xi′)
+ #
+= (|B| −1)(|J| −1)
+|B||J|N 2
+L
+ 
+Ei,j
+"
+(Luθ(xi) −R(xi)) (Luθ(xi′) −R(xi′))
+#!2
+= (|B| −1)(|J| −1)
+|B||J|
+g(θ)2
+(72)
+Taking together
+VarB,J[gB,J(θ)] = EB,J[gB,J(θ)2] −g(θ)2
+= C1 + C2(|B| −1) + C3(|J| −1) + (1 −|B| −|J|)g(θ)2
+|B||J|
+= C4|J| + C5|B| + C6
+|B||J|
+.
+(73)
+A.3
+Proof of Lemma 5.2
+Proof. Recall the PINN’s neural network structure in Definition 1:
+uθ(x) = WLσ(WL−1σ(· · · σ(W1x) · · · ).
+After taking the derivative with respect to x, there is only one Rd vector term:
+∂uθ(x)
+∂x
+= WL · Φ(1)
+L−1(x)WL−1 · · · · · Φ(1)
+1 (x)W1 ∈Rd,
+(74)
+where Φ(n)
+l
+(x) = diag[σ(n)(Wlσ(Wl−1σ(· · · σ(W1x) · · · )] ∈Rml×ml and σ(n) denotes the ac-
+tivation function’s n-th order derivative which is also a pointwise function. Hence, the first-order
+derivative’s two norm has an upper bound of QL
+l=1 ∥M(l)∥due to bounded activation function in
+Assumption 5.1, i.e., ∥Φ(n)
+l
+(x)∥≤1. More specifically, since ∥AB∥≤∥A∥∥B∥for all matrices
+A, B, we have
+
+∂uθ(x)
+∂x
+ ≤
+L
+Y
+l=1
+∥Wl∥
+L−1
+Y
+l=1
+Φ(1)
+l
+(x)
+ ≤
+L
+Y
+l=1
+∥Wl∥≤
+L
+Y
+l=1
+M(l).
+(75)
+After taking the second derivative, due to the nested structure of the neural network, the result will be
+the sum of L −1 parts induced by the derivative of each Φ(1)
+l
+(x), 1 ≤l ≤L −1 with respect to x.
+28
+Each of the L −1 parts is a Rd×d matrix, and we further treat each row of them as one Rd vector
+term. Hence, there are d(L −1) number of Rd vector terms in total:
+∂2uθ(x)
+∂x2
+=
+(L−1
+X
+l=1
+(WLΦ(1)
+L−1(x) · · · Wl+1)diag(Φ(2)
+l
+(x)Wl · · · Φ(2)
+1 (x)(W1):,j)(Wl · · · Φ(1)
+1 (x)W1)
+)
+1≤j≤d
+(76)
+where we call each (WLΦ(1)
+L−1(x) · · · Wl+1)diag(Φ(2)
+l
+(x)Wl · · · Φ(2)
+1 (x)(W1):,j)(Wl · · · Φ(1)
+1 (x)W1) ∈
+Rd as a Rd vector term. Each of these d(L −1) number of Rd vector terms has an upper bound of
+M(L) QL−1
+l=1 M(l)2:
+(WLΦ(1)
+L−1(x) · · · Wl+1)diag(Φ(2)
+l
+(x)Wl · · · Φ(2)
+1 (x)(W1):,j)(Wl · · · Φ(1)
+1 (x)W1)
+
+≤
+ L
+Y
+k=1
+∥Wk∥
+! Φ(2)
+l
+(x)Wl · · · Φ(2)
+1 (x)(W1):,j
+
+≤
+ L
+Y
+k=1
+∥Wk∥
+!  
+lY
+k=1
+∥Wl∥
+!
+≤M(L)
+L−1
+Y
+l=1
+M(l)2.
+(77)
+In sum, for the second-order derivative, we have the lemma holds for the second-order case:
+vec
+∂2uθ(x)
+∂x2
+ ≤d(L −1)M(L)
+L−1
+Y
+l=1
+M(l)2.
+(78)
+Next, we try to discover the induction rule. For the n-th order derivative with n ≥1, it is the
+sum and the concatenation of (n −1)!dn−1(L −1)n−1 number of Rd vector terms (0! = 1),
+where each of them is bounded by M(L) QL−1
+l=1 M(l)n. Furthermore, each of the terms con-
+tains the product of at most n(L −1) matrix-valued function depending on x, which are
+{Φ(1)
+l
+(x)}L−1
+l=1 , {Φ(2)
+l
+(x)}L−1
+l=1 , . . . {Φ(n)
+l
+(x)}L−1
+l=1 . They are crucial in the product rule of deriva-
+tives.
+For instance, in the first-order derivative where n = 1, there is only one Rd term, bounded by
+QL
+l=1 M(l). This term also contains the product of L −1 matrix-valued function depending on x,
+which are {Φ(1)
+l
+(x)}L−1
+l=1 .
+For instance, in the second-order case where n = 2, the result is the sum and the concatenation of
+d(L −1) terms. Each of them can be bounded by M(L) QL−1
+l=1 M(l)2. These terms also contain the
+product of at most 2(L −1) matrix-valued function depending on x, which are {Φ(1)
+l
+(x)}L−1
+l=1 and
+{Φ(2)
+l
+(x)}L−1
+l=1 .
+Using the principle of induction, after taking the n-th derivative, there will be (n−1)!dn−1(L−1)n−1
+number of Rd vector terms, and each term has an upper bound of M(L) QL−1
+l=1 M(l)n. Each term
+contains at most n(L −1) matrix-valued function depending on x. The key to the proof is that
+∂ϕ(n)
+l
+(x)
+∂x
+= ϕ(n+1)
+l
+(x)Wl · · · ϕ(n+1)
+1
+(x)W1,
+
+∂ϕ(n)
+l
+(x)
+∂x
+ ≤
+lY
+k=1
+∥Wk∥≤
+L−1
+Y
+l=1
+M(l),
+∀l ≤L −1,
+(79)
+where ϕ(n)
+l
+(x) = σ(n)(Wlσ(Wl−1σ(· · · σ(W1x) · · · ) and Φ(n)
+l
+(x) = diag
+
+ϕ(n)
+l
+(x)
+
+. In other
+words, taking derivative to Φ(n)
+l
+(x) = diag
+
+ϕ(n)
+l
+(x)
+
+with respect to x will generate (l −1) more
+matrix-valued functions depending on x, which are
+n
+Φ(n+1)
+k
+(x)
+ol−1
+k=1. The term’s upper bound is
+multiplied/enlarged by at most QL−1
+l=1 M(l).
+29
+Consequently, for the case of (n + 1)-th order derivative, it is the sum and the concatenation of
+at most (n −1)!dn−1(L −1)n−1 · n(L −1) · d = n!dn(L −1)n number of Rd vector terms,
+where (n −1)!dn−1(L −1)n−1 is the number of Rd vector terms in the n-th order derivative,
+n(L −1) is the number of x-dependent matrix-valued functions in each term which is crucial in
+the product rule of derivatives, and d is due to the derivative tensor size. Each of these terms is
+bounded by M(L) · QL−1
+i=1 M(l)n · QL−1
+i=1 M(l) = M(L) · QL−1
+i=1 M(l)n+1. Each of these terms
+contains the product of at most (n + 1)(L −1) matrix-valued functions depending on x, which are
+{Φ(1)
+l
+(x)}L−1
+l=1 , {Φ(2)
+l
+(x)}L−1
+l=1 , . . . {Φ(n+1)
+l
+(x)}L−1
+l=1 . Hence, our induction assumption holds. Also,
+the norm of (n + 1)-th order derivative tensor will be upper bounded by
+vec
+ ∂n+1
+∂xn+1 uθ(x)
+
+(80)
+≤(n −1)!dn−1(L −1)n−1 · nd(L −1) · M(L)
+L−1
+Y
+l=1
+M(l)n ·
+L−1
+Y
+l=1
+M(l)
+(81)
+= n!dn(L −1)nM(L)
+L−1
+Y
+l=1
+M(l)n+1.
+(82)
+If we further take the analytical derivative with respect to Wl, the same logic and induction still
+apply. Concretely, we consider the exact derivatives with respect to the model parameter θ first. Since
+θ = {Wl}L
+l=1, we consider Wl
+∂uθ(x)
+∂Wl
+=
+h
+WLΦ(1)
+L−1(x) · · · WlΦ(1)
+l
+(x)
+iT
+· σ (Wl−1 · · · σ(W1x) · · · ) ∈Rml×ml−1,
+l > 1.
+(83)
+∂uθ(x)
+∂W1
+=
+h
+WLΦ(1)
+L−1(x) · · · W1Φ(1)
+1 (x)
+iT
+· x ∈Rm1×d
+(84)
+For all layer index l, ∂uθ(x)
+∂Wl
+is at most a Rh2 vector, whose each entry is bounded by QL
+l=1 M(l)
+for l ̸= 1. For l = 1, it is bounded by QL
+l=1 M(l) · ∥x∥. Furthermore, each of the terms contains
+the product of at most (L −1) matrix-valued function depending on x, which are {Φ(1)
+l
+(x)}L−1
+l=1 .
+They are crucial in the product rule of derivatives. Hence, our previous induction still applies to each
+of the h2 entries, and the final bound will be h2n!dn(L −1)nM(L) QL−1
+l=1 M(l)n+1 max {∥x∥, 1}.
+Intuitively, max {∥x∥, 1} is due to the derivative concerning W1, h2 is due to the size of model
+parameters, n + 1 is due to the n-th order derivatives for x and another derivative for θ.
+A.4
+Proof of Theorem 3
+Proof. Since we assume the SDZE zeroth-order trajectories in equations (27, 28) are bounded, we
+can denote such bound as M(l) := max {maxn {∥W n
+l ∥} , 1} < ∞.
+By Lemma 5.2, the norm of high-order derivatives of the neural network throughout the optimization
+will fall into a compact domain.
+Due to Assumption 5.2, the values generated by the PDE operator acting on the neural network and its
+latent analytical derivative with respect to model parameters θ (the exact spatial gradient underlying
+the optimization) will also fall into a bounded domain throughout the optimization, whose closure is
+compact.
+Since we bound the latent exact gradient produced by the physics-informed loss functions, we can
+further bound the latent spatial gradient variance during optimization.
+For the exact spatial gradient corresponding to the single-pass estimator,
+VarB,J(gB,J(θ)) ≤
+1
+|B||J|NrN 2
+L
+Nr
+X
+i=1
+NL
+X
+j=1
+∥gi,j(θ) −g(θ)∥2 ≤
+2
+|B||J|NL
+max
+i,j ∥gi,j(θ)∥2, (85)
+30
+where gi,j(θ) := (Luθ(xi) −R(xi))
+  ∂
+∂θLjuθ(xi)
+
+.
+For the exact spatial gradient corresponding to the double-pass estimator,
+gB,I,J(θ) =
+1
+|B||I|NL
+X
+n∈B
+
+NL
+|J|
+
+X
+j∈J
+Ljuθ(xn)
+
+−R(xn)
+
+
+ X
+i∈I
+∂
+∂θ Liuθ(xn)
+!
+=
+1
+|B||I||J|
+X
+n∈B
+X
+i∈I
+X
+j∈J
+
+Ljuθ(xn) −R(xn)
+NL
+  ∂
+∂θ Liuθ(xn)
+
+,
+(86)
+VarB,I,J(gB,I,J(θ)) ≤
+1
+|B||I||J|NrN 2
+L
+Nr
+X
+n=1
+NL
+X
+i=1
+NL
+X
+j=1
+(gn,i,j(θ) −g(θ))2 ≤
+2
+|B||I||J| max
+n,i,j ∥gn,i,j(θ)∥2,
+(87)
+where gn,i,j(θ) :=
+
+Ljuθ(xn) −R(xn)
+NL
+   ∂
+∂θLiuθ(xn)
+
+.
+Consequently,
+∥gi,j(θ)∥≤∥Luθ(xi) −R(xi)∥
+
+∂
+∂θ Ljuθ(xi)
+ ≤
+
+max
+i,j |Ljuθ(xi)| + R
+
+max
+i,j
+
+∂
+∂θ Ljuθ(xi)
+ ,
+(88)
+∥gn,i,j(θ)∥≤
+Ljuθ(xn) −R(xn)
+NL
+
+
+∂
+∂θ Liuθ(xn)
+ ≤
+
+max
+n,j |Ljuθ(xn)| + R
+
+max
+n,i
+
+∂
+∂θ Liuθ(xn)
+ .
+(89)
+Since |Ljuθ(xi)| and
+ ∂
+∂θLjuθ(xi)
+ can be bounded throughout the optimization process thanks to
+Lemma 5.2 and Assumption 5.2, the underlying exact spatial gradient variance during optimization is
+universally bounded and finite, i.e., the spatial gradient variance bounds are agnostic of the epoch n.
+Crucially, by Theorem 5 derived in Section 5.3, the variance of the zeroth-order subspace gradient
+ˆg is proportionally compressed and bounded by a multiplier of the exact spatial gradient variance
+(scaling with the subspace capacity q). Because the variance of the latent spatial gradient g(θ) is
+universally bounded, the SDZE zeroth-order optimization trajectory strictly inherits this boundedness.
+Thus, we complete the proof by applying standard convergence guarantees for variance-bounded
+zeroth-order descent methods Mertikopoulos et al. [2020].
+A.5
+Proofs of Theorem 4, 5 and 6
+The proofs for the subspace variance compression and global convergence strictly follow the frame-
+work of low-dimensional Gaussian smoothing Nozawa et al. [2025]. By substituting the projection
+matrix P possessing the exact orthogonality P⊤P = Iq into Stein’s Identity, the expectations al-
+gebraically map to the projected gradients within the Stiefel manifold. Specifically, for quadratic
+loss functions (Theorem 5), integrating by parts with respect to the Gaussian measure z ∼N(0, Iq)
+yields the constant variance scaling factor of (q + 2) and the expected cosine similarity of 1/q.
+For Theorem 6, since the underlying spatial loss surrogate L satisfies the Lipschitz smoothness
+requirements bounded by L1 (established by Lemma 5.2), and Theorem 4 bounds the approximation
+error Φ(θ) introduced by the finite differences, taking expectations over the ZO descent trajectory
+yields a telescope summation. By selecting the perturbation step size ϵ to offset the approximation
+error introduced by the trace bounded by q, the optimization trajectory successfully guarantees
+convergence to the critical points at a rate of O(P/ϵ).
+31

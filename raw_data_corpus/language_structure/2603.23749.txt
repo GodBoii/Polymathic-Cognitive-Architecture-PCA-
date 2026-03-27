@@ -1,0 +1,1521 @@
+Efficient Benchmarking of AI Agents
+Franck Ndzomga∗
+Abstract
+Evaluating AI agents on comprehensive benchmarks is expensive because each evaluation
+requires interactive rollouts with tool use and multi-step reasoning. We study whether small task
+subsets can preserve agent rankings at substantially lower cost. Unlike static language model
+benchmarks, agent evaluation is subject to scaffold-driven distribution shift, since performance
+depends on the framework wrapping the underlying model. Across eight benchmarks, 33 agent
+scaffolds, and 70+ model configurations, we find that absolute score prediction degrades under
+this shift, while rank-order prediction remains stable. Exploiting this asymmetry, we propose a
+simple optimization-free protocol: evaluate new agents only on tasks with intermediate historical
+pass rates (30–70%).
+This mid-range difficulty filter, motivated by Item Response Theory,
+reduces the number of evaluation tasks by 44–70% while maintaining high rank fidelity under
+scaffold and temporal shifts. It provides more reliable rankings than random sampling, which
+exhibits high variance across seeds, and outperforms greedy task selection under distribution
+shift. These results suggest that reliable leaderboard ranking does not require full-benchmark
+evaluation.
+LOAO
+Within-Scaffold
+LOAO
+Temporal
+LOSO
+Random 20%
+Evaluation Protocol (increasing 
+R² gap 
+)
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Performance
+Midrange (30 70% pass rate)
+Mean across 8 benchmarks
+Fully nested evaluations
+Mid-Difficulty Tasks Preserve Rankings Better Than Scores
+ (rank prediction)
+R² (score prediction)
+=0.38
+Figure 1: The Robustness Gap. Spearman ρ (ranking) and R2 (score prediction) across evalu-
+ation regimes. Ranking fidelity remains robust even as absolute score prediction rapidly degrades
+under temporal, scaffold and random shift.
+∗ndzomgafs@gmail.com
+1
+arXiv:2603.23749v1  [cs.AI]  24 Mar 2026
+1
+Introduction
+Agent benchmarks are increasingly used to evaluate AI systems on complex, multi-step tasks re-
+quiring reasoning, tool use, and interaction with external environments. Running these benchmarks
+is expensive and creates a situation reminiscent of the compute divide in Machine Learning research
+(Besiroglu et al., 2024). The Holistic Agent Leaderboard (Kapoor et al., 2026)—one of the most
+comprehensive standardized evaluation efforts for AI agents—required roughly $40,000 to evaluate
+agents on nine benchmarks, despite considering at most two scaffolds per benchmark and only one
+run per scaffold–model configuration. Such costs create a barrier for independent researchers and
+small labs, and make statistically robust evaluation difficult in practice (Gonzalez et al., 2025).
+Prior work on benchmark reduction has shown that NLP and language-model evaluations can
+often be compressed to much smaller task subsets while preserving the ability to predict model
+scores (Vivek et al., 2024; Polo et al., 2024; Perlitz et al., 2024; Subramani et al., 2025). Agent
+benchmarks, however, introduce a source of shift that static evaluations lack: performance depends
+not only on the underlying model but also on the scaffold, the harness governing tool use, memory,
+retry logic, and execution flow. A reduced evaluation suite for agents must therefore generalize
+across scaffolds and over time, not only across models. The reduction problem is also more stringent:
+agent benchmarks typically contain dozens to hundreds of tasks rather than thousands, and each
+task requires a full agent loop rather than a single prompt–response pass.
+This paper studies whether the number of benchmark tasks can be significantly reduced while
+preserving the signal that agent leaderboards actually consume: rankings. We make three contri-
+butions:
+1. We identify a robust empirical asymmetry between ranking and score prediction under
+scaffold and temporal shift, which makes benchmark reduction feasible in the agent setting.
+2. We propose the Mid-Range Difficulty Filter (MR), a deterministic, optimization-free task
+selection rule that retains tasks with pass rates between 30–70%. The rule is motivated by Item
+Response Theory: tasks near 50% pass rate carry the strongest discriminative information about
+latent agent ability.
+3. We evaluate MR against greedy, random, stratified, and extreme-difficulty baselines under five
+protocols of increasing distributional shift, using proper nested cross-validation throughout.
+MR achieves the best ranking fidelity across the eight benchmarks we study while
+remaining stable across evaluation regimes, in contrast to the high-variance behavior of random
+and greedy selection.
+Together, these results support a practical conclusion: routine leaderboard evaluation can de-
+fault to reduced task suites, with full-benchmark runs reserved for initialization, drift monitoring,
+and major capability transitions.
+2
+Background and Related Work
+A growing literature studies how to reduce the cost of benchmark evaluation without substantially
+changing benchmark scores or rankings. Most prior work focuses on NLP benchmarks or language
+model (LM) evaluations rather than agent benchmarks. For example, Vivek et al. (2024) propose
+Anchor Point Selection, a method for identifying small representative subsets of benchmark exam-
+ples that can reliably rank models and estimate instance-level behavior on the full dataset. Similarly,
+Polo et al. (2024) shows that the performance of a LM in suites such as MMLU (Hendrycks et al.,
+2
+2021) and HELM (Liang et al., 2023) can be estimated from a much smaller set of carefully selected
+examples, which produces large reductions in the evaluation cost. Perlitz et al. (2024) studies the
+computation–reliability trade-off in HELM and proposes the Decision Impact on Reliability (DIoR)
+measure together with an evaluation algorithm that can substantially reduce the evaluation cost
+while preserving the reliability of the ranking.
+More recently, Subramani et al. (2025) studied
+benchmark reduction from performance matrices alone, showing that small representative subsets
+of datasets can preserve model rankings and predict held-out performance on benchmarks such as
+HELM, MMLU and BigBenchLite (Srivastava et al., 2023).
+A related line of work uses psychometric ideas, especially Item Response Theory (IRT) (Baker,
+2001), to determine which benchmark items are the most informative (Gignac and Ili´c, 2025).
+Rodriguez et al. (2021) propose DAD (Difficulty and Ability Discriminating) leaderboards, which
+model latent item difficulty and model ability to analyze leaderboard reliability and identify infor-
+mative or erroneous evaluation items. Applying the DAD framework to the SQuAD 2.0 leaderboard
+shows that IRT-based rankings are more stable than rankings based solely on average accuracy
+and can improve the reliability of evaluation when only a small subset of items is available.These
+approaches emphasize that benchmark items differ in difficulty and discrimination, and that bench-
+mark rankings can change depending on which items are selected. Recent work extends this per-
+spective to LM evaluations, for example by using richer IRT models to diagnose benchmark quality
+and construct smaller benchmark variants that better align with human preferences (Zhou et al.,
+2026).
+Our work is close in spirit to these papers, but differs in setting and objective. Prior benchmark
+reduction work primarily studies model evaluation on NLP or LM benchmarks. Agent benchmarks
+introduce an additional and central source of shift: performance depends not only on the underlying
+model, but also on the scaffold that governs tool use, memory, retry logic, and execution flow. As
+a result, reduced evaluations for agents must generalize not only across models, but also across
+scaffolds and over time. The reduction problem is also more stringent in the agent setting. In
+LM evaluations, reducing a benchmark often means moving from thousands of examples to a few
+hundred. Agent benchmarks, however, often contain only dozens or hundreds of tasks to begin with,
+and each task is much more expensive because it requires a full agent loop rather than a single
+prompt–response pass. To be genuinely cost-efficient, a reduced agent benchmark must therefore
+extract a strong signal from both fewer tasks and relatively few fully evaluated agents.
+3
+Methods
+3.1
+Problem Setup
+Let us suppose that for every benchmark at our disposal, we have access to a per task performance
+matrix X ∈[0, 1]n×m, where n is the number of agents and m is the number of tasks. Each entry
+Xij indicates whether agent i solved task j. When each agent is evaluated once per task, entries
+are binary (Xij ∈{0, 1}); when multiple trials are run, Xij is the fraction of trials in which agent i
+solved task j. The full benchmark score for agent i is the mean across all tasks:
+yi = 1
+m
+m
+X
+j=1
+Xij
+(1)
+Collecting these scores over all agents gives the benchmark score vector
+y = (y1, . . . , yn)⊤.
+(2)
+3
+The goal of benchmark reduction is to identify a subset S ⊆{1, . . . , m} with |S| = k ≪m such
+that performance on S alone predicts y. Let XS ∈[0, 1]n×k denote the submatrix of X restricted
+to the columns in S. We fit a Ridge regression on the selected columns, ˆy = XSβ, where β ∈Rk is
+the Ridge coefficient vector with regularization parameter α = 1.0 throughout for score calibration.
+For rank prediction alone, an unweighted mean over selected tasks suffices.
+A critical distinction in this work is between two prediction targets that impose different re-
+quirements on the task subset.
+Score prediction.
+We ask how accurately the subset predicts each agent’s full benchmark score,
+measured by the coefficient of determination:
+R2 = 1 −
+P
+i(yi −ˆyi)2
+P
+i(yi −¯y)2
+(3)
+where ˆyi is the Ridge-predicted score for agent i and ¯y =
+1
+n
+P
+i yi is the mean benchmark
+score across agents. High R2 requires the subset to capture the absolute difficulty structure of the
+benchmark—not just which agents are better, but by how much (calibration). This is sensitive to
+any shift in the relationship between subset performance and full-benchmark performance.
+Rank prediction.
+We ask whether the subset preserves the ordering of agents, measured by
+two complementary rank correlations. Spearman’s ρ is the Pearson correlation computed on rank
+vectors:
+ρ =
+P
+i(ri −¯r)(si −¯s)
+pP
+i(ri −¯r)2 pP
+i(si −¯s)2
+(4)
+where ri and si are the ranks of agent i in the predicted and actual orderings respectively (with
+ties assigned midranks), and ¯r, ¯s are their means. It captures overall monotonic association and is
+sensitive to large rank displacements.
+Kendall’s τ counts concordant and discordant pairs, adjusted for ties (we use the τb variant
+throughout and write τ for brevity):
+τ =
+C −D
+p
+(n0 −n1)(n0 −n2)
+(5)
+where a pair (i, j) is concordant if ˆyi > ˆyj and yi > yj (or both inequalities reversed) and
+discordant if the inequalities disagree; C and D are the counts of concordant and discordant pairs,
+n0 =
+ n
+2
+
+is the total number of pairs, and n1, n2 are the number of pairs tied in the predicted and
+actual rankings respectively. Kendall’s τ has a direct probabilistic interpretation: (τ + 1)/2 is the
+probability that a randomly chosen pair of agents is ranked correctly. For instance, τ = 0.80 means
+that 90% of all pairwise comparisons agree with the full benchmark. Because τ counts pairwise
+errors rather than squared rank displacements, it provides a stricter test of ranking fidelity than
+ρ, which tends to be numerically higher for the same underlying agreement.
+We report both
+throughout: ρ for comparability with prior work, τ for interpretability.
+These two targets can diverge substantially. A task subset can produce poorly calibrated score
+predictions (R2 ≪1) while still correctly identifying which agents outperform which (ρ ≈1,
+τ ≈1). As we show in Section 4, this divergence is not merely theoretical: under scaffold-induced
+distribution shift, R2 collapses while both rank metrics remain high. This asymmetry is the key to
+cost-efficient agent evaluation, because most practical use cases—model selection, scaffold selection,
+leaderboard ranking—require only rank prediction.
+4
+To achieve benchmark reduction, one needs a task selection method: a function σ that maps
+the entire task set {1, . . . , m} (and, optionally, historical performance data) to a subset S =
+σ({1, . . . , m}) ⊆{1, . . . , m} with |S| = k ≪m.
+3.2
+Data
+We study eight agent benchmarks: Terminal-Bench 2.0 (Merrill et al., 2026), a benchmark of
+AI agents in terminal environments with rich temporal structure, and seven benchmarks from
+the Holistic Agent Leaderboard (HAL), spanning diverse task domains but with smaller agent
+populations.
+Terminal-Bench 2.0.
+Terminal-Bench evaluates AI agents on 89 tasks, each attempted 5 times
+per agent, yielding a fractional success rate per cell.
+At the time we scraped it, the leader-
+board contained 101 agents drawn from 23 distinct agent scaffolds (OpenHands (Wang et al.,
+2025), Codex CLI (OpenAI, 2025), Aider (Aider-AI, 2024), and various custom implementations).
+Terminal-Bench has a natural temporal structure: 50 agents were present at launch in October 2025,
+and 51 were added over the following 3.5 months across 17 scaffold types not represented in the orig-
+inal batch. This makes Terminal-Bench uniquely suited for evaluating whether the task selection
+part of the benchmark reduction process generalizes to novel agent architectures.
+Holistic Agent Leaderboard.
+HAL (Kapoor et al., 2026) contains results from nine benchmarks
+spanning coding (SWE-bench Verified (Jimenez et al., 2024), CoreBench Hard (Siegel et al., 2024),
+USACO (Shi et al., 2024), SciCode (Tian et al., 2024), ScienceAgentBench (Chen et al., 2025)),
+web navigation (Online Mind2Web (Xue et al., 2025)), general assistance (GAIA (Mialon et al.,
+2024), AssistantBench (Yoran et al., 2024)), and customer service (TAU-bench Airline (Yao et al.,
+2025)). ScienceAgentBench and AssistantBench are excluded from our analysis because they do not
+provide the clean binary per-task success signals necessary for task selection and ranking prediction.
+TAU-bench uses reward-thresholding rather than a native binary success report per task: a task
+is considered successful if the reward is strictly positive, and overall accuracy corresponds to the
+average reward across tasks. We found that reward-thresholding still provides an exploitable per-
+task signal, so we retained TAU-bench in our analysis. Table 1 summarizes the key statistics of
+each benchmark at the time of data acquisition.
+Benchmark
+Agents
+Tasks
+Scaffolds
+Avg task ρ
+CoreBench Hard
+38
+45
+2
+0.10
+GAIA
+32
+165
+2
+0.15
+Mind2Web
+22
+300
+2
+0.03
+SciCode
+24
+65
+2
+0.12
+SWE-bench Verified
+28
+50
+2
+0.29
+TAU-bench Airline
+26
+50
+2
+0.08
+USACO
+13
+307
+2
+0.17
+Terminal-Bench 2.0
+101
+89
+23
+0.30
+Table 1: Benchmark statistics. Avg task ρ: mean pairwise Spearman correlation between task
+outcome vectors across agents; higher values indicate a more homogeneous benchmark.
+Benchmarks from HAL differ from Terminal-Bench in three important respects. First, in most
+cases, they record a single trial per task, producing binary outcomes with no within-cell variance
+5
+estimation; this makes the per task signal noisier. Second, each HAL benchmark includes only
+two scaffolds, limiting the diversity of the agent population. Third, agent sample sizes are modest
+(n = 13–38), constraining the reliability of any data-driven selection procedure.
+The final column in Table 1, average task ρ, reports the mean pairwise Spearman correlation
+between task outcome vectors. Higher values indicate that agent performance is consistent across
+tasks; lower values indicate more variable performance patterns.
+Cost structure.
+Table 2 reports per-run evaluation costs from HAL. A single SWE-bench Ver-
+ified run costs a median of $163, with per-task costs ranging from $0.08 (DeepSeek R1) to $32.00
+(Claude Opus 4.1 High) – a spread of 400× driven by model pricing and scaffold design. Evaluating
+one agent on all eight selected HAL benchmarks costs a median of roughly $800 in API fees. The
+total cost across all 242 agent runs is approximately $46,000, consistent with HAL’s reported esti-
+mate of ∼$40,000 (Kapoor et al., 2026) since additional runs were added between the publication
+of the paper and our data acquisition efforts. The total cost of one agent run depends on the
+benchmark, the scaffold, and the model used. State of the art models can push costs as high as
+$2,829 on GAIA before accounting for caching benefits.
+Benchmark
+Tasks
+Agents
+Med. $/run
+Max $/run
+Med. $/task
+Range $/task
+SWE-bench Verified
+50
+33
+$163
+$1600
+$3.26
+$0.08–32.00
+CoreBench Hard
+45
+45
+$66
+$510
+$1.47
+$0.05–11.33
+GAIA
+165
+32
+$140
+$2829
+$0.85
+$0.05–17.14
+Mind2Web
+300
+22
+$276
+$1610
+$0.92
+$0.02–5.37
+SciCode
+65
+33
+$67
+$625
+$1.03
+$0.00–9.62
+TAU-bench Airline
+50
+26
+$22
+$180
+$0.44
+$0.01–3.61
+USACO
+307
+13
+$56
+$276
+$0.18
+$0.00–0.90
+Table 2: Per-run evaluation costs on HAL benchmarks. Costs reflect API fees and vary with model
+and scaffold.
+The Terminal-Bench 2.0 leaderboard does not offer the level of fine-grained details HAL offers
+to track the cost of each agent run.
+3.3
+Task Selection Strategies
+The challenge of agent benchmark reduction consists of finding a task selection strategy that allows
+us to run fewer tasks while still recovering agent rankings and benchmark scores. We evaluate three
+main task selection strategies: Mid-Range, Greedy, and Random selection.
+Mid-Range Difficulty Filter (MR).
+We select all tasks whose pass rate falls in the interval
+[0.30, 0.70]. The choice of band is motivated by Item Response Theory (Baker, 2001). Let p denote
+the probability that an agent solves a task. Under a Bernoulli response model with logistic link,
+the Fisher information about the latent ability parameter θ is I(θ) = p(1 −p). This quantity is
+maximized at p = 0.5 and falls to half its maximum at p ≈0.146 and p ≈0.854.
+We target a benchmark reduction of roughly 50% as a practical efficiency requirement. The 30–
+70% band provides a simple fixed rule that is substantially narrower than the full high-information
+region (15–85%), while still retaining moderately difficult tasks.
+We apply the mid-range filtering protocol only to benchmarks with a sufficiently populated
+intermediate-difficulty band. In our data, SciCode contains only four tasks in the 30–70% pass-
+rate interval, making the protocol unstable. We therefore exclude it from the main MR evaluation
+6
+results, and retain it only in the per-benchmark breakdown to illustrate a case where the mid-range
+protocol is not appropriate.
+Greedy Forward Selection (Greedy-k).
+Starting from an empty set, we iteratively add the
+task that maximizes cross-validated leave-one-agent-out R2 under Ridge regression (Hoerl and
+Kennard, 1970), using the hat-matrix shortcut for efficient computation.
+For fair comparison
+with MR, we use k tasks, where k equals the number of mid-range tasks for that evaluation fold.
+Specifically, in each evaluation fold, we first compute the MR band on the training agents to obtain
+a fold-specific budget ki, then evaluate Greedy (and all other baselines) at exactly that budget. This
+fully nested, matched-budget design ensures no information leakage and enables direct comparison
+across methods.
+Random Sampling (Random-k).
+We sample k tasks uniformly at random, where k is matched
+to the MR pool size in each evaluation fold for fair comparison. We use 100 random seeds; a meta-
+bootstrap analysis confirms this yields stable estimates across all benchmarks (variance of the
+estimated mean and standard deviation below 2 × 10−5). We report mean ± standard deviation
+across seeds. This baseline tests whether the identity of selected tasks matters, or whether any
+sufficiently large random subset suffices.
+Other baselines.
+We also evaluate Hardest-k (the k tasks with lowest pass rate), Easiest-k
+(the k tasks with highest pass rate), and Stratified-k (uniform sampling across difficulty deciles).
+All baselines use the same fold-specific budget k as MR.
+3.4
+Evaluation Protocols
+All evaluations use proper nested cross-validation (CV): task selection occurs inside the CV loop,
+so the test agent’s data is never used during task selection. This prevents the optimistic bias that
+arises when tasks are selected on the full dataset before splitting.
+We evaluate under five protocols, ordered by increasing distributional shift:
+1. Within-Scaffold LOAO. Leave-one-agent-out, restricted to agents sharing the same scaffold.
+On Terminal-Bench, we evaluate on the three scaffolds with ≥10 agent runs (Terminus 2: 30,
+Mini-SWE-Agent: 13, OpenHands: 12). On HAL, each scaffold typically contains 10–20 agent
+runs, and we discard the ones that do not.
+2. LOAO. Leave-one-agent-out across all agents regardless of scaffold. Tasks are reselected for
+each fold.
+3. Random 80/20 splits. Random partition of agents into 80% train, 20% test (×100 seeds).
+4. LOSO. Leave-one-scaffold-out: train on all agents from other scaffolds, test on the held-out
+scaffold. Tasks selected on training scaffolds only.
+5. Temporal expanding window.
+Train on all agents submitted before time t, predict the
+agent submitted at time t. Tasks selected on the training set at each step. This mirrors real
+leaderboard operation.
+We report Spearman ρ, Kendall τ, and R2.
+7
+4
+Results
+4.1
+The ρ–R2 Divergence:
+Rank Prediction is Preserved Even When Score
+Prediction Collapses
+By running 5 evaluation protocols across 8 agent benchmarks and 6 task selection strategies, we
+show empirically that leaderboard rankings are preserved better than absolute scores.
+Rank prediction is stable across protocols (ρ = 0.90–0.96), while score prediction drops from
+R2 = 0.90 to R2 = 0.54 under random splits and R2 = 0.65 under scaffold shift. On individual
+benchmarks, the divergence is more extreme: R2 goes negative on Online Mind2Web under LOSO
+while ρ remains above 0.90. The temporal expansion window protocol shows high ρ (0.90) because
+the growing training set offsets the distributional shift. It is the protocol that mirrors the most
+real leaderboard operation.
+Table 3 reports the central finding: under proper nested cross-validation, Spearman ρ remains
+stable across all evaluation protocols while R2 degrades substantially. This empirical reality can be
+exploited to reduce the cost of AI agent evaluation. It means that we need not run full benchmark
+suites to be able to compare agents against each other and rank them. The worst Kendall’s τ
+among optimal task selection strategies is 0.80 (LOSO), meaning that 90% of agent pairs are
+ranked correctly: for every 100 pairwise comparisons, only 10 are inverted.
+ρ
+τ
+R2
+Protocol
+Best
+Avg
+Best
+Avg
+Best
+Avg
+Benchmarks
+LOAO
+0.95
+0.91
+0.85
+0.79
+0.90
+0.74
+8
+Within-Scaffold LOAO
+0.96
+0.86
+0.87
+0.74
+0.89
+0.65
+8
+Temporal
+0.90
+0.85
+0.81
+0.73
+0.71
+0.52
+8
+LOSO
+0.92
+0.87
+0.80
+0.73
+0.65
+0.50
+7
+Random 20%
+0.90
+0.86
+0.84
+0.79
+0.54
+0.46
+8
+Table 3: Rank prediction (ρ, τ) vs. score prediction (R2) across evaluation protocols. ”Best” selects
+the top-performing task selection method per benchmark; ”Avg” averages across methods.
+Agent benchmarks are often used to estimate absolute capability. In practice, even a full run
+of a benchmark suite merely provides a biased estimate of the capability we are trying to measure.
+The estimate is biased by distributional limitations (benchmark tasks are a convenience sample,
+not a representative draw from the space of all relevant challenges), construct validity failures
+(Zhu et al., 2025) (seven of ten widely used agent benchmarks exhibit either task validity failures,
+where a trivial agent can pass without possessing the target capability, or outcome validity failures,
+where the grader awards credit for incorrect completions), and scaffold confounding (performance
+depends jointly on the model and the scaffold wrapping it, so absolute scores conflate capability
+with confounding engineering choices). These biases are structural: they affect the expectation of
+the score, not just its variance, and cannot be eliminated by running more tasks or more agents.
+Focusing on rank prediction rather than score reconstruction is therefore defensible on epistemic
+grounds, not merely practical ones: absolute scores are already systematically misleading before
+any reduction is applied, and rankings inherit less of this structural bias because affine distortions
+to the score scale leave orderings intact. In other words, ranking agents on a benchmark is more
+defensible than estimating their absolute capabilities, since it requires no assumption that the
+benchmark reliably measures the underlying capability it is intended to assess.
+8
+4.2
+Mid-Range Task Selection Is the Best Strategy Across Benchmarks and
+Evaluation Protocols
+The Mid-Range selection strategy preserves ranking better than all the other strategies evaluated.
+Although most strategies can achieve high peak performance (ρ ≈0.99) under optimal conditions,
+their lower bounds reveal severe vulnerabilities to distribution changes. Random and Greedy can
+have a Spearman ρ as low as 0.54 and 0.56 respectively.
+Mid-Range task selection (MR) maintains the highest mean (ρ = 0.94) while providing a robust
+safety net (worst-case ρ = 0.87), avoiding the catastrophic degradation seen in Greedy and Random
+selection, as presented in Figure 2.
+Mid-Range
+Easiest
+Random
+Stratified
+Greedy
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Spearman 
+0.94
+worst: 0.87
+best: 0.99
+0.92
+worst: 0.83
+best: 0.98
+0.88
+worst: 0.54
+best: 0.99
+0.88
+worst: 0.68
+best: 0.98
+0.86
+worst: 0.56
+best: 0.99
+Range across 7 intersecting benchmarks
+(Excludes benchmarks missing valid baseline data)
+Task Selection Strategies: Mean vs. Range of Performance
+Mean 
+Worst case
+Best case
+Figure 2: Range of Performance by Selection Strategy. Mean, best-case, and worst-case
+Spearman ρ across overlapping benchmarks and evaluation protocols. Mid-Range task selection
+offers the overall best ranking preservation across benchmarks.
+Figure 3 shows that while baseline strategies show high variance and severe performance degra-
+dation on specific benchmark splits (indicated by the low-lying scatter points), Mid-Range selec-
+tion maintains tightly clustered, high-fidelity rankings (> 0.85 mean ρ) regardless of the evaluation
+regime.
+Across all evaluation protocols, the results reveal a clear ordering driven by difficulty filtering.
+MR achieves the best rank and score prediction (ρ = 0.910, R2 = 0.670), closely followed by
+Easiest-k (ρ = 0.894, R2 = 0.628). Stratified-k (ρ = 0.875) falls between: better than Random
+(ρ = 0.816) by guaranteeing a balanced sample, but worse than MR because it forces inclusion
+of hard, noisy tasks.
+Greedy-k (ρ = 0.842) systematically overfits and thus has less reliable
+performance under temporal and scaffold shift.
+Hardest-k is catastrophic (ρ = 0.638, R2 =
+−3.360): when agents universally fail selected tasks, discrimination becomes impossible.
+The critical insight is that the dominant factor is which tasks are excluded, not which are
+included. Both MR and Easiest-k succeed because they drop the hardest tasks, which contribute
+noise rather than signal. MR is preferred over Easiest-k for two reasons: it achieves better R2
+(by also excluding ceiling-effect tasks where all agents succeed) and features principled theoretical
+motivation from IRT. Stratified-k’s intermediate performance confirms this: forcing inclusion of
+hard tasks proportional to the original benchmark actively degrades ranking prediction.
+9
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Spearman 
+LOAO
+LOSO
+Mid-Range
+Greedy
+Easiest
+Stratified
+Random
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Spearman 
+Random 20%
+Mid-Range
+Greedy
+Easiest
+Stratified
+Random
+Temporal
+Method Performance Across Evaluation Protocols
+Figure 3: Performance Stability Across Distribution Shifts. Average Spearman ρ by task
+selection strategy, disaggregated across four evaluation protocols (LOAO, LOSO, Random 20%,
+and Temporal shift). Mid-Range selection maintains reliable rankings (> 0.85 mean ρ) regardless
+of the evaluation regime.
+Across all evaluation protocols, MR achieves the highest ranking preservation on five out of
+eight benchmarks and comes in a close second on the rest. Random task selection performs well
+on average, but this average is computed over 100 seeds, which does not reflect real benchmark
+practice and would itself defeat the purpose of cost reduction. Its large variance makes it unusable
+as a deployment strategy; we retain it as a useful baseline.
+Random
+Benchmark
+k
+MR
+Greedy
+Easiest
+Stratified
+µ ± σ
+Worst / Best
+TerminalBench
+39
+0.980
+0.988
+0.970
+0.979
+0.980 ± .003
+0.962 / 0.991
+GAIA
+77
+0.946
+0.927
+0.928
+0.930
+0.938 ± .015
+0.872 / 0.987
+SWE-bench Mini
+20
+0.920
+0.881
+0.922
+0.902
+0.903 ± .026
+0.695 / 0.977
+USACO
+81
+0.938
+0.886
+0.861
+0.914
+0.924 ± .033
+0.700 / 0.995
+τ-bench Airline
+27
+0.944
+0.834
+0.920
+0.874
+0.860 ± .038
+0.708 / 0.957
+CoreBench Hard
+14
+0.901
+0.869
+0.896
+0.741
+0.780 ± .050
+0.588 / 0.910
+Online Mind2Web
+86
+0.921
+0.612
+0.913
+0.798
+0.808 ± .062
+0.543 / 0.962
+SciCode
+4
+0.736
+0.753
+0.736
+—
+0.364 ± .147
+−0.189 / 0.734
+Table 4: Per-benchmark mean ρ across all evaluation protocols. Random reports mean ± std over
+100 seeds per protocol; Worst/Best denote extreme seed outcomes across all protocols.
+10
+Why Easiest Is Competitive: It Selects Mid-Range Tasks
+The Easiest-k achieves surprisingly competitive ranking performance (Table 4), but not
+because easy tasks are inherently informative. On 4 of 8 benchmarks, Easiest-k and MR
+select identical or near-identical task sets: when a benchmark’s difficulty distribution is
+left-skewed—many hard tasks, few easy ones—the k easiest tasks simply have a higher over-
+lap with the mid-range band.
+The performance gap between MR and Easiest-k corre-
+lates strongly with their task-set overlap (r = −0.71, p = 0.05): where overlap is high
+(CoreBench, SciCode, τ-bench), the two methods are nearly indistinguishable; where
+overlap is low (USACO, 14% overlap), MR outperforms Easiest-k by ∆ρ = 0.078. Easi-
+est-k is competitive precisely when, and because, it is a noisy approximation of MR.
+Appendix A.4 visualizes the underlying difficulty distributions that drive this overlap.
+20
+40
+60
+80
+100
+Task Overlap with Mid-Range (%)
+0.025
+0.000
+0.025
+0.050
+0.075
+0.100
+0.125
+MR advantage over Easiest-k (
+)
+MR wins 
+ EK wins
+Pearson r =
+0.71,  p = 0.048
+As overlap 
+, MR advantage 
+ under shift
+Lower task overlap 
+ larger MR advantage under shift
+In-Distribution (LOAO)
+Distribution Shift (LOSO + Temporal)
+TBench
+GAIA
+SWE-bench
+USACO
+-bench
+CoreBench
+Online Mind2Web
+SciCode
+Figure 4: The MR–Easiest performance gap correlates with task-set overlap (r = −0.71,
+p = 0.048): Easiest-k is competitive when it selects the same tasks as MR. USACO (14%
+overlap) is the benchmark where the two sets genuinely differ, and it is where MR most
+clearly wins (∆ρ = 0.078 under distribution shift).
+4.3
+Cost Reduction
+Table 5 reports the per-benchmark task and cost reduction from MR filtering. Typical task reduc-
+tion ranges from 44% to 70%, with a median of 58%. These are significant reductions that translate
+into per-run savings ranging from $5–$22 for τ-bench Airline to $149–$253 for Online Mind2Web.
+11
+MR ρ
+Cost Savings
+Benchmark
+N
+kMR
+Reduction
+LOAO
+LOSO
+Temp.
+Median
+Range
+TerminalBench
+89
+39
+56%
+0.986
+0.984
+0.975
+—
+—
+GAIA
+165
+82
+50%
+0.956
+0.926
+0.974
+$70.3
+$40.1–$237.7
+SWE-bench Mini
+50
+21
+58%
+0.924
+0.896
+0.968
+$94.5
+$37.9–$234.0
+USACO
+307
+93
+70%
+0.940
+—
+0.950
+$39.3
+$19.6–$55.8
+τ-bench Airline
+50
+28
+44%
+0.967
+0.956
+0.945
+$9.8
+$5.2–$22.4
+CoreBench Hard
+45
+15
+67%
+0.918
+0.912
+0.903
+$44.1
+$16.8–$67.5
+Online Mind2Web
+300
+95
+68%
+0.939
+0.909
+0.930
+$188.7
+$149.2–$253.2
+Total/Mean
+1006
+373
+63%
+0.947
+0.931
+0.949
+$446.7
+$268.8–$870.6
+Table 5: Benchmark reduction from mid-range filtering. Task reduction is the fraction eliminated;
+cost savings (per agent, per benchmark) assume linear scaling with task count, using median
+agent cost from HAL leaderboards. TerminalBench lacks HAL-style cost data. USACO LOSO is
+unavailable because all but one agent use a single scaffold. SciCode excluded due to insufficient
+mid-range tasks (k = 4).
+5
+Discussion
+5.1
+Practical Protocol for Benchmark Operators
+To take advantage of benchmark reduction using the MR task selection strategy, we recommend a
+four-phase deployment:
+Phase 0—Cold Start. Use all available historical agent runs to estimate per-task pass rates;
+even 5–10 runs provide a usable first estimate, and estimates improve continuously as more agents
+are added. Tasks near the band boundaries will be estimated with more uncertainty under small
+agent runs, but misclassification at the boundary has limited consequence given the width of the
+mid-range band.
+Phase 1—Setup. Select all tasks in the 30–70% pass rate band. If fewer than 10% of tasks fall
+in this band, widen incrementally to 25–75%, then to the theoretically motivated 15–85% bound
+derived from the IRT Fisher information criterion I(θ) = p(1 −p) ≥1
+2Imax.
+Phase 2—Ongoing. Run new agents on selected tasks only. Report rankings, not absolute scores
+from the reduced suite. If absolute scores must be reported, report Ridge-predicted full-benchmark
+scores rather than raw scores on the reduced task set, and accompany them with confidence intervals
+to reflect prediction uncertainty.
+Phase 3—Maintenance. Fix the task set until evidence suggests otherwise. If score prediction
+is needed, refit Ridge weights every 5–10 agents. Monitor ρ on occasional full-benchmark validation
+runs; trigger reselection only if ρ falls below 0.75.
+This protocol is inappropriate when: only a few agent runs are expected and cold-start cost
+cannot be recouped; absolute capability claims are needed; or the difficulty distribution is so skewed
+that fewer than 10% of tasks fall in the mid-range band (as in SciCode, where fewer than 5 of 65
+tasks are mid-range).
+12
+5.2
+A Call for Per-Task Transparency
+This study is possible only because HAL and Terminal-Bench publish per-task, per-agent results—
+the full performance matrix, not just aggregate scores. Most benchmarks do not.
+Even when per-task data nominally exists, it is often distributed across nested JSON logs or
+multiple API endpoints, requiring substantial engineering effort to reconstruct into a usable format.
+Data that is publicly available but not readily accessible limits reproducibility and community reuse.
+We recommend that benchmark operators publish, alongside any leaderboard, a single flat file
+(CSV or equivalent) containing one row per agent–task pair with columns for agent identifier, task
+identifier, outcome, scaffold/harness, model, and submission date. This costs nothing beyond what
+is already computed during evaluation but enables the community to study evaluation efficiency,
+detect benchmark saturation, identify redundant tasks, and build reduced evaluation suites. The
+amortization argument depends on this: historical rollouts become shared training data only if they
+are shared—and shared in a format that anyone can load in one line of code.
+6
+Limitations
+MR requires a populated mid-range difficulty band to function properly. It fails on SciCode, where
+only about four tasks fall into this band, and more generally, benchmarks with highly skewed
+difficulty distributions are less compatible with this approach.
+There is a non-trivial cold-start cost: approximately five to ten agents must be evaluated on the
+full benchmark before reduction becomes reliable for incremental use, and closer to fifteen agents
+are needed for stability across all future comparisons.
+For HAL benchmarks, the number of agent runs is relatively small (n = 13–38), with limited
+scaffold diversity and minimal ability to estimate run-to-run variance. We mitigated this using
+nested cross-validation and replication across eight benchmarks, but larger and more diverse pop-
+ulations would strengthen the conclusions.
+For TerminalBench, the temporal validation window spans approximately 3.5 months (105
+days), during which the agent population increased by about 40%. We observe that task selection
+quality degrades over time as the population evolves. In particular, large capability jumps, reflected
+as sudden increases in MR pass rates, can invalidate previously selected tasks more quickly than
+gradual drift. In such cases, a full-benchmark run is required to confirm results, collect additional
+data, and potentially redo task selection or declare the benchmark saturated.
+All benchmarks in this study use binary or near-binary outcomes per task. Benchmarks with
+grading that obscure the relationship between per-task outcomes and overall score may behave
+differently and are not directly covered by these results.
+Finally, the 30–70% difficulty band is a practical heuristic motivated by item response theory
+and cost reduction targets, rather than a theoretically unique or optimal choice.
+7
+Conclusion
+Our results show that reliable AI agent leaderboard rankings do not require full-benchmark evalu-
+ation. Across eight benchmarks and multiple distribution-shift regimes, ranking remains substan-
+tially more stable than absolute score prediction, making reduced evaluation feasible even when
+calibration degrades.
+This motivates a simple practical rule: evaluate new agents on mid-range tasks only. The MR
+protocol reduces evaluation cost substantially while preserving leaderboard fidelity more reliably
+13
+than random or greedy alternatives. Its value is operational rather than universal: it is best suited
+to benchmarks with a populated intermediate-difficulty band, transparent per-task outcomes, and
+ongoing agent arrivals that justify amortizing the initial full-benchmark cost.
+More broadly, the paper advocates for a shift in the way agent evaluation is framed. Agent
+benchmarks are often treated as instruments for measuring absolute capability—a difficult-to-attain
+ideal given construct validity failures and non-representative task distributions—but in practice
+they are primarily used to compare and rank systems. Once evaluation is aligned with that use case,
+selective measurement becomes a principled and effective alternative to exhaustive benchmarking.
+Reduced evaluation should therefore be the default for routine leaderboard maintenance, with
+full-benchmark runs reserved for initialization, drift checks, major capability jumps, and saturation
+analysis.
+Reproducibility
+All code, data, and pre-computed results are available at https://github.
+com/fsndzomga/efficient-benchmarking-ai-agents. The repository includes the per-task per-
+formance matrices for all eight benchmarks we used, evaluation scripts for all five protocols (LOAO,
+LOSO, temporal, random split, within-scaffold LOAO), and CSV outputs that form the basis of
+all tables and figures in this paper.
+References
+Aider-AI.
+Aider:
+Ai pair programming in your terminal, 2024.
+URL https://github.com/
+Aider-AI/aider. GitHub repository.
+Frank B. Baker. The Basics of Item Response Theory. ERIC Clearinghouse on Assessment and
+Evaluation, College Park, MD, 2nd edition, 2001. ISBN 9781886047037. doi: unspecified. URL
+https://eric.ed.gov/?id=ED458219.
+Relevance: Introductory IRT reference underpinning
+“difficulty/discrimination/information” claims often used to justify mid-range item selection.
+Tamay Besiroglu, Sage Andrus Bergerson, Amelia Michael, Lennart Heim, Xueyun Luo, and Neil
+Thompson. The compute divide in machine learning: A threat to academic contribution and
+scrutiny?, 2024. URL https://arxiv.org/abs/2401.02452.
+Ziru Chen, Shijie Chen, Yuting Ning, Qianheng Zhang, Boshi Wang, Botao Yu, Yifei Li, Zeyi Liao,
+Chen Wei, Zitong Lu, Vishal Dey, Mingyi Xue, Frazier N. Baker, Benjamin Burns, Daniel Adu-
+Ampratwum, Xuhui Huang, Xia Ning, Song Gao, Yu Su, and Huan Sun. Scienceagentbench:
+Toward rigorous assessment of language agents for data-driven scientific discovery, 2025. URL
+https://arxiv.org/abs/2410.05080.
+Gilles E. Gignac and David Ili´c. Psychometrically derived 60-question benchmarks: Substantial effi-
+ciencies and the possibility of human-ai comparisons. Intelligence, 110:101922, 2025. ISSN 0160-
+2896.
+doi: https://doi.org/10.1016/j.intell.2025.101922.
+URL https://www.sciencedirect.
+com/science/article/pii/S016028962500025X.
+Miguel Angel Alvarado Gonzalez, Michelle Bruno Hernandez, Miguel Angel Pe˜naloza Perez,
+Bruno Lopez Orozco, Jesus Tadeo Cruz Soto, and Sandra Malagon.
+Do repetitions matter?
+strengthening reliability in llm evaluations, 2025. URL https://arxiv.org/abs/2509.24086.
+Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob
+Steinhardt. Measuring massive multitask language understanding. In International Conference
+on Learning Representations, 2021. URL https://openreview.net/forum?id=d7KBjmI3GmQ.
+14
+Arthur E. Hoerl and Robert W. Kennard. Ridge regression: Biased estimation for nonorthogonal
+problems. Technometrics, 12(1):55–67, 1970. doi: 10.1080/00401706.1970.10488634. URL https:
+//doi.org/10.1080/00401706.1970.10488634.
+Carlos E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir Press, and Karthik
+Narasimhan. Swe-bench: Can language models resolve real-world github issues?, 2024. URL
+https://arxiv.org/abs/2310.06770.
+Sayash Kapoor, Benedikt Stroebl, Peter Kirgis, Nitya Nadgir, Zachary S Siegel, Boyi Wei, Tianci
+Xue, Ziru Chen, Felix Chen, Saiteja Utpala, Franck Ndzomga, Dheeraj Oruganty, Sophie Luskin,
+Kangheng Liu, Botao Yu, Amit Arora, Dongyoon Hahm, Harsh Trivedi, Huan Sun, Juyong Lee,
+Tengjun Jin, Yifan Mai, Yifei Zhou, Yuxuan Zhu, Rishi Bommasani, Daniel Kang, Dawn Song,
+Peter Henderson, Yu Su, Percy Liang, and Arvind Narayanan. Holistic agent leaderboard: The
+missing infrastructure for ai agent evaluation. In The Fourteenth International Conference on
+Learning Representations, 2026. doi: 10.48550/arXiv.2510.11977. URL https://openreview.
+net/forum?id=vUaY1t64ZZ. Relevance: Introduces HAL as a standardized, cost-aware, third-
+party evaluation platform and harness, enabling cross-scaffold agent evaluation analyses central
+to minimal-suite selection.
+Percy Liang, Rishi Bommasani, Tony Lee, Dimitris Tsipras, Dilara Soylu, Michihiro Yasunaga,
+Yian Zhang, Deepak Narayanan, Yuhuai Wu, Ananya Kumar, Benjamin Newman, Binhang
+Yuan, Bobby Yan, Ce Zhang, Christian Cosgrove, Christopher D. Manning, Christopher R´e,
+Diana Acosta-Navas, Drew A. Hudson, Eric Zelikman, Esin Durmus, Faisal Ladhak, Frieda
+Rong, Hongyu Ren, Huaxiu Yao, Jue Wang, Keshav Santhanam, Laurel Orr, Lucia Zheng,
+Mert Yuksekgonul, Mirac Suzgun, Nathan Kim, Neel Guha, Niladri Chatterji, Omar Khattab,
+Peter Henderson, Qian Huang, Ryan Chi, Sang Michael Xie, Shibani Santurkar, Surya Ganguli,
+Tatsunori Hashimoto, Thomas Icard, Tianyi Zhang, Vishrav Chaudhary, William Wang, Xuechen
+Li, Yifan Mai, Yuhui Zhang, and Yuta Koreeda. Holistic evaluation of language models, 2023.
+URL https://arxiv.org/abs/2211.09110.
+Mike A. Merrill et al. Terminal-bench: Benchmarking agents on hard, realistic tasks in command
+line interfaces. arXiv preprint, 2026. URL https://arxiv.org/abs/2601.11868. Relevance:
+Independent agent benchmark ecosystem (terminal/CLI) used for out-of-distribution validation
+of minimal evaluation suites and cross-scaffold transfer claims.
+Gr´egoire Mialon, Cl´ementine Fourrier, Thomas Wolf, Yann LeCun, and Thomas Scialom. Gaia: a
+benchmark for general ai assistants. In The Twelfth International Conference on Learning Repre-
+sentations, 2024. doi: 10.48550/arXiv.2311.12983. URL https://openreview.net/forum?id=
+fibxvahvs3. Relevance: Tool-using assistant benchmark; exemplifies expensive, heterogeneous
+agent evaluation motivating subset-based cost reductions.
+OpenAI. Codex: Lightweight coding agent for the terminal, 2025. URL https://github.com/
+openai/codex. GitHub repository.
+Yotam Perlitz, Elron Bandel, Ariel Gera, Ofir Arviv, Liat Ein-Dor, Eyal Shnarch, Noam Slonim,
+Michal Shmueli-Scheuer, and Leshem Choshen. Efficient benchmarking of language models, 2024.
+URL https://arxiv.org/abs/2308.11696.
+Felipe Maia Polo, Lucas Weber, Leshem Choshen, Yuekai Sun, Gongjun Xu, and Mikhail Yurochkin.
+tinybenchmarks: evaluating llms with fewer examples.
+arXiv preprint, 2024.
+URL https:
+//arxiv.org/abs/2402.14992. Relevance: Demonstrates that carefully selected tiny subsets can
+15
+approximate full-benchmark ranking/score estimates for LLMs; directly analogous to “minimal
+suites” for agents.
+Pedro Rodriguez, Joe Barrow, Alexander Hoyle, John P. Lalor, Robin Jia, and Jordan Boyd-Graber.
+Evaluation examples are not equally informative: How should that change NLP leaderboards?
+In Chengqing Zong, Fei Xia, Wenjie Li, and Roberto Navigli, editors, Proceedings of the 59th
+Annual Meeting of the Association for Computational Linguistics and the 11th International Joint
+Conference on Natural Language Processing (Volume 1: Long Papers), pages 4486–4503, Online,
+August 2021. Association for Computational Linguistics. doi: 10.18653/v1/2021.acl-long.346.
+URL https://aclanthology.org/2021.acl-long.346/.
+Quan Shi, Michael Tang, Karthik Narasimhan, and Shunyu Yao.
+Can language models solve
+olympiad programming?, 2024. URL https://arxiv.org/abs/2404.10952.
+Zachary S. Siegel, Sayash Kapoor, Nitya Nagdir, Benedikt Stroebl, and Arvind Narayanan. Core-
+bench: Fostering the credibility of published research through a computational reproducibility
+agent benchmark, 2024. URL https://arxiv.org/abs/2409.11363.
+Aarohi Srivastava et al. Beyond the imitation game: Quantifying and extrapolating the capabilities
+of language models. Transactions on Machine Learning Research, 2023. ISSN 2835-8856. URL
+https://openreview.net/forum?id=uyTL5Bvosj. Featured Certification.
+Nishant Subramani, Alfredo Gomez, and Mona Diab. Simba: Simplifying benchmark analysis using
+performance matrices alone, 2025. URL https://arxiv.org/abs/2510.17998.
+Minyang Tian, Luyu Gao, Shizhuo Dylan Zhang, Xinan Chen, Cunwei Fan, Xuefei Guo, Roland
+Haas, Pan Ji, Kittithat Krongchon, Yao Li, Shengyan Liu, Di Luo, Yutao Ma, Hao Tong, Kha
+Trinh, Chenyu Tian, Zihan Wang, Bohao Wu, Yanyu Xiong, Shengzhu Yin, Minhui Zhu, Kilian
+Lieret, Yanxin Lu, Genglin Liu, Yufeng Du, Tianhua Tao, Ofir Press, Jamie Callan, Eliu Huerta,
+and Hao Peng. Scicode: A research coding benchmark curated by scientists, 2024. URL https:
+//arxiv.org/abs/2407.13168.
+Rajan Vivek, Kawin Ethayarajh, Diyi Yang, and Douwe Kiela.
+Anchor points: Benchmarking
+models with much fewer examples, 2024. URL https://arxiv.org/abs/2309.08638.
+Xingyao Wang, Boxuan Li, Yufan Song, Frank F. Xu, Xiangru Tang, Mingchen Zhuge, Jiayi Pan,
+Yueqi Song, Bowen Li, Jaskirat Singh, Hoang H. Tran, Fuqiang Li, Ren Ma, Mingzhang Zheng,
+Bill Qian, Yanjun Shao, Niklas Muennighoff, Yizhe Zhang, Binyuan Hui, Junyang Lin, Robert
+Brennan, Hao Peng, Heng Ji, and Graham Neubig. Openhands: An open platform for ai software
+developers as generalist agents, 2025. URL https://arxiv.org/abs/2407.16741.
+Tianci Xue, Weijian Qi, Tianneng Shi, Chan Hee Song, Boyu Gou, Dawn Song, Huan Sun, and
+Yu Su. An illusion of progress? assessing the current state of web agents, 2025. URL https:
+//arxiv.org/abs/2504.01382.
+Shunyu Yao, Noah Shinn, Pedram Razavi, and Karthik R Narasimhan.
+{$\tau$}-bench:
+A
+benchmark for \underline{T}ool-\underline{A}gent-\underline{U}ser interaction in real-world
+domains. In The Thirteenth International Conference on Learning Representations, 2025. URL
+https://openreview.net/forum?id=roNSXZpUDN.
+Ori Yoran, Samuel Joseph Amouyal, Chaitanya Malaviya, Ben Bogin, Ofir Press, and Jonathan
+Berant. Assistantbench: Can web agents solve realistic and time-consuming tasks?, 2024. URL
+https://arxiv.org/abs/2407.15711.
+16
+Hongli Zhou, Hui Huang, Ziqing Zhao, Lvyuan Han, Huicheng Wang, Kehai Chen, Muyun Yang,
+Wei Bao, Jian Dong, Bing Xu, Conghui Zhu, Hailong Cao, and Tiejun Zhao. Lost in benchmarks?
+rethinking large language model benchmarking with item response theory, 2026. URL https:
+//arxiv.org/abs/2505.15055.
+Yuxuan Zhu, Tengjun Jin, Yada Pruksachatkun, Andy Zhang, Shu Liu, Sasha Cui, Sayash Kapoor,
+Shayne Longpre, Kevin Meng, Rebecca Weiss, Fazl Barez, Rahul Gupta, Jwala Dhamala, Jacob
+Merizian, Mario Giulianelli, Harry Coppock, Cozmin Ududec, Jasjeet Sekhon, Jacob Steinhardt,
+Antony Kellermann, Sarah Schwettmann, Matei Zaharia, Ion Stoica, Percy Liang, and Daniel
+Kang. Establishing best practices for building rigorous agentic benchmarks, 2025. URL https:
+//arxiv.org/abs/2507.02825.
+17
+A
+Appendix
+Use of Large Language Models.
+LLMs were used for text editing, proofreading, chart polish-
+ing, and coding assistance during the preparation of this work. The authors assume full responsi-
+bility for all text and results presented in this paper.
+A.1
+A Theory of Why Rankings Are Easier Than Scores
+This section provides a possible theoretical basis for the empirical results in Section 4. We char-
+acterize why rank prediction from a task subset is more robust than score prediction, even under
+scaffold and temporal shift.
+A.1.1
+Two Sources of Distortion
+The reduced evaluation pipeline introduces two transformations between the quantity we observe
+and the quantity we want to recover. First, subset restriction: we observe performance on a subset
+S of tasks rather than the full benchmark. Second, scaffold shift: the agents we evaluate may use
+scaffolds not represented in the historical data used to select S. Reliable ranking from a reduced
+suite requires that the composition of these two transformations be approximately monotone. A
+simple way to formalize this is through affine distortions.
+Let y(m) denote agent m’s full-benchmark score and ¯xS(m) its mean score on the selected
+subset S. Even without scaffold shift, subset restriction introduces a distortion:
+y(m) ≈αsub · ¯xS(m) + βsub + εsub(m)
+(6)
+where αsub > 0 captures the scale mismatch between subset and full-benchmark difficulty, βsub is
+a level shift, and εsub(m) is a residual. When αsub > 0 and the residual is small, the mapping is
+approximately monotone: the subset recovers rankings even if it does not recover calibrated scores.
+The mid-range difficulty filter is designed to keep this residual small. Tasks near 50% pass rate
+carry maximal Fisher information about latent agent ability under an IRT model, so the subset
+captures the region of the difficulty spectrum where agents are most reliably discriminated. By
+contrast, very hard tasks (where most agents fail) and very easy tasks (where most agents succeed)
+contribute little to the ordering signal, and their exclusion has limited effect on the monotonicity
+of the subset-to-full mapping.
+A.1.2
+Scaffold Shift and Approximate Monotonicity
+Now consider the second transformation. When a new scaffold S2 appears that was not present
+during task selection, the relationship between subset scores under the original scaffolds and full-
+benchmark scores under the new scaffold involves a further distortion:
+yS2(m) ≈α · ¯xS(m) + β + ε(m)
+(7)
+where yS2(m) is agent m’s full-benchmark score under scaffold S2, and ¯xS(m) is computed from
+historical scaffolds. This composed transformation—subset restriction followed by scaffold shift—
+preserves rankings as long as it remains approximately monotone, meaning α > 0 and ε(m) is small
+enough not to invert pairwise orderings. Score prediction is more demanding: it requires recovering
+the correct scale (α ≈1) and intercept (β ≈0), which is sensitive to any shift in these parameters.
+This framing would explain the ρ–R2 divergence observed in Section 4. The LOSO protocol
+measures the composed distortion directly: Spearman ρ remains above 0.90 even when R2 drops
+18
+below 0.65, confirming that the composition of subset restriction and scaffold shift is approximately
+rank-preserving in practice, even when it is not score-preserving.
+Note that approximate monotonicity under scaffold shift does not require scaffold changes to be
+model-independent in a strong sense. Some scaffolds are co-optimized with specific model families
+(e.g., through system prompts, tool schemas, or post-training), which introduces genuine scaffold–
+model interactions. Two factors may explain why rankings nonetheless remain stable in aggregate.
+First, scaffold engineering has practical limits: it is difficult to design a harness that boosts a
+weaker model’s performance so dramatically that it overtakes a substantially stronger one on a
+sufficiently challenging benchmark. Co-optimized scaffolds can narrow the gap between models, but
+the improvement they provide is typically insufficient to reverse the ordering imposed by underlying
+capability differences, if these capability differences are high enough. Second, co-optimized scaffolds
+may represent a minority of the scaffold population: if most scaffolds are approximately model-
+agnostic, the few with strong model interactions are diluted when averaging over the full agent
+set. These explanations are not mutually exclusive, and our data do not distinguish between them.
+What the empirical results establish is that, regardless of mechanism, the composed transformation
+remains approximately monotone at the population level observed across all 8 benchmarks we
+studied.
+A.1.3
+Temporal Shift as Composed Transformations
+Temporal shift—the distribution change that occurs as new agents are submitted over time—layers
+a third source of distortion on top of subset restriction and scaffold shift. Over the 3.5-month
+temporal window in Terminal-Bench, the agent population doubled with 17 novel scaffold types
+and newer foundation models.
+Each new scaffold introduces its own approximately monotone
+distortion relative to the historical data used for task selection. A composition of approximately
+monotone functions is itself approximately monotone, so the cumulative temporal shift inherits the
+rank-preserving property of its components, provided no individual shift is severe enough to invert
+the ordering.
+The capability component of temporal shift—new, more powerful foundation models—could in
+principle break this structure. A sufficiently large capability jump would constitute a nonlinear
+shift that violates the monotone approximation: if an entire class of previously intractable tasks
+becomes routine, the mid-range band estimated from historical data would no longer target the
+discriminative region. However, the temporal expanding-window protocol achieves ρ = 0.921, only
+0.01 below the LOAO baseline, suggesting that capability improvements during the observation
+period were incremental enough to remain within the monotone regime. This is not guaranteed
+to hold indefinitely, which is why the deployment protocol in Section 5.1 prescribes periodic full-
+benchmark runs when evidence of drift or discontinuity appears.
+A.2
+Post-Hoc Verification of Mid-Range Band Selection
+As stated previously, for the Mid-Range task selection strategy, we filter tasks to those with his-
+torical pass rates in the interval [0.30, 0.70] (the 30–70 band). It is crucial to emphasize that this
+specific threshold was selected a priori. The choice was motivated by principles from Item Response
+Theory (IRT)—which posits that items with pass rates near p = 0.5 provide maximal discriminative
+power between closely matched capabilities—balanced against a practical desire for more aggressive
+computational cost reduction than theoretically broader optimal intervals (e.g., 15–85). Choosing
+the filtering band by optimizing for correlation directly on the benchmark data would introduce
+circularity and overstate the generalizability of the subset selection.
+19
+To verify that our a priori selection was reasonable, we performed a post-hoc sensitivity analysis
+across seven benchmarks (excluding Scicode due to data size constraints).
+We evaluated how
+tightening the percentile band affects both the rank preservation (measured by Spearman ρ against
+the full benchmark) and the total task reduction (computational savings).
+10-90
+15-85
+20-80
+25-75
+30-70
+35-65
+40-60
+45-55
+Mid-Range Band (Percentiles)
+0.75
+0.80
+0.85
+0.90
+0.95
+1.00
+Average Spearman 
+a priori choice
+Spearman  (left axis)
+Task Reduction % (right axis)
+0
+20
+40
+60
+80
+100
+Average Task Reduction (%)
+Figure 5: Post-hoc sensitivity analysis of mid-range bands. The average Spearman rank
+correlation ρ (blue, left axis) and average task reduction percentage (red, right axis) across seven
+benchmarks for increasingly narrow mid-range bands. Shaded regions denote ±1 standard deviation
+across the benchmarks. The 30–70 band, chosen a priori, strikes a highly favorable balance.
+As shown in Figure 5, there is a clear empirical trade-off between rank preservation and task
+reduction. Wider bands (e.g., 10–90) achieve near-perfect correlation (ρ ≈0.98) but only reduce
+tasks by roughly 30%. Extremely tight bands (e.g., 45–55) reduce tasks by 90% but see correlations
+drop more precipitously and with higher variance across benchmarks.
+The pre-selected 30–70 band occupies an effective position on this Pareto frontier. Averaged
+across the evaluated benchmarks, this band maintains a highly reliable Spearman correlation of
+ρ = 0.95 ± 0.02, while yielding a substantial average task reduction of 60% ± 11%. This post-hoc
+analysis confirms that our theoretically motivated, a priori choice provides robust, high-fidelity
+rankings without requiring data-snooping optimizations.
+A.3
+Per-Benchmark Performance by Task Selection Strategy
+Figure 6 reports mean Spearman ρ (averaged across evaluation protocols) for each combination of
+task selection strategy and benchmark, along with worst-case ρ in gray.
+Several patterns emerge from the per-benchmark breakdown.
+MR achieves the best or tied-best mean ρ on five of eight benchmarks (GAIA, USACO, τ-
+bench Airline, CoreBench Hard, Online Mind2Web) and is within 0.01 of the best on the remaining
+three. More importantly, its worst-case performance never drops below 0.56 (SciCode, where the
+mid-range band contains only a handful of tasks), and stays above 0.87 on all benchmarks where
+the protocol is well-defined.
+Greedy achieves the highest single-benchmark ρ (0.99 on Terminal-Bench) but pays for this
+with poor worst cases: it drops to 0.48 on SciCode and 0.56 on Online Mind2Web, confirming that
+data-driven selection overfits when the agent population shifts.
+20
+TerminalBench
+GAIA
+SWE-bench Mini
+USACO
+-bench Airline
+CoreBench Hard
+Online Mind2Web
+SciCode
+Mid-Range
+Greedy
+Easiest
+Stratified
+Random
+0.98
+w: 0.97
+0.99*
+w: 0.98
+0.97
+w: 0.96
+0.98
+w: 0.97
+0.98
+w: 0.96
+0.95*
+w: 0.93
+0.93
+w: 0.92
+0.93
+w: 0.87
+0.93
+w: 0.91
+0.94
+w: 0.87
+0.92
+w: 0.89
+0.88
+w: 0.77
+0.92*
+w: 0.89
+0.90
+w: 0.87
+0.90
+w: 0.70
+0.94*
+w: 0.93
+0.89
+w: 0.82
+0.86
+w: 0.83
+0.91
+w: 0.90
+0.92
+w: 0.70
+0.94*
+w: 0.91
+0.83
+w: 0.73
+0.92
+w: 0.90
+0.87
+w: 0.86
+0.86
+w: 0.71
+0.90*
+w: 0.87
+0.87
+w: 0.79
+0.90
+w: 0.87
+0.74
+w: 0.68
+0.78
+w: 0.59
+0.92*
+w: 0.91
+0.61
+w: 0.56
+0.91
+w: 0.85
+0.80
+w: 0.73
+0.81
+w: 0.54
+0.74
+w: 0.56
+0.75*
+w: 0.48
+0.74
+w: 0.56
+N/A
+0.36
+w: -0.19
+Task Selection Strategy × Benchmark (Mean  Across Protocols)
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Spearman 
+Figure 6: Task Selection Strategy × Benchmark (Mean ρ Across Protocols). Each cell
+shows the mean Spearman ρ across evaluation protocols; worst-case ρ is shown below in gray.
+Asterisks mark the best-performing strategy per benchmark.
+Easiest is competitive on benchmarks with left-skewed difficulty distributions (CoreBench
+Hard, τ-bench Airline), where the easiest tasks overlap substantially with the mid-range band.
+Where the two task sets genuinely diverge—most visibly on USACO—MR pulls ahead.
+Random shows the characteristic pattern discussed in the main text: respectable means but
+worst cases as low as −0.19 (SciCode) and 0.54 (Online Mind2Web), making it unusable as a
+deployment rule despite acceptable average performance. Also, random selection is averaged over
+100 seeds, which itself defeats the purpose of cost reduction in practice.
+SciCode is an outlier across all strategies. Its difficulty distribution is heavily skewed, leaving
+very few tasks in the mid-range band. All strategies degrade on this benchmark, which confirms the
+limitation noted in Section 5: MR requires a sufficiently populated intermediate-difficulty region
+to function reliably.
+A.4
+Task Difficulty Distributions: Easiest-k vs. Mid-Range Overlap
+Figure 7 shows the task difficulty distribution for each benchmark, with the Easiest-k and MR
+task sets highlighted. The vertical dashed lines mark the 30–70% mid-range band.
+The figure makes visible the mechanism behind Easiest-k’s surprisingly competitive perfor-
+mance. When a benchmark’s difficulty distribution is left-skewed—concentrated toward hard tasks
+with a thinner right tail—the k easiest tasks fall inside or near the mid-range band, producing
+high overlap and near-identical ranking fidelity. CoreBench Hard and SciCode reach 100% overlap:
+every task selected by Easiest-k is also a mid-range task. SWE-bench Mini (95%) and τ-bench
+Airline (93%) are close behind.
+As overlap decreases, the two strategies diverge.
+TerminalBench (62%), GAIA (57%), and
+21
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Task Pass Rate
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+3.5
+Density
+CoreBench Hard
+(100% Task Overlap)
+Easiest-kMR (k=15)
+Mid-Range (k=15)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Task Pass Rate
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+20.0
+SciCode
+(100% Task Overlap)
+Easiest-kMR (k=4)
+Mid-Range (k=4)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Task Pass Rate
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+SWE-bench Mini
+(95% Task Overlap)
+Easiest-kMR (k=21)
+Mid-Range (k=21)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Task Pass Rate
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+2.00
+-bench Airline
+(93% Task Overlap)
+Easiest-kMR (k=28)
+Mid-Range (k=28)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Task Pass Rate
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+Density
+TerminalBench
+(62% Task Overlap)
+Easiest-kMR (k=39)
+Mid-Range (k=39)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Task Pass Rate
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+GAIA
+(57% Task Overlap)
+Easiest-kMR (k=82)
+Mid-Range (k=82)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Task Pass Rate
+0.0
+0.5
+1.0
+1.5
+2.0
+Online Mind2Web
+(56% Task Overlap)
+Easiest-kMR (k=95)
+Mid-Range (k=95)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Task Pass Rate
+0.00
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+2.00
+USACO
+(14% Task Overlap)
+Easiest-kMR (k=93)
+Mid-Range (k=93)
+Why Easiest-k 
+ Mid-Range: Task Difficulty Distributions
+Figure 7: Why Easiest-k ≈MR: Task Difficulty Distributions. Each panel shows the task
+pass-rate density for one benchmark, with Easiest-k (green) and MR (orange) task sets overlaid.
+Dashed lines mark the 30–70% mid-range band. Panels are ordered by decreasing task overlap
+between the two strategies.
+Online Mind2Web (56%) show moderate separation: Easiest-k begins pulling in ceiling-effect tasks
+where most agents succeed, which contribute less discriminative signal. USACO is the clearest case
+of genuine divergence at 14% overlap. Its difficulty distribution is right-skewed, so the easiest tasks
+cluster near pass rates of 0.7–1.0, well above the mid-range band. This is exactly the benchmark
+where MR most clearly outperforms Easiest-k (∆ρ = 0.078 under distribution shift), confirming
+that the performance gap tracks task-set divergence rather than any intrinsic advantage of easy
+tasks.
+22

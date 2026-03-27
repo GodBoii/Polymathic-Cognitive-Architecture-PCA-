@@ -1,0 +1,3578 @@
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Allen Nie 1 * Xavier Daull 2 * Zhiyi Kuang 3 * Abhinav Akkiraju 4 Anish Chaudhuri 3 Max Piasevoli 5
+Ryan Rong 3 YuCheng Yuan 3 Prerit Choudhary 3 Shannon Xiao 3 Rasool Fakoor 6
+Adith Swaminathan 7 Ching-An Cheng 8
+Abstract
+Generative optimization uses large language mod-
+els (LLMs) to iteratively improve artifacts (such
+as code, workflows or prompts) using execution
+feedback. It is a promising approach to building
+self-improving agents, yet in practice remains brit-
+tle: despite active research, only 9% of surveyed
+agents used any automated optimization. We ar-
+gue that this brittleness arises because, to set up
+a learning loop, an engineer must make “hidden”
+design choices: What can the optimizer edit and
+what is the “right” learning evidence to provide
+at each update? We investigate three factors that
+affect most applications: the starting artifact, the
+credit horizon for execution traces, and batching
+trials and errors into learning evidence. Through
+case studies in MLAgentBench, Atari, and Big-
+Bench Extra Hard, we find that these design deci-
+sions can determine whether generative optimiza-
+tion succeeds, yet they are rarely made explicit in
+prior work. Different starting artifacts determine
+which solutions are reachable in MLAgentBench,
+truncated traces can still improve Atari agents,
+and larger minibatches do not monotonically im-
+prove generalization on BBEH. We conclude that
+the lack of a simple, universal way to set up learn-
+ing loops across domains is a major hurdle for
+productionization and adoption. We provide prac-
+tical guidance for making these choices.
+1. Introduction
+Rapid advances in the capabilities of large language models
+(LLMs) have enabled a proliferation of software systems
+1Work done before joining Google DeepMind 2French Na-
+tional Centre for Scientific Research (CNRS) 3Stanford University
+4Carnegie Mellon University 5Microsoft 6AWS 7Netflix 8Work
+done at Microsoft Research. Now at Google Research. Corre-
+spondence to: Allen Nie <allennie@google.com>, Adith Swami-
+nathan <aswaminathan@netflix.com>, Ching-An Cheng <chin-
+gan@google.com>.
+Preprint. March 26, 2026.
+with the ability to perceive, plan, and reflect (Kwa et al.,
+2025). Recent work has shown that LLMs have the ability
+to generate and revise program workflows to optimize an
+objective (Yang et al., 2024), such as increasing compute
+throughput or decreasing latency of hardware accelerator
+kernels (Ouyang et al., 2025a; Lange et al., 2025b; Wei et al.,
+2025b; Zhang et al., 2025c), design novel algorithms for
+search and matrix multiplication (Wei et al., 2025a; Press
+et al., 2025; Novikov et al., 2025), exploiting security vulner-
+abilities (Zhang et al., 2025a; Chaudhuri et al., 2025), and
+propose therapeutic candidates for diseases (Ghareeb et al.,
+2025). This ability to optimize objectives, combined with
+LLMs continuing to approach human-level performance in
+producing complex programs (Jimenez et al., 2024; Wang
+et al., 2025a; El-Kishky et al., 2025; Wei et al., 2025c),
+gives rise to an emerging class of software that automati-
+cally changes its own behavior to achieve a desired outcome.
+Automated generation and optimization with LLMs have
+been adopted broadly in two types of applications. The first
+is to use the LLM to repeatedly modify a software program
+to improve on a metric, such as writing kernels that have low
+compute latency (Baronio et al., 2025; Wei et al., 2025b;
+Zhang et al., 2025c), creating automated ML pipelines to
+train models that achieve high test accuracy (Huang et al.,
+2024; Chan et al., 2025; Toledo et al., 2025), and writing a
+script that can exploit security vulnerabilities (Zhang et al.,
+2025a). The second type uses LLMs to modify another
+LLM system to achieve desired behavior, also using metrics
+like success rate, through prompt tuning and direct code
+revisions (Khattab et al., 2024; Yuksekgonul et al., 2025;
+Cheng et al., 2024; Wang et al., 2024; Zhang et al., 2025b).
+The underlying mechanism in both types of applications is
+the same: construction of an LLM-based generative opti-
+mization process to ingest feedback and modify an existing
+system, which we describe as a learning loop in Section 2.
+However, despite the popularity in research, LLM-based
+generative optimization has not been widely adopted in
+production. Pan et al. (2025b) report that the current devel-
+opment of agentic systems remains largely human-driven,
+with only 9% of surveyed systems employing any form of
+automated design, including simple LLM-assisted prompt
+tuning. By contrast, using LLMs to optimize programs has
+1
+arXiv:2603.23994v1  [cs.LG]  25 Mar 2026
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+been more successful in specialized domains (Toledo et al.,
+2025; Novikov et al., 2025). In a field where end-to-end
+automation that scales with compute is a highly sought-after
+objective (Sutton, 2019; Hendrycks et al., 2025), the lack
+of wider adoption is puzzling, pointing to a potential gap
+between the high ideal of an automated LLM optimizer and
+reality, especially for optimizing LLM agentic systems.
+This lack of adoption is not a consequence of inadequate
+infrastructure support or insufficient software abstraction.
+On the contrary, over the past two years, a rich ecosys-
+tem of powerful libraries for building agentic systems has
+emerged (Khattab et al., 2024; Wu et al., 2024; LangChain,
+2024; Cheng et al., 2024; Li et al., 2025). Many of these
+libraries offer mechanisms for automatically optimizing
+different targets, ranging from tuning prompts (Khattab
+et al., 2024; Yuksekgonul et al., 2025) to program synthe-
+sis (Cheng et al., 2024). Most of them have received con-
+siderable attention from agent engineers, suggesting that
+the low adoption rate cannot be attributed solely to limited
+awareness or inadequate software.
+In this paper, we hypothesize that the low adoption stems
+from the hidden difficulty of setting up the learning loop.
+Our experiments show that getting the learning loop right
+requires substantial engineering effort and/or guesswork.
+This setup burden is a major hurdle for productionization,
+which requires simple, universal solutions across applica-
+tion domains. We first introduce two core concepts that
+impact the learning loop in Section 2: system initialization
+and learning context construction. Then we examine three
+case studies to isolate and highlight the challenges related
+to these core concepts, and show how different design de-
+cisions can impact the final performance. In Section 4, we
+show how different system architectures and initializations
+impact the final model quality of an ML training pipeline. In
+Section 5, using the example of an Atari game-playing pro-
+gram, we show that engineers can specify a credit horizon
+that is shorter than the full gameplay trajectory and still learn
+programs that obtain high reward on a full playthrough. But
+updating the system too frequently with too short a credit
+horizon leads to worse performance. Finally, in Section 6,
+we show that the number of examples placed in the learning
+context matters for optimizing the prompt of an LLM call.
+Interestingly, many of the challenges in setting up a learn-
+ing loop for LLM-based optimization parallel well-studied
+concepts in machine learning. The starting artifact prob-
+lem resembles neural network architecture (Zoph & Le,
+2017) and weights initialization (Glorot & Bengio, 2010),
+where different starting points determine which solutions
+are reachable. The credit horizon problem mirrors hori-
+zon debates in episodic reinforcement learning (i.e. de-
+ciding how many timesteps to include before computing
+returns (Arjona-Medina et al., 2019)) and truncated back-
+propagation through time (Tallec & Ollivier, 2017; Shaban
+et al., 2019). The experience batching problem parallels
+batch size selection in stochastic gradient descent, where
+the number of examples aggregated per update affects both
+learning dynamics and generalization (Smith et al., 2018).
+However, unlike traditional ML where practitioners have
+developed theoretical guidance and/or heuristics, the learn-
+ing loop design space for generative optimization remains
+largely unexplored. We suggest that the challenges of LLM-
+based generative optimization are similar to the challenges
+in traditional machine learning and can be studied systemat-
+ically rather than treated as ad hoc engineering.
+2. Building a Learning Loop
+We start by describing the concept of a learning loop1,
+which is ubiquitous in a wide range of LLM-based
+generative optimization applications (Figure 1).
+We
+are given an initial system (
+) that takes an input
+and produces an output, and an oracle to give feed-
+back (
+) that can serve as a signal for optimizing.
+LLM
+Optimizer
+Feedback
+Input
+Output
+Learning Context
+Initial System
+Loop
+Update
+Figure 1. The learning loop
+of generative optimization.
+Theoretically,
+these
+two
+terms define a conceptual
+learning problem. However,
+in practice, more details are
+needed to implement an ac-
+tual learning loop with an
+LLM optimizer: What ex-
+actly should be included
+in a learning context (i.e.
+the message to send in the
+LLM’s API call) so that the
+LLM optimizer can make ef-
+fective updates? As shown
+in Figure 1, a typical learn-
+ing context includes input, output, feedback, and initial/cur-
+rent system. In addition, other common information in-
+cludes task background and the optimizer’s past experiences
+of successes/failures. Once designed, the content of the
+learning context will be dynamically updated during opti-
+mization to reflect the up-to-date optimization status.
+Similar to how a numerical optimization process depends on
+its initial condition and optimization step function, we can
+also break down the analysis of the learning loop into: What
+is the starting point? What information should be provided
+to the LLM optimizer at each step?
+Initial System (Starting Artifact)
+This includes the ini-
+tial code, prompt, and files that make up the system. The
+initial system can also consist of documentation and design
+sketches that are sent to an LLM programmer (such as GPT
+1We give a more rigorous description of the learning loop in
+Appendix D, connecting to the framework by Cheng et al. (2024).
+2
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Context at T=L
+Different Starting
+Artifacts
+Batching Parallel Learning
+Experiences
+Initial
+System
+Learning Context with Different
+Credit Horizons
+T=1
+T=2
+...
+T=L
+LLM
+Optimizer
+Context at T=1
+Initial System
+Input
+Output
+Feedback
+LLM
+Optimizer
+Update
+N=1,2,…n
+N
+N
+Figure 2. Three Key Decisions for Implementing a Learning Loop. To set up iterative generative optimization, an agent engineer
+must make three core decisions. For the initial system: What (1) starting artifacts (
+instructions, files, specs) to provide? Different
+initializations can lead to different solution spaces. For the learning context (
+): What learning evidence to provide to the LLM optimizer
+– (2) how many steps to include per trial (credit horizon) and (3) how many trials to batch together (experience batching).
+Codex, Claude Code, or Gemini CLI). The initial system is a
+choice made by the engineer. In addition, the engineer must
+also determine which part of the system can be changed by
+the LLM optimizer and which part is constrained, e.g., the
+whole codebase or just certain functions. In Section 4, we
+show that different designs lead to major differences in the
+quality of ML pipelines generated by an LLM optimizer,
+giving rise to the starting artifact problem.
+Learning Context (Credit Horizon)
+Prior work often
+assumes either that the context is sufficient for the LLM op-
+timizer to improve successfully (Cheng et al., 2024) or that
+the feedback usually contains useful signal (Nie et al., 2024;
+Xu et al., 2025). However, what context is necessary or suffi-
+cient can be ambiguous in practice, especially for multi-step
+problems, where the system being optimized is used multi-
+ple times sequentially. The agentic system community has
+already started to explore solutions for this problem, with
+early work from Zhang et al. (2025d); Sun et al. (2025);
+Ye et al. (2025); Zhang et al. (2025b). More generally, it
+is unclear how many steps of the process’s execution trace
+should be included in the learning context for the optimizer.
+Should we optimize the agent for instantaneous feedback,
+or should we only optimize it until all feedback in the multi-
+step process has been observed? In Section 5, we study an
+exemplar version of this problem by optimizing an Atari
+game-playing program, where both dense short-term (after
+each action) and long-term reward (after the game ends) can
+be used to modify the agentic system’s behavior. We see that
+for four out of eight games, optimizing for short-term dense
+reward produced systems that also performed comparably
+well for the full episode. We call this the credit horizon
+problem, which is related to the effective horizon in RL
+(Laidlaw et al., 2023; Cheng et al., 2021).
+Learning Context (Experience Batching)
+After deciding
+the credit horizon (the number of steps to include for the
+optimizer), another key decision is about how to present
+the experience of successes and failures of independent
+trials to the optimizer. The community has previously used
+words like memory to study this phenomenon (Zhou et al.,
+2025a; Chhikara et al., 2025; Ouyang et al., 2025b; Zhang
+et al., 2025c). However, most of these works focus on
+techniques for “retrieving” relevant memories. We instead
+focus on an even simpler but more fundamental aspect:
+the amount of in-context experience across independent
+trials provided to the optimizer through the mechanism of
+“batching.” In Section 6, we look at this problem in a setup
+inspired by batched stochastic gradient descent. We study
+a task involving optimization of a prompted LLM system.
+We explore different numbers of (input, output, feedback)
+triplets to put in the learning context. We observe that “batch
+size” affects whether the LLM optimizer can find a prompt
+that does well on a hidden test set. We show that the optimal
+number of triplets is different for each task, however, which
+gives rise to the experience batching problem.
+In our experiments, we find that the best configurations to
+address all three problems are task-dependent. Different
+tasks require different setups in order to achieve the best re-
+sults. All three problems introduce complexities and require
+the agent engineer to make nuanced decisions.
+We note that the learning loop can be implemented with any
+LLM optimization and search algorithms (Novikov et al.,
+2025; Pan et al., 2025a; Lange et al., 2025a; Agrawal et al.,
+2025; Ren et al., 2026) and the main focus of our paper is
+to study the factors that impact the learning loop, not the
+small differences between individual libraries. Our goal
+is to investigate other lesser-known factors that critically
+impact the success of the optimization in order to provide
+practical guidelines beyond a mere choice of a “search” al-
+gorithm. We implement our experiments using the optimiza-
+tion framework Trace (Cheng et al., 2024). We acknowledge
+that framework-specific factors could exist, but we note that
+all the factors discussed in the paper are universal to any
+iterative LLM-based optimization and exist across frame-
+works.
+3
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Figure 3. Different Starting Artifacts for MLAgentBench. We compare two initialization schemes for the ML pipeline creation task.
+Left: One-function approach where the LLM optimizer implements and modifies a single train model function that handles the entire
+pipeline from data ingestion to prediction. Right: Many-function approach where the pipeline is decomposed into modular components.
+Both initializations contain equivalent information in their docstrings; the only difference is the level of modularization.
+3. Related Work
+Learning Loop in Self-Improving Agents
+The concept
+of a loop is widely discussed in the LLM agent commu-
+nity, commonly referred to as an agent loop (Zhao et al.,
+2025; Bolin, 2026), a sampling loop (Anthropic, 2025),
+or a “Ralph” loop (Huntley, 2026). These loops typically
+enable abilities like self-debugging (Chen et al., 2024), self-
+correction (Xiong et al., 2025), and self-refinement (Madaan
+et al., 2023) to make agents more likely to succeed within
+a single task execution. In contrast, rather than optimiz-
+ing for the highest success rate on an individual task, our
+learning loop is designed for continual learning through
+repeated trial and error (Huang et al., 2025; Monea et al.,
+2025). Compared with a within-task agent loop, our learn-
+ing loop accumulates experience across tasks, where the
+success or failure of any single attempt is secondary to the
+agent’s eventual mastery.
+Context Engineering
+Building the right context for
+LLMs has received significant attention in recent works.
+Beyond compression of overly long inputs, carefully con-
+structed context can substantially improve performance
+across diverse tasks (Chen et al., 2026; Zhang et al., 2025d).
+Related concepts have been explored under the term “mem-
+ory” (Wang et al., 2025b; Ouyang et al., 2025b; Zhou et al.,
+2025a), focusing on techniques to retrieve and manage rel-
+evant past information. We use the term learning context
+to refer to the evidence provided to an LLM optimizer for
+system improvement. We focus specifically on two aspects
+that have received little systematic investigation: the horizon
+of multi-step traces and the number of independent traces.
+These two factors impact LLM self-improvement loops but
+have not been discussed in depth in prior work.
+Agentic Libraries with Learning Loops
+Many frame-
+works enable LLMs to iteratively modify systems (Yang
+et al., 2024), particularly for prompt optimization (Khat-
+tab et al., 2024; Cheng et al., 2024; Yuksekgonul et al.,
+2025; Wang et al., 2024). These works implement learn-
+ing loops as candidate-selection procedures, using tech-
+niques like cross-validation (Khattab et al., 2024) or Pareto
+optimization (Conway et al., 2025; Agrawal et al., 2025).
+However, these works primarily showcase successful ap-
+plications rather than investigating the design choices and
+instabilities that make learning loops difficult to implement.
+4. ML Agent Case Study for the Starting
+Artifact Problem
+An agent engineer must provide a starting point for the opti-
+mization process (the learning loop described in Section 2).
+We study the sensitivity of LLM-based generative optimiza-
+tion to the choice of initialization and parameter constraint.
+We found that the choice of starting artifacts can play a large
+role in the converged performance, not too dissimilar to how
+parameter initialization of a neural network can affect the
+learned model’s quality (Glorot & Bengio, 2010).
+Task
+We use the task of creating an ML training pipeline
+as an example. This task has been popularized by Huang
+et al. (2024); Chan et al. (2025); Toledo et al. (2025), often
+under the name of ML agent or AI research agent. The
+input to the LLM optimizer includes task description and
+datasets, and the output of the LLM is to build a codebase
+that consists of data ingestion, model building, training,
+and hyperparameter search (model selection). The start-
+ing artifact we provide to the LLM optimizer consists of
+the function name, an input-output type signature, and a
+docstring that suggests what this function could be about
+along with some general heuristic, e.g. that features can be
+normalized.
+Setup
+We explore two initialization options for cre-
+ating an automated ML pipeline.
+We can ask the
+LLM to write a single function, train model, which
+takes in a dataset and returns a trained model (Fig-
+ure 3 left).
+Or we can follow the engineering prin-
+ciple of modularization to break the pipeline down to
+separate functions (e.g., preprocess, select features,
+create ensemble model, train model, and predict)
+and ask LLM to optimize these components explicitly (Fig-
+ure 3 right). It is important to note that the single func-
+4
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Research 
+Agent
+Learned 
+ML Pipeline
+(One) 
+Learned 
+ML Pipeline
+(Multi)
+0
+20
+40
+60
+80
+Outperformed % of Submissions
+70.8%
+72.7%
+86.6%
+51.2%
+61.6%
+62.7%
+(a) Spaceship Titanic
+Research 
+Agent
+Learned 
+ML Pipeline 
+(One)
+Learned 
+ML Pipeline
+(Multi) 
+0
+10
+20
+30
+40
+50
+60
+70
+80
+49.8%
+75.6%
+54.6%
+41.7%
+64.1%
+43.8%
+(b) Housing Price
+Figure 4.
+Kaggle leaderboard performance, reported as the
+percentile of the trained ML model submissions (higher is bet-
+ter).
+tion’s docstring is equivalent to a concatenated version of
+all the docstrings in the many-function initialization scheme.
+The only difference is whether modularization, i.e. asking
+the LLM to implement multiple functions, is better than
+implementing one function. Early work suggests that de-
+composing a hard task into multiple easier tasks seems to
+help, e.g., least-to-most prompting (Zhou et al., 2023) and
+Parsel (Zelikman et al., 2023).
+Experiment
+We perform a train-validation split on the
+dataset to create a validation partition and use the task-
+specific metric on the validation dataset as the optimiza-
+tion objective (i.e., maximize accuracy or minimize error).
+We follow the MLAgentBench evaluation protocol detailed
+in Section A. We use OptoPrime (Cheng et al., 2024) as the
+generative optimizer. We apply fine-grained style feedback
+to the generative optimizer at different stages of the task-
+specific validation metric (see Figure A2). For the Spaceship
+Titanic task, both the staged feedback and checkpoint selec-
+tion use validation F1. We additionally experimented with
+improvement style feedback, i.e. when the model fails to
+improve the task-specific validation metric relative to the
+previous step, we append an improvement suggestion to the
+feedback string.
+We compare against the ResearchAgent proposed by Huang
+et al. (2024).
+To make the comparison fair, we pre-
+downloaded the datasets for the ResearchAgent and made
+sure it could produce a machine learning model with valid
+test submission files for Kaggle (Huang et al., 2024). We
+track the average performance achieved by the learned ML
+pipeline under both initialization schemes, as well as the
+best result. After 20 optimization steps, we select the check-
+point with the best task-specific internal validation metric
+and submit its predictions on the Kaggle’s hidden test set
+to obtain a Kaggle competition score and leaderboard per-
+centile, reported in Table 1 and Figure 4.
+Housing Price
+Spaceship Titanic
+RMSE (↓)
+Accuracy (↑)
+ResearchAgent (Huang et al., 2024)
+Average
+–
+0.149
+78.17
+Best
+–
+0.145
+79.84
+Learned ML Pipeline (Ours)
+Average
+One
+0.135
+79.65
+Multi
+0.147
+79.69
+Best
+One
+0.129
+80.00
+Multi
+0.141
+80.43
+Table 1. MLAgentBench result. We run both systems 5 times and
+report the average and best Kaggle submission score across runs.
+One and Multi refer to a one-function vs many-functions workflow
+design for the learned ML pipeline (Figure 3). Both systems use
+the same underlying LLM (Claude Sonnet-3.5-v2).
+Results
+On both tasks, the gap between ResearchA-
+gent (Huang et al., 2024) and our learned ML pipeline is
+around 11.5%-22.4% on average, and the best machine
+learning model produced by the learned ML pipeline sur-
+passes 86.6% of human submissions. We notice a difference
+between our two initialization options. In Figure 4a, for
+the Spaceship Titanic dataset, asking the LLM optimizer to
+implement and modify a single function (train model) is
+worse than implementing and modifying a set of functions.
+Over 5 trials, if we look at the best pipeline generated under
+these two initial conditions, we see a large contrast, with
+one initial system configuration (one-function) surpassing
+72.7% of leaderboard submissions, while the other configu-
+ration (many-function) surpasses 86.6%. However, for the
+Housing Price dataset, the observed ordering is flipped. The
+one-function initial system configuration resulted in the best
+ML pipeline that produced a model that surpassed 75.6%
+of leaderboard submissions, while the many-function initial
+system configuration only surpassed 54.6% of submissions.
+The difference is noticeable both in terms of average quality
+and best pipeline across runs. We show some examples of
+the learned ML pipeline code in Figure F1.
+Takeaways: Starting Artifact
+Different initial systems lead to measurably differ-
+ent learned systems in both average and best-case
+performance across 5 runs.
+5. Atari Game Case Study for the Credit
+Horizon Problem
+Game playing has been a central focus in RL (Mnih et al.,
+2013; Silver et al., 2016; Brown & Sandholm, 2019). It
+is a natural multi-step task where a system needs to take
+game screen inputs from each time step and output an action
+for the game controller. Atari games often have dense rich
+5
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+5
+10
+15
+20
+Optimization Step
+20
+10
+0
+10
+Score
+Pong
+Multi-Step
+One-Step
+5
+10
+15
+20
+25
+30
+Optimization Step
+0
+50
+100
+150
+Score
+Breakout
+Multi-Step
+One-Step
+5
+10
+15
+20
+Optimization Step
+600
+700
+800
+900
+1000
+Score
+Space Invaders
+Multi-Step
+One-Step
+5
+10
+15
+20
+25
+30
+Optimization Step
+22
+24
+26
+28
+30
+Score
+Freeway
+Multi-Step
+One-Step
+5
+10
+15
+20
+25
+30
+Optimization Step
+0
+2000
+4000
+Score
+Asterix
+Multi-Step
+One-Step
+5
+10
+15
+20
+25
+30
+Optimization Step
+60
+80
+100
+120
+Score
+Enduro
+Multi-Step
+One-Step
+5
+10
+15
+20
+25
+30
+Optimization Step
+0
+200
+400
+600
+Score
+Q*bert
+Multi-Step
+One-Step
+5
+10
+15
+20
+25
+30
+Optimization Step
+0
+50
+100
+150
+Score
+Seaquest
+Multi-Step
+One-Step
+Figure 5. Credit Horizon Comparison Across Games. Performance of agents optimized with one-step (immediate reward) vs multi-step
+(full rollout) credit horizons across 5 trials. Both setups use agents with the same starting artifacts. We see that observing full execution
+traces (multi-step) is only useful in discovering better code in 4 out of 8 games, suggesting credit horizon is a design choice and can be
+tuned to each task.
+reward for each step, but many tasks involve long-horizon
+strategic planning to get the highest possible cumulative re-
+ward. This creates a controlled testbed to compare different
+credit horizons: should we optimize the agent after every
+action using immediate rewards, or wait until a full episode
+completes?
+Task
+We adopt the Arcade Learning Environment
+(ALE) (Mnih et al., 2013) and use object-centric Atari En-
+vironments (OCAtari) (Delfosse et al., 2024) to provide
+structured state representations (object positions, veloci-
+ties, lives, and rewards) rather than raw screen pixels. We
+pass the OCAtari object dictionary directly, without addi-
+tional manual feature engineering or natural-language an-
+notation. The LLM optimizer revises a Python program
+of several functions (such as predict ball, decide move)
+(Figure B3). The program takes structured state input at
+time step t and outputs an action at. The program itself is
+stateless, mimicking a Markov policy that a traditional RL
+algorithm has to learn. Each game requires different strate-
+gies: Pong and Breakout involve predicting ball trajectories
+and positioning paddles, while Space Invaders requires co-
+ordinating shooting and movement decisions while avoiding
+enemy projectiles. We release the code 2.
+Setup
+We
+compare
+two
+credit
+horizon
+configu-
+rations.
+We
+use
+Gymnasium
+ALE
+environments
+{env}-NoFrameskip-v4 with action repeat 4 and sticky
+action probability 0.0 (Appendix B). In the one-step
+condition, the LLM optimizer receives a trace containing
+only a single observation, action and its immediate reward,
+and updates the Python program after every step.
+In
+2https://github.com/ameliakuang/
+LLM-Game-Playing-Agents
+0
+100
+200
+300
+400
+500
+Wall-clock Time to Reach Best Performance (minutes)
+0%
+6.25%
+12.5%
+25%
+50%
+100%
+200%
+400%
+800%
+1600%
+Normalized to Human Score (log-scale)
+Neural Net (DQN)
+Neural Net (PPO)
+Code (LLM)
+Human (100%)
+Pong
+Breakout
+Space Invaders
+Freeway
+Asterix
+Enduro
+Q*bert
+Seaquest
+26x faster
+Figure 6. Training Efficiency Comparison. Deep RL training
+builds on CleanRL (Huang et al., 2022); PPO uses ten parallel
+environments for sampling while DQN and LLM use a single envi-
+ronment. Both PPO and DQN use batch training on a single A100
+GPU. All algorithms use object-centric inputs from OCAtari. The
+deep RL algorithms convert this information into numeric vectors,
+whereas the LLM takes the raw dictionary without additional anno-
+tation. Scores are normalized to map 0% to random performance
+on the task and 100% to human performance. See Appendix B.5
+for details.
+the multi-step condition, the optimizer receives full
+rollout traces before each update; the rollout length is
+game-dependent and reported in Appendix B. In both
+conditions, we append a templated natural-language
+feedback string derived from the observed rewards after the
+trace is collected. Both conditions use the same starting
+agent initialization with modular function designs (e.g.,
+predict ball trajectory and select action for Pong;
+see Appendix B.2 for representative examples).
+6
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+0.0
+0.1
+0.2
+0.3
+Validation Accuracy
+Dyck Languages
+0.00
+0.25
+0.50
+0.75
+Geometric Shapes
+0.0
+0.1
+0.2
+0.3
+Linguini
+0.2
+0.3
+0.4
+Causal Understanding
+0
+5
+10
+15
+Number of Updates
+0.4
+0.6
+0.8
+Validation Accuracy
+Disambiguation QA
+0
+5
+10
+15
+Number of Updates
+0.0
+0.2
+0.4
+0.6
+Boolean Expressions
+0
+5
+10
+15
+Number of Updates
+0.25
+0.50
+0.75
+1.00Movie Recommendation
+0
+5
+10
+15
+Number of Updates
+0.25
+0.50
+0.75
+Boardgame QA
+Base Workflow
+batch size = 1
+batch size = 3
+batch size = 5
+Figure 7. Validation Learning Curves Across Batch Sizes. Performance across optimization iterations for different batch sizes (3 trials,
+shaded area shows standard error). Larger batches often show faster initial learning but can plateau earlier. Training set: 15 examples;
+validation set: 10 examples.
+Experiment
+We run 5 trials for each game under both
+credit horizon conditions. We use OptoPrime (Cheng et al.,
+2024) as the LLM optimizer with Claude Sonnet-3.5 as the
+backend. For evaluation, we run the learned agent for up to
+4000 steps and report the final score. The optimization runs
+for 30 iterations for each trial.
+Results
+Figure 5 shows that the credit horizon can be
+task-dependent. Under the aggregate comparison shown
+in the figure, multi-step optimization outperforms one-step
+optimization in four of the eight games (Pong, Breakout,
+Space Invaders, and Asterix), while one-step optimization
+performs better in the other four (Freeway, Enduro, Q*bert,
+and Seaquest). This split suggests that credit horizon is a
+genuine design choice.
+The representative games in the appendix help interpret
+why the outcomes differ. Space Invaders benefits more
+from longer traces because effective play requires coordinat-
+ing shooting and movement under delayed consequences,
+whereas games such as Freeway can benefit from more
+frequent updates based on short-horizon feedback. Paddle-
+and-ball games such as Pong and Breakout sit between these
+extremes: they still admit relatively interpretable local ge-
+ometric cues, but longer traces can remain useful because
+action quality depends on how returns shape future trajecto-
+ries.
+As a side observation, Figure 6 shows that generative opti-
+mization achieves competitive scores with substantially less
+wall-clock time compared to traditional Deep RL methods,
+despite using only a single environment instance versus 10
+parallel instances for the deep RL baselines.
+This finding has practical implications: even in a controlled
+environment like Atari with clear episodic structure, there is
+no universal answer to “how long should the credit horizon
+be?” The agent engineer must consider the causal structure
+of the task. For tasks where immediate feedback accurately
+reflects progress toward the final goal, shorter credit hori-
+zons can be sufficient and may even speed up optimization
+by providing more frequent updates. For tasks requiring
+long-term planning, longer credit horizons become neces-
+sary despite the computational cost.
+Takeaways: Credit Horizon
+Short credit horizons can be sufficient when immedi-
+ate rewards align with long-term rewards, but longer
+traces are needed when they misalign and success
+requires coordination over time.
+6. BigBench Extra Hard Case Study for the
+Experience Batching Problem
+LLM agents are used for general language understanding
+tasks (from document processing to logical deductions).
+These tasks often come with a set of labeled data for the
+agent designer to manually tune the design and to eval-
+uate the system. When applying LLM-based generative
+optimization to automate the process here (e.g., tuning the
+agent’s prompt), the agent engineer must decide how many
+execution traces (input, output, feedback triplets) should
+be included in the learning context per update, similar to
+minibatching in stochastic gradient descent. Even when
+the LLM’s inherent context length limit is not a problem:
+training on single examples can be noisy and unstable, while
+aggregating across large batches (with conflicting evidence)
+is provably hard for LLMs to reason globally (Schnabel
+et al., 2025).
+7
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Minibatch Size
+Dyck Languages
+Geometric Shapes
+Linguini
+Causal Understanding
+Un-Optimized
+0.114 ± 0.007
+0.074 ± 0.003
+0.183 ± 0.010
+0.114 ± 0.005
+Batch=1
+0.183 ± 0.049
+0.343 ± 0.039
+0.149 ± 0.024
+0.375 ± 0.146
+Batch=3
+0.063 ± 0.010
+0.389 ± 0.040
+0.234 ± 0.012
+0.408 ± 0.097
+Batch=5
+0.190 ± 0.031
+0.200 ± 0.099
+0.170 ± 0.030
+0.531 ± 0.018
+Minibatch Size
+Disambiguation QA
+Boolean Expressions
+Movie Recommendation
+Boardgame QA
+Un-Optimized
+0.358 ± 0.013
+0.076 ± 0.009
+0.238 ± 0.007
+0.371 ± 0.003
+Batch=1
+0.537 ± 0.036
+0.177 ± 0.005
+0.889 ± 0.038
+0.341 ± 0.032
+Batch=3
+0.295 ± 0.091
+0.238 ± 0.006
+0.683 ± 0.119
+0.278 ± 0.009
+Batch=5
+0.526 ± 0.035
+0.154 ± 0.034
+0.810 ± 0.016
+0.276 ± 0.007
+Table 2. Test Set Performance Across Batch Sizes. Best accuracy per task is bolded; standard error shown in gray. Different tasks have
+different optimal batch sizes, and larger batches do not always improve performance on the full test set (175+ holdout test examples). For
+Boardgame QA, optimization degrades performance, suggesting meta-overfitting. Base model is Claude Sonnet-3.5-v2.
+Task
+We study this problem through optimizing prompted
+LLM systems on BigBench Extra Hard (BBEH) (Kazemi
+et al., 2025), a benchmark of challenging language un-
+derstanding tasks including logical reasoning (Dyck Lan-
+guages, Boolean Expressions), spatial reasoning (Geometric
+Shapes), language understanding (Linguini, Disambigua-
+tion QA), and domain-specific question answering (Movie
+Recommendation, Boardgame QA, Causal Understanding).
+Each task requires the agent to produce a single prompt and
+postprocessing code that generalizes across diverse question
+types within that task.
+Setup
+We design a simple two-component agent (Fig-
+ure C1): a call llm function that takes the task query and
+an optimizable prompt, and an answer extraction func-
+tion that parses the LLM’s response. Both components are
+optimized by the LLM optimizer. We compare three batch
+sizes: 1, 3, and 5 examples per optimizer update. For batch
+size k, at each optimization iteration, we sample k train-
+ing examples, execute the agent on each, collect feedback
+(correct/incorrect with ground truth solutions for incorrect
+answers), and concatenate all execution traces into a sin-
+gle learning context for the optimizer. We use 15 training
+examples, 10 validation examples, and hold out the rest
+for testing. Each configuration runs for 15 optimization
+iterations across 3 trials.
+Experiment
+We use OptoPrime (Cheng et al., 2024) as the
+LLM optimizer with Claude Sonnet-3.5 as the backend. We
+evaluate the learned agents on the held-out test set (typically
+175+ examples per task) and report mean accuracy with
+standard errors across trials.
+Results
+Table 2 reveals a striking pattern: the optimal
+batch size is task-dependent, and larger batches do not mono-
+tonically improve generalization. For some tasks, batch
+size 1 achieves the best test performance (Disambiguation
+QA: 0.537, Movie Recommendation: 0.889). For others,
+batch size 3 works best (Geometric Shapes: 0.389, Linguini:
+0.234, Boolean Expressions: 0.238). Still others benefit
+from batch size 5 (Dyck Languages: 0.190, Causal Under-
+standing: 0.531). We also found that optimization does not
+always help. For Boardgame QA, the unoptimized baseline
+achieves 0.371 accuracy, but all optimization configurations
+perform worse (0.341, 0.278, 0.276). We suspect this re-
+flects a type of meta-overfitting: the optimizer finds prompts
+and code that perform well on the 15 training examples but
+fail to generalize to the test distribution.
+Figure 7 shows validation performance across optimiza-
+tion iterations. We observe different convergence patterns:
+larger batch sizes often enable faster initial learning but
+can plateau more quickly (e.g., Geometric Shapes), while
+smaller batches show noisier but sometimes more sustained
+improvement. This mirrors classical batch size trade-offs
+in neural network training, where larger batches provide
+more stable gradients but may converge to different local op-
+tima than smaller batches. The task-dependence of optimal
+batch size presents a practical challenge: the agent engineer
+cannot set a universal batch size configuration before run-
+ning the learning loop. Instead, they must either perform
+hyperparameter search (expensive) or develop task-specific
+heuristics (manual effort).
+Takeaways: Experience Batching
+Larger batches can speed up early learning but they
+do not reliably improve final generalization. No
+single batch size works across all tasks.
+7. Conclusion and Discussion
+We analyzed the difficulty of setting up a learning loop
+for generative optimization, identifying three key design
+decisions that critically influence optimization outcomes:
+starting artifact, credit horizon, and experience batching.
+Through experiments across three domains—ML agent
+8
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+pipelines, Atari game-playing programs, and prompt op-
+timization on BBEH—we found no single universal recipe
+that works across all tasks.
+Generative optimization has other degrees of freedom that
+we did not ablate, such as the design of the feedback ora-
+cle, the choice of LLM used as the optimizer, and specific
+optimization schemes studied in prior work. We instead
+sought to isolate learning-loop design choices that are often
+treated as implementation details but can materially change
+outcomes. Interestingly, these choices closely parallel long-
+studied concepts in machine learning such as neural network
+initialization, truncated horizons in reinforcement learning,
+and batch size in stochastic gradient descent.
+Viewed through this lens, we conjecture that with sustained
+research explorations generative optimization may eventu-
+ally admit robust “defaults” that enable broad adoption: just
+as Transformers (Vaswani et al., 2017) provided a broadly
+useful inductive bias for sequence modeling, we may dis-
+cover starting artifacts for agents that are broadly optimiz-
+able across tasks; and just as Adam (Kingma & Ba, 2014)
+works well across a wide range of neural architectures, we
+may discover robust ways to structure the learning context
+— what traces to include, truncate, and batch — that transfer
+across agent designs and domains.
+References
+Agrawal, L. A., Tan, S., Soylu, D., Ziems, N., Khare, R.,
+Opsahl-Ong, K., Singhvi, A., Shandilya, H., Ryan, M. J.,
+Jiang, M., Potts, C., Sen, K., Dimakis, A. G., Stoica, I.,
+Klein, D., Zaharia, M., and Khattab, O. GEPA: Reflective
+prompt evolution can outperform reinforcement learning.
+arXiv preprint arXiv:2507.19457, 2025.
+Anthropic.
+Claude quickstarts.
+https://github.
+com/anthropics/claude-quickstarts/blob/main/
+computer-use-demo/computer use demo/loop.py,
+2025. Source code (GitHub). Accessed: 2026-01-28.
+Arjona-Medina, J. A., Gillhofer, M., Widrich, M., Un-
+terthiner, T., Brandstetter, J., and Hochreiter, S. RUD-
+DER: return decomposition for delayed rewards.
+In
+NeurIPS, pp. 13566–13577, 2019.
+Badia, A. P., Piot, B., Kapturowski, S., Sprechmann, P.,
+Vitvitskyi, A., Guo, Z. D., and Blundell, C. Agent57:
+Outperforming the Atari human benchmark. In ICML,
+pp. 507–517, 2020.
+Baronio, C., Marsella, P., Pan, B., Guo, S., and Alberti,
+S. Kevin: Multi-turn RL for generating CUDA kernels.
+arXiv preprint arXiv:2507.11948, 2025.
+Bolin,
+M.
+Unrolling
+the
+Codex
+agent
+loop.
+https://openai.com/index/
+unrolling-the-codex-agent-loop/, 2026. OpenAI
+Engineering blog post. Accessed: 2026-01-28.
+Brown, N. and Sandholm, T. Superhuman AI for multiplayer
+poker. Science, 365(6456):885–890, 2019.
+Chan, J. S., Chowdhury, N., Jaffe, O., Aung, J., Sherburn, D.,
+Mays, E., Starace, G., Liu, K., Maksin, L., Patwardhan,
+T., Madry, A., and Weng, L. MLE-bench: Evaluating
+machine learning agents on machine learning engineering.
+In ICLR, 2025.
+Chaudhuri, A., Choudhary, P., Piasevoli, M., Xiao, S., and
+Nie, A. Optimizing agentic architectures for cybersecurity
+tasks with Trace. In ICML 2025 Workshop on Program-
+matic Representations for Agent Learning, 2025. URL
+https://openreview.net/forum?id=uRV6vlXiOQ.
+Chen, T., Kornblith, S., Norouzi, M., and Hinton, G. A
+simple framework for contrastive learning of visual rep-
+resentations. In ICML, pp. 1597–1607, 2020.
+Chen, T., Tan, Z., Bo, X., Wu, Y., Gong, T., Chu, Q., and
+Ye, J. Flora: Effortless context construction to arbitrary
+length and scale. In AAAI, pp. 30288–30296, 2026.
+Chen, X., Lin, M., Sch¨arli, N., and Zhou, D. Teaching large
+language models to self-debug. In ICLR, 2024.
+Cheng, C.-A., Kolobov, A., and Swaminathan, A. Heuristic-
+guided reinforcement learning. In NeurIPS, pp. 13550–
+13563, 2021.
+Cheng, C.-A., Nie, A., and Swaminathan, A. Trace is the
+next autodiff: Generative optimization with rich feedback,
+execution traces, and LLMs. In NeurIPS, pp. 71596–
+71642, 2024.
+Chhikara, P., Khant, D., Aryan, S., Singh, T., and
+Yadav, D.
+Mem0:
+Building production-ready AI
+agents with scalable long-term memory. arXiv preprint
+arXiv:2504.19413, 2025.
+Conway, A., Dey, D., Hackmann, S., Hausknecht, M.,
+Schmidt, M. D., Steadman, M. L., and Volynets, N. syftr:
+Pareto-optimal generative AI. In AutoML, pp. 6/1–33,
+2025.
+Delfosse, Q., Bl¨uml, J., Gregori, B., Sztwiertnia, S., and
+Kersting, K. OCAtari: Object-centric Atari 2600 rein-
+forcement learning environments. In RLC, 2024.
+Doumbouya, M. K. B., Jurafsky, D., and Manning, C. D.
+Tversky neural networks: Psychologically plausible deep
+learning with differentiable Tversky similarity. arXiv
+preprint arXiv:2506.11035, 2025.
+9
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+El-Kishky, A., Wei, A., Saraiva, A., Minaiev, B., Selsam, D.,
+Dohan, D., Song, F., Lightman, H., Clavera, I., Pachocki,
+J., Tworek, J., Kuhn, L., Kaiser, L., Chen, M., Schwarzer,
+M., Rohaninejad, M., McAleese, N., o3 contributors,
+M¨urk, O., Garg, R., Shu, R., Sidor, S., Kosaraju, V., and
+Zhou, W. Competitive programming with large reasoning
+models. arXiv preprint arXiv:2502.06807, 2025.
+Gal, Y., Islam, R., and Ghahramani, Z. Deep bayesian active
+learning with image data. In ICML, pp. 1183–1192, 2017.
+Ghareeb, A. E., Chang, B., Mitchener, L., Yiu, A.,
+Szostkiewicz, C. J., Laurent, J. M., Razzak, M. T., White,
+A. D., Hinks, M. M., and Rodriques, S. G. Robin: A
+multi-agent system for automating scientific discovery.
+arXiv preprint arXiv:2505.13400, 2025.
+Glorot, X. and Bengio, Y. Understanding the difficulty of
+training deep feedforward neural networks. In AISTATS,
+pp. 249–256, 2010.
+Hastie, T., Tibshirani, R., and Friedman, J. The Elements of
+Statistical Learning: Data Mining, Inference, and Predic-
+tion. Springer, 2 edition, 2009.
+Hendrycks, D., Song, D., Szegedy, C., Lee, H., Gal, Y.,
+Brynjolfsson, E., Li, S., Zou, A., Levine, L., Han, B.,
+Fu, J., Liu, Z., Shin, J., Lee, K., Mazeika, M., Phan, L.,
+Ingebretsen, G., Khoja, A., Xie, C., Salaudeen, O., Hein,
+M., Zhao, K., Pan, A., Duvenaud, D., Li, B., Omohundro,
+S., Alfour, G., Tegmark, M., McGrew, K., Marcus, G.,
+Tallinn, J., Schmidt, E., and Bengio, Y. A definition of
+AGI. arXiv preprint arXiv:2510.18212, 2025.
+Houlsby, N., Husz´ar, F., Ghahramani, Z., and Lengyel, M.
+Bayesian active learning for classification and preference
+learning. arXiv preprint arXiv:1112.5745, 2011.
+Huang, A., Block, A., Foster, D. J., Rohatgi, D., Zhang,
+C., Simchowitz, M., Ash, J. T., and Krishnamurthy, A.
+Self-improvement in language models: The sharpening
+mechanism. In ICLR, 2025.
+Huang, Q., Vora, J., Liang, P., and Leskovec, J. MLAgent-
+Bench: Evaluating language agents on machine learning
+experimentation. In ICML, pp. 20271–20309, 2024.
+Huang, S., Dossa, R. F. J., Ye, C., Braga, J., Chakraborty, D.,
+Mehta, K., and Ara´ujo, J. G. M. CleanRL: High-quality
+single-file implementations of deep reinforcement learn-
+ing algorithms. Journal of Machine Learning Research,
+23(274):1–18, 2022.
+Huntley, G.
+Everything is a Ralph loop.
+https://
+ghuntley.com/loop/, 2026. Accessed: 2026-01-28.
+Jimenez, C. E., Yang, J., Wettig, A., Yao, S., Pei, K., Press,
+O., and Narasimhan, K. R. SWE-bench: Can language
+models resolve real-world Github issues? In ICLR, 2024.
+Kazemi, M., Fatemi, B., Bansal, H., Palowitch, J., Anas-
+tasiou, C., Mehta, S. V., Jain, L. K., Aglietti, V., Jindal,
+D., Chen, P., Dikkala, N., Tyen, G., Liu, X., Shalit, U.,
+Chiappa, S., Olszewska, K., Tay, Y., Tran, V. Q., Le,
+Q. V., and Firat, O. BIG-bench extra hard. In ACL, pp.
+26473–26501, 2025.
+Khattab, O., Singhvi, A., Maheshwari, P., Zhang, Z., San-
+thanam, K., A, S. V., Haq, S., Sharma, A., Joshi, T. T.,
+Moazam, H., Miller, H., Zaharia, M., and Potts, C. DSPy:
+Compiling declarative language model calls into state-of-
+the-art pipelines. In ICLR, 2024.
+Kingma, D. P. and Ba, J. Adam: A method for stochastic
+optimization. arXiv preprint arXiv:1412.6980, 2014.
+Kwa, T., West, B., Becker, J., Deng, A., Garcia, K., Hasin,
+M., Jawhar, S., Kinniment, M., Rush, N., Arx, S. V.,
+Bloom, R., Broadley, T., Du, H., Goodrich, B., Jurkovic,
+N., Miles, L. H., Nix, S., Lin, T., Parikh, N., Rein, D.,
+Sato, L. J. K., Wijk, H., Ziegler, D. M., Barnes, E., and
+Chan, L. Measuring AI ability to complete long tasks.
+arXiv preprint arXiv:2503.14499, 2025.
+Laidlaw, C., Russell, S. J., and Dragan, A. Bridging RL
+theory and practice with the effective horizon. In NeurIPS,
+pp. 58953–59007, 2023.
+LangChain. LangGraph: A low-level orchestration frame-
+work for building controllable agents, 2024. URL https:
+//langchain-ai.github.io/langgraph/.
+Lange, R. T., Imajuku, Y., and Cetin, E. ShinkaEvolve:
+Towards open-ended and sample-efficient program evolu-
+tion. arXiv preprint arXiv:2509.19349, 2025a.
+Lange, R. T., Sun, Q., Prasad, A., Faldor, M., Tang, Y.,
+and Ha, D. Towards robust agentic CUDA kernel bench-
+marking, verification, and optimization. arXiv preprint
+arXiv:2509.14279, 2025b.
+Li, Z., Zhang, H., Han, S., Liu, S., Xie, J., Zhang, Y.,
+Choi, Y., Zou, J., and Lu, P. In-the-flow agentic system
+optimization for effective planning and tool use. arXiv
+preprint arXiv:2510.05592, 2025.
+Madaan, A., Tandon, N., Gupta, P., Hallinan, S., Gao, L.,
+Wiegreffe, S., Alon, U., Dziri, N., Prabhumoye, S., Yang,
+Y., Gupta, S., Majumder, B. P., Hermann, K., Welleck,
+S., Yazdanbakhsh, A., and Clark, P. Self-refine: Iterative
+refinement with self-feedback. In NeurIPS, pp. 46534–
+46594, 2023.
+Mnih, V., Kavukcuoglu, K., Silver, D., Graves, A.,
+Antonoglou, I., Wierstra, D., and Riedmiller, M. Playing
+Atari with deep reinforcement learning. arXiv preprint
+arXiv:1312.5602, 2013.
+10
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Monea, G., Bosselut, A., Brantley, K., and Artzi, Y. LLMs
+are in-context bandit reinforcement learners. In COLM,
+2025.
+Nie, A., Cheng, C.-A., Kolobov, A., and Swaminathan, A.
+The importance of directional feedback for LLM-based
+optimizers. arXiv preprint arXiv:2405.16434, 2024.
+Novikov, A., V˜u, N., Eisenberger, M., Dupont, E., Huang,
+P.-S., Wagner, A. Z., Shirobokov, S., Kozlovskii, B., Ruiz,
+F. J. R., Mehrabian, A., Kumar, M. P., See, A., Chaudhuri,
+S., Holland, G., Davies, A., Nowozin, S., Kohli, P., and
+Balog, M. AlphaEvolve: A coding agent for scientific and
+algorithmic discovery. arXiv preprint arXiv:2506.13131,
+2025.
+Ouyang, A., Guo, S., Arora, S., Zhang, A. L., Hu, W.,
+Re, C., and Mirhoseini, A. KernelBench: Can LLMs
+write efficient GPU kernels? In ICML, pp. 47356–47415,
+2025a.
+Ouyang, S., Yan, J., Hsu, I.-H., Chen, Y., Jiang, K., Wang,
+Z., Han, R., Le, L. T., Daruki, S., Tang, X., Tiru-
+malashetty, V., Lee, G., Rofouei, M., Lin, H., Han, J.,
+Lee, C.-Y., and Pfister, T. ReasoningBank: Scaling agent
+self-evolving with reasoning memory. arXiv preprint
+arXiv:2509.25140, 2025b.
+Pan, J., Li, X., Lian, L., Snell, C. V., Zhou, Y., Yala, A.,
+Darrell, T., Keutzer, K., and Suhr, A. Learning adap-
+tive parallel reasoning with language models. In COLM,
+2025a.
+Pan, M. Z., Arabzadeh, N., Cogo, R., Zhu, Y., Xiong, A.,
+Agrawal, L. A., Mao, H., Shen, E., Pallerla, S., Patel, L.,
+Liu, S., Shi, T., Liu, X., Davis, J. Q., Lacavalla, E., Basile,
+A., Yang, S., Castro, P., Kang, D., Gonzalez, J. E., Sen, K.,
+Song, D., Stoica, I., Zaharia, M., and Ellis, M. Measuring
+agents in production. arXiv preprint arXiv:2512.04123,
+2025b.
+Pascanu, R., Mikolov, T., and Bengio, Y. On the difficulty
+of training recurrent neural networks. In ICML, pp. 1310–
+1318, 2013.
+Press, O., Amos, B., Zhao, H., Wu, Y., Ainsworth, S.,
+Krupke, D., Kidger, P., Sajed, T., Stellato, B., Park, J.,
+Bosch, N., Meril, E., Steppi, A., Zharmagambetov, A.,
+Zhang, F., P´erez-Pi˜neiro, D., Mercurio, A., Zhan, N.,
+Abramovich, T., Lieret, K., Zhang, H., Huang, S., Bethge,
+M., and Press, O. Algotune: Can language models speed
+up general-purpose numerical programs? In NeurIPS,
+2025.
+Ren, X., Nie, A., Xie, T., and Cheng, C.-A.
+POLCA:
+Stochastic generative optimization with LLM.
+arXiv
+preprint arXiv:2603.14769, 2026.
+Schnabel, T., Tomlinson, K., Swaminathan, A., and Neville,
+J. Lost in transmission: When and why LLMs fail to
+reason globally. In NeurIPS, 2025.
+Shaban, A., Cheng, C.-A., Hatch, N., and Boots, B. Trun-
+cated back-propagation for bilevel optimization. In AIS-
+TATS, pp. 1723–1732, 2019.
+Shalev-Shwartz, S. Online learning and online convex opti-
+mization. Foundations and Trends® in Machine Learning,
+4(2):107–194, 2012.
+Silver, D., Huang, A., Maddison, C. J., Guez, A., Sifre, L.,
+Van Den Driessche, G., Schrittwieser, J., Antonoglou, I.,
+Panneershelvam, V., Lanctot, M., Dieleman, S., Grewe,
+D., Nham, J., Kalchbrenner, N., Sutskever, I., Lillicrap, T.,
+Leach, M., Kavukcuoglu, K., Graepel, T., and Hassabis,
+D. Mastering the game of Go with deep neural networks
+and tree search. Nature, 529(7587):484–489, 2016.
+Smith, S. L., Kindermans, P.-J., and Le, Q. V. Don’t decay
+the learning rate, increase the batch size. In ICLR, 2018.
+Sun, W., Lu, M., Ling, Z., Liu, K., Yao, X., Yang, Y., and
+Chen, J. Scaling long-horizon LLM agent via context-
+folding. arXiv preprint arXiv:2510.11967, 2025.
+Sutton,
+R. S.
+The bitter lesson,
+2019.
+URL
+http://www.incompleteideas.net/IncIdeas/
+BitterLesson.html.
+Tallec, C. and Ollivier, Y. Unbiasing truncated backpropa-
+gation through time. arXiv preprint arXiv:1705.08209,
+2017.
+Toledo, E., Hambardzumyan, K., Josifoski, M., Hazra, R.,
+Baldwin, N., Audran-Reiss, A., Kuchnik, M., Magka, D.,
+Jiang, M., Lupidi, A. M., Lupu, A., Raileanu, R., Niu,
+K., Shavrina, T., Gagnon-Audet, J.-C., Shvartsman, M.,
+Sodhani, S., Miller, A. H., Charnalia, A., Dunfield, D.,
+Wu, C.-J., Stenetorp, P., Cancedda, N., Foerster, J. N., and
+Bachrach, Y. AI research agents for machine learning:
+Search, exploration, and generalization in MLE-bench.
+In NeurIPS, 2025.
+Towers, M., Kwiatkowski, A., Balis, J. U., Cola, G. D.,
+Deleu, T., Goul˜ao, M., Andreas, K., Krimmel, M., KG,
+A., Perez-Vicente, R. D. L., Terry, J. K., Pierr´e, A., Schul-
+hoff, S. V., Tai, J. J., Tan, H., and Younis, O. G. Gym-
+nasium: A standard interface for reinforcement learning
+environments. In NeurIPS, 2025.
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. Attention
+is all you need. In NeurIPS, 2017.
+Wang, W., Alyahya, H. A., Ashley, D. R., Serikov, O.,
+Khizbullin, D., Faccio, F., and Schmidhuber, J. How
+11
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+to correctly do semantic backpropagation on language-
+based agentic systems. arXiv preprint arXiv:2412.03624,
+2024.
+Wang, X., Li, B., Song, Y., Xu, F. F., Tang, X., Zhuge, M.,
+Pan, J., Song, Y., Li, B., Singh, J., Tran, H. H., Li, F.,
+Ma, R., Zheng, M., Qian, B., Shao, Y., Muennighoff, N.,
+Zhang, Y., Hui, B., Lin, J., Brennan, R., Peng, H., Ji, H.,
+and Neubig, G. OpenHands: An open platform for AI
+software developers as generalist agents. In ICLR, 2025a.
+Wang, Z. Z., Mao, J., Fried, D., and Neubig, G. Agent
+workflow memory. In ICML, pp. 63897–63911, 2025b.
+Wei, A., Nie, A., Teixeira, T. S. F. X., Yadav, R., Lee, W.,
+Wang, K., and Aiken, A. Improving parallel program
+performance with LLM optimizers via agent-system in-
+terfaces. In ICML, 2025a.
+Wei, A., Sun, T., Seenichamy, Y., Song, H., Ouyang, A.,
+Mirhoseini, A., Wang, K., and Aiken, A. Astra: A multi-
+agent system for GPU kernel performance optimization.
+arXiv preprint arXiv:2509.07506, 2025b.
+Wei, Y., Duchenne, O., Copet, J., Carbonneaux, Q., Zhang,
+L., Fried, D., Synnaeve, G., Singh, R., and Wang, S. I.
+SWE-RL: Advancing LLM reasoning via reinforcement
+learning on open software evolution. In NeurIPS, 2025c.
+Wu, Q., Bansal, G., Zhang, J., Wu, Y., Li, B., Zhu, E., Jiang,
+L., Zhang, X., Zhang, S., Liu, J., Awadallah, A. H., White,
+R. W., Burger, D., and Wang, C. AutoGen: Enabling next-
+gen LLM applications via multi-agent conversations. In
+COLM, 2024.
+Xiong, W., Zhang, H., Ye, C., Chen, L., Jiang, N., and
+Zhang, T. Self-rewarding correction for mathematical
+reasoning. arXiv preprint arXiv:2502.19613, 2025.
+Xu, W., Nie, A., Zheng, R., Modi, A., Swaminathan, A., and
+Cheng, C.-A. Provably learning from language feedback.
+arXiv preprint arXiv:2506.10341, 2025.
+Yang, C., Wang, X., Lu, Y., Liu, H., Le, Q. V., Zhou, D.,
+and Chen, X. Large language models as optimizers. In
+ICLR, 2024.
+Ye, R., Zhang, Z., Li, K., Yin, H., Tao, Z., Zhao, Y., Su, L.,
+Zhang, L., Qiao, Z., Wang, X., Xie, P., Huang, F., Chen,
+S., Zhou, J., and Jiang, Y. AgentFold: Long-horizon
+web agents with proactive context management. arXiv
+preprint arXiv:2510.24699, 2025.
+Yuksekgonul, M., Bianchi, F., Boen, J., Liu, S., Lu, P.,
+Huang, Z., Guestrin, C., and Zou, J. Optimizing gener-
+ative AI by backpropagating language model feedback.
+Nature, 639(8055):609–616, 2025.
+Yuksekgonul, M., Koceja, D., Li, X., Bianchi, F., McCaleb,
+J., Wang, X., Kautz, J., Choi, Y., Zou, J., Guestrin, C., and
+Sun, Y. Learning to discover at test time. arXiv preprint
+arXiv:2601.16175, 2026.
+Zelikman, E., Huang, Q., Poesia, G., Goodman, N., and
+Haber, N. Parsel: Algorithmic reasoning with language
+models by composing decompositions. In NeurIPS, pp.
+31466–31523, 2023.
+Zhang, A. K., Perry, N., Dulepet, R., Ji, J., Menders, C., Lin,
+J. W., Jones, E., Hussein, G., Liu, S., Jasper, D. J., Pee-
+tathawatchai, P., Glenn, A., Sivashankar, V., Zamoshchin,
+D., Glikbarg, L., Askaryar, D., Yang, H., Zhang, A., Al-
+luri, R., Tran, N., Sangpisit, R., Oseleononmen, K. O.,
+Boneh, D., Ho, D. E., and Liang, P. Cybench: A frame-
+work for evaluating cybersecurity capabilities and risks
+of language models. In ICLR, 2025a.
+Zhang, A. L., Kraska, T., and Khattab, O. Recursive lan-
+guage models. arXiv preprint arXiv:2512.24601, 2025b.
+Zhang, G., Zhu, S., Wei, A., Song, Z., Nie, A., Jia, Z.,
+Vijaykumar, N., Wang, Y., and Olukotun, K. AccelOpt:
+A self-improving LLM agentic system for AI accelerator
+kernel optimization. arXiv preprint arXiv:2511.15915,
+2025c.
+Zhang, Q., Hu, C., Upasani, S., Ma, B., Hong, F., Kama-
+nuru, V., Rainton, J., Wu, C., Ji, M., Li, H., Thakker, U.,
+Zou, J., and Olukotun, K. Agentic context engineering:
+Evolving contexts for self-improving language models.
+arXiv preprint arXiv:2510.04618, 2025d.
+Zhao, C., Zhang, T., Su, H., Zhang, Y., Su, S., Xu, M., Liu,
+Y., Han, W., Werner, J., Cheng, C. N., and Mehdad, Y.
+Agent-in-the-loop: A data flywheel for continuous im-
+provement in LLM-based customer support. In EMNLP,
+pp. 1919–1930, 2025.
+Zhou, D., Sch¨arli, N., Hou, L., Wei, J., Scales, N., Wang,
+X., Schuurmans, D., Cui, C., Bousquet, O., Le, Q. V.,
+and Chi, E. H. Least-to-most prompting enables complex
+reasoning in large language models. In ICLR, 2023.
+Zhou, H., Chen, Y., Guo, S., Yan, X., Lee, K. H., Wang, Z.,
+Lee, K. Y., Zhang, G., Shao, K., Yang, L., and Wang, J.
+Memento: Fine-tuning LLM agents without fine-tuning
+LLMs. arXiv preprint arXiv:2508.16153, 2025a.
+Zhou, Z., Qu, A., Wu, Z., Kim, S., Prakash, A., Rus, D.,
+Zhao, J., Low, B. K. H., and Liang, P. P. MEM1: Learning
+to synergize memory and reasoning for efficient long-
+horizon agents. arXiv preprint arXiv:2506.15841, 2025b.
+Zoph, B. and Le, Q. Neural architecture search with rein-
+forcement learning. In ICLR, 2017.
+12
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+A
+MLAgentBench Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 14
+A.1
+Experimental setup. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .14
+A.2
+Agent design details. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .14
+A.3
+Feedback design details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 14
+A.4
+Learning dynamics and meta-overfitting. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .15
+A.5
+Representative learned ML pipeline examples. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .16
+B
+Atari Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 16
+B.1
+Experimental setup. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .16
+B.2
+Agent design details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 17
+B.3
+Feedback design details. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .18
+B.4
+Credit horizon and rollout design . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 19
+B.5
+Object-centric deep RL baselines . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 19
+B.6
+Representative learned artifact examples. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .21
+C
+BigBench Extra Hard Details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 21
+C.1
+Experimental setup . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 21
+C.2
+Agent design details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 21
+C.3
+Feedback design details. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .22
+C.4
+Batchify operator details . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 22
+C.5
+Task-specific observations . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 23
+C.6
+Additional task-specific training details. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .23
+D
+Building a Learning Loop: Extended Discussion. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .23
+D.1
+The OPTO framework. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .23
+D.2
+Workflow graphs and learning graphs . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 23
+D.3
+Building learning graphs by template . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 24
+D.4
+The choice of starting artifact . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 25
+D.5
+The choice of credit horizon . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 26
+D.6
+The choice of experience batching . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 26
+D.7
+Additional considerations: feedback design. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .26
+E
+Further Discussion and Disclosures . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 26
+E.1
+Agents, agentic systems, and the scope of this paper . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 26
+E.2
+Additional examples of generative optimization in agentic workflows. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .27
+E.3
+Disclosures and LLM access cards . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 28
+F
+Optimized code examples. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .29
+F.1
+MLAgentBench code examples . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 29
+F.2
+Atari code examples . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 29
+13
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+A. MLAgentBench Details
+A.1. Experimental Setup
+The MLAgentBench experiments instantiate the starting-artifact problem on a task that asks the LLM optimizer to improve
+an end-to-end machine learning pipeline. We consider two Kaggle tasks, Housing Price and Spaceship Titanic, and compare
+two initialization schemes: a one-function workflow and a more modular many-function workflow. In both cases, the
+optimizer receives the same task description and the same high-level implementation hints through docstrings; what differs
+is the decomposition of the initial workflow.
+Our setup slightly differs from the original MLAgentBench setup (Huang et al., 2024), where the LLM agent is additionally
+asked to download the dataset and generate the submission file. We instead download the dataset outside the agent and
+generate the submission file after optimization completes. The difference is not consequential for our purposes because we
+want to isolate the effect of different starting artifacts on the optimization outcome.
+A.2. Agent Design Details
+The learned ML pipeline shares a similar design for both tasks with modular components for different steps of the machine
+learning pipeline. In the many-function initialization, the workflow is broken into components such as preprocessing, feature
+selection, ensemble construction, training, and prediction. This decomposition makes explicit which parts of the pipeline
+the optimizer is allowed to revise and gives the optimizer a more structured hypothesis class than a single monolithic
+train model function. The schematic comparison below is adapted from the Housing Price implementations3, though for
+both tasks, we use the same implementation.
+1 @trace.model
+2 class Pipeline:
+3
+def __call__(self , x, y=None , test_data=None):
+4
+# [Workflow structure / specs]
+5
+# One editable function through the pipeline
+6
+return self.train_model(x, y, test_data)
+7
+8
+@trace.bundle(trainable=True)
+9
+def train_model(self , x, y=None , test_data=None):
+10
+"""
+11
+[Program documentation]
+12
+Task guidance , constraints ,
+13
+and modeling hints live here.
+14
+15
+In the MLAgentBench example ,
+16
+the docstring for this function
+17
+is a concatenation of all docstrings
+18
+for the many -function initialization.
+19
+"""
+20
+# [Initial implementation]
+21
+# Starter code for the full pipeline
+22
+...
+(a) One-function initialization.
+1 @trace.model
+2 class Pipeline:
+3
+def __call__(self , x, y=None , test_data=None):
+4
+# [Workflow structure / specs]
+5
+# Explicit interfaces between multiple
+editable functions
+6
+x = self.preprocess(x)
+7
+z = self.select_features(x)
+8
+m = self.train_model(z, y)
+9
+return self.predict(m, z)
+10
+11
+@trace.bundle(trainable=True)
+12
+def preprocess(self , x):
+13
+"""[Program documentation]"""
+14
+...
+# [Initial implementation]
+15
+16
+@trace.bundle(trainable=True)
+17
+def select_features(self , x):
+18
+"""[Program documentation]"""
+19
+...
+# [Initial implementation]
+20
+21
+@trace.bundle(trainable=True)
+22
+def train_model(self , z, y):
+23
+"""[Program documentation]"""
+24
+...
+# [Initial implementation]
+25
+26
+@trace.bundle(trainable=True)
+27
+def predict(self , m, z):
+28
+"""[Program documentation]"""
+29
+...
+# [Initial implementation]
+(b) Many-function initialization.
+Figure A1. Trace program for the two MLAgentBench initializations. The one-function design exposes the full pipeline through a
+single trainable function, whereas the many-function design exposes preprocessing, feature selection, model training, and prediction as
+separate trainable components.
+A.3. Feedback Design Details
+We provide task-specific feedback instructions when the agent reaches different performance levels. Figure A2 shows the
+feedback templates used for Spaceship Titanic and Housing Price. Table A1 summarizes the staged suggestive feedback
+3https://github.com/AbhinavAkkiraju/data-science-agent/tree/main/house-prices
+14
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+used for both tasks. This feedback design is intended to give the optimizer more direction than a bare validation score while
+still leaving room for nontrivial revisions.
+Spaceship Titanic Feedback Template
+Epoch [epoch]/20
+Accuracy: [val accuracy]
+F1: [val f1]
+Precision: [val precision]
+Recall: [val recall]
+[SUGGESTION]
+(a) Spaceship Titanic.
+Housing Price Feedback Template
+Epoch [epoch]/20
+RMSE: [val rmse]
+MAE: [val mae]
+r2: [val r2]
+[SUGGESTION]
+(b) Housing Price.
+Figure A2. Feedback templates used for the learned ML pipeline on the Spaceship Titanic and Housing Price tasks.
+Validation F1
+Suggestive Feedback
+Val F1 < 0.5
+“Model performance is poor. Try
+better feature engineering and
+preprocessing.”
+0.5 ≤Val F1 < 0.7
+“Model is showing promise but needs
+improvement. Consider
+class balancing techniques.”
+0.7 ≤Val F1 < 0.8
+“Model is performing well.
+Fine-tune hyperparameters for
+further improvements.”
+Val F1 ≥0.8
+“Excellent performance! Focus on
+preventing overfitting.”
+(a) Spaceship Titanic feedback.
+Validation r2
+Suggestive Feedback
+r2 ≤0
+“Model is performing worse than
+baseline. Focus on better feature
+engineering and selection.”
+0 < r2 < 0.5
+“Model has poor predictive power.
+Try more advanced preprocessing
+or different algorithms.”
+0.5 ≤r2 < 0.7
+“Model is improving but still has
+room for growth. Consider
+feature interactions.”
+r2 ≥0.7
+“Model is performing well.
+Fine-tune hyperparameters for
+further improvements.”
+(b) Housing Price feedback.
+Table A1. Staged feedback templates for Spaceship Titanic and Housing Price. Highlighted phrases mark the parts that differ across
+feedback levels within each task.
+A.4. Learning Dynamics and Meta-Overfitting
+Train/Validation Data Splitting
+We create a train-validation split outside the agent and use the validation metric as the
+optimization signal. Kaggle test submissions are reserved for final external evaluation and are never used during optimization.
+We use OptoPrime (Cheng et al., 2024) as the generative optimizer and evaluate each configuration across multiple trials.
+Kaggle does not permit enough test submissions for the test set to be used as an optimization signal, so the held-out split
+within the available training data becomes the reward source for generative optimization. We provide 80% of the original
+training data to the agent and reserve the remaining 20% as the internal validation split used for feedback and checkpoint
+selection.
+Optimization Details
+Concretely, the outer optimization loop is identical between the one-function and many-function
+initializations. In both cases, we fix a train-validation split outside the agent, run OptoPrime for 20 optimization steps with
+memory size 5, compute validation metrics after each step, and convert those metrics into a natural-language feedback string
+before calling the optimizer update. For the Spaceship Titanic task shown here, staged feedback thresholds and checkpoint
+selection both use validation F1; accuracy, precision, and recall are included in the feedback string as auxiliary diagnostics.
+The checkpoint with the best task-specific internal validation metric is then used to generate the final Kaggle submission.
+Thus, the main difference between the two initializations is not the outer training protocol, but the editable part of the
+program exposed to the optimizer.
+15
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Figure A3. One Optimization Trajectory of LLM Optimizer on the ML Pipeline. We show a single optimization trajectory from the
+Spaceship Titanic dataset. The feedback string reports Accuracy, F1 score, Precision, and Recall, but both staged feedback and checkpoint
+selection are based on validation F1. Each dot (step) represents a full execution of the training pipeline code written by the LLM optimizer
+with a fully trained model. We see that LLM optimizer tends to overfit to the training data and exhibits classical overfitting behavior even
+without numerical gradient descent.
+Figure A3 shows the learning progress of one trial of the Spaceship Titanic task. Although it resembles ordinary model
+overfitting at first glance, the figure reflects a different phenomenon. At each optimization step, the agent produces a new
+fully trained model from scratch. What increases over time is the optimizer’s tendency to discover pipeline code revisions
+that fit the training split at the expense of generalization. We refer to this as meta-overfitting: the generative optimizer learns
+to make workflow revisions that improve the immediate validation-driven objective while drifting toward brittle pipelines.
+A.5. Representative Learned ML Pipeline Examples
+We provide a snippet of the learned ML pipeline code to show how the LLM optimizer writes specific preprocess-
+ing logic (Figure F1).
+The full implementation is publicly available at https://github.com/AbhinavAkkiraju/
+data-science-agent.
+B. Atari Details
+B.1. LLM Optimizer Experimental Setup
+The per-game training configuration is reported in Table B2. Across all eight games, we use frame skipping to shorten the
+effective horizon and set the sticky-action probability to 0.0, since in our experiments removing sticky actions led to more
+stable optimization of the learned policy code.
+We generate data on-the-fly using object-centric Atari Environments (OCAtari) (Delfosse et al., 2024)4, a wrapper around
+the Gymnasium API (Towers et al., 2025). Instead of raw pixels, the learned agent receives a structured dictionary of objects
+at each timestep. This representation makes the revised code more interpretable and gives the optimizer direct access to
+semantically meaningful state variables. The full eight-game set is Pong, Breakout, Space Invaders, Freeway, Asterix,
+Enduro, Q*bert, and Seaquest. To keep the appendix compact, the screenshots, feedback templates, and code examples
+below focus on Pong, Breakout, and Space Invaders as representative games.
+The OCAtari wrapper returns game-specific dictionaries. As representative examples, Pong exposes a compact state with
+Player, Ball, and Enemy. Breakout additionally groups remaining bricks into row-wise lists RB/OB/YB/GB/AB/BB and
+records lives.
+Pong
+In Pong, the player controls a paddle on the right side of the screen to deflect the ball into the enemy’s goal. The
+player scores a point if the enemy misses the ball. The game ends when one side scores 21 points.
+4https://github.com/k4ntz/OC Atari
+16
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Breakout
+In Breakout, the player moves a bottom paddle horizontally to deflect a ball that scores against brick walls upon
+contact. The brick wall consists of six rows of different colored bricks, with higher bricks worth more points. Hitting higher
+bricks increases ball speed and therefore the difficulty of recovery. The player wins after scoring 864 points and loses a life
+when the ball drops out of range.
+Space Invaders
+In Space Invaders, the player controls a cannon at the bottom of the screen and must move left or right
+while firing at descending aliens. Enemy projectiles, shield usage, and firing cadence make the action-value of any single
+move more dependent on longer-term state evolution than in Pong or Breakout.
+Reset handling is also game-specific in the code. As representative examples, Breakout automatically applies FIRE after
+reset so that each rollout starts with the ball in play, whereas Pong and Space Invaders use a standard reset.
+Name
+Repo
+Deep RL Repo (CleanRL)
+https://github.com/ameliakuang/cleanrl obj centric/blob/master/cleanrl/
+LLM Code Repo
+https://github.com/ameliakuang/LLM-Game-Playing-Agents
+Wandb Log for DQN Training
+https://wandb.ai/kuangzy-amelia-stanford-university/obj-dqn-5trials-new
+Wandb Log for PPO Training
+https://wandb.ai/kuangzy-amelia-stanford-university/obj-ppo-5trials-flatten
+Table B1. Repositories and Experiment Logs used for the Atari experiments.
+(a) Pong
+(b) Breakout
+(c) Space Invaders
+Figure B1. Annotated screenshots from three representative Atari games showing how OCAtari (Delfosse et al., 2024) translates pixels
+into object annotations in Pong, Breakout, and Space Invaders.
+B.2. Agent Design Details
+Pong
+To succeed at Pong, the agent should accurately predict where the ball will intersect the player’s paddle plane
+while accounting for wall bounces. We therefore use a workflow centered on trajectory prediction and paddle control, with
+17
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Game
+One-Step
+Multi-Step
+Optimizer Steps
+Evaluation Protocol
+Pong
+1 step
+400 steps
+20
+10 episodes × 4000 steps
+Breakout
+1 step
+300 steps
+30
+1 episode × 4000 steps
+Space Invaders
+1 step
+25 steps
+20
+1 episode × 4000 steps
+Freeway
+1 step
+100 steps
+30
+3 episodes × 2500 steps
+Asterix
+1 step
+100 steps
+30
+3 episodes × 20000 steps
+Enduro
+1 step
+100 steps
+30
+1 episode × 5000 steps
+Q*bert
+1 step
+100 steps
+30
+1 episode × 4000 steps
+Seaquest
+1 step
+100 steps
+30
+1 episode × 4000 steps
+Table B2. Per-game Atari credit-horizon configurations. All games use ALE {env}-NoFrameskip-v4 environments with action repeat 4,
+sticky action probability 0.0, optimizer memory size 5, and Claude Sonnet-3.5 via OptoPrime.
+OCAtari Breakout Observation Example
+TracedEnv.step.step16 = {
+‘Player’: {‘x’: 99, ‘y’: 189, ‘w’: 16, ‘h’: 4, ‘dx’: 0, ‘dy’: 0},
+‘Ball’: {‘x’: 7, ‘y’: 193, ‘w’: 2, ‘h’: 4, ‘dx’: -4, ‘dy’: 4},
+‘RB’: [{‘x’: 8, ‘y’: 57, ‘w’: 144, ‘h’: 6}],
+‘OB’: [{‘x’: 8, ‘y’: 63, ‘w’: 144, ‘h’: 6}],
+‘YB’: [{‘x’: 8, ‘y’: 69, ‘w’: 144, ‘h’: 6}],
+‘GB’: [{‘x’: 8, ‘y’: 75, ‘w’: 144, ‘h’: 6}],
+‘AB’: [{‘x’: 8, ‘y’: 81, ‘w’: 144, ‘h’: 6}],
+‘BB’: [{‘x’: 8, ‘y’: 87, ‘w’: 144, ‘h’: 6}],
+‘lives’: 5,
+‘reward’: 0.0
+}
+Figure B2. Example of a returned observation, game information, and reward from Breakout. Note that this is the raw return from
+OCAtari, not further processed. There is no annotation of what “RB”, “OB”, “YB”, “GB”, “AB”, and “BB” represent. They are acronyms
+for the bounding boxes with colors.
+trainable functions such as predict ball trajectory() and select action(). The initialized version returns the current
+ball coordinate and a random movement decision; the learned version uses a more structured geometric heuristic.
+Breakout
+Breakout also depends on ball trajectory, but the objective is richer because paddle placement affects which bricks
+the ball can target next. The workflow therefore includes predict ball trajectory(), generate paddle target(), and
+select paddle action(). The initialized agent is intentionally underspecified so the optimizer must discover both reliable
+returns and useful targeting behavior.
+Space Invaders
+For Space Invaders, we separate movement and firing into decide shoot(), decide movement(), and
+combine actions(). This decomposition makes clear that the game requires concurrent control over attack and defense
+rather than pure interception of a moving ball.
+B.3. Feedback Design Details
+We provide game-specific feedback instructions when the agent reaches different reward regions. The goal is not only to
+report score, but also to guide the optimizer toward qualitatively better behavior for each game. Here, we explore a type
+of feedback design similar to traditional reward shaping, where we provide different feedback at different stages of the
+agent performance. Without the need to constantly have a human-in-the-loop to provide per-step feedback, staged feedback
+still allows engineers to inject dynamic information and provide granular domain-specific guidance to the LLM. In the
+actual optimization loop, the optimizer sees both the execution trace, which contains the raw rewards, and an appended
+template-based natural-language feedback string derived from those rewards. We give representative examples in Table B3
+and B4. Note that the feedback is template-based, and that the performance thresholds (set on the trajectory level) triggering
+different messages are pre-determined by the engineer.
+18
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Figure B3. Representative initial systems for Atari games. We show the workflow design of different decision-making program
+components for three representative Atari game agents. The learned agent receives an object-centric dictionary of game state information
+and uses Python code to process the observation and output an action.
+Performance
+Level
+Feedback
+Low
+(Reward ≤0)
+“Your score is −5 points. Try to
+improve paddle positioning to
+prevent opponent scoring.”
+Medium
+(0 < Reward
+< 19)
+“Keep it up! You’re scoring 12 points
+against the opponent but you are still
+9 points from winning the game. Try
+improving paddle positioning to
+prevent opponent scoring.”
+High
+(Reward
+≥
+19)
+“Good job! You’re close to winning
+the game! You’re scoring 20 points
+against the opponent, only 1 point
+short of winning.”
+(a) Pong feedback.
+Performance
+Level
+Feedback
+Low
+(Reward ≤0)
+“Your score is -5 points. Try to improve paddle
+positioning to return the ball and avoid
+losing lives.”
+Medium
+(0 < Reward <
+300)
+“Keep it up! You’re scoring 50 points against
+the opponent but you are still 300 points from
+winning the game. Try improving paddle
+positioning to return the ball and avoid losing
+lives.”
+High
+(Reward ≥300)
+“Good job! You’re close to winning the game!
+You’re scoring 320 points against the opponent,
+try ensuring you return the ball, only
+30 points short of winning.”
+(b) Breakout feedback.
+Table B3. Staged feedback templates for Pong and Breakout. Highlighted phrases mark the parts that differ between the corresponding
+High, Medium, and Low feedback levels across the two games.
+B.4. Credit Horizon and Rollout Design
+The main paper compares one-step and multi-step credit horizons across all eight games. In the one-step condition, the
+optimizer receives a trace containing a single action and its immediate reward and updates the policy after every step. In the
+multi-step condition, the optimizer receives a longer rollout before proposing a revision. The per-game rollout lengths are
+summarized in Table B2; the representative games discussed below use 400 steps for Pong, 300 for Breakout, and 25 for
+Space Invaders.
+These values were chosen to balance two opposing forces. Longer traces reveal delayed consequences and are more faithful
+to the eventual control objective, but they also consume more of the optimizer’s context budget and reduce update frequency.
+The representative games differ meaningfully in how informative local rewards are. Pong and Breakout provide immediate
+geometric cues that often align with full-episode success, whereas Space Invaders requires more strategic coordination
+between movement, shooting, and threat avoidance. This is why the credit-horizon choice is exposed as a design decision
+rather than left implicit in the implementation.
+B.5. Object-Centric Deep RL Baselines
+The DQN and PPO curves in Figure 6 were produced with object-centric variants of CleanRL (Huang et al., 2022). We
+adapted an existing library rather than building a custom deep RL stack from scratch. In these runs, a master’s student in
+Computer Science implemented the object-centric baselines in roughly three days, and the subsequent training, debugging,
+19
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Performance Level
+Feedback
+High
+(Reward ≥300)
+“Great job! You’re performing well with an
+average score of 320. Try to improve your
+shooting accuracy and dodging.”
+Medium
+(100 ≤Reward < 300)
+“Good progress! Your average score is 180.
+Focus on better timing for shooting and
+avoiding enemy projectiles.”
+Low
+(Reward < 100)
+“Your average score is 70. Try to improve your
+strategy for shooting aliens and dodging
+projectiles.”
+Table B4. Staged feedback for the Space Invaders agent at different performance levels.
+Setting
+DQN baseline
+PPO baseline
+Observation
+OCAtari objects converted
+to normalized numeric vectors
+Training steps per run
+10M
+10M
+Parallel envs per job
+1
+10
+Seeds per game
+5
+5
+Batch size
+512
+1280
+Minibatch size
+—
+320
+(a) Concrete settings used for the object-centric deep RL baselines.
+Algorithm
+Time (min)
+Score (%)
+Neural Net (DQN)
+291.6
+(184.3–469.1)
+71.5
+(47.5–114.2)
+Neural Net (PPO)
+219.3
+(163.3–255.2)
+108.1
+(71.6–143.7)
+Code (LLM)
+8.3
+(4.3–21.0)
+44.3
+(3.0–100.2)
+(b) Median runtime and score statistics, reported with interquar-
+tile range (25%–75%).
+Table B5. Left: concrete settings for the object-centric deep RL baselines. Right: median runtime and score statistics across games.
+and result collection took about two weeks. The goal was to obtain reasonable neural baselines with modest engineering
+effort, not to carry out an exhaustive baseline-optimization campaign.
+All deep RL agents used object-centric inputs from OCAtari (Delfosse et al., 2024) rather than raw pixels. For the neural
+baselines, the object information was converted into numeric features and fed to multilayer perceptrons, rather than passed
+as the raw Python dictionary used by the LLM agent. The main implementation files were the shared object wrapper
+obj atari env.py5 together with the training scripts obj dqn atari.py6 and obj ppo cleanrl.py.7 Both inherited most
+algorithmic hyperparameters from the corresponding CleanRL implementations. We did not run a broad hyperparameter
+sweep or a systematic search over network families. The architecture changes we made were limited to a few hand-chosen
+MLP size adjustments that varied by game; for example, we used a smaller DQN encoder for Pong and larger ones for
+harder games such as Breakout and Space Invaders. Each run used 10M environment steps, and the experiment launch
+scripts ran five seeds per game.
+All runs were executed on a single machine with 48 CPUs, 96 logical CPUs, and 8 NVIDIA A100-SXM4-40GB GPUs.
+Although the machine had 8 GPUs, each individual training job used only one 40GB A100. The remaining GPUs were used
+to run other jobs concurrently, not to accelerate a single run with multi-GPU training. Reported wall-clock times therefore
+reflect straightforward single-job, single-GPU training. This is the intended interpretation of Figure 6: the comparison is
+against practical object-centric deep RL baselines implemented with limited tuning, rather than against the fastest achievable
+DQN or PPO systems. We use this to represent what a single developer can achieve in a reasonable amount of time.
+For Figure 6, instead of using the total training time, which is the duration of 10M steps, we use the logged timestamps to
+identify when each run first reaches its highest score. Since deep RL training is not stable and performance can regress
+5https://github.com/ameliakuang/cleanrl obj centric/blob/master/cleanrl/obj atari env.py
+6https://github.com/ameliakuang/cleanrl obj centric/blob/master/cleanrl/obj dqn atari.py
+7https://github.com/ameliakuang/cleanrl obj centric/blob/master/cleanrl/obj ppo cleanrl.py
+20
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+instead of monotonically improve, this captures the time until the best solution is discovered, making the reporting protocol
+for deep RL results more comparable to that of LLM-based runs.
+B.6. Representative Learned Artifact Examples
+We provide representative initial code (with docstrings) together with the learned revisions for three games: Pong in
+Figures F2 and F3, Breakout in Figures F4, F5, F6, and F7, and Space Invaders in Figures F8, F9, and F10. Figure B4
+highlights a few of the higher-level strategies that emerged in the learned code. These examples are intended to make the
+broader credit-horizon discussion concrete by showing the kinds of code policy the optimizer actually discovers.
+1 # Increase margin and add dynamic
+adjustment
+2 # based on ball distance
+3 base_margin = 4
+4 ball_x = obs[’Ball’].get(’x’, 0)
+5 dist_factor = (140 - ball_x) / 140
+6 margin = base_margin * (1 +
+dist_factor)
+7
+8 # Add momentum -based adjustment
+9 if obs[’Ball’].get(’dx’, 0) > 0:
+10
+ball_dy =
+obs[’Ball’].get(’dy’, 0)
+11
+predicted_ball_y += ball_dy *
+dist_factor
+(a) Pong: adaptive interception instead of
+pure ball chasing.
+1 # Ball in upper half - aim for
+tunnels
+2 # to high bricks
+3 if ball[’y’] < 120:
+4
+# Look for gaps in brick rows
+to target
+5
+for color in [’RB’, ’OB’]:
+6
+...
+7
+8
+# Adjust paddle to deflect ball
+9
+# toward high -value bricks
+10
+if ball[’x’] < high_brick_x:
+11
+target_x = pre_ball_x - 4
+(b) Breakout: tunnel-seeking returns toward
+higher-value bricks.
+1 # There can only be one player
+bullet
+2 # on the field at a time
+3 for key , obj in obs.items ():
+4
+if key.startswith(’Bullet ’)
+and obj.get(’dy’, 0) < 0:
+5
+return False
+6
+7 # Move away from threats;
+otherwise move
+8 # toward more aliens
+9 if threat_left > threat_right:
+10
+move = 1
+11 elif aliens_right > aliens_left:
+12
+move = 1
+(c) Space Invaders: respect firing constraints
+while balancing attack and defense.
+Figure B4. Representative high-level strategies discovered by the optimizer. These short excerpts show that the learned revisions do
+more than tune local action thresholds: Pong adds distance- and momentum-aware interception, Breakout begins to target tunnels and
+higher-value bricks, and Space Invaders combines action constraints with threat-aware positioning.
+Figure B4 and the full code examples in Figures F2–F10 suggest that the LLM optimizer often discovers compact game-
+specific heuristics rather than generic code cleanups. In Pong, the learned changes become more anticipatory; in Breakout,
+they begin to encode targeting decisions about where the return should send the ball next; and in Space Invaders, they
+coordinate firing and movement under environment constraints. These representative cases make the learned code policy
+easier to inspect and help explain why longer credit horizons can be especially useful in games with more strategic needs.
+C. BigBench Extra Hard Details
+C.1. Experimental Setup
+BigBench Extra Hard (BBEH) (Kazemi et al., 2025) is a benchmark of challenging language-understanding tasks. In the
+finalized study reported in the main paper, we use eight tasks spanning logical reasoning (Dyck Languages, Boolean Expres-
+sions), spatial reasoning (Geometric Shapes), language understanding (Linguini, Disambiguation QA), recommendation and
+rule-based reasoning (Movie Recommendation, Boardgame QA), and causal reasoning (Causal Understanding).
+For each task, we form a fixed split from dataset order: the first 15 examples are used for training, the next 10 for validation,
+and the remainder for held-out testing. During optimization, we still perform random minibatching within the 15-example
+training set. At each optimizer update, we sample k training examples, where k ∈{1, 3, 5} is the batch size under study,
+execute the current agent on each example, collect correctness feedback, and concatenate the resulting traces before sending
+them to the optimizer. Note that the 3 trials represent different random batch shuffling of the same training set.
+C.2. Agent Design Details
+The training code is available online8. It instantiates a simple two-part agent, matching the abstraction in the main paper.
+One part is a trainable prompt template that is concatenated with each question before calling the base LLM. The other
+is a trainable answer-extraction function that postprocesses the raw response into the exact output format expected by the
+evaluator.
+8https://github.com/AgentOpt/OpenTrace/blob/experimental/examples/bbeh/bbeh trace.py
+21
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Parameter
+Value
+Training examples per task
+First 15 examples
+Validation examples per task
+Next 10 examples
+Held-out test examples per task
+Remaining examples (typically 175+)
+Batch sizes compared
+1, 3, 5
+Total optimizer update steps
+15
+Number of trials (seeds)
+3
+LLM optimizer
+OptoPrime
+LLM backend
+Claude Sonnet-3.5-v2
+Table C1. BigBench Extra Hard experimental configurations.
+Figure C1.
+Agent design for BigBench Extra Hard.
+The agent consists of two optimizable components: call llm and
+answer extraction. During optimization, multiple traces can be concatenated through the batchify operator ⊕before being shown to
+the optimizer.
+call llm
+In code, this corresponds to combining the trainable prompt template with the task query and passing the
+resulting string to the backend LLM. The prompt is the main optimization target and is revised across updates.
+answer extraction
+The trainable extract answer function parses the raw LLM response into the final answer. The
+initialized implementation simply splits on the string “Answer:”, which makes formatting part of the optimization problem
+rather than assuming it is solved in advance.
+The optimizer therefore receives traces containing the input query, the prompt used, the raw response, the extracted answer,
+and the resulting correctness feedback. This makes BBEH a clean testbed for the experience-batching question in the main
+paper because the editable artifact is small, but still includes both prompting and postprocessing decisions.
+C.3. Feedback Design Details
+Feedback is provided by a task-agnostic guide that returns a binary score together with a short natural-language message.
+When the prediction is correct, the guide returns a success message; when it is incorrect, the guide reveals the expected
+answer and asks for a revision to the prompt or program.
+The metric is also intentionally simple. For multiple-choice tasks, the evaluator extracts the last answer of the form (A),
+(B), etc.; otherwise it compares the predicted string to the target by exact match. This deliberately minimal design lets us
+study batch size without introducing task-specific reward shaping.
+C.4. Batchify Operator Details
+The batchify operator ⊕concatenates execution traces from multiple independent examples into a single learning context.
+For batch size k, we construct
+BatchTrace = Trace1 ⊕Trace2 ⊕· · · ⊕Tracek.
+Each trace contains the question, the agent’s predicted answer, and the feedback string. The concatenated batch trace is then
+passed to the optimizer as one context so that it can search for revisions that generalize across several examples rather than
+specializing to a single case.
+22
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+The implementation keeps the total update budget fixed at 15 across batch sizes. Since each task has 15 training examples,
+this is realized by changing the number of passes over the training set: batch size 1 uses 1 epoch, batch size 3 uses 3 epochs,
+and batch size 5 uses 5 epochs. In all cases, the optimizer is allowed to make 15 updates per trial.
+C.5. Task-Specific Observations
+Task-dependent batch size
+As noted in the main text, the validation curves in Figure 7 show that the effect of batching is
+strongly task-dependent. Larger batches often produce smoother early learning, but they do not consistently yield the best
+final test performance. Smaller batches are noisier, yet sometimes continue improving for longer.
+Meta-overfitting in Boardgame QA
+Boardgame QA remains the clearest failure case. As discussed in the main paper,
+the unoptimized baseline outperforms all optimized variants, suggesting that the optimizer can over-specialize the prompt
+and extraction logic to the small training set rather than learn changes that generalize to held-out questions. This problem
+can be addressed by reshuffling the training and validation set as a whole, though such a design choice is beyond the scope
+of this paper.
+C.6. Additional Task-Specific Training Details
+In the implementation, the baseline condition skips optimizer updates and directly evaluates the initialized agent on the
+validation and held-out test splits. For optimized runs, validation is evaluated throughout training and held-out test accuracy
+is computed separately after optimization. The final plots and tables aggregate these saved validation curves and test
+accuracies across three trials.
+D. Building a Learning Loop: Extended Discussion
+A learning loop can be built in many ways. Here, we discuss some of the key concepts in a learning loop by presenting
+the optimization problem using a graph formalism. This particular viewpoint is not commonly used in practice, but is the
+backbone of TextGrad (Yuksekgonul et al., 2025) and DSPy (Khattab et al., 2024). At a high level, the discussion below is
+analogous to how TensorFlow or PyTorch combine per-example or per-timestep computation into a larger optimization
+graph, for example, through reduce mean / sum, concatenation operators such as cat / stack, or temporal unrolling across
+a sequence like scan.
+We first discuss the intuitive notions of a learning loop and a learning context using the framework of OPTO (Optimization
+with Trace Oracle). We then connect that formalism back to the engineering decisions highlighted in the main paper: how the
+workflow is modularized, which components are made optimizable, and what form of feedback is supplied to the optimizer.
+We note that there are many other forms of learning, such as building an explicit memory of past experiences (i.e., a
+generate-retrieve-summarize system) (Zhou et al., 2025b; Ouyang et al., 2025b), or updating LLM parameters during test
+time (i.e., test-time training) (Yuksekgonul et al., 2026). We focus only on learning through the lens of optimization, where
+agent learning happens during an optimization step, after the agent has interacted with the environment and collected
+sufficient experiences.
+D.1. The OPTO Framework
+OPTO (Optimization with Trace Oracle) (Cheng et al., 2024) was proposed as a unified framework for describing iterative
+generative optimization problems. An OPTO problem (a generalization of numerical optimization) is described by a tuple
+(Θ, ω, T ), where Θ is the parameter space, ω is the problem context and T is a Trace Oracle. For a parameter θ ∈Θ, the
+Trace Oracle T returns a tuple (f, g) where g is a computational graph involving θ and f is a feedback signal provided to
+exactly one node in g – the output node.
+D.2. Workflow Graphs and Learning Graphs
+Example.
+We define a workflow Wθ with two functions hθ1, hθ2, each controlled by its own parameter. Given an input xi,
+let the intermediate node be oi = hθ1(xi) and the output be yi = hθ2(oi). A single execution of the workflow on xi induces
+a graph gi with directional edges (xi, θ1) →oi and (oi, θ2) →yi (see Figure D1), together with feedback fi attached to the
+23
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+output node. We refer to gi as the workflow graph produced by this execution. In other words, Wθ denotes the parameterized
+system, while gi denotes one concrete execution trace of that system.
+This already captures many workflows. For example, for a customer-support agent, hθ1 can be an RAG database query
+function, where θ1 is the retrieval search query. Once the database returns a list of items, hθ2 can be an LLM call that
+synthesizes those items into a final answer, and θ2 represents the tunable instruction for the answer style and content.
+x
+o
+y
+f
+θ1
+θ2
+Figure D1. An example workflow graph gi produced by a single execution of Wθ. The graph contains input node xi, intermediate node
+oi, output node yi, feedback fi, and the parameter nodes θ1, θ2 that influence the output.
+The workflow graph gi can be viewed as one experience of the system: one input, one execution, one output, and its
+associated feedback. This is often enough for single-instance optimization, but it is not enough to specify many learning
+problems of interest. An agent may need to generalize across multiple independent examples, or delay its update until a full
+sequence of interactions has finished. In such cases, the optimizer should not receive only one workflow graph; it should
+receive a larger graph that represents the right unit of learning.
+We call this optimizer-facing object the learning graph, denoted by Glearn. It is constructed from one or more workflow
+graphs through a fixed learning template T:
+Glearn = T(g1, . . . , gk).
+The template determines how individual experiences are combined before being shown to the optimizer. In the language of
+OPTO, Glearn is the graph returned to the optimizer for the learning problem under consideration.
+D.3. Building Learning Graphs by Template
+We now describe how to build the learning graph for common learning problems. We assume a workflow Wθ is given,
+where θ denotes the optimizable parameters. Without loss of generality, the workflow takes an input xi and returns an output
+yi = Wθ(xi), although both xi and yi may be structured objects rather than scalars. The workflow here may represent an
+entire software system, including multiple LLM calls, tools, retrieval steps, and decision rules. A single execution of this
+workflow on xi produces a workflow graph gi.
+We further assume a feedback oracle that maps an execution into feedback fi, which can be numerical, textual, visual, or
+structured. We do not assume that the feedback is differentiable or even scalar; we only assume it contains useful information
+about the quality of the execution. Given a collection of workflow graphs {gi} and associated feedback {fi}, a learning
+template specifies how they should be combined into Glearn before being passed to the generative optimizer.
+Interactive Learning Template. Here the agent learns on the fly as it interacts with the world (Shalev-Shwartz, 2012).
+At each step, it sees an input x1, outputs y1, receives feedback f1, and then updates its parameter θ. No cross-example
+composition is needed:
+Glearn = Tinteractive(g1) = g1.
+This covers online-learning and bandit-style settings where a single experience already defines one update.
+Batch Learning Template. In batch learning, the agent should update from several independent examples at once (Hastie
+et al., 2009). Consider a minibatch
+
+(xi, zi)
+B
+i=1, where zi denotes the task-specific supervision or comparison signal
+associated with input xi. Executing the workflow on each example yields workflow graphs {gi}B
+i=1 with outputs {oi}B
+i=1
+and feedback {fi}B
+i=1. The batch template aggregates these experiences into one learning graph:
+Glearn = Tbatch(g1, . . . , gB),
+ˆo =
+B
+M
+i=1
+oi.
+24
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+Figure D2. Representing different learning problems through graph templates. Each dotted rectangle denotes a workflow graph
+produced by a single execution of the workflow. A learning template specifies how one or more workflow graphs are combined into
+the learning graph Glearn shown to the optimizer. In batch learning, independent workflow graphs are aggregated using ⊕. In episodic
+learning, workflow graphs are linked through temporal/environment transitions denoted by ⇒and the result is presented to the optimizer.
+The aggregated feedback LB
+i=1 fi is then attached to ˆo. Intuitively, the batchify operator ⊕plays the role of concatenating
+multiple experiences into one optimizer-facing context.
+Episodic Learning Template. In episodic learning, the experiences are not independent. Instead, the output of one
+execution influences the next observation through the environment. We therefore link the workflow graphs sequentially:
+g1 ⇒g2 ⇒· · · ⇒gT ,
+where ⇒denotes the environment transition from one step to the next. This is the key difference from batch learning: the
+examples are chained causally rather than merely aggregated. After constructing this trajectory-level structure, we obtain the
+learning graph
+Glearn = Tepisodic(g1, . . . , gT ),
+which can optionally include aggregated episode-level observations or feedback, such as ˆo = LT
+i=1 oi.
+Remark. Choosing the right learning template matters because it determines the learning context shown to the optimizer.
+If we want a parameter that generalizes across a dataset but instead optimize from one example at a time, the optimizer
+may become overly sensitive to presentation order. Conversely, if an agent’s actions have delayed consequences, then
+changing the behavior before the episode terminates can create objective mismatch. The distinction between workflow
+graphs, learning templates, and the resulting learning graph makes explicit what counts as one update in the learning loop.
+D.4. The Choice of Starting Artifact
+The starting artifact is not a single object, but a set of design decisions about what the LLM optimizer is allowed to edit and
+what prior structure it starts from. Different agentic frameworks expose different interfaces for these choices. The OPTO
+framework naturally maps the starting artifact to three concrete components. This decomposition is useful because it makes
+clear what inductive bias is being given to the LLM optimizer.
+Workflow Structure and Specs.
+First, the engineer chooses the number of files, functions, or program components that
+make up the workflow, together with how they connect to one another. In OPTO, this appears as the graph connectivity and
+the input-output signature of each function. In other frameworks, the same choice may appear as interface specifications
+between files, tool schemas, or a plan for how different modules call each other. This choice matters because it determines
+the search space: changing one monolithic function is a different optimization problem from changing a set of coordinated
+components with explicit interfaces. However, this is usually overlooked in many agentic frameworks, or is mixed together
+with program documentation.
+Program Documentation.
+Second, the engineer can provide docstrings, comments, instructions, or other textual descrip-
+tions that explain what each function or program component is intended to do. In OPTO, function docstrings are a natural
+25
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+way to instantiate this idea. In other agentic frameworks, the same role may be fulfilled by documents, instruction manuals,
+and READMEs. These artifacts shape the optimizer’s interpretation of the system and therefore can be changed by engineers
+to guide the optimizer’s search.
+Initial Implementations.
+Third, the engineer can decide how much starter code to provide before optimization begins. At
+one extreme, a function may be left almost entirely unspecified except for its signature and documentation. At the other
+extreme, the engineer may provide a partial or even fully working implementation and ask the optimizer to improve or
+refactor it. In all cases, the amount of initial implementation changes what the LLMs see as the starting context and changes
+the initial experience, i.e., whether the program succeeds or fails.
+D.5. The Choice of Credit Horizon
+Besides deciding how the workflow graph is constructed, the rest of the design choices are about how the learning graph is
+constructed. The learning graph is the context that is provided as input to the optimizer. If the applicable learning template
+is intended to capture the long-term effects of the workflow, then the credit horizon is the number of steps to include in the
+learning graph.
+The choice of credit horizon is commonly studied in RL, though instead of directly deciding a horizon length to truncate,
+usually it is dynamically balanced by a discount factor (Badia et al., 2020). Direct credit-horizon truncation is, however,
+more commonly studied in recurrent neural networks, where truncated back-propagation through time (TBPTT) is used to
+truncate the gradient computation at a fixed horizon (Pascanu et al., 2013; Tallec & Ollivier, 2017; Shaban et al., 2019).
+D.6. The Choice of Experience Batching
+When a batch learning template is used, the engineer has decided that a workflow must generalize to and accommodate
+a diverse set of inputs and perform well to handle them. This dictates that the LLM optimizer that is used to update the
+workflow cannot overfit to just a single example – it must learn to reason across different examples sampled from a larger
+distribution. Thus, experience batching closely mimics the study of batch size in stochastic gradient descent, where the
+number of examples aggregated per update affects both learning dynamics and generalization (Smith et al., 2018). It is also
+closely related to active learning, where examples are selected to be put in a batch to make learning more efficient (Houlsby
+et al., 2011; Gal et al., 2017), as well as contrastive learning, where positive and negative examples are balanced in a batched
+setting (Chen et al., 2020; Doumbouya et al., 2025).
+D.7. Additional Considerations: Feedback Design
+Feedback design is an important part of the learning loop, but we do not attempt to treat it comprehensively in this paper.
+We instead point readers to prior work that explores informative and effective feedback design (Chen et al., 2024; Nie et al.,
+2024; Wei et al., 2025a; Xu et al., 2025). In the case-study appendices below, we mainly use staged and suggestive feedback
+and provide concrete examples of how it is instantiated.
+Staged and Suggestive Feedback. The simplest feedback reports correctness or reward. In practice, however, the engineer
+often has additional freedom to vary the feedback according to performance regimes or execution states. The staged reward
+templates in the Atari appendix and the templates in the MLAgentBench appendix are examples of this design choice.
+E. Further Discussion and Disclosures
+E.1. Agents, Agentic Systems, and the Scope of This Paper
+There is ongoing disagreement in the literature about how narrowly to define an “LLM agent.” One useful definition is that
+an LLM agent is a system in which the LLM repeatedly selects actions through interaction with an environment and receives
+feedback from that environment. Under this view, some systems optimized in this paper are plainly agents, while others are
+better understood as software artifacts that contain LLM components.
+For the purposes of this paper, the distinction is less important than the shared optimization structure. Whether the target is a
+prompt, a retrieval routine, a game-playing policy, or a multi-function software workflow (see Figure E1), the engineering
+problem is to specify an initial artifact, execute it, collect feedback, and present the resulting evidence to a generative
+optimizer. This shared structure is what motivates our use of the term learning loop.
+26
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+LLM
+Optimizer
+LLM
+Problem
+Response
+LLM
+Problem
+Prompted LLM
+Retrieve
+Prompted LLM with Database
+LLM
+Optimizer
+Task Info
+Trained
+Model
+ML Pipeline
+Prompt
+Instruction
+LLM
+Optimizer
+Prompt
+Instruction
+Response
+Dataset
+Data Loading
+Model
+Train
+Model
+Selection
+Processing
+Figure E1. Examples of LLM-based generative optimization applied to different kinds of systems: a prompted system with a search tool
+(left), a more complex prompting setup with retrieval code (middle), and an end-to-end machine learning pipeline (right). We use
+to
+mark an LLM API call and
+to mark text or code files.
+LLM
+Optimizer
+LLM
+Problem
+Response
+Prompt
+Instruction
+Prompt
+Instruction
+LLM
+Optimizer
+Prompt
+Instruction
+LLM
+Optimizer
+Prompt
+Instruction
+...
+Figure E2. Infinite nested agentic system optimization. It is easy to construct an example in which one optimizer writes the instructions
+for another optimizer, creating an infinite regress of optimization problems. We do not study that setting in this paper and instead focus on
+commonly used, finite agentic systems.
+Figure E2 illustrates an interesting case of the learning-by-optimization perspective: we can always find another layer
+to optimize – we can construct a recursively nested optimization problem where an optimizer optimizes the prompts or
+instructions of an inner optimizer. Such examples are conceptually interesting, but they obscure the more practically relevant
+design issues studied in the main paper. The appendix therefore uses them only to clarify the scope of our claims.
+E.2. Additional Examples of Generative Optimization in Agentic Workflows
+The three case studies in the main paper are not meant to exhaust the design space of agentic workflows. To illustrate the
+broader applicability of the learning-loop perspective, we include one additional example drawn from earlier experiments
+with LangGraph-based agents.
+We implemented two popular LLM-agent designs with LangGraph (LangChain, 2024). The first is program-aided language
+modeling (PAL), in which one module writes a Python program and another executes it. The second is a self-refine
+agent (Madaan et al., 2023), in which the system iteratively proposes, verifies, and refines solutions. In both cases, we
+optimized the internal modules with OptoPrime rather than treating the agent design as fixed.
+GSM8K
+Causal Understanding
+Boardgame QA
+PAL Agent
+78.9
+5.0
+5.0
+Learned PAL Agent (Ours)
+93.4
+42.5
+33.0
+Self-Refine Agent (Madaan et al., 2023)
+78.2
+0.0
+0.0
+Learned Self-Refine Agent (Ours)
+86.8
+44.0
+32.5
+Table E1. Comparison of baseline LLM-agent designs and their optimized versions on GSM8K and two BBEH tasks.
+The learning-loop structure in these examples is similar to the BBEH appendix: multiple execution traces are aggregated,
+feedback is revealed at the level of successes and failures, and the optimizer proposes code or prompt revisions to internal
+modules. Although these experiments are not central to the three main problems studied in the paper, they reinforce the claim
+that generative optimization applies naturally to structured agentic workflows beyond the particular domains emphasized in
+the main text.
+27
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+E.3. Disclosures and LLM Access Cards
+E.3.1. LARGE LANGUAGE MODEL ACCESS CARD
+The experiments in this paper were conducted during the period of February 2025 to April 2025. The primary model used for
+optimization was Anthropic Claude Sonnet-3.5-v2. Whenever we compare against other learned-agent baselines, including
+re-run implementations of prior methods, we use the same model endpoint during the same period whenever possible so that
+differences in access conditions do not dominate the comparison.
+E.3.2. LARGE LANGUAGE MODEL USE FOR WRITING
+A small number of sentences and paragraphs in the paper were polished with GPT-5 after the authors had already drafted
+the original text. The model was used for editing and polishing rather than for generating new technical claims, results, or
+arguments from scratch.
+28
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+F. Optimized Code Examples
+The large code examples referenced in the appendix are grouped here so that figures and tables in the earlier appendix
+sections can stay closer to the corresponding discussion.
+F.1. MLAgentBench Code Examples
+1 import trace
+2
+3 @trace.model
+4 class SpaceshipTitanicPipeline(Module):
+5
+6
+@trace.bundle(trainable=True)
+7
+def preprocess(self , data):
+8
+"""
+9
+[... docstring is skipped to save space ...]
+10
+"""
+11
+# Create a copy to avoid modifying original data
+12
+# Handle missing values in numeric columns
+13
+numeric_columns = ["Age", "RoomService", "FoodCourt", "ShoppingMall",
+14
+"Spa", "VRDeck"]
+15
+for col in numeric_columns:
+16
+processed_data[col] = processed_data[col]. fillna(processed_data[col]. median ())
+17
+18
+# Handle boolean/categorical columns
+19
+processed_data["VIP"] = processed_data["VIP"]. fillna(False)
+20
+processed_data["CryoSleep"] = processed_data["CryoSleep"]. fillna(False)
+21
+22
+# Convert HomePlanet to numeric using label encoding
+23
+if "HomePlanet" in processed_data.columns:
+24
+processed_data["HomePlanet"] = processed_data["HomePlanet"]. fillna("Unknown")
+25
+planet_map = {"Earth": 0, "Europa": 1, "Mars": 2, "Unknown": 3}
+26
+processed_data["HomePlanet"] = processed_data["HomePlanet"].map(planet_map)
+27
+28
+# (skipped some code)
+29
+30
+# Age -related features
+31
+processed_data["Age"] = processed_data["Age"]. fillna(processed_data["Age"]. median ())
+32
+processed_data["AgeGroup"] = pd.qcut(
+33
+processed_data["Age"], q=6, labels =[0, 1, 2, 3, 4, 5]
+34
+).astype(int)
+35
+36
+# Interaction features
+37
+processed_data["CryoSleepVIP"] = processed_data["CryoSleep"]. astype(int) *
+processed_data["VIP"]. astype(int)
+38
+processed_data["SpendingPerAge"] = processed_data["TotalSpending"] / processed_data["Age"].clip(lower =1)
+39
+processed_data["HasSpent"] = (processed_data["TotalSpending"] > 0).astype(int)
+40
+processed_data["SpendingVariety"] = (processed_data[spending_columns] > 0).sum(axis =1)
+41
+42
+# ... standard scaling , dropping columns , etc.
+43
+44
+# Final check for NaN values
+45
+processed_data = processed_data.fillna (0)
+46
+return processed_data
+Figure F1. Final code for Spaceship Titanic Learned Agent. Docstrings are generated by ChatGPT and then edited by the authors.
+F.2. Atari Code Examples
+1 import trace
+2
+3 @trace.model
+4 class Policy(Module):
+5
+def __call__(self , obs):
+6
+predicted_ball_y = self.predict_ball_trajectory(obs)
+7
+action = self.select_action(predicted_ball_y , obs)
+8
+return action
+9
+10
+@trace.bundle(trainable=True)
+11
+def predict_ball_trajectory(self , obs):
+12
+"""
+13
+Predict the y-coordinate where the ball will intersect with the player ’s paddle by calculating its
+trajectory ,
+14
+using ball’s (x, y) and (dx, dy) and accounting for bounces off the top and bottom walls.
+15
+29
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+16
+Game Setup:
+17
+- Screen dimensions: The game screen has boundaries where the ball bounces
+18
+- Top boundary: approximately y=30
+19
+- Bottom boundary: approximately y=190
+20
+- Paddle positions:
+21
+- Player paddle: right side of screen (x = 140)
+22
+- Enemy paddle: left side of screen (x = 16)
+23
+24
+Args:
+25
+obs (dict): Dictionary containing object states for "Player", "Ball", and "Enemy".
+26
+Each object has position (x,y), size (w,h), and velocity (dx ,dy).
+27
+28
+Returns:
+29
+float: Predicted y-coordinate where the ball will intersect the player ’s paddle plane.
+30
+Returns None if ball position cannot be determined.
+31
+32
+"""
+33
+if ’Ball’ in obs:
+34
+return obs[’Ball’].get("y", None)
+35
+return None
+36
+37
+@trace.bundle(trainable=True)
+38
+def select_action(self , predicted_ball_y , obs):
+39
+’’’
+40
+Select the optimal action to move player paddle by comparing current player position and predicted_ball_y.
+41
+42
+IMPORTANT! Movement Logic:
+43
+- If the player paddle ’s y position is GREATER than predicted_ball_y: Move DOWN (action 2)
+44
+(because the paddle needs to move downward to meet the ball)
+45
+- If the player paddle ’s y position is LESS than predicted_ball_y: Move UP (action 3)
+46
+(because the paddle needs to move upward to meet the ball)
+47
+- If the player paddle is already aligned with predicted_ball_y: NOOP (action 0)
+48
+(to stabilize the paddle when it’s in position)
+49
+Ensure stable movement to avoid missing the ball when close by.
+50
+51
+Args:
+52
+predicted_ball_y (float): predicted y coordinate of the ball or None
+53
+obs(dict): Dictionary of current game state , mapping keys ("Player", "Ball", "Enemy") to values
+(dictionary of keys (’x’, ’y’, ’w’, ’h’, ’dx’, ’dy’) to integer values)
+54
+Returns:
+55
+int: 0 for NOOP , 2 for DOWN , 3 for UP
+56
+’’’
+57
+58
+if predicted_ball_y is not None and ’Player ’ in obs:
+59
+return random.choice ([2, 3])
+60
+return 0
+Figure F2. Initial code for Pong agent.
+1 import trace
+2
+3 @trace.model
+4 class Policy(Module):
+5
+def __call__(self , obs):
+6
+predicted_ball_y = self.predict_ball_trajectory(obs)
+7
+action = self.select_action(predicted_ball_y , obs)
+8
+return action
+9
+10
+@trace.bundle(trainable=True)
+11
+def predict_ball_trajectory(self , obs):
+12
+"""(same as before , skipped to save space)"""
+13
+if ’Ball’ in obs:
+14
+ball = obs[’Ball’]
+15
+# If ball moving away from player , return None
+16
+if ball.get(’dx’, 0) < 0:
+17
+return None
+18
+19
+# Calculate time to reach paddle
+20
+paddle_x = 140
+21
+ball_x = ball.get(’x’, 0)
+22
+ball_dx = ball.get(’dx’, 0)
+23
+if ball_dx == 0:
+24
+return ball.get(’y’, None)
+25
+26
+time_to_paddle = (paddle_x - ball_x) / ball_dx
+27
+28
+# Calculate predicted y position with improved accuracy
+29
+ball_y = ball.get(’y’, 0)
+30
+ball_dy = ball.get(’dy’, 0)
+30
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+31
+predicted_y = ball_y + ball_dy * time_to_paddle
+32
+33
+# Account for bounces with improved accuracy
+34
+num_bounces = 0
+35
+while predicted_y < 30 or predicted_y > 190:
+36
+if predicted_y < 30:
+37
+predicted_y = 30 + (30 - predicted_y)
+38
+if predicted_y > 190:
+39
+predicted_y = 190 - (predicted_y - 190)
+40
+num_bounces += 1
+41
+if num_bounces > 4:
+# Limit bounce calculations
+42
+break
+43
+44
+return predicted_y
+45
+return None
+46
+47
+@trace.bundle(trainable=True)
+48
+def select_action(self , predicted_ball_y , obs):
+49
+’’’(same as before , skipped to save space)’’’
+50
+if predicted_ball_y is not None and ’Player ’ in obs:
+51
+# Calculate center of paddle
+52
+paddle_center = obs[’Player ’][’y’] + obs[’Player ’][’h’]/2
+53
+54
+# Increase margin and add dynamic adjustment based on ball distance
+55
+base_margin = 4
+56
+if ’Ball’ in obs:
+57
+ball_x = obs[’Ball’].get(’x’, 0)
+58
+dist_factor = (140 - ball_x) / 140
+# Normalized distance factor
+59
+margin = base_margin * (1 + dist_factor)
+# Larger margin when ball is far
+60
+61
+# Add momentum -based adjustment
+62
+if obs[’Ball’].get(’dx’, 0) > 0:
+63
+ball_dy = obs[’Ball’].get(’dy’, 0)
+64
+# Scale adjustment based on distance
+65
+predicted_ball_y += ball_dy * dist_factor
+66
+else:
+67
+margin = base_margin
+68
+69
+# More aggressive movement thresholds
+70
+if paddle_center > predicted_ball_y + margin:
+71
+return 2
+# Move down
+72
+elif paddle_center < predicted_ball_y - margin:
+73
+return 3
+# Move up
+74
+return 0
+# Stay in position
+75
+return 0
+Figure F3. Final learned code for Pong agent.
+1 @trace.model
+2 class Policy(Module):
+3
+def __call__(self , obs):
+4
+pre_ball_x = self.predict_ball_trajectory(obs)
+5
+target_paddle_pos = self.generate_paddle_target(pre_ball_x , obs)
+6
+action = self.select_paddle_action(target_paddle_pos , obs)
+7
+return action
+8
+9
+@trace.bundle(trainable=True)
+10
+def predict_ball_trajectory(self , obs):
+11
+"""
+12
+Predict the x-coordinate where the ball will intersect with the player ’s paddle by calculating its
+trajectory ,
+13
+using ball’s (x, y) and (dx, dy) and accounting for bounces off the right and left walls.
+14
+15
+Game setup:
+16
+- Screen dimensions: The game screen has left and right walls and brick wall where the ball bounces
+17
+- Left wall: x=9
+18
+- Right wall: x=152
+19
+- Paddle positions:
+20
+- Player paddle: bottom of screen (y=189)
+21
+- Ball speed:
+22
+- Ball deflects from higher -scoring bricks would have a higher speed and is harder to catch.
+23
+- The paddle would deflect the ball at different angles depending on where the ball lands on the paddle
+24
+25
+Args:
+26
+obs (dict): Dictionary containing object states for "Player", "Ball", and blocks "{color}B" (color in
+[R/O/Y/G/A/B]).
+27
+Each object has position (x,y), size (w,h), and velocity (dx ,dy).
+28
+Returns:
+29
+float: Predicted x-coordinate where the ball will intersect the player ’s paddle plane.
+31
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+30
+Returns None if ball position cannot be determined.
+31
+"""
+32
+if ’Ball’ not in obs:
+33
+return None
+34
+35
+@trace.bundle(trainable=True)
+36
+def generate_paddle_target(self , pre_ball_x , obs):
+37
+"""
+38
+Calculate the optimal x coordinate to move the paddle to catch the ball (at predicted_ball_x)
+39
+and deflect the ball to hit bricks with higher scores in the brick wall.
+40
+41
+Logic:
+42
+- Prioritize returning the ball when the ball is coming down (positive dy)
+43
+- The brick wall consists of 6 vertically stacked rows from top to bottom:
+44
+- Row 1 (top): Red bricks (7 pts)
+45
+- Row 2: Orange (7 pts)
+46
+- Row 3: Yellow (4 pts)
+47
+- Row 4: Green (4 pts)
+48
+- Row 5: Aqua (1 pt)
+49
+- Row 6 (bottom): Blue (1 pt)
+50
+- Strategic considerations:
+51
+- Breaking lower bricks can create paths to reach higher -value bricks above
+52
+- Creating vertical tunnels through the brick wall is valuable as it allows
+53
+the ball to reach and bounce between high -scoring bricks at the top
+54
+- Balance between safely returning the ball and creating/utilizing tunnels
+55
+to access high -value bricks
+56
+- Ball speed increases when hitting higher bricks , making it harder to catch
+57
+58
+Args:
+59
+pre_ball_x (float): predicted x coordinate of the ball intersecting with the paddle or None
+60
+obs (dict): Dictionary containing object states for "Player", "Ball", and blocks "{color}B" (color in
+[R/O/Y/G/A/B]).
+61
+Each object has position (x,y), size (w,h), and velocity (dx ,dy).
+62
+Returns:
+63
+float: Predicted x-coordinate to move the paddle to.
+64
+Returns None if ball position cannot be determined.
+65
+"""
+66
+if pre_ball_x is None or ’Ball’ not in obs:
+67
+return None
+68
+return None
+Figure F4. Initial code for Breakout agent (Part 1).
+1 import trace
+2
+3 @trace.model
+4 class Policy(Module):
+5
+6
+# (continued from above)
+7
+8
+@trace.bundle(trainable=True)
+9
+def select_paddle_action(self , target_paddle_pos , obs):
+10
+"""
+11
+Select the optimal action to move player paddle by comparing current player position and
+target_paddle_pos.
+12
+13
+Movement Logic:
+14
+- If the player paddle ’s center position is GREATER than target_paddle_pos: Move LEFT (action 3)
+15
+- If the player paddle ’s center position is LESS than target_paddle_pos: Move RIGHT (action 2)
+16
+- If the player paddle is already aligned with target_paddle_pos: NOOP (action 0)
+17
+(to stabilize the paddle when it’s in position)
+18
+Ensure stable movement to avoid missing the ball when close by.
+19
+20
+Args:
+21
+target_paddle_pos (float): predicted x coordinate of the position to best position the paddle to
+catch the ball ,
+22
+and hit the ball to break brick wall.
+23
+obs (dict): Dictionary containing object states for "Player", "Ball", and blocks "{color}B" (color in
+[R/O/Y/G/A/B]).
+24
+Each object has position (x,y), size (w,h), and velocity (dx ,dy).
+25
+Returns:
+26
+int: 0 for NOOP , 2 for RIGHT , 3 for LEFT
+27
+"""
+28
+if target_paddle_pos is None or ’Player ’ not in obs:
+29
+return 0
+30
+31
+paddle = obs[’Player ’]
+32
+paddle_x = paddle[’x’]
+33
+paddle_w = paddle[’w’]
+32
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+34
+paddle_center = paddle_x + (paddle_w / 2)
+35
+36
+# Add deadzone to avoid oscillation
+37
+deadzone = 2
+38
+if abs(paddle_center - target_paddle_pos) < deadzone:
+39
+return 0
+# NOOP if close enough
+40
+elif paddle_center > target_paddle_pos:
+41
+return 3
+# LEFT
+42
+else:
+43
+return 2
+# RIGHT
+Figure F5. Initial code for Breakout agent (Part 2).
+1 @trace.model
+2 class Policy(Module):
+3
+4
+def __call__(self , obs):
+5
+pre_ball_x = self.predict_ball_trajectory(obs)
+6
+target_paddle_pos = self.generate_paddle_target(pre_ball_x , obs)
+7
+action = self.select_paddle_action(target_paddle_pos , obs)
+8
+return action
+9
+10
+@trace.bundle(trainable=True)
+11
+def predict_ball_trajectory(self , obs):
+12
+"""(same as before , skipped to save space)"""
+13
+if pre_ball_x is None or ’Ball’ not in obs or ’Player ’ not in obs:
+14
+return None
+15
+16
+ball = obs[’Ball’]
+17
+paddle = obs[’Player ’]
+18
+19
+# Default to centering paddle on predicted ball position
+20
+target_x = pre_ball_x
+21
+22
+# Adjust paddle position based on current ball direction and brick locations
+23
+if ball[’dy’] > 0:
+# Ball moving down
+24
+if ball[’y’] < 120:
+# Ball in upper half - aim for tunnels to high bricks
+25
+# Look for gaps in brick rows to target
+26
+high_brick_x = None
+27
+for color in [’RB’, ’OB’]:
+# Check red and orange rows
+28
+if color in obs:
+29
+bricks = obs[color]
+30
+if len(bricks) > 0:
+31
+brick = bricks [0]
+32
+high_brick_x = brick[’x’] + (brick[’w’] / 2)
+33
+break
+34
+35
+if high_brick_x is not None:
+36
+# Adjust paddle to deflect ball toward high -value bricks
+37
+if ball[’x’] < high_brick_x:
+38
+target_x = pre_ball_x - 4
+# Hit ball on right side
+39
+else:
+40
+target_x = pre_ball_x + 4
+# Hit ball on left side
+41
+42
+# Ensure target is within screen bounds
+43
+paddle_half_width = paddle[’w’] / 2
+44
+target_x = max(9 + paddle_half_width , min (152 - paddle_half_width , target_x))
+45
+46
+return target_x
+Figure F6. Learned code for Breakout agent (Part 1).
+1 @trace.model
+2 class Policy(Module):
+3
+4
+# (continued from above)
+5
+6
+@trace.bundle(trainable=True)
+7
+def generate_paddle_target(self , pre_ball_x , obs):
+8
+"""(same as before , skipped to save space)"""
+9
+if ’Ball’ not in obs:
+10
+return None
+11
+12
+ball = obs[’Ball’]
+13
+ball_x = ball[’x’]
+14
+ball_y = ball[’y’]
+33
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+15
+ball_dx = ball[’dx’]
+16
+ball_dy = ball[’dy’]
+17
+18
+# If ball is not moving , can’t predict
+19
+if ball_dx == 0 and ball_dy == 0:
+20
+return None
+21
+22
+# Calculate time to reach paddle
+23
+paddle_y = 189
+# Player paddle y-position
+24
+if ball_dy != 0:
+# Avoid division by zero
+25
+time_to_paddle = (paddle_y - ball_y) / ball_dy
+26
+if time_to_paddle > 0:
+# Only predict if ball is moving toward paddle
+27
+# Account for wall bounces
+28
+x = ball_x + (ball_dx * time_to_paddle)
+29
+num_bounces = 0
+30
+while x < 9 or x > 152:
+31
+if x < 9:
+32
+x = 9 + (9 - x)
+# Reflect off left wall
+33
+if x > 152:
+34
+x = 152 - (x - 152)
+# Reflect off right wall
+35
+num_bounces += 1
+36
+if num_bounces > 10:
+# Prevent infinite bounces
+37
+break
+38
+return x
+39
+return None
+40
+41
+@trace.bundle(trainable=True)
+42
+def select_paddle_action(self , target_paddle_pos , obs):
+43
+"""(same as before , skipped to save space)"""
+44
+if target_paddle_pos is None or ’Player ’ not in obs:
+45
+return 0
+46
+47
+paddle = obs[’Player ’]
+48
+paddle_x = paddle[’x’]
+49
+paddle_w = paddle[’w’]
+50
+paddle_center = paddle_x + (paddle_w / 2)
+51
+52
+# Add deadzone to avoid oscillation
+53
+deadzone = 2
+54
+if abs(paddle_center - target_paddle_pos) < deadzone:
+55
+return 0
+# NOOP if close enough
+56
+elif paddle_center > target_paddle_pos:
+57
+return 3
+# LEFT
+58
+else:
+59
+return 2
+# RIGHT
+Figure F7. Learned code for Breakout agent (Part 2).
+1 @trace.model
+2 class Policy(Module):
+3
+4
+def __call__(self , obs):
+5
+shoot_decision = self.decide_shoot(obs)
+6
+move_decision = self.decide_movement(obs)
+7
+return self.combine_actions(shoot_decision , move_decision)
+8
+9
+@trace.bundle(trainable=True)
+10
+def decide_shoot(self , obs):
+11
+’’’
+12
+Decide whether to shoot based on enemy positions and existing projectiles.
+13
+14
+Args:
+15
+obs (dict): Game state observation containing object states for "Player", "Shield0", "Shield1",
+"Alien0", "Alien1", etc.
+16
+Each object has position (x,y), size (w,h), and velocity (dx ,dy).
+17
+Player bullets have negative dy velocity and alien bullets have positive dy velocity
+18
+19
+Strategy tips:
+20
+- You can only have one missile at a time
+21
+- Try to shoot when aliens are aligned with your ship
+22
+- Prioritize shooting at lower aliens as they’re closer to you
+23
+- Consider the movement of aliens when deciding to shoot
+24
+25
+Returns:
+26
+bool: True if should shoot , False otherwise
+27
+’’’
+28
+29
+# There can only be one player bullet on the field at a time
+30
+# Check for player bullets (which have negative dy velocity)
+34
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+31
+for key , obj in obs.items():
+32
+if key.startswith(’Bullet ’) and obj.get(’dy’, 0) < 0:
+33
+return False
+34
+35
+return random.choice ([True , False])
+36
+37
+@trace.bundle(trainable=True)
+38
+def decide_movement(self , obs):
+39
+’’’
+40
+Decide movement direction based on enemy positions and projectiles.
+41
+42
+Args:
+43
+obs (dict): Game state observation containing object states for "Player", "Shield0", "Shield1",
+"Alien0", "Alien1", etc.
+44
+Each object has position (x,y), size (w,h), and velocity (dx ,dy).
+45
+Player bullets have negative dy velocity and alien bullets have positive dy velocity
+46
+47
+Strategy tips:
+48
+- Move to dodge enemy projectiles
+49
+- Position yourself under aliens to shoot them
+50
+- Stay away from the edges of the screen
+51
+- Consider moving toward areas with more aliens to increase score
+52
+53
+Returns:
+54
+int: -1 for left , 1 for right , 0 for no movement
+55
+’’’
+56
+57
+player = obs[’Player ’]
+58
+59
+return random.choice ([-1,0,1])
+Figure F8. Initial code for Space Invaders agent (Part 1).
+1 @trace.model
+2 class Policy(Module):
+3
+4
+# (continued from above)
+5
+6
+@trace.bundle(trainable=True)
+7
+def combine_actions(self , shoot , movement):
+8
+’’’
+9
+Combine shooting and movement decisions into final action.
+10
+11
+Args:
+12
+shoot (bool): Whether to shoot
+13
+movement (int): Movement direction
+14
+15
+Action mapping:
+16
+- 0: NOOP (no operation)
+17
+- 1: FIRE (shoot without moving)
+18
+- 2: RIGHT (move right without shooting)
+19
+- 3: LEFT (move left without shooting)
+20
+- 4: RIGHT+FIRE (move right while shooting)
+21
+- 5: LEFT+FIRE (move left while shooting)
+22
+23
+Returns:
+24
+int: Final action (0: NOOP , 1: FIRE , 2: RIGHT , 3: LEFT , 4: RIGHT+FIRE , 5: LEFT+FIRE)
+25
+’’’
+26
+27
+if shoot and movement > 0:
+28
+return 4
+# RIGHT+FIRE
+29
+elif shoot and movement < 0:
+30
+return 5
+# LEFT+FIRE
+31
+elif shoot:
+32
+return 1
+# FIRE
+33
+elif movement > 0:
+34
+return 2
+# RIGHT
+35
+elif movement < 0:
+36
+return 3
+# LEFT
+37
+return 0
+# NOOP
+Figure F9. Initial code for Space Invaders agent (Part 2).
+1 @trace.model
+2 class Policy(Module):
+3
+35
+Understanding the Challenges in Iterative Generative Optimization with LLMs
+4
+def __call__(self , obs):
+5
+shoot_decision = self.decide_shoot(obs)
+6
+move_decision = self.decide_movement(obs)
+7
+return self.combine_actions(shoot_decision , move_decision)
+8
+9
+@trace.bundle(trainable=True)
+10
+def decide_shoot(self , obs):
+11
+"""(same as before , skipped to save space)"""
+12
+13
+# There can only be one player bullet on the field at a time
+14
+# Check for player bullets (which have negative dy velocity)
+15
+for key , obj in obs.items():
+16
+if key.startswith(’Bullet ’) and obj.get(’dy’, 0) < 0:
+17
+return False
+18
+19
+player = obs[’Player ’]
+20
+for key , obj in obs.items():
+21
+if key.startswith(’Alien’):
+22
+# Check if alien is aligned with player (within 5 pixels)
+23
+if abs(obj[’x’] - player[’x’]) < 5:
+24
+# Prioritize lower aliens (higher y value)
+25
+if obj[’y’] > 60:
+# Adjust this threshold as needed
+26
+return True
+27
+return False
+28
+29
+@trace.bundle(trainable=True)
+30
+def decide_movement(self , obs):
+31
+"""(same as before , skipped to save space)"""
+32
+player = obs[’Player ’]
+33
+move = 0
+34
+threat_left = 0
+35
+threat_right = 0
+36
+aliens_left = 0
+37
+aliens_right = 0
+38
+39
+for key , obj in obs.items():
+40
+if key.startswith(’Alien’):
+41
+if obj[’x’] < player[’x’]:
+42
+aliens_left += 1
+43
+else:
+44
+aliens_right += 1
+45
+elif key.startswith(’Bullet ’) and obj[’dy’] > 0:
+# Enemy bullet
+46
+if obj[’x’] < player[’x’]:
+47
+threat_left += 1
+48
+else:
+49
+threat_right += 1
+50
+51
+# Move away from threats
+52
+if threat_left > threat_right:
+53
+move = 1
+54
+elif threat_right > threat_left:
+55
+move = -1
+56
+# If no immediate threat , move towards more aliens
+57
+elif aliens_left > aliens_right:
+58
+move = -1
+59
+elif aliens_right > aliens_left:
+60
+move = 1
+61
+62
+return move
+63
+64
+@trace.bundle(trainable=True)
+65
+def combine_actions(self , shoot , movement):
+66
+"""(same as before , skipped to save space)"""
+67
+if shoot and movement > 0:
+68
+return 4
+# RIGHT+FIRE
+69
+elif shoot and movement < 0:
+70
+return 5
+# LEFT+FIRE
+71
+elif shoot:
+72
+return 1
+# FIRE
+73
+elif movement > 0:
+74
+return 2
+# RIGHT
+75
+elif movement < 0:
+76
+return 3
+# LEFT
+77
+return 0
+# NOOP
+Figure F10. Learned code for Space Invaders agent.
+36

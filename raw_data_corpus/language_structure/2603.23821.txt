@@ -1,0 +1,4150 @@
+Perturbation: A simple and efficient adversarial tracer
+for representation learning in language models
+Joshua Rozner1 and Cory Shain1
+1Stanford University
+rozner@stanford.edu, cory.shain@gmail.com
+Abstract
+Linguistic representation learning in deep neu-
+ral language models (LMs) has been studied
+for decades, for both practical and theoretical
+reasons. However, finding representations in
+LMs remains an unsolved problem, in part due
+to a dilemma between enforcing implausible
+constraints on representations (e.g., linearity;
+Arora et al. 2024) and trivializing the notion of
+representation altogether (Sutter et al., 2025).
+Here we escape this dilemma by reconceptual-
+izing representations not as patterns of activa-
+tion but as conduits for learning. Our approach
+is simple: we perturb an LM by fine-tuning it
+on a single adversarial example and measure
+how this perturbation “infects” other examples.
+Perturbation makes no geometric assumptions,
+and unlike other methods, it does not find rep-
+resentations where it should not (e.g., in un-
+trained LMs). But in trained LMs, perturbation
+reveals structured transfer at multiple linguistic
+grain sizes, suggesting that LMs both gener-
+alize along representational lines and acquire
+linguistic abstractions from experience alone.
+1
+Introduction
+Understanding the latent representations of black-
+box machine learning systems like neural language
+models (LMs) is a growing scientific field (Smolen-
+sky, 1990; McCoy et al., 2019; Pimentel et al.,
+2020; Rogers et al., 2020; Belinkov, 2022; Geiger
+et al., 2025), and many studies in this domain have
+argued that LMs acquire a rich diversity of lin-
+guistic abstractions during training, ranging from
+morphology (Mikolov et al., 2013; Stanczak et al.,
+2022) to syntax (Linzen et al., 2016; Tenney et al.,
+2019; Hewitt and Manning, 2019; Gauthier et al.,
+2020; Hu et al., 2024a) to semantics (Conneau et al.,
+2018; Templeton et al., 2024). For this reason, LMs
+are a powerful testbed for longstanding scientific
+questions about the kinds of linguistic representa-
+tions that can be acquired from experience (Gold,
+1967; Elman, 1990; Warstadt and Bowman, 2022;
+Misra and Mahowald, 2024; Millière, 2024; Rozner
+et al., 2025a; Futrell and Mahowald, 2025).
+However, finding representations in LMs re-
+mains an open problem. Early work hypothesized
+that representations would be encoded as activation
+patterns and attempted to read representations di-
+rectly from specific neurons (Linzen et al., 2016)
+or by training probing classifiers (Tenney et al.,
+2019). Such probing approaches are fraught (Alain
+and Bengio, 2017): they are correlational (Geiger
+et al., 2022), they can learn the representation di-
+rectly (Hewitt and Liang, 2019; Belinkov, 2022),
+and they will fail to find representations that are
+outside the solution space of the classifier (Adi
+et al., 2017). There has thus been a shift toward
+approaches, collectively called mechanistic inter-
+pretability (Elhage et al., 2021), that attempt to
+ground the notion of representation in the causal
+effects of activation patterns on model behavior
+(Tucker et al., 2021; Templeton et al., 2024; Saphra
+and Wiegreffe, 2024; Geiger et al., 2025). One
+such method is distributed alignment search (DAS;
+Geiger et al. 2024), which uses gradient descent to
+find a transformation on model states that agrees
+with a hypothesized causal abstraction (Arora et al.,
+2024). DAS and related methods often draw on the
+linear representation hypothesis that many model
+representations are approximately linearly encoded
+(Mikolov et al., 2013; Elhage et al., 2022; Park
+et al., 2024; Arora et al., 2024). But even linear
+DAS recovers spurious structure in untrained mod-
+els (Wu et al., 2023; Arora et al., 2024). Addi-
+tionally, although some LM representations have
+been shown to be linearly encoded (Nanda et al.,
+2023; Park et al., 2024), a number of known ex-
+ceptions (White et al., 2021; Csordás et al., 2024;
+Diego Simon et al., 2024; Engels et al., 2025) mo-
+tivate relaxing the linearity constraint. However,
+Sutter et al. (2025) proved that without constraints
+on the function that aligns low-level neural network
+states with variables in a high level causal model,
+1
+arXiv:2603.23821v1  [cs.CL]  25 Mar 2026
+any network can be aligned with any causal model
+(see also Makelov et al. 2024; Grant et al. 2025
+for discussion of mechanisms by which supervised
+causal interventions like DAS might find spurious
+causal pathways). This presents a dilemma: lin-
+ear DAS is both too expressive (capable of finding
+causal linear subspaces where it should not) and not
+expressive enough (incapable of finding nonlinear
+structure where it should). Any attempt to fix one
+horn of the dilemma worsens the other. Together,
+these considerations suggest that techniques like
+DAS that directly optimize for a causal effect also
+run the risk of reifying assumptions, making it diffi-
+cult to determine for any given finding how much it
+reflects real causal structure vs. prior assumptions.
+Here we propose to escape this dilemma by lever-
+aging the insight that representations are conduits
+for learning (Hinton, 1986; Shepard, 1987; Tenen-
+baum et al., 2011): changes to a representation
+immediately generalize to all future uses of that rep-
+resentation. We build on this idea with the method
+of perturbation: we finetune a language model on
+a single adversarial example and then trace how
+this corruption propagates to other examples. Per-
+turbation makes no assumptions about the repre-
+sentational geometry of the model’s hidden states,
+but instead rests on the following key assumption:
+if a model represents a certain abstraction, then
+a corruption introduced into the abstraction via
+perturbation should selectively propagate to other
+examples that also implicate the abstraction.
+We bring our method to bear on the aforemen-
+tioned learnability questions in linguistic theory by
+applying it to the well-studied problem of whether
+and how LMs come to represent linguistic abstrac-
+tions like syntactic categories and constructions
+(Kim and Smolensky, 2021; Misra and Mahowald,
+2024; Patil et al., 2024). There are many existing
+linguistic benchmarks that could be tested using
+our approach. To keep things feasible, we selected
+three benchmarks of different linguistic grain sizes:
+morphological, lexical, and syntactic (see §2.2).
+Across these evaluations, we find that perturbation
+is both a sensitive and selective tool for causal rep-
+resentation discovery, finding rich interpretable lin-
+guistic structure in trained models and no structure
+in untrained ones. This result supports both the use
+of perturbation as an LM interpretability technique
+and the hypothesis that LMs emergently discover
+rich linguistic abstractions from experience alone,
+convergent with many similar recent findings (e.g.,
+Warstadt et al., 2023; Misra and Kim, 2023; Hu
+et al., 2024a; Rozner et al., 2025b).
+2
+Methods
+2.1
+Perturbation
+We develop the method of perturbation to quantify
+representational similarities across strings that con-
+tain a hypothesized representation. For example,
+the word duck has multiple senses (e.g., an animal,
+a food, and an action) that might be represented
+differently in models. We therefore train on a sin-
+gle datapoint designed to corrupt a representation
+of interest (e.g., finetuning to generate glam in-
+stead of duck in the context A ___ quacks) and then
+measure the impact of this intervention on other
+model behaviors. For example, the context in the
+example above favors the animal sense of duck (as
+opposed to the food or action senses). If the model
+is perturbed to produce glam in such a context, in
+which other contexts will this perturbation increase
+the probability of glam relative to duck? For all
+instances of duck regardless of sense, for only the
+animal sense of duck, or in another manner? Per-
+turbation thus becomes a kind of “tracer injection”
+for latent LM representations (e.g., putative word
+senses), allowing us to use gradations of transfer
+learning as a window into the underlying represen-
+tation space. Below we formalize this method by
+first defining the construct of a remapping and then
+elaborating on how this construct is used both to
+define a perturbation and to evaluate its effects.
+Remapping
+Let a token be a pair ⟨w, i⟩repre-
+senting an element w of the model’s vocabulary W
+at position i ∈N. Let a string S be a finite set of
+tokens {⟨w(1), i(1)⟩, . . . , ⟨w(n), i(n)⟩} with all posi-
+tion indices distinct, i.e. i(j) ̸= i(k) for j ̸= k. Any
+string S can be partitioned into a critical region R
+and a context C.
+Let a remapping from an original string So =
+Ro ∪Co to an alternate string Sa = Ra ∪Ca
+be a 4-tuple: ⟨Co, Ro, Ca, Ra⟩. In other words, a
+remapping expresses a correspondence between
+the contexts and critical regions of two strings
+(the original and the alternate).
+An example
+remapping is ⟨{⟨A, 1⟩, ⟨quacks, 3⟩}, {⟨duck, 2⟩},
+{⟨A, 1⟩, ⟨quacks, 3⟩}, {⟨glam, 2⟩}⟩. This example
+remaps A duck quacks into A glam quacks. For
+simplicity, we will notate the remapping for the
+above example as follows, with the critical region
+in bold: A duck quacks [duck →glam]. We use the
+construct of a remapping in two ways: to perturb
+a model by finetuning it to respect a remapping,
+2
+and to evaluate a perturbed model by measuring
+the degree to which it respects a remapping.
+Perturbation
+Let p(S) be a language model and
+M(T) be a remapping ⟨C(T)
+o
+, R(T)
+o
+, C(T)
+a
+, R(T)
+a
+⟩.
+We perturb p into ˜pM(T ) by finetuning it (changing
+its weights) on M(T). To reduce notational clutter,
+we henceforth omit the subscript on ˜pM(T ) and the
+superscript on M(T). We minimize the following
+perturbation objective:
+L (M, p) = −log
+p (Ra|Ca)
+p (Ro|Co)
+
+In other words, we train the model to e.g., use glam
+instead of duck in the context A ___ quacks.
+Evaluation
+We use remappings to evaluate the
+causal effect of perturbing p into ˜p. Inspired by re-
+lated work on causal interpretation of LMs (Arora
+et al., 2024), we take the log odds-ratio of the al-
+ternate to the original in an evaluation remapping
+M(E) = ⟨C(E)
+o
+, R(E)
+o
+, C(E)
+a
+, R(E)
+a
+⟩, before and af-
+ter perturbation (again omitting the superscript):
+R (M, p, ˜p) = log
+ ˜p (Ra | Ca)
+p (Ra | Ca) · p (Ro | Co)
+˜p (Ro | Co)
+
+For example, we can ask how perturbing the
+model on A duck quacks [duck →glam] affects
+model behavior on The duck led her ducklings
+[duck →glam], thereby quantifying transfer to
+another instance of the same sense of duck. For
+simplicity of exposition, we define perturbation and
+evaluation above with respect to a single remap-
+ping, but both definitions can be applied without
+loss of generality to multiple remappings, simply
+by aggregating (e.g., averaging) over remappings.
+Interpretation
+We impose no further formal
+constraints
+on
+remappings:
+the
+choice
+of
+Co, Ro, Ca, Ra for training and evaluation is left
+to the experimenter. Which remappings are mean-
+ingful depends on the research question, and many
+remappings are likely nonsensical (e.g., A duck
+quacks →Feed the dog). One way to create mean-
+ingful remappings is to fix the context (i.e., set Co
+and Ca to be maximally similar—ideally, identical)
+and vary the critical region. This is the approach
+taken by all experiments in this study. What the
+perturbation method can tell us about LMs’ repre-
+sentations therefore depends on the design of the
+remappings used for perturbation and evaluation.
+2.2
+Experimental Design
+Tasks and Benchmarks
+We apply our method to
+three published benchmarks for linguistic abstrac-
+tion learning across linguistic grain sizes. First,
+we study morphological representations via mor-
+phological categories in BATS (Gladkova et al.,
+2016) dataset. Second, we study lexical representa-
+tions via word senses in CoarseWSD-20 (Loureiro
+et al., 2021). Third, we study syntactic represen-
+tations via filler-gap dependency constructions in
+the dataset developed by Boguraev et al. (2025).
+We note that we use the terms morphology, lexicon,
+and syntax merely as convenience labels, without
+implying mutual exclusivity (see e.g., Bach, 1983;
+Marantz and Halle, 1993; Goldberg, 1995).
+Implementation
+Because the perturbation ob-
+jective L requires both p (Ro|Co) and p (Ra|Ca),
+we run Sa and So through the model in a single
+batch, flip the sign of the gradients on Ro, and
+backpropagate in a single pass. Models are fitted
+using Adam (Kingma and Ba, 2014) with hyper-
+parameter selection described in A.2. Two of our
+benchmarks (morphological and lexical) require
+bidirectional context, so we use masked language
+models (MLMs): RoBERTa (Liu et al., 2019), mod-
+ernBERT (Warner et al., 2025), and GPT-BERT, a
+BabyLM trained on a developmentally plausible
+quantity of data (Warstadt et al., 2023; Charpen-
+tier and Samuel, 2024). Our syntactic benchmark
+needs only preceding context, allowing us to use
+an autoregressive model (Pythia 1.4B, the same as
+used by Boguraev et al. 2025; Biderman et al.,
+2023). In all cases, we equally weight the loss on
+all tokens of the critical regions in the two-entry
+batch. For evaluation, since MLMs do not give
+p(R|C) for multitoken words, we approximate it
+using the MLM pseudo-log-likeliood of Kauf and
+Ivanova (2023). All likelihoods are computed using
+the minicons library (Misra, 2022).1
+Evaluation
+Each of our benchmarks contains
+strings that implicitly belong to one or more la-
+tent classes (e.g., distinct senses of a word) whose
+representations we seek to study.
+We use two
+types of evaluations. First, we quantify and visual-
+ize the effects of perturbation within and between
+classes, substantiating any claimed differences with
+regression-based statistical tests. Second, for the
+morphological and lexical benchmarks (where we
+1Reproduction code and data for all experiments is avail-
+able at github.com/jsrozner/perturbation.
+3
+have strong prior expectations that successful rep-
+resentation learning will yield discriminable latent
+classes), we use a generic notion of clusterability
+for evaluation, which measures the degree to which
+similarities are higher within vs. between classes as
+an area under the curve (AUC, see A.4 for details).
+3
+Morphological Representations
+Methods: We ask whether perturbation distin-
+guishes two uses of the suffix -er: deverbal (e.g.,
+teach vs. teacher) and comparative (e.g., tall vs.
+taller). We start with the BATS dataset (Gladkova
+et al., 2016), which has 50 pairs for both classes,
+and obtain naturalistic usages by sampling sen-
+tences from the GPT-BERT Cosmo corpus (Char-
+pentier and Samuel 2024; accessed via Hugging-
+Face, Wolf et al. 2019). We create remappings for
+perturbation and evaluation by removing the -er
+suffix: For example: The man was taller than the
+boy [taller →tall].
+Results: We report results for RoBERTa-large on
+98 sentences. We find (Fig 1A) that in untrained
+models, transfer occurs only due to shared tokens;2
+By contrast, in trained models (Fig 1B), transfer
+is instead dominated by class membership, as is
+clear in aggregate (Fig 1C). Representations from
+RoBERTa-large give clusterability of 0.89; rep-
+resentations at random initialization give cluster-
+ability of 0.52, which is close to chance, as ex-
+pected. Perturbation thus qualitatively shows the
+emergence of a clear deverbal-comparative distinc-
+tion during training. In B.5, we also report results
+for RoBERTa-base, ModernBERT, and GPT-BERT,
+which behave similarly, though we note that GPT-
+BERT exhibits notably smaller average transfer
+for deverbal-deverbal, which may agree with prior
+work in humans and models that the derivational
+morphologies like the deverbal (verb to noun) may
+be harder to generalize than inflectional ones (Glad-
+kova et al., 2016; Pacton and Peereman, 2023).
+We test this effect quantitatively using linear re-
+gression with three factors: class has three lev-
+els: within-class comparative, within-class dever-
+bal, and between-class; trained is true or false;
+tokenization has four levels: single-single (the crit-
+ical regions of both the perturbation and evalu-
+ation are singly-tokenized), single-multi (one of
+2Vertical patterning is observed in untrained models, indi-
+cating that, for a given model initialization, some items are
+more likely to be influenced than others overall. But permuta-
+tion tests (see B.3) show that this patterning is unpredictable
+across random initializations.
+Model
+Perturb
+(trained)
+Perturb
+(un-
+trained)
+Cos
+Best
+layer
+Cos
+Last
+layer
+ModernBERT-B
+0.829
+0.556
+0.755
+0.738
+ModernBERT-L
+0.871
+0.553
+0.801
+0.769
+RoBERTa-B
+0.811
+0.502
+0.798
+0.759
+RoBERTa-L
+0.845
+0.515
+0.889
+0.816
+GPT-BERT
+0.692
+0.563
+0.713
+0.693
+Table 1: Average AUC clusterability in Lexical Representa-
+tions task over all 20 words from CWSD.
+the critical regions is singly-tokenized and one
+is multi-token), multi-different (both regions are
+multitoken with differing final tokens), and multi-
+same (both regions are multitoken with the same
+final token). We perform post-estimation using the
+marginal-effects package (Arel-Bundock et al.,
+2024). The response variable is the cell values (log-
+odds ratio) from the matrices in Fig 1A-B, omitting
+the diagonal and symmetrizing by averaging the
+two interactions for each pair (9,506 observations).
+We find that trained models show significant
+within-class transfer (1.73, p < 0.001) and min-
+imal between-class transfer (0.003, p = 0.97;
+diff=1.72, p < 0.001). By contrast, untrained mod-
+els show comparatively weaker within class trans-
+fer (0.56, p < 0.001) and stronger between-class
+transfer (0.75, p < 0.001). The interaction be-
+tween class and training is significant: within class
+transfer is larger in trained than untrained models
+(diff=1.17, p < 0.001); and between-class transfer
+is smaller (diff=-0.75, p < 0.001). Moreover, the
+significant transfer both within and between classes
+in untrained models is driven by shared tokeniza-
+tion: average transfer when a token is shared is 2.6
+for within-class and 3.3 for between-class transfer,
+whereas when there is no shared token, these values
+drop to -0.12 and -0.08 respectively (both differ-
+ences are significant, p < 0.001). By contrast, for
+trained models, although some tokenization effects
+persist, average between-class transfer with shared
+tokenization is only 0.04 (diff vs. untrained=-3.2,
+p < 0.001), showing that, over the course of train-
+ing, RoBERTa learns to ignore superficially shared
+tokens and prioritize the representation of the word
+as a whole. See B.2 for full results of the linear
+model.
+4
+Lexical Representations
+Methods: We ask whether perturbation reveals
+latent distinctions between different senses for
+the same word string (word sense disambiguation,
+WSD), using the CoarseWSD-20 dataset (CWSD;
+4
+Sing.
+-er
+-X
+Sing.
+-er
+-der
+-ier
+-ier
+-lier
+-rier-r
+-X
+Deverbal
+Comparative
+−3
+−2
+−1
+0
+1
+2
+3
+A
+Sing.
+-er
+-X
+Sing.
+-er
+-der
+-ier
+-ier
+-lier
+-rier-r
+-X
+Deverbal
+Comparative
+−3
+−2
+−1
+0
+1
+2
+3
+B
+Deverbal
+Comp
+−4
+−2
+0
+2
+4
+6
+8
+log-odds
+Deverbal
+Comp
+C
+Figure 1: A, B: Transfer for Morphology task in RoBERTa-large. A is randomly initialized; B is the trained model.
+Cell i, j corresponds to finetuning on the ith remapping and evaluating on the jth. Items are grouped hierarchically
+by morphological class (outer, deverbal vs. comparative) and tokenization (inner, e.g., Sing. means singly tokenized,
+-er means the final token is -er, etc.). C: Distribution of transfer effects (log-odds) to deverbal (magenta) vs.
+comparative (cyan) depending on which class is perturbed (x-axis), with the median indicated in each distribution.
+1
+2
+3
+4
+perturb
+1
+2
+3
+4
+cosine
+0
+2
+4
+6
+8
+10
+12
+0.4
+0.6
+0.8
+1.0
+Figure 2: Similarity matrices for square (WSD) us-
+ing perturbation (left) and cosine (right). Block struc-
+ture corresponds to four senses: shape, company, town
+square, numerical square (e.g., 4,9). AUCs: 0.94, 0.87
+Loureiro et al. 2021). CWSD is a course-grained,
+naturalistic dataset drawn from Wikipedia with 20
+nouns, each with two to five distinct senses as la-
+beled by expert annotators. In general, the intended
+sense for each word in this dataset is strongly in-
+dicated by the sentential context. In all cases, we
+perturb the word of interest to the nonce token glam
+(e.g., He is eating an apple [apple →glam]). As
+shown in C.2, other nonce tokens yield qualitatively
+similar results. Recent work by Teglia et al. (2025)
+found that the cosine similarity of contextualized
+word embeddings (especially intermediate layers)
+in MLMs reliably distinguished word senses. Al-
+though this result aligns with linguistic expecta-
+tions (e.g., Reif et al., 2019), cosine similarity is
+correlational and thus cannot establish a causal ef-
+fect of putative word sense representations (see In-
+troduction); other concerns also exist (Ethayarajh,
+2019; Timkey and van Schijndel, 2021; Zhou et al.,
+2022; Steck et al., 2024). We adopt the Teglia
+et al. approach to WSD as a correlational baseline
+against which to compare our causal perturbation
+method. Because this baseline requires layer se-
+lection, we consider two approaches: last layer
+and best layer. Best-layer uses the best-performing
+layer for each word; it is an oracle steel-man that al-
+lows the baseline to “peek” at its own performance,
+resulting in a conservative comparison.
+Our design provides two measures of similarity
+(correlational cosine distance vs. causal perturba-
+tion transfer). For each of the 20 words in the
+dataset, we sample 100 examples equally balanced
+over the senses for that word (see C.1). The simi-
+larity measures are evaluated against ground-truth
+word sense labels using the clusterability technique
+introduced in §2.2; we compute clusterability for
+each word and then average over all words.
+Results:
+Figure
+2
+provides
+example
+ModernBERT-L similarity matrices for senses of
+square using perturbation and cosine similarity.
+Exhaustive visualizations, including for untrained
+models, are given in C.3. As shown, both methods
+convergently reveal that latent word senses exert
+a strong influence on model representations, but
+this influence tends to be more pronounced under
+perturbation, suggesting that the causal influence
+of word sense representations in LMs may be even
+larger than the correlational impression given by
+state similarities.
+We evaluate this impression
+quantitatively in Table 1, where perturbation
+clusterability is higher than the oracle best-layer
+clusterability in three of five models. Our results
+therefore converge with the Teglia et al. finding
+that LMs represent word senses, while also
+grounding this conclusion directly in causal effects
+on model learning.
+5
+Syntactic Representations
+Methods: We turn finally to LM representations
+of syntax via filler-gap (FG) constructions (e.g., I
+know whoi the man liked [gapi], where the referent
+of who is indexed to the referent of a phonologi-
+5
+cleft
+wh_finite
+wh_nonfinite
+pseudo_cleft
+restricted_rc
+topicalization
+wh_question
+control
+control_lexical
+FG
+non-FG ctl
+0
+FG
+non-FG ctl
+256
+FG
+non-FG ctl
+512
+FG
+non-FG ctl
+1000
+FG
+non-FG ctl
+2000
+FG
+non-FG ctl
+5000
+FG
+non-FG ctl
+10000
+FG
+non-FG ctl
+143000
+1
+0
+1
+2
+3
+Figure 3: Transfer (aggregated over animacy and embeddedness conditions) from each FG and control to FG,
+(minimal) non-FG conditions, and controls. FG and non-FG exhibit similar transfer through step 1k, after which
+transfer to non-FG begins decreasing. Once FG is learned (step 2k-5k), minimal transfer is seen to/from controls.
+0
+128
+256
+512
+1k
+2k
+5k
+10k 143k
+Step
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+Avg effect
+fg 
+ fg
+fg 
+ nonfg
+c-lex 
+ fg
+c-num 
+ fg
+fg 
+ c-lex
+fg 
+ c-num
+FG
+FG
+FG
+non-FG
+FG
+ctl
+ctl
+FG
+ctl
+non-FG
+1.0
+0.5
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+untrained
+trained
+A
+B
+Figure 4: A: Transfer between indicated classes over
+training. Std errors are too small to be seen. B: Transfer
+between indicated classes in untrained (magenta) and
+trained (cyan) models, with medians shown.
+cally null gap in its source position; Ross, 1967).
+Diverse types of FG constructions exist (e.g., En-
+glish has wh-questions, relative clauses, clefts and
+pseudoclefts, among others), and linguists debate
+the degree of shared representation between them
+(e.g., Ross, 1967; Chomsky, 1986; Culicover, 1999;
+Levine and Hukari, 2006). Thus, unlike coarse-
+grained word senses that enjoy relatively strong
+consensus, the expected representation of FG con-
+structions in English is an open question, one which
+perturbation allows us to study through the vehicle
+of LMs. Recently, Boguraev et al. (2025) showed
+that DAS finds representational transfer in LMs
+across diverse filler-gap constructions. But given
+open concerns about DAS (i.e., the risk of reifying
+researcher assumptions and/or missing nonlinear
+representations, see Introduction), here we revisit
+this finding using perturbation.
+The Boguraev et al. dataset contains seven FG
+types: two embedded question types (know vs.
+wonder), matrix wh-questions, restrictive relatives,
+clefts, pseudoclefts, and topicalization (see D, Ta-
+ble A7 for details). For each type, the authors
+designed pairs of sentences that vary a minimal
+part of the context with a corresponding change in
+output (e.g., I know [who, that] the man liked →
+[., him]). These pairs are also varied along two di-
+mensions: animacy of the extracted element (e.g., I
+know [what, who] the man saw) and embeddedness
+of the extraction site (e.g., I know who [the nurse
+said that] the man liked). When studied using DAS,
+the design above ostensibly measures sensitivity to
+relatedness between FG constructions; it does not
+measure selectivity to FG over non-FG construc-
+tions. To address this, Boguraev et al. added two
+control conditions to serve as foils: (a) an agree-
+ment control (ctrl-agr) that manipulates subject-
+verb agreement (The [boy, boys] the man liked →
+[is, are]) and (b) a transitivity control (ctrl-trans)
+that manipulates the transitivity of the verb (That
+man [ran, liked] →[., him]).
+This dataset provides natural remappings for per-
+turbation and evaluation. For example, we can per-
+turb on I know who the man liked . [. →him] and
+evaluate transfer on Who the man liked was [was
+→it]. Conceptually, this allows us to trace cor-
+ruptions of the model’s native filler-gap representa-
+tions. However, perturbation offers a key advantage
+over DAS for this benchmark: whereas DAS needs
+both the FG and non-FG condition (e.g., I know
+that the man liked [., him]) to train its intervention,
+perturbation needs only the FG condition. Thus
+with perturbation, we can use the minimal non-FG
+condition as a control that is maximally similar
+to the FG condition. We consider non-FG a much
+stronger control than ctrl-agr and ctrl-trans used by
+Boguraev et al., and while we report transfer to ctrl-
+agr and ctrl-trans, we focus on the minimal non-
+FG controls in our interpretation of results. We also
+make our train and evaluation mappings disjoint
+with respect to label: all evaluation remappings
+have critical regions that differ from the critical re-
+gions of the perturbation remapping thus enabling
+a more conservative test of transfer than the one
+used by Boguraev et al. (which does not have the
+same disjointness property).
+The different FG conditions differ not only in
+construction type but also in which words can sen-
+sibly occupy the critical region. For example, the
+embedded question conditions might contrast punc-
+tuation with a pronoun, whereas pseudoclefts might
+contrast a verb with a pronoun (see Table A7). Sim-
+ilarity of causal transfer (using either DAS or per-
+6
+turbation) will plausibly be influenced by similarity
+(both exact lexical or, e.g., part of speech) of eval-
+uation targets, in addition to the influence of any
+abstractions they might share (like FG). We sub-
+stantiate this concern in D.2, where we show that
+there are large differences in critical region similar-
+ity (CRS)—the degree of lexical overlap between
+possible completions (critical regions) for different
+pairs of FG conditions in the dataset created by
+Boguraev et al.. DAS cannot directly control for
+this confound, which creates a previously undocu-
+mented interpretational problem for their results.3
+For example, ctrl-agr has almost no CRS with any
+FG condition (Figure A2), so it is an anticonserva-
+tive control. By contrast, we can and do control
+for this confound using perturbation, simply by
+subtracting out the transfer to the minimal non-FG
+control mentioned above (which has maximally
+similar context and evaluates against identical crit-
+ical regions). This yields a tightly controlled esti-
+mate of the portion of perturbation transfer that is
+selectively driven by FG, over and above superfi-
+cial contextual and lexical similarities. Henceforth
+we refer to this controlled estimate (i.e., the pair-
+wise difference between transfer in FG→FG and
+FG→non-FG), because it subtracts out the baseline
+transfer rate.
+Results: Perturbation transfer across Pythia 1.4B
+training checkpoints is shown in Figure 3 from
+each FG condition and from the Boguraev et al.
+control conditions (rows) to (i) other FG condi-
+tions (left columns), (ii) minimal non-FG condi-
+tion (middle columns), and (iii) ctrl-agr and ctrl-
+trans (right columns), aggregating for simplicity
+across the animacy and embeddedness conditions.
+baselined-transfer is obtained by subtracting the
+non-FG block from the FG block. We provide
+unaggregated and baselined-transfer versions in
+Figure A7. As shown, the model initially shows lit-
+tle between-condition transfer (step 0), but quickly
+acquires transfer primarily as a function of CRS.
+For example, at step 512, transfer is highly simi-
+lar between the FG and non-FG conditions, with
+especially strong transfer between the restrictive
+relative and pseudocleft conditions, which have
+common targets (D.2, Figure A2). By step 2k, how-
+ever, we see the model begin to distinguish FG
+3Note that exact lexical match between training and evalu-
+ation completions may also pose a problem, since Boguraev
+et al. did not use disjoint targets when training DAS. Given
+that DAS can cause models to output arbitrary targets (Wu
+et al., 2023; Arora et al., 2024) this may further confound their
+results. Our evaluation eliminates this issue.
+from the minimal non-FG controls, and transfer
+is much stronger to FG over non-FG conditions
+by the end of training. Fig 4A supports this gen-
+eral impression by showing aggregate transfer over
+the course of training: FG perturbations transfer
+roughly equally to FG and non-FG until step 512,
+when they begin to strongly diverge. Models show
+some transfer to ctrl-trans initially, which peaks
+around step 512, begins to decrease at step 1k—
+which is also when the model begins to distinguish
+FG from non-FG—and mostly vanishes by step
+5k. We speculate on causes of this behavior in
+D.3. Our results reveal not only the structure of
+representations at specific checkpoints but also the
+dynamics of their emergence over training, both of
+which show interpretable patterns that align with
+linguistic theorizing.
+We also follow up on Boguraev et al.’s report
+of minimal transfer between embedded and non-
+embedded FGs. Our approach is more conserva-
+tive than theirs (we use fully disjoint training and
+evaluation sets and intervene unsupervised from a
+single training example), but we nonetheless find
+substantial baselined-transfer between the embed-
+dedness conditions (see D, Figure A7, right column,
+especially steps 2k, 5k, and 10k, where between-
+condition structure begins to emerge; statistical
+tests of significance in Section D.4), suggesting
+some degree of common representation between
+FG constructions even when composed with unre-
+lated constructions (subordinate clauses).
+In Fig 4B we plot distributions of (unbase-
+lined) transfer from FG perturbations to three broad
+classes of examples (other FG conditions, non-FG
+conditions, and Boguraev et al. controls); as well
+as from the Boguraev et al. controls to the FG
+and non-FG conditions. Untrained models show
+no transfer across the board. Trained models gener-
+alize FG perturbations most strongly to other FG
+conditions, with much weaker transfer in the other
+comparisons (see D.4 for statistical comparisons).
+In D.5, we briefly discuss gradations in similarity
+among the individual FG conditions. Finally, as a
+sanity check, we measure the change in perplexity
+under FG perturbations on a wikitext sample (10k
+words; Merity et al. 2017): Pythia-1.4B perplexity
+changes minimally from 23.58 to 23.60, suggest-
+ing that perturbation has fairly selective effects and
+largely preserves overall model function.
+7
+6
+Discussion
+We developed perturbation as a bottom-up method
+for studying LM representations, based on the hy-
+pothesis that representations are conduits for learn-
+ing (Hinton, 1986; Shepard, 1987). We supported
+this hypothesis by showing that perturbation re-
+veals interpretable morphological, lexical, and syn-
+tactic structure.
+Perturbation has several advantages over other
+techniques. First, perturbation is data-driven: it
+uses only a single unlabeled training example, and
+we provide no guidance to the model about how
+we expect it to generalize the perturbation. Per-
+turbation thus avoids the interpretational pitfalls
+of supervised interpretability methods like probing
+and DAS—including the risk of reifying researcher
+assumptions (see Introduction, Sutter et al. 2025).
+Second, this data-drivenness allows the experi-
+menter to make inferences not only about whether
+a model contains a hypothesized representation, but
+also about how functionally important that repre-
+sentation is. For example, in the filler-gap analysis,
+we observe transfer not only along the filler-gap
+dimension, but also according to animacy and em-
+beddedness, which were not of direct interest.
+Third, as perturbation makes no geometric as-
+sumptions, it can recover arbitrary representations
+(linear or non-linear).
+Fourth, we have shown empirically that, unlike
+supervised approaches like probing (Hewitt and
+Liang, 2019) and DAS (Arora et al., 2024), pertur-
+bation does not find high-level “representations” in
+untrained models. Selectivity for real over spuri-
+ous representations has long been a sought-after
+(and hard-to-achieve) property of interpretability
+techniques (Hewitt and Liang, 2019; Arora et al.,
+2024; Sutter et al., 2025), and we find that perturba-
+tion naturally has this property. Moreover, because
+perturbation transfer is weak when representations
+are absent, perturbation can support nuanced in-
+ferences about the emergence of representations
+during training, with potential implications both
+for pretraining design and for studying statistical
+learning in humans via LM proxies (Warstadt and
+Bowman, 2022; Frank, 2023). For example, our
+perturbation-based findings lend new support to
+claims that usage is sufficient to learn much mor-
+phological, lexical, and syntactic structure (Gold-
+berg, 2003; Tomasello, 2005; Bybee, 2006).
+Fifth, perturbation’s simplicity makes it both
+data- and compute-efficient (A.3), requiring only
+one training instance per intervention, a small num-
+ber (5-10) of gradient steps for training, and a sin-
+gle forward pass per evaluation batch. This con-
+trasts with supervised approaches like probing and
+DAS, which require sufficient training data to train
+additional projections of model states, often at each
+layer in the model. Perturbation is thus compatible
+with small naturalistic datasets.
+Sixth, as shown in §5, as perturbation requires
+only a single remapping, it enables tight experimen-
+tal controls that are not possible with DAS, which
+needs the control remapping for training.
+Lastly, perturbation is a simple and inexpen-
+sive tool for linguists studying the relatedness of
+linguistic phenomena (e.g., Goldberg, 1995; Ste-
+fanowitsch and Gries, 2003; Langacker, 2005; By-
+bee, 2010; Diessel, 2023). One recently developed
+method for this purpose is corpus-ablation-based
+acquisition studies (Misra and Mahowald, 2024;
+Patil et al., 2024; Leong and Linzen, 2026). Though
+these methods have been successful, they require
+meticulous curation of relatively large corpora and
+potentially days-long retraining of even small LMs.
+7
+Conclusion
+We introduced perturbation, a simple, data-driven
+method for studying representations in language
+models. Across morphological, lexical, and syn-
+tactic structures, perturbation systematically re-
+vealed linguistically interpretable representations
+that emerge with training. Our work offers an
+escape from the dilemma faced by supervised
+methods between being too expressive and not ex-
+pressive enough, while also converging with and
+strengthening prior claims that many linguistic ab-
+stractions can be acquired from distributional evi-
+dence alone.
+Limitations
+This work has several limitations. First, as dis-
+cussed (Methods), although perturbation is unsu-
+pervised in the sense that it trains on unlabeled
+examples, the interpretability of results is only as
+good as the selection of remappings and controls.
+As with most interpretability methods, researchers
+must take care to set up the experiment in ways that
+will support accurate and useful conclusions.
+Second, we found in some cases that perturba-
+tion transfer was influenced by tokenization (§3).
+More work is needed to determine whether this
+is a limitation of the perturbation method, an in-
+8
+trinsic property of LM representations of multiply-
+tokenized words, or some combination of the two.
+Third, although we tested perturbation on both
+autoregressive and masked language models, our
+current implementation does not support perturbing
+autoregressive models given bidirectional context,
+limiting the range of representations that can be
+studied in autoregressive models. For example,
+we would not be able to reliably study word sense
+disambiguation in autoregressive models, because
+disambiguating sense information often follows the
+ambiguous word. Given the prevalence of autore-
+gressive models in actual use, future work should
+focus on addressing this limitation.
+Fourth, we focused for practical reasons exclu-
+sively on linguistic representations English. Pertur-
+bation is perfectly amenable to studying representa-
+tions in other languages as well as representations
+of nonlinguistic knowledge (e.g., commonsense,
+social, or situational knowledge). We hope our
+proposal will support future research along these
+lines.
+Fifth, unlike approaches like DAS (Geiger et al.,
+2024) or circuit analysis (Elhage et al., 2021), per-
+turbation is more useful for finding shared repre-
+sentations than controllable “mechanisms.” For ex-
+ample, although perturbation can detect when LMs
+distinguish different senses of a given word, it does
+not reveal how the senses are encoded by the model
+or how to intervene on that encoding in order to
+steer model behavior. Perturbation may ultimately
+be useful as an initial guide to identifying steerable
+mechanisms under weaker geometrical constraints
+than e.g., DAS, but more work is needed to explore
+this possibility.
+Sixth, although our work was partially motivated
+by usage-based theories of grammar, we recog-
+nize that the recovery of linguistic structure in
+statistical learners with no innate symbolically-
+specified grammar (LMs) is not necessarily in-
+compatible with the existence of innate grammati-
+cal constraints in humans. Our work instead con-
+tributes to a growing body of evidence on the feasi-
+bility of bottom-up statistical learning of linguistic
+structure, which is one of many dimensions of de-
+bate on the human capacity for language.
+Acknowledgements
+We are grateful to Emily Goodwin, Jasper Jian,
+Nathan Roll, Yuhan Zhang, Amir Zur, and other
+members of the CLiMB Lab at Stanford for com-
+ments and discussion. We are grateful to Sasha
+Boguraev for answering questions about their meth-
+ods and dataset.
+References
+Yossi Adi, Einat Kermany, Yonatan Belinkov, Ofer Lavi,
+and Yoav Goldberg. 2017. Fine-grained analysis of
+sentence embeddings using auxiliary prediction tasks.
+In International Conference on Learning Representa-
+tions.
+Guillaume Alain and Yoshua Bengio. 2017. Under-
+standing intermediate layers using linear classifier
+probes. ICLR 2017 Workshop Track.
+Vincent Arel-Bundock, Noah Greifer, and Andrew
+Heiss. 2024. How to intrpret statistical models us-
+ing marginaleffects for R and Python. Journal of
+Statistical Software, 111(9):1–32.
+Aryaman Arora, Dan Jurafsky, and Christopher Potts.
+2024.
+CausalGym: Benchmarking causal inter-
+pretability methods on linguistic tasks. In Proceed-
+ings of the 62nd Annual Meeting of the Association
+for Computational Linguistics (Volume 1: Long Pa-
+pers), pages 14638–14663, Bangkok, Thailand. As-
+sociation for Computational Linguistics.
+Emmon Bach. 1983. On the relationship between word-
+grammar and phrase-grammar. Nat. Lang. Linguist.
+Theory, 1(1):65–89.
+Yonatan Belinkov. 2022. Probing classifiers: Promises,
+shortcomings, and advances. Computational Linguis-
+tics, 48(1):207–219.
+Stella Biderman, Hailey Schoelkopf, Quentin Anthony,
+Herbie Bradley, Kyle O’Brien, Eric Hallahan, Mo-
+hammad Aflah Khan, Shivanshu Purohit, USVSN Sai
+Prashanth, Edward Raff, Aviya Skowron, Lintang
+Sutawika, and Oskar Van Der Wal. 2023. Pythia:
+a suite for analyzing large language models across
+training and scaling. In Proceedings of the 40th Inter-
+national Conference on Machine Learning, ICML’23.
+JMLR.org.
+Sasha Boguraev, Christopher Potts, and Kyle Mahowald.
+2025. Causal interventions reveal shared structure
+across English filler–gap constructions. In Proceed-
+ings of the 2025 Conference on Empirical Methods in
+Natural Language Processing, pages 25032–25053,
+Suzhou, China. Association for Computational Lin-
+guistics.
+Joan Bybee. 2006.
+From Usage to Grammar:
+The Mind’s Response to Repetition.
+Language,
+82(4):711–733.
+Joan Bybee. 2010. Language, usage and cognition.
+Cambridge University Press.
+Lucas Charpentier, Leshem Choshen, Ryan Cotterell,
+Mustafa Omer Gul, Michael Y. Hu, Jing Liu, Jaap
+9
+Jumelet, Tal Linzen, Aaron Mueller, Candance Ross,
+Raj Sanjay Shah, Alex Warstadt, Ethan Gotlieb
+Wilcox, and Adina Williams. 2025.
+Findings of
+the third BabyLM challenge: Accelerating language
+modeling research with cognitively plausible data. In
+Proceedings of the First BabyLM Workshop, pages
+399–420, Suzhou, China. Association for Computa-
+tional Linguistics.
+Lucas Georges Gabriel Charpentier and David Samuel.
+2024. GPT or BERT: why not both?
+In The 2nd
+BabyLM Challenge at the 28th Conference on Com-
+putational Natural Language Learning, pages 262–
+283, Miami, FL, USA. Association for Computa-
+tional Linguistics.
+Noam Chomsky. 1986. Barriers. The MIT Press, Mas-
+sachusetts Institute of Technology, Cambridge.
+Alexis Conneau, German Kruszewski, Guillaume Lam-
+ple, Loïc Barrault, and Marco Baroni. 2018. What
+you can cram into a single $&!#* vector: Probing
+sentence embeddings for linguistic properties. In
+Proceedings of the 56th Annual Meeting of the As-
+sociation for Computational Linguistics (Volume 1:
+Long Papers), pages 2126–2136, Melbourne, Aus-
+tralia. Association for Computational Linguistics.
+Róbert Csordás, Christopher Potts, Christopher D Man-
+ning, and Atticus Geiger. 2024. Recurrent neural
+networks learn to store and generate sequences us-
+ing non-linear representations. In Proceedings of the
+7th BlackboxNLP Workshop: Analyzing and Inter-
+preting Neural Networks for NLP, pages 248–262,
+Miami, Florida, US. Association for Computational
+Linguistics.
+Peter W Culicover. 1999. Syntactic Nuts: Hard Cases,
+Syntactic Theory, and Language Acquisition. Oxford
+University Press, London, England.
+Pablo J Diego Simon, Stéphane d’Ascoli, Emmanuel
+Chemla, Yair Lakretz, and Jean-Rémi King. 2024. A
+polar coordinate system represents syntax in large
+language models. Advances in Neural Information
+Processing Systems, 37:105375–105396.
+Holger Diessel. 2023. The constructicon: Taxonomies
+and networks. Cambridge University Press.
+Nelson Elhage, Tristan Hume, Catherine Olsson,
+Nicholas Schiefer, Tom Henighan, Shauna Kravec,
+Zac Hatfield-Dodds, Robert Lasenby, Dawn Drain,
+Carol Chen, Roger Grosse, Sam McCandlish, Jared
+Kaplan, Dario Amodei, Martin Wattenberg, and
+Christopher Olah. 2022.
+Toy models of super-
+position.
+https://transformer-circuits.pub/
+2022/toy_model/index.html. Accessed: –.
+Nelson Elhage, Neel Nanda, Catherine Olsson, Tom
+Henighan, Nicholas Joseph, Ben Mann, Amanda
+Askell, Yuntao Bai, Anna Chen, Tom Conerly, Nova
+DasSarma, Dawn Drain, Deep Ganguli, Zac Hatfield-
+Dodds, Danny Hernandez, Andy Jones, Jackson
+Kernion, Liane Lovitt, Kamal Ndousse, and 6 others.
+2021. A mathematical framework for transformer
+circuits.
+https://transformer-circuits.pub/
+2021/framework/index.html. Accessed: 2026-3-
+4.
+Jeffrey L Elman. 1990. Finding structure in time. Cog-
+nitive science, 14(2):179–211.
+Joshua Engels, Eric J Michaud, Isaac Liao, Wes Gurnee,
+and Max Tegmark. 2025. Not all language model fea-
+tures are one-dimensionally linear. In The Thirteenth
+International Conference on Learning Representa-
+tions.
+Kawin Ethayarajh. 2019. How contextual are contextu-
+alized word representations? Comparing the geom-
+etry of BERT, ELMo, and GPT-2 embeddings. In
+Proceedings of the 2019 Conference on Empirical
+Methods in Natural Language Processing and the
+9th International Joint Conference on Natural Lan-
+guage Processing (EMNLP-IJCNLP), pages 55–65,
+Hong Kong, China. Association for Computational
+Linguistics.
+Michael C Frank. 2023. Bridging the data gap between
+children and large language models. Trends in Cog-
+nitive Sciences.
+Richard Futrell and Kyle Mahowald. 2025. How linguis-
+tics learned to stop worrying and love the language
+models. Behavioral and Brain Sciences, page 1–98.
+Jon Gauthier, Jennifer Hu, Ethan Wilcox, Peng Qian,
+and Roger Levy. 2020. SyntaxGym: An online plat-
+form for targeted evaluation of language models. In
+Proceedings of the 58th Annual Meeting of the Associ-
+ation for Computational Linguistics: System Demon-
+strations, pages 70–76, Online. Association for Com-
+putational Linguistics.
+Atticus Geiger, Duligur Ibeling, Amir Zur, Maheep
+Chaudhary, Sonakshi Chauhan, Jing Huang, Arya-
+man Arora, Zhengxuan Wu, Noah Goodman, Christo-
+pher Potts, and 1 others. 2025. Causal abstraction: A
+theoretical foundation for mechanistic interpretability.
+Journal of Machine Learning Research, 26(83):1–64.
+Atticus Geiger, Zhengxuan Wu, Hanson Lu, Josh
+Rozner, Elisa Kreiss, Thomas Icard, Noah Good-
+man, and Christopher Potts. 2022. Inducing causal
+structure for interpretable neural networks. In In-
+ternational Conference on Machine Learning, pages
+7324–7338. PMLR.
+Atticus Geiger, Zhengxuan Wu, Christopher Potts,
+Thomas Icard, and Noah Goodman. 2024. Finding
+alignments between interpretable causal variables
+and distributed neural representations. In Causal
+Learning and Reasoning, pages 160–187. PMLR.
+Anna Gladkova, Aleksandr Drozd, and Satoshi Mat-
+suoka. 2016. Analogy-based detection of morpholog-
+ical and semantic relations with word embeddings:
+what works and what doesn’t. In Proceedings of the
+NAACL Student Research Workshop, pages 8–15, San
+Diego, California. Association for Computational
+Linguistics.
+10
+E Mark Gold. 1967. Language identification in the limit.
+Information and control, 10(5):447–474.
+Adele E Goldberg. 1995. Constructions: A construction
+grammar approach to argument structure. Chicago
+UP.
+Adele E Goldberg. 2003. Constructions: A new the-
+oretical approach to language. Trends in cognitive
+sciences, 7(5):219–224.
+Satchel Grant, Simon Jerome Han, Alexa R. Tartaglini,
+and Christopher Potts. 2025. Addressing divergent
+representations from causal interventions on neural
+networks. Preprint, arXiv:2511.04638.
+John Hewitt and Percy Liang. 2019. Designing and in-
+terpreting probes with control tasks. In Proceedings
+of the 2019 Conference on Empirical Methods in Nat-
+ural Language Processing and the 9th International
+Joint Conference on Natural Language Processing
+(EMNLP-IJCNLP), pages 2733–2743, Hong Kong,
+China. Association for Computational Linguistics.
+John Hewitt and Christopher D. Manning. 2019. A
+structural probe for finding syntax in word represen-
+tations. In Proceedings of the 2019 Conference of
+the North American Chapter of the Association for
+Computational Linguistics: Human Language Tech-
+nologies, Volume 1 (Long and Short Papers), pages
+4129–4138, Minneapolis, Minnesota. Association for
+Computational Linguistics.
+Geoffrey E Hinton. 1986. Learning distributed repre-
+sentations of concepts. In Proceedings of the Annual
+Meeting of the Cognitive Science Society, volume 8.
+Jennifer Hu, Kyle Mahowald, Gary Lupyan, Anna
+Ivanova, and Roger Levy. 2024a. Language mod-
+els align with human judgments on key grammatical
+constructions. Proceedings of the National Academy
+of Sciences, 121(36):e2400917121.
+Michael Y. Hu, Aaron Mueller, Candace Ross, Ad-
+ina Williams, Tal Linzen, Chengxu Zhuang, Ryan
+Cotterell, Leshem Choshen, Alex Warstadt, and
+Ethan Gotlieb Wilcox. 2024b. Findings of the sec-
+ond BabyLM challenge: Sample-efficient pretraining
+on developmentally plausible corpora. In The 2nd
+BabyLM Challenge at the 28th Conference on Com-
+putational Natural Language Learning, pages 1–21,
+Miami, FL, USA. Association for Computational Lin-
+guistics.
+Carina Kauf and Anna Ivanova. 2023. A better way to
+do masked language model scoring. In Proceedings
+of the 61st Annual Meeting of the Association for
+Computational Linguistics (Volume 2: Short Papers),
+pages 925–935, Toronto, Canada. Association for
+Computational Linguistics.
+Najoung Kim and Paul Smolensky. 2021. Testing for
+grammatical category abstraction in neural language
+models. In Proceedings of the Society for Compu-
+tation in Linguistics 2021, pages 467–470, Online.
+Association for Computational Linguistics.
+Diederik P Kingma and Jimmy Ba. 2014. Adam: A
+method for stochastic optimization. arXiv preprint
+arXiv:1412.6980.
+Ronald W Langacker. 2005. Construction grammars:
+Cognitive, radical, and less so. Cognitive linguistics:
+Internal dynamics and interdisciplinary interaction,
+32:101–159.
+Cara Su-Yi Leong and Tal Linzen. 2026. Manipulating
+language models’ training data to study syntactic
+constraint learning: The case of english passivization.
+Journal of Memory and Language, 149:104751.
+R Levine and T E Hukari. 2006. The unity of unbounded
+dependency constructions. Center for the Study of
+Language and Information, Stanford.
+Tal Linzen, Emmanuel Dupoux, and Yoav Goldberg.
+2016. Assessing the ability of LSTMs to learn syntax-
+sensitive dependencies. Transactions of the Associa-
+tion for Computational Linguistics, 4:521–535.
+Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Man-
+dar Joshi, Danqi Chen, Omer Levy, Mike Lewis,
+Luke Zettlemoyer, and Veselin Stoyanov. 2019.
+RoBERTa: A robustly optimized bert pretraining ap-
+proach. Preprint, arXiv:1907.11692.
+Daniel Loureiro, Kiamehr Rezaee, Mohammad Taher
+Pilehvar, and Jose Camacho-Collados. 2021. Anal-
+ysis and evaluation of language models for word
+sense disambiguation. Computational Linguistics,
+47(2):387–443.
+Aleksandar Makelov, Georg Lange, Atticus Geiger, and
+Neel Nanda. 2024. Is this the subspace you are look-
+ing for? an interpretability illusion for subspace acti-
+vation patching. In The Twelfth International Confer-
+ence on Learning Representations.
+Alec Marantz and Morris Halle. 1993.
+Distributed
+morphology and the pieces of inflection. In Ken-
+neth Locke Hale and Samuel Jay Keyser, editors,
+The View from Building 20: Essays in Linguistics in
+Honor of Sylvain Bromberger, pages 112–176. MIT
+Press, Cambridge.
+R. Thomas McCoy, Tal Linzen, Ewan Dunbar, and
+Paul Smolensky. 2019. RNNs implicitly implement
+tensor-product representations. In International Con-
+ference on Learning Representations.
+Stephen Merity, Caiming Xiong, James Bradbury, and
+Richard Socher. 2017. Pointer sentinel mixture mod-
+els. In International Conference on Learning Repre-
+sentations.
+Tomáš Mikolov, Ilya Sutskever, Kai Chen, Greg S Cor-
+rado, and Jeff Dean. 2013. Distributed representa-
+tions of words and phrases and their compositionality.
+Advances in neural information processing systems,
+26.
+Raphaël Millière. 2024. Language models as models of
+language. Preprint, arXiv:2408.07144.
+11
+Kanishka Misra. 2022. minicons: Enabling flexible be-
+havioral and representational analyses of transformer
+language models. arXiv preprint arXiv:2203.13112.
+Kanishka Misra and Najoung Kim. 2023.
+Abstrac-
+tion via exemplars? a representational case study
+on lexical category inference in bert.
+Preprint,
+arXiv:2312.03708.
+Kanishka Misra and Kyle Mahowald. 2024. Language
+models learn rare phenomena from less rare phenom-
+ena: The case of the missing AANNs. In Proceed-
+ings of the 2024 Conference on Empirical Methods
+in Natural Language Processing, pages 913–929, Mi-
+ami, Florida, USA. Association for Computational
+Linguistics.
+Neel Nanda, Andrew Lee, and Martin Wattenberg. 2023.
+Emergent linear representations in world models of
+self-supervised sequence models. In Proceedings
+of the 6th BlackboxNLP Workshop: Analyzing and
+Interpreting Neural Networks for NLP, pages 16–30,
+Singapore. Association for Computational Linguis-
+tics.
+Sébastien Pacton and Ronald Peereman. 2023. Mor-
+phology as an aid in orthographic learning of new
+words: The influence of inflected and derived forms
+in spelling acquisition.
+Journal of Experimental
+Child Psychology, 232:105675.
+Kiho Park, Yo Joong Choe, and Victor Veitch. 2024.
+The linear representation hypothesis and the geome-
+try of large language models. In Proceedings of the
+41st International Conference on Machine Learning,
+pages 39643–39666.
+Abhinav Patil, Jaap Jumelet, Yu Ying Chiu, Andy La-
+pastora, Peter Shen, Lexie Wang, Clevis Willrich,
+and Shane Steinert-Threlkeld. 2024. Filtered corpus
+training (FiCT) shows that language models can gen-
+eralize from indirect evidence. Transactions of the
+Association for Computational Linguistics, 12:1597–
+1615.
+F. Pedregosa, G. Varoquaux, A. Gramfort, V. Michel,
+B. Thirion, O. Grisel, M. Blondel, P. Prettenhofer,
+R. Weiss, V. Dubourg, J. Vanderplas, A. Passos,
+D. Cournapeau, M. Brucher, M. Perrot, and E. Duch-
+esnay. 2011.
+Scikit-learn: Machine learning in
+Python.
+Journal of Machine Learning Research,
+12:2825–2830.
+Tiago Pimentel, Josef Valvoda, Rowan Hall Maudslay,
+Ran Zmigrod, Adina Williams, and Ryan Cotterell.
+2020. Information-theoretic probing for linguistic
+structure. In Proceedings of the 58th Annual Meet-
+ing of the Association for Computational Linguistics,
+pages 4609–4622, Online. Association for Computa-
+tional Linguistics.
+Emily Reif, Ann Yuan, Martin Wattenberg, Fernanda B
+Viegas, Andy Coenen, Adam Pearce, and Been Kim.
+2019. Visualizing and measuring the geometry of
+bert.
+Advances in neural information processing
+systems, 32.
+Anna Rogers, Olga Kovaleva, and Anna Rumshisky.
+2020. A primer in BERTology: What we know about
+how BERT works. Transactions of the Association
+for Computational Linguistics, 8:842–866.
+John Robert Ross. 1967. Constraints on variables in
+syntax. Ph.D. thesis, MIT.
+Joshua Rozner, Leonie Weissweiler, Kyle Mahowald,
+and Cory Shain. 2025a. Constructions are revealed
+in word distributions. In Proceedings of the 2025
+Conference on Empirical Methods in Natural Lan-
+guage Processing, pages 2116–2138, Suzhou, China.
+Association for Computational Linguistics.
+Joshua Rozner, Leonie Weissweiler, and Cory Shain.
+2025b. BabyLM’s first constructions: Causal inter-
+ventions provide a signal of learning. In Proceed-
+ings of the 2025 Conference on Empirical Methods
+in Natural Language Processing, pages 2237–2249,
+Suzhou, China. Association for Computational Lin-
+guistics.
+Ivan A Sag. 2010. English filler-gap constructions. Lan-
+guage, pages 486–545.
+Naomi Saphra and Sarah Wiegreffe. 2024. Mechanistic?
+In Proceedings of the 7th BlackboxNLP Workshop:
+Analyzing and Interpreting Neural Networks for NLP,
+pages 480–498, Miami, Florida, US. Association for
+Computational Linguistics.
+Roger N Shepard. 1987. Toward a universal law of
+generalization for psychological science. Science,
+237(4820):1317–1323.
+Paul Smolensky. 1990. Tensor product variable bind-
+ing and the representation of symbolic structures in
+connectionist systems. Artificial intelligence, 46(1-
+2):159–216. Publisher: Elsevier.
+Karolina Stanczak, Edoardo Ponti, Lucas Torroba Hen-
+nigen, Ryan Cotterell, and Isabelle Augenstein. 2022.
+Same neurons, different languages: Probing mor-
+phosyntax in multilingual pre-trained models. In
+Proceedings of the 2022 Conference of the North
+American Chapter of the Association for Computa-
+tional Linguistics: Human Language Technologies,
+pages 1589–1598, Seattle, United States. Association
+for Computational Linguistics.
+Harald Steck, Chaitanya Ekanadham, and Nathan
+Kallus. 2024. Is cosine-similarity of embeddings
+really about similarity? In Companion Proceedings
+of the ACM Web Conference 2024, pages 887–890.
+Anatol Stefanowitsch and Stefan Th. Gries. 2003. Col-
+lostructions: Investigating the interaction of words
+and constructions. International Journal of Corpus
+Linguistics, 8(2):209–243.
+Denis Sutter, Julian Minder, Thomas Hofmann, and
+Tiago Pimentel. 2025. The non-linear representation
+dilemma: Is causal abstraction enough for mecha-
+nistic interpretability? In The Thirty-ninth Annual
+Conference on Neural Information Processing Sys-
+tems.
+12
+Simone Teglia, Simone Tedeschi, and Roberto Navigli.
+2025. How much do encoder models know about
+word senses?
+In Proceedings of the 63rd Annual
+Meeting of the Association for Computational Lin-
+guistics (Volume 1: Long Papers), pages 2266–2277,
+Vienna, Austria. Association for Computational Lin-
+guistics.
+Adly Templeton, Tom Conerly, Jonathan Marcus, Jack
+Lindsey, Trenton Bricken, Brian Chen, Adam Pearce,
+Craig Citro, Emmanuel Ameisen, Andy Jones, Hoagy
+Cunningham, Nicholas L Turner, Callum McDougall,
+Monte MacDiarmid, Alex Tamkin, Esin Durmus,
+Tristan Hume, Francesco Mosconi, C Daniel Free-
+man, and 7 others. 2024. Scaling monosemanticity:
+Extracting interpretable features from claude 3 son-
+net. https://transformer-circuits.pub/2024/
+scaling-monosemanticity/. Accessed: 2026-3-4.
+Joshua B Tenenbaum, Charles Kemp, Thomas L Grif-
+fiths, and Noah D Goodman. 2011. How to grow a
+mind: statistics, structure, and abstraction. Science,
+331(6022):1279–1285.
+Ian Tenney, Dipanjan Das, and Ellie Pavlick. 2019.
+BERT rediscovers the classical NLP pipeline. In
+Proceedings of the 57th Annual Meeting of the Asso-
+ciation for Computational Linguistics, pages 4593–
+4601, Florence, Italy. Association for Computational
+Linguistics.
+William Timkey and Marten van Schijndel. 2021. All
+bark and no bite: Rogue dimensions in transformer
+language models obscure representational quality.
+In Proceedings of the 2021 Conference on Empiri-
+cal Methods in Natural Language Processing, pages
+4527–4546, Online and Punta Cana, Dominican Re-
+public. Association for Computational Linguistics.
+Michael Tomasello. 2005. Constructing a language: A
+usage-based theory of language acquisition. Harvard
+university press.
+Mycal Tucker, Peng Qian, and Roger Levy. 2021. What
+if this modified that? syntactic interventions with
+counterfactual embeddings. In Findings of the Asso-
+ciation for Computational Linguistics: ACL-IJCNLP
+2021, pages 862–875, Online. Association for Com-
+putational Linguistics.
+Benjamin Warner, Antoine Chaffin, Benjamin Clavié,
+Orion Weller, Oskar Hallström, Said Taghadouini,
+Alexis Gallagher, Raja Biswas, Faisal Ladhak, Tom
+Aarsen, Griffin Thomas Adams, Jeremy Howard, and
+Iacopo Poli. 2025. Smarter, better, faster, longer:
+A modern bidirectional encoder for fast, memory
+efficient, and long context finetuning and inference.
+In Proceedings of the 63rd Annual Meeting of the
+Association for Computational Linguistics (Volume
+1: Long Papers), pages 2526–2547, Vienna, Austria.
+Association for Computational Linguistics.
+Alex Warstadt and Samuel R Bowman. 2022. What
+artificial neural networks can tell us about human lan-
+guage acquisition. In Algebraic structures in natural
+language, pages 17–60. CRC Press.
+Alex Warstadt, Aaron Mueller, Leshem Choshen, Ethan
+Wilcox, Chengxu Zhuang, Juan Ciro, Rafael Mos-
+quera, Bhargavi Paranjabe, Adina Williams, Tal
+Linzen, and Ryan Cotterell. 2023. Findings of the
+BabyLM challenge: Sample-efficient pretraining on
+developmentally plausible corpora. In Proceedings
+of the BabyLM Challenge at the 27th Conference on
+Computational Natural Language Learning, pages
+1–34, Singapore. Association for Computational Lin-
+guistics.
+Jennifer C. White, Tiago Pimentel, Naomi Saphra, and
+Ryan Cotterell. 2021. A non-linear structural probe.
+In Proceedings of the 2021 Conference of the North
+American Chapter of the Association for Computa-
+tional Linguistics: Human Language Technologies,
+pages 132–138, Online. Association for Computa-
+tional Linguistics.
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien
+Chaumond, Clement Delangue, Anthony Moi, Pier-
+ric Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz,
+and Jamie Brew. 2019. Huggingface’s transformers:
+State-of-the-art natural language processing. CoRR,
+abs/1910.03771.
+Zhengxuan Wu, Atticus Geiger, Thomas Icard, Christo-
+pher Potts, and Noah Goodman. 2023. Interpretabil-
+ity at scale: Identifying causal mechanisms in alpaca.
+In Thirty-seventh Conference on Neural Information
+Processing Systems.
+Kaitlyn Zhou, Kawin Ethayarajh, Dallas Card, and Dan
+Jurafsky. 2022. Problems with cosine as a measure
+of embedding similarity for high frequency words.
+In Proceedings of the 60th Annual Meeting of the
+Association for Computational Linguistics (Volume
+2: Short Papers), pages 401–423, Dublin, Ireland.
+Association for Computational Linguistics.
+A
+Supplement: Methods
+A.1
+Models
+We use GPT-BERT as our BabyLM because it was
+the best-performing model in the 2024 BabyLM
+challenge (Hu et al., 2024b) and is an MLM. We
+use the version of it that was used as a baseline
+in the 2025 BabyLM challenge (Charpentier et al.,
+2025).4 Other models (RoBERTa, ModernBERT,
+and Pythia) are also obtained from Huggingface.
+For GPT-BERT, RoBERTa and ModernBERT, we
+use Huggingface’s from_config method to obtain
+a randomly initialized version of the model. For
+the untrained Pythia model, we use the untrained
+step 0 checkpoint.
+4Accessed
+via
+HuggingFace:
+https:
+//huggingface.co/BabyLM-community/
+babylm-baseline-100m-gpt-bert-mixed
+13
+A.2
+Hyperparameter selection
+As each model has a slightly different size and
+structure, we tune perturbation parameters (learn-
+ing rate and number of steps) against AUC cluster-
+ability (see 2.2, A.4; either separating the linguistic
+classes of interest, or distinguishing a control class)
+using a separate training set before conducting final
+evaluation on a held-out test set. (For Lexical Rep-
+resentations and Filler Gap, train-test splits were
+provided by the existing benchmarks. For Morphol-
+ogy, we create the separate sets via separate sam-
+ples of the Cosmo Corpus.) Details of the classes
+and controls are provided in each experiment sec-
+tion and final hyperparameter choices are in each
+experiment section’s corresponding Appendix.
+Though we use separate train and test sets to
+make sure that we do not tune the perturbation pa-
+rameters to the train set, performance across train-
+ing and test sets is similar and there is no evidence
+that, in optimizing steps and learning rate, pertur-
+bation “learns the train set.” For example, for mor-
+phology, RoBERTa-large has AUC 0.898 on the
+training set and 0.889 on the test set. ModernBERT-
+large has AUC 0.858 on training and 0.871 on test.
+In the hyperparameter search, we observe that
+perturbation achieves high clusterability on trained
+models at a variety of learning rates and gradient
+steps. Unsurprisingly, high learning rates or too
+many steps can collapse model behavior; lower
+learning rates produce smaller effects. In Section 5:
+Syntactic Representations we report how much
+model perplexity changes after perturbation on the
+filler-gap syntax task. Unsurprisingly, during hyper-
+parameter tuning on the filler-gap syntax task, we
+observe that higher learning rates and more gradi-
+ent steps raise perplexity more than lower learning
+rates and fewer steps.
+A.3
+Cost of perturbation training and
+evaluation
+Perturbation is relatively inexpensive to run. For
+example, for Section 5: Syntactic Representations,
+we can run a full experiment on a Pythia-1.4B
+checkpoint in 15 minutes on a single Nvidia RTX
+A6000. This produces 145k observations: 5 sep-
+arate training perturbations of each of 34 classes
+(170 perturbations), with each evaluated on 25 ex-
+amples from each class (150 data points per square
+in the similarity matrices produced in Figure A7).
+For comparison, Boguraev et al. (2025) report
+that for one model checkpoint, training and evalua-
+tion on two Nvidia A40 GPUs required 262 hours.
+Our entire FG analysis (which tested 13 model
+checkpoints on both FG and the non-FG control)
+took 15 × 13 × 2 = 7hrs.
+A.4
+Clusterability AUC
+As noted in Section 2.2: Experimental Design, we
+use a generic notion of clusterability for evaluation,
+which measures the degree to which similarities
+are higher within vs. between classes as an area
+under the curve. Specifically, we compute an n×n
+perturbation transfer matrix (i.e., a perturbation-
+based similarity matrix) across all examples in the
+dataset, where the value at cell i, j is the log odds-
+ratio R when the model is evaluated on remapping
+j after being perturbed (i.e., trained) using remap-
+ping i. We treat these scores as a classifier signal
+for “same cluster” and compute the area under the
+curve (AUC) of the receiver operating character-
+istic against a label matrix L where Li,j = 1 iff i
+and j are of the same class, and zero otherwise.5 In
+this setting, a higher AUC indicates that same-class
+items tend to have higher similarity scores than
+different-class items. Clusterability has the bene-
+fit that it produces a deterministic value that does
+not depend on the choice of a particular clustering
+technique or seed.
+B
+Supplement for Section 3:
+Morphological Representations
+B.1
+Methods
+As described in Section 3:
+Morphological
+Representations, we evaluate on a test set of 98
+examples (one each of the 2 × 50 = 100 -er words,
+except for two words which were not found in the
+BabyLM Cosmo corpus). Hyperparameters (learn-
+ing rate and number of epochs) were tuned on sepa-
+rate data for training to maximize AUC clusterabil-
+ity across the two classes. Hyperparameters for all
+models tested are given in B.5.
+When computing AUC clusterability for mor-
+phology, we do not symmetrize the matrix.
+B.2
+Linear model
+Marginal
+effects
+are
+computed
+with
+the
+marginal-effects
+package
+(Arel-Bundock
+et al., 2024) using balanced factor weights.
+Table A1 gives average effects across the three
+5We use scikit (Pedregosa et al., 2011). As the distribution
+of classes in the dataset is not always balanced we compute
+AUC with reweighting, so that the distribution within both the
+positive and negative label sets is equal across classes.
+14
+trained class
+tokenization
+effect
+p-val
+multi-diff
+−0.10 ± 0.03
+0.003
+multi-same
+3.3±0.2
+< 0.001
+single-multi
+−0.06 ± 0.02
+0.009
+single-single
+−0.09 ± 0.05
+0.04
+multi-diff
+−0.17 ± 0.06
+0.05
+multi-same
+2.6 ±0.2
+< 0.001
+single-multi
+−0.10 ± 0.04
+0.03
+single-single
+−0.10 ± 0.08
+0.02
+multi-diff
+0.03 ± 0.03
+0.03
+multi-same
+0.04 ± 0.2
+0.09
+single-multi
+−0.14 ± 0.02
+< 0.001
+single-single
+0.08 ± 0.05
+0.06
+multi-diff
+0.95 ±0.06
+< 0.001
+multi-same
+1.3 ±0.2
+< 0.001
+single-multi
+1.34 ±0.04
+< 0.001
+single-single
+3.32 ±0.08
+< 0.001
+false
+between
+class
+within
+class
+true
+between
+class
+within
+class
+Table A1: Morphology Linear Model Summary: Average ef-
+fects by all three factors. Average effects greater than 0.1 are
+bolded. As discussed in §3, untrained models show mean-
+ingful transfer only in the multi-same (shared token) setting.
+Trained models show meaningful transfer only to items of the
+same class. In trained models single-single transfer is signif-
+icantly higher than other tokenization settings (discussed in
+B.4).
+trained
+untrained
+diff
+within class
+1.73
+(p < 0.001)
+0.56
+(p < 0.001)
+1.17
+(p < 0.001)
+between class
+0.003
+(p = 0.97)
+0.75
+(p < 0.001)
+-0.75
+(p < 0.001)
+Table A2: Marginal effects by class and training status. (Note:
+since we use balanced factor weights, these correspond to the
+average of the corresponding values in Table A1.) Trained
+models show transfer only within class. Untrained models
+show some transfer both within and between classes, but this
+is because the average includes pairs with shared tokens (see
+Table A3).
+factors tested in the linear model in §3 (though
+it omits for clarity the distinction between
+same-class-comparative and same-class-deverbal).
+Table A2 and Table A3 give average effects for the
+aggregations discussed in that section.
+B.3
+Vertical patterning in untrained models
+We verify that vertical patterning in the untrained
+model is random. We initialize a HuggingFace
+RoBERTa-large model with seven different seeds.
+We compute the transfer matrix on the common
+training dataset for all of these models.
+We look for linear dependence in the transfer
+matrix structure (i.e. consistent vertical pattern-
+ing across initializations) using a permutation test.
+We consider the first 33 × 33 block of each matrix
+(this is the portion of the matrix before any shared
+tokens). We first compute the average observed
+Pearson correlation coefficient (on flattened matri-
+trained
+untrained
+within class
+1.3
+2.6
+between class
+0.04
+(p = 0.9)
+3.3
+within class
+1.87
+-0.12
+between class
+-0.01
+(p = 0.6)
+-0.08
+Shared token
+No shared token
+Table A3: Marginal effects by whether there is a shared token
+(i.e., multi-same is True). This table can be computed from
+Table A1, with averaging in the case of within-class (deverbal
+and comparative) and no-shared-token (average of the three
+values for the tokenization factor that are not multi-same).
+Untrained models show transfer (both within and between
+classes) only when there is a shared token. Trained models
+show similar transfer effect regardless of whether there is a
+shared token. In trained models, effect size with no shared
+token (1.87) is higher than shared token (1.3) because the
+single-single tokenization setting has higher transfer than all
+multi-token settings. P-values are < 0.001 except where
+indicated.
+ces with diagonal excluded) over all pairs of the 7
+transfer matrices (21 unique pairs).
+We test under column permutation and also full
+matrix permutation. For column permutation, we
+construct a null distribution by computing the same
+statistic (i.e. average of correlation coefficient over
+21 matrix pairs) under n=10,000 random permu-
+tations of the matrix columns, which results in a
+p-value of 0.720 (i.e., the permuted matrices pro-
+duce a statistic larger than the observed statistic in
+72% of trials).
+For the full matrix permutation, we do the same
+but randomly permute the entire matrix (we flat-
+ten, shuffle, and then unflatten). Under n=10,000
+random permutations of the matrices, we obtain a
+p-value of 0.725. We thus fail to find evidence of
+systematic patterning in the transfer to particular
+items when there are no shared tokens.
+B.4
+Additional findings from the morphology
+analysis
+Multi-token effects
+In trained models, within-
+class pairs show significantly higher transfer when
+both are singly-tokenized: single-single (3.32) vs.
+multi-diff (0.95; diff = 2.37, p < 0.001; see Ta-
+ble A1). This suggests either that our approach
+to perturbation does not work as well in the multi-
+token setting, or that shared representations are
+weaker in multitoken words.
+Mediators of transfer (i.e. ablations)
+As per-
+turbation enables us to easily alter aspects of the
+context or critical region remappings, we further
+investigate the extent to which generalization is
+mediated by different aspects of the remappings
+15
+perturbation setting
+AUC-all
+AUC-single
+AUC-multi
+eff diff (single)
+eff diff (multi)
+normal
+(+ tall, - taller)
+0.889
+0.981
+0.796
+3.24 ± 0.08
+(p < 0.001)
+1.3 ± 0.3
+(p < 0.001)
+no contrastive
+(+ tall)
+0.831
+0.963
+0.755
+1.96 ± 0.08
+(p < 0.001)
+1.0 ± 0.3
+(p < 0.001)
+no context
+(+ tall, - taller)
+0.792
+0.995
+0.681
+12.1 ± 0.4
+(p < 0.001)
+2.9 ± 1.4
+(p = 0.045)
+common target (blue)
+(+ blue, - taller)
+0.767
+0.836
+0.738
+2.6 ± 0.1
+(p < 0.001)
+1.6 ± 0.5
+(p < 0.001)
+common target (blue)
+no contrastive
+(+ blue)
+0.743
+0.782
+0.717
+1.9 ± 0.1
+(p < 0.001)
+1.7 ± 0.5
+(p < 0.001)
+-eze morpheme
+(+talleze, - taller)
+0.709
+0.794
+0.665
+1.2 ± 0.7
+(p < 0.001)
+0.5 ± 0.2
+(p = 0.022)
+Table A4: Results under various changes to the train and eval remappings on RoBERTa-large. Row 1 reproduces the result
+presented in the main text, for comparison. AUC-single and AUC-multi give clusterability of the subset of words that are singly
+or multi-tokenized. Eff diff give the difference in effect in the linear model across same-class and between-class, then conditioned
+by whether words are singly or multitokenized.
+(Table A4).
+As we saw that tokenization (single vs. multiple)
+has a significant effect on transfer, we report results
+(AUC and average marginal effect) by tokeniza-
+tion. (For example, AUC-single is the clusterabil-
+ity metric but only on the portion of the similarity
+matrix corresponding to singly-tokenized words.)
+We again compute a linear model in the same way
+as before, but with factors only for class and tok-
+enization. Eff diff in the last two columns gives
+the difference between marginal effects for in-class
+vs. between-class transfer, separated by single to-
+ken (second-to-last column) and multi-token (last
+column) conditions. This effect size and p-value
+indicates whether or not the two classes (deverbal
+vs. comparative) are distinguished by the model
+using perturbation.
+Row 1 reproduces the main text result for
+RoBERTa-large. Row 2 ablates the contrastive loss:
+normally we train (+tall, -taller), but here we train
+only to (+tall). Evaluation in the no-contrastive set-
+ting is still computed with log odds of both items
+(tall, taller).
+In the following rows we explore three remap-
+ping changes which are potentially linguistically
+meaningful. First, we set the context to ∅and per-
+turb only on the critical region. Single-token words
+are still well-distinguished (AUC 0.995), but multi-
+token words have clusterability of only 0.681. In
+other words, without context, transfer in singly-
+tokenized pairs still reflects differences in morpho-
+logical class. On the other hand, multi-token words
+are no longer separated, suggesting that the model
+may rely more on context to achieve stable repre-
+sentations for multitoken words. (Note that effects
+in the no-context setting are larger since perturba-
+tion is no longer conditioned on any context.)
+Second, instead of contrastively perturbing e.g.,
+toward tall and away from taller, we perturb only
+towards a different static token, blue. This allows
+us to assess how the model transfers the pertur-
+bation from the context alone, without any direct
+feedback about the intended content of the critical
+region. For completeness, we present this result
+both with and without contrastive loss; the linguis-
+tically meaningful result that captures transfer due
+to context only is the one without contrastive loss.
+This approach gives overall AUC of 0.74, showing
+that the contexts contain meaningful information
+that affects how the model generalizes the training
+remapping.
+Third, we test transfer using an unknown mor-
+pheme (e.g. taller -> talleze). (Note, in this setting,
+we evaluate on talleze vs. taller rather than tall
+vs. taller.) This produces the lowest AUC, and the
+model again fails to distinguish the deverbal and
+comparative in the multitoken setting (p=0.022). In
+other words, perturbing to a novel suffix inhibits
+transfer along morphological class dimension, pos-
+sibly because the model is unlikely to have a pre-
+existing representation for X-eze. (Moreover, the
+fact that X-eze is always multi-tokenized, is likely
+to further confound transfer.)
+B.5
+Additional results for other models
+We use the following parameters for pertur-
+bation (chosen by highest clusterability AUC
+on the train set):
+RoBERTa-base:
+LR=1e-5,
+epochs=5; RoBERTa-large: LR=1e-5, epochs=5;
+16
+babylm-gpt-bert
+Deverbal
+Comparative
+untrained
+Deverbal
+Comparative
+trained
+deverbal
+comparative
+−2.5
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+effects (trained)
+deverbal
+comp
+mbert-base
+Deverbal
+Comparative
+Deverbal
+Comparative
+deverbal
+comparative
+−1
+0
+1
+2
+3
+deverbal
+comp
+mbert-large
+Deverbal
+Comparative
+Deverbal
+Comparative
+deverbal
+comparative
+−2
+−1
+0
+1
+2
+3
+4
+5
+deverbal
+comp
+rob-base
+Deverbal
+Comparative
+Deverbal
+Comparative
+deverbal
+comparative
+−1
+0
+1
+2
+3
+deverbal
+comp
+−6
+−4
+−2
+0
+2
+4
+6
+−6
+−4
+−2
+0
+2
+4
+6
+−3
+−2
+−1
+0
+1
+2
+3
+−3
+−2
+−1
+0
+1
+2
+3
+−3
+−2
+−1
+0
+1
+2
+3
+−3
+−2
+−1
+0
+1
+2
+3
+−3
+−2
+−1
+0
+1
+2
+3
+−3
+−2
+−1
+0
+1
+2
+3
+Figure A1: Results for all models, with untrained on left, trained in middle, and effect distribution (log-odds) in
+trained models on right. Effect sizes in the heatmaps are clipped to 7,3,3,3,3 respectively (effect sizes vary based on
+learning rate, which was tuned per model) so that the diagonal does not hide the rest of the heatmap structure. The
+final row (rob-large) is the same as is shown in the main text.
+17
+Model
+AUC un-
+trained
+AUC
+trained
+ModernBERT-B
+0.53
+0.84
+ModernBERT-L
+0.54
+0.86
+RoBERTa-B
+0.51
+0.87
+RoBERTa-L
+0.52
+0.89
+GPT-BERT
+0.54
+0.74
+Table A5: Morphology: AUC clusterability across models by
+train status.
+ModernBERT-base:
+LR=5e-5,
+epochs=3;
+ModernBERT-large:
+LR=5e-5,
+epochs=3;
+GPT-BERT: LR=5e-4, epochs=5.
+AUC clusterability is given in Table A5, and
+transfer-based similarity matrices are shown in Fig-
+ure A1.
+C
+Supplement for Section 4: Lexical
+Representations
+C.1
+Methods
+Dataset
+We provide additional details for the
+CoarseWSD-20 dataset (CWSD; Loureiro et al.
+2021). All sentences in the dataset are entirely
+lowercase. The dataset consists of the following
+words: apple, arm, bank, bass, bow, chair, club,
+crane, deck, digit, hood, java, mole, pitcher, pound,
+seal, spring, square, trunk, yard.
+When sampling sentences for our train and test
+sets, we omit a small number of examples where
+the target word occurs multiple times in the sen-
+tence. As noted in §4, for each of the 20 words in
+the dataset, we sample 100 examples equally bal-
+anced over the senses for that word. Some words
+have insufficient examples for a given sense. In
+those cases, clusterability is reweighted to be bal-
+anced (see A.4). The total number of examples
+sampled is 1606 (versus 2000 possible), with 136k
+similarity scores for analysis.
+As we find that tokenization can impact pertur-
+bation results (§3), we report words that are not
+singly tokenized: For RoBERTa, 5 usages in the
+test dataset have the target word split into two
+tokens (this can happen, for example, if the tar-
+get word occurs at the start of the sentence). For
+Modern-BERT, in addition to those 5 usages, all
+usages of ‘crane’ are two tokens. For GPT-BERT,
+‘crane’, ‘hood’, ‘java’, ‘mole’, and ‘pitcher’ are
+always two tokens.
+Hyperparameters
+Hyperparameters (learning
+rate and number of epochs) were tuned on
+separate data for training (the CWSD train
+Word
+Perturb AUC
+glam
+0.871
+aaaa
+0.883
+acuity
+0.865
+nonce
+0.889
+Table A6: Average AUC on test set using other perturbation
+targets in ModernBERT-large.
+split) to maximize average AUC clusterabil-
+ity across word senses.
+For the final test,
+we use the following settings:
+RoBERTa-
+base:
+LR=3e-6,
+epochs=3;
+RoBERTa-large:
+LR=3e-6, epochs=1; ModernBERT-base: LR=3e-
+5, epochs=3;
+ModernBERT-large:
+LR=3e-5,
+epochs=3; GPT-BERT: LR=1e-6, epochs=1.
+Computations
+For the word-vector baseline, we
+run the model forward and extract the hidden state.
+When a word has multiple tokens, we follow Teglia
+et al. (2025) and average. We normalize with Eu-
+clidean norm prior to computing the similarity ma-
+trix, which is just the dot products of the two repre-
+sentations.
+C.2
+Additional results: other perturbation
+targets
+We
+test
+three
+other
+remapping
+targets
+on
+ModernBERT-large for the test set (note that hy-
+perparameters were tuned using “glam”); see Ta-
+ble A6.
+C.3
+Similarity visualizations
+See Figure A6. Perturbation provides both quanti-
+tatively higher AUC and qualitatively better visual
+separation between word senses. Perturbation also
+more clearly reveals graded relatedness of different
+senses. For example, for square, there is visibly
+more transfer between the geometric shape usage
+and the town square usage (which share a notion of
+shape) than there is between either of these usages
+and the company usage (which has little semanti-
+cally in common with the geometric notion of a
+square).
+D
+Supplement for Section 5: Syntactic
+Representations
+D.1
+Methods
+Dataset
+Table A7 is reproduced from Boguraev
+et al. (2025) and shows example non-embedded,
+animate minimal pairs. For description of the inan-
+imate and embedded conditions, the reader is re-
+ferred to the original paper.
+18
+Construction Prefix
+Filler
+NC Article
+NP
+Verb
+Label
+Emb. Wh-Q (Know) I know
+who/that
+the
+man
+liked
+./him
+Emb. Wh- (Wonder) I wonder who/if
+the
+man
+liked
+./him
+Matrix Wh-Q
+Who/""
+did the
+man
+like
+?/him
+Restr. Rel. Clause The boy who/and
+the
+man
+liked
+was/him
+Cleft It was
+the boy/clear that the
+man
+liked
+./the boy
+Pseudo-Cleft
+Who/That
+the
+man
+liked
+was/it
+Topicalization Actually, the boy/""
+the
+man
+liked
+./the boy
+Agreement Control (ctrl-agr) The
+boy/boys
+that the
+man
+liked
+is/are
+Transitive Control (ctrl-trans)
+Once/Today
+some/that man/boy ran/liked ./him
+Table A7: Studied filler-gap pairs, reproduced from Boguraev et al. (2025)
+Perturbation
+During perturbation training and
+evaluation, for all completions/targets (sentence
+suffixes) in the Boguraev et al. dataset, only the
+first token of any completion is considered. We
+confirmed that this is consistent with how Bogu-
+raev et al. conducted their experiments. Though
+some examples in the dataset have multiple word
+targets, the authors confirmed (p.c.) that only the
+first (singly-tokenized) word is considered in these
+cases.
+The perturbation code released with our work is
+implemented so that multiple token targets can be
+targeted. Though we test multitoken targets in the
+MLM case, we do not do so in the autoregressive
+case, to improve comparability to prior work.
+Experiment
+For each trial, we sample a single
+perturbation target and 25 disjoint evaluation exam-
+ples. For each of of the 34 conditions (7 FG × 2
+animacy × 2 embeddedness, plus 2×2 cross of an-
+imacy and embeddedness conditions for ctrl-trans,
+plus 2 embeddedness conditions for ctrl-agr), we
+run 5 separate trials (34 × 5 total perturbations).
+Because we are trying to perturb the model’s rep-
+resentation of FG constructions, we always perturb
+to the incorrect completion in a minimal pair (e.g.,
+I know who the man liked him, The boy that the
+man liked are, Once some man ran him). For these
+training perturbations, the prefix string is always
+FG (e.g., who), singular (e.g., boy), or intransitive
+(e.g., ran). (These are all parallel in the structure of
+Table A7.)
+For evaluation, we use both versions of the prefix
+string for FG (these form our FG, nonFG condi-
+tions). For evaluation we do not make use of plural
+ctrl-agr nor transitive ctrl-trans.
+Hyperparameters
+For hyperparameter tuning
+(learning rate and number of epochs), we max-
+imize AUC clusterability, where we take as our
+classes FG and controls (ctrl-agr, ctrl-trans). We
+do not consider whether the model groups different
+controls together, just whether the entire group ctrl-
+agr and ctrl-trans is more self-similar than similar
+to FG. Final hyperparameters for Pythia-1.4B are
+LR=1e-6 and epochs=5.
+D.2
+Effects of Critical Region Similarity
+We compute critical region similarity (CRS) for
+the minimal pairs using a modified Jaccard mea-
+sure. The similarity of any two conditions S(i, j)
+is given by
+S(i, j) =
+X
+w∈V
+min
+ Ci(w), Cj(w)
+
+max(Ti, Tj)
+where V is the space of all possible label words,
+Ci(w) is the count of the word w in the minimal
+pairs for condition i, and Ti = P
+w∈V Ci is the
+total size of the label space for class i.
+We compute the modified Jaccard similarity on
+the train split (the test split has similar CRS) for the
+FG targets/completions (Figure A2), the non-FG
+targets/completions (Figure A3), and both together
+(Figure A4). In Boguraev et al. (2025), during train-
+ing, DAS learns parameters such that the model
+outputs the FG label (Figure A2). During evalua-
+tion, the effect of the intervention learned by DAS
+is evaluated simultaneously against both the FG
+and non-FG targets.
+Observations and implications
+As noted in the
+main text, in the FG condition, ctrl-agr has no
+output targets in common with pseudocleft or re-
+stricted relative clause (i.e., CRS is 0), and is thus
+an anticonservative control. In their Section 5,
+Boguraev et al. study the degree of transfer be-
+tween different FG conditions, but they do not con-
+trol for the confound shown here.
+We note that while our baselined-transfer con-
+dition should account for differences in CRS, we
+19
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+Figure A2: Modified Jaccard similarity of output labels
+(CRS) for minimal pairs across conditions for FG condi-
+tion. This corresponds to the target labels toward which
+perturbation and DAS train, and to positive evaluation
+effects.
+may nonetheless still observe patterning in filler-
+gap similarities that resemble the CRS matrix. This
+a strength of our design: we want to be able to
+capture deeper representational similarity even be-
+tween construction types that are similar for more
+superficial reasons, and our controls enable us to
+do this.
+D.3
+Additional discussion of transfer over the
+course of training
+In Figure 4, FG and non-FG are seen to be nearly
+perfectly confounded through step 512. They differ
+only in, e.g., who vs. that, and thus transfer from
+FG to non-FG is likely mediated by token set over-
+lap before the FG/non-FG distinction is learned.
+Through step 512, we also see transfer to/from
+ctrl-trans. Note that this corresponds to transfer
+to/from the perturbation I know who the man liked
+. [. →him] from/to Once some man ran . [. →
+him]. In this case, excess transfer between FG and
+ctrl-trans could be mediated by confounding of
+transitive and intransitive verbs or by the absence
+of an FG-nonFG distinction. We did not investigate
+the extent to which the model confounds transitive
+and intransitive verbs early on, but even without an
+FG-nonFG distinction, as the model learns to dis-
+tinguish transitive and intransitive verbs, we would
+expect transfer to ctrl-trans to decrease.
+D.4
+Statistical comparisons
+We conduct some additional statistical analyses.
+Transfer to/from FG is significant
+First, we test
+the significance of observed differences in Fig 4B.
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+Figure A3: Modified Jaccard similarity of output labels
+(CRS) for minimal pairs across conditions for the non-
+FG condition. This corresponds to the contrastive /
+anti-loss target for perturbation. DAS does not use this
+in training. This affects negative evaluation effects in
+both perturbation and DAS.
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+Figure A4: Modified Jaccard similarity of output labels
+(CRS) for minimal pairs across conditions aggregating
+both FG and non-FG labels.
+We tested whether mean FG->FG effect is
+greater than FG->non-FG and FG->control effects
+using a one-sided permutation tests (n = 5,000
+permutations). FG->FG effects are significantly
+larger than both FG->non-FG (difference = 0.90,
+p < 0.001) and FG->control (difference = 1.18,
+p < 0.001).
+We also tested whether the effects are signif-
+icantly greater in trained than untrained models
+(i.e.
+for each pair of violin plots): All were
+significant (p < 0.001) with average difference
+(trained - untrained): FG->FG diff=1.55, FG->non-
+FG diff=0.65, FG -> ctl diff=0.21, ctl->FG diff =
+0.36 ctl -> non-FG = 0.20
+Effects of animacy and embeddedness
+In the
+original Boguraev et al.
+study as well as our
+20
+condition trained
+class
+effect
+p-val
+diff
+0.001
+0.73
+same_an
+0.014
+0.002
+same_inan
+0.003
+0.49
+diff
+0.773
+< 0.001
+same_an
+1.358
+< 0.001
+same_inan
+1.037
+< 0.001
+diff
+0.006
+0.07
+same_emb
+-0.004
+0.43
+same_unemb0.016
+< 0.001
+diff
+0.687
+< 0.001
+same_emb
+1.356
+< 0.001
+same_unemb1.124
+< 0.001
+animacy
+false
+true
+embed
+false
+true
+Table A8: Syntax (filler-gap) Linear Model: Average effects
+for baselined-transfer by model trained status and animacy
+and embeddedness condition.
+own, the animacy and embeddedness manipula-
+tions were primarily intended as controls to test
+whether abstract FG transfer occurred across these
+manipulations. However, Boguraev et al. report
+that these control manipulations have a substantial
+impact on transfer in and of themselves (i.e., DAS
+transfer is higher when the items match vs mis-
+match the animacy of the extracted element). Here
+we explore whether perturbations in this dataset
+also transfer along animacy and embeddedness
+dimensions. Within the FG conditions, we test
+aggregate baselined-transfer across animacy and
+embeddedness conditions quantitatively using lin-
+ear regression with three factors: animacy has
+three levels: same-animate, same-inanimate, and
+different; embeddedness has three levels: same-
+emb, same-unemb, and different; trained is true or
+false. We again perform post-estimation using the
+marginal-effects package. The response vari-
+able is the unaggregated cell values (log-odds ratio)
+from the matrices in Figure A7, using the third
+column, which is baselined-transfer, and the first
+row (step 0, untrained) and the last row (step 143k,
+trained), for a total of 196k observations.
+Marginal effects are given in Table A8. In all
+but one case, effects are not significantly different
+from 0 for untrained models. All effects in trained
+models are significant (p < 0.001).
+Within trained models, the effect of same vs. dif-
+ferent animacy and embeddedness is significant:
+the marginal effect of same animacy vs. diff ani-
+macy is 0.42, p < 0.001 and same embeddnedness
+vs. diff embeddedness is 0.55, p < 0.001.
+cleft
+who_know
+who_wonder
+pseudo_cleft
+restricted_rc
+topicalization
+who_question
+1.6
+0.9
+1.0
+1.0
+1.1
+0.9
+0.8
+0.5
+1.1
+1.2
+1.1
+0.6
+0.6
+0.9
+0.6
+1.2
+1.6
+1.3
+0.7
+0.6
+1.1
+0.5
+0.9
+1.1
+2.8
+0.4
+0.6
+1.3
+0.9
+0.9
+1.0
+1.1
+1.6
+0.8
+0.8
+0.3
+0.4
+0.4
+0.5
+0.4
+0.7
+0.4
+0.3
+0.6
+0.9
+1.5
+0.4
+0.5
+1.6
+Figure A5: Average baselined-transfer in Pythia-1.4B
+aggregated by FG condition. This corresponds to an
+aggregate (averaged) of the final step 143k FG-nonFG
+plot in Figure A7.
+D.5
+Comments on FG similarities
+While we have argued for a common core of rep-
+resentation across the FG conditions, we have
+not studied representational differences/similarities
+between the different FG conditions themselves.
+While highly relevant to linguistic theory (Sag,
+2010), a full treatment of this question is beyond
+the scope of this work, and here we simply offer
+some exploratory observations. In Figure A5 we
+show aggregated (across animacy and embedded-
+ness conditions) baselined-transfer. We make the
+following observations: first, topicalization shows
+the lowest transfer in and out. Second, self-transfer
+in pseudoclefts is notably higher than for other con-
+ditions. Third, off-diagonal, the most substantial
+transfers (> 1.1) are who_question to/from pseudo-
+cleft (1.5,1.3); who_nonfinite to pseudocleft (1.3);
+wh_finite to/from wh_nonfinite (1.2, 1.2). Further
+work is needed substantiate these observations and
+link them to theoretical accounts of linguistic rep-
+resentations.
+E
+Use of AI Assistants
+ChatGPT and Claude (AIs) were used to produce
+initial versions of some visualization code. Some
+code was initially generated by AI for human re-
+view. All code (including from AIs) used in this
+study was carefully tested and reviewed by the au-
+thors.
+21
+auc: 0.91
+apple
+1
+2
+perturb
+trained
+auc: 0.54
+perturb
+untrained
+auc: 0.78
+cos
+trained
+auc: 0.53
+cos
+untrained
+auc: 0.95
+arm
+1
+2
+auc: 0.55
+auc: 0.89
+auc: 0.53
+auc: 0.89
+bank
+1
+2
+auc: 0.55
+auc: 0.73
+auc: 0.52
+auc: 0.69
+bass
+1
+2
+3
+auc: 0.55
+auc: 0.60
+auc: 0.52
+auc: 0.79
+bow
+1
+2
+3
+auc: 0.54
+auc: 0.67
+auc: 0.53
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+Figure A6: Lexical Representations: Similarity matrices for all words with ModernBERT-large. Clipping: Values
+for perturbation trained are clipped to 15 so that the diagonal does not overwhelm visualization. Values for perturb
+untrained and cosine untrained are clipped to show as much structure as possible. The color scale is nonlinear to
+enhance visualize distinction (computed with PowerNorm). We note that the three senses for bass are bass guitar,
+bass (vocal), and bass (string instrument). bow has three senses: bow of a boat, bow (and arrow), bow for string
+instrument. The second and third senses seem to interact; both are bow-shaped.
+22
+auc: 0.88
+chair
+1
+2
+perturb
+trained
+auc: 0.55
+perturb
+untrained
+auc: 0.83
+cos
+trained
+auc: 0.53
+cos
+untrained
+auc: 0.87
+club
+1
+2
+3
+auc: 0.53
+auc: 0.73
+auc: 0.52
+auc: 0.85
+crane
+1
+2
+auc: 0.53
+auc: 0.74
+auc: 0.52
+auc: 0.67
+deck
+1
+2
+auc: 0.49
+auc: 0.54
+auc: 0.52
+auc: 0.96
+digit
+1
+2
+auc: 0.58
+auc: 0.88
+auc: 0.53
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+Figure A6: (Fig contd). The apparently anomalous bottom 3 rows/cols for chair (seat vs. e.g., academic position)
+are mislabeled. deck has only two senses (deck of boat, deck as of a house), with the second having only 7 examples
+in the test dataset.
+23
+auc: 0.88
+hood
+1
+2
+3
+perturb
+trained
+auc: 0.62
+perturb
+untrained
+auc: 0.79
+cos
+trained
+auc: 0.56
+cos
+untrained
+auc: 0.94
+java
+1
+2
+auc: 0.53
+auc: 0.90
+auc: 0.52
+auc: 0.95
+mole
+1
+2
+3
+4
+5
+auc: 0.59
+auc: 0.85
+auc: 0.57
+auc: 0.91
+pitcher
+1
+2
+auc: 0.65
+auc: 0.85
+auc: 0.59
+auc: 0.79
+pound
+1
+2
+auc: 0.53
+auc: 0.67
+auc: 0.51
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+Figure A6: (Fig contd).
+24
+auc: 0.91
+seal
+1
+2
+3
+4
+perturb
+trained
+auc: 0.54
+perturb
+untrained
+auc: 0.71
+cos
+trained
+auc: 0.52
+cos
+untrained
+auc: 0.90
+spring
+1
+2
+3
+auc: 0.55
+auc: 0.88
+auc: 0.53
+auc: 0.94
+square
+1
+2
+3
+4
+auc: 0.54
+auc: 0.87
+auc: 0.52
+auc: 0.90
+trunk
+1
+2
+3
+auc: 0.56
+auc: 0.74
+auc: 0.53
+auc: 0.82
+yard
+1
+2
+auc: 0.55
+auc: 0.73
+auc: 0.53
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+0.0
+7.5
+15.0
+18.0
+20.5
+23.0
+0.0
+0.5
+1.0
+0.92
+0.97
+1.00
+Figure A6: (Fig contd). The four senses of seal: animal, R&B singer, mark, mechanical. The senses for square
+were discussed in the main text. The cross pattern is the result of differences in tokenization: examples forming the
+cross pattern have square at sentence start so the token has no included starting space character.
+25
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 0 – normal FG
+non-FG
+baselined-transfer (FG - non-FG)
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 16 – normal FG
+non-FG
+baselined-transfer (FG - non-FG)
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 128 – normal FG
+non-FG
+baselined-transfer (FG - non-FG)
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 256 – normal FG
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+non-FG
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+baselined-transfer (FG - non-FG)
+−2
+−1
+0
+1
+2
+3
+4
+5
+−2
+−1
+0
+1
+2
+3
+4
+5
+−2
+−1
+0
+1
+2
+3
+4
+5
+−2
+−1
+0
+1
+2
+3
+4
+5
+Figure A7: Syntactic Representations: Plots over the course of Pythia-1.4b training. Column one (FG) is non-
+baselined-transfer, column two (non-FG) is transfer to the minimal non-FG control, and column three gives
+baselined-transfer. As non-FG tests transfer only from FG →nonFG, the rightmost 6 columns from the FG matrices
+are not present (and similarly for baselined-transfer). Patterning in early steps is clearly seen, which reflects the
+non-independence of the underlying output label sets. Each cell is an average of 125 effect scores from 5 trials each
+with 25 evaluation remappings.
+26
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 512 – normal FG
+non-FG
+baselined-transfer (FG - non-FG)
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 1000 – normal FG
+non-FG
+baselined-transfer (FG - non-FG)
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 2000 – normal FG
+non-FG
+baselined-transfer (FG - non-FG)
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 5000 – normal FG
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+non-FG
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+baselined-transfer (FG - non-FG)
+−2
+−1
+0
+1
+2
+3
+4
+5
+−2
+−1
+0
+1
+2
+3
+4
+5
+−2
+−1
+0
+1
+2
+3
+4
+5
+−2
+−1
+0
+1
+2
+3
+4
+5
+Figure A7: (Fig contd).
+27
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 10000 – normal FG
+non-FG
+baselined-transfer (FG - non-FG)
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 20000 – normal FG
+non-FG
+baselined-transfer (FG - non-FG)
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 50000 – normal FG
+non-FG
+baselined-transfer (FG - non-FG)
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 100000 – normal FG
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+non-FG
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+baselined-transfer (FG - non-FG)
+−2
+−1
+0
+1
+2
+3
+4
+5
+−2
+−1
+0
+1
+2
+3
+4
+5
+−2
+−1
+0
+1
+2
+3
+4
+5
+−2
+−1
+0
+1
+2
+3
+4
+5
+Figure A7: (Fig contd).
+28
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+ctl agr
+emb ctl agr
+ctl trans an
+ctl trans inan
+emb ctl trans an
+emb ctl trans inan
+step 143000 – normal FG
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+non-FG
+cl an
+wh know an
+wh won an
+pscl an
+res rc an
+top an
+whq an
+cl inan
+wh know inan
+wh won inan
+pscl inan
+res rc inan
+top inan
+whq inan
+cl an emb
+wh know an emb
+wh won an emb
+pscl an emb
+res rc an emb
+top an emb
+whq an emb
+cl inan emb
+wh know inan emb
+wh won inan emb
+pscl inan emb
+res rc inan emb
+top inan emb
+whq inan emb
+baselined-transfer (FG - non-FG)
+−2
+−1
+0
+1
+2
+3
+4
+5
+Figure A7: (Fig contd).
+29

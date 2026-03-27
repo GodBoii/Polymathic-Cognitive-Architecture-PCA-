@@ -1,0 +1,294 @@
+Supercharging Federated Intelligence Retrieval
+Dimitris Stripelis∗, Patrick Foley, Mohammad Naseri, William Lindskog-Münzing,
+Chong Shen Ng, Daniel Janes Beutel, Nicholas D. Lane
+Flower Labs
+Abstract
+RAG typically assumes centralized access to documents, which breaks down when
+knowledge is distributed across private data silos. We propose a secure Federated
+RAG system built using Flower that performs local silo retrieval, while server-
+side aggregation and text generation run inside an attested, confidential compute
+environment, enabling confidential remote LLM inference even in the presence of
+honest-but-curious or compromised servers. We also propose a cascading inference
+approach that incorporates a non-confidential third-party model (e.g., Amazon
+Nova) as auxiliary context without weakening confidentiality.
+1
+Introduction
+Retrieval-Augmented Generation (RAG) improves factual grounding and domain adaptability of
+LLMs by conditioning generation on external knowledge. However, RAG assumes centralized docu-
+ment access - a loose assumption that fails in practice, since organizational data is distributed across
+data silos and cannot be aggregated centrally due to regulatory, proprietary, or privacy constraints.
+Federated RAG (FedRAG) mitigates this limitation by performing retrieval locally within each
+silo and aggregating the results on the server to construct a unified generation context [1]. This
+approach enables cross-silo knowledge access while preserving data locality, making it well-suited
+for sensitive domains such as healthcare and finance. However, most existing FedRAG pipelines offer
+limited security guarantees, as retrieved documents are exchanged in plaintext and can be exposed to
+honest-but-curious or compromised servers.
+In this work, we present a secure FedRAG architecture built on Flower [2] that uses confidential
+computing to protect federated aggregation and generation within a trusted execution environment
+(TEE), with silo participation enforced via attestation and authorization [3].
+Unlike prior FedRAG approaches based on fine-tuning [4], secure inference [3], or encrypted retrieval
+and communication [3, 5, 6], we enable confidential remote LLM inference via Flower Confidential
+Remote Compute (CRC) [7], a service running LLMs remotely with confidential computing. We
+also introduce a cascading inference approach that integrates a non-confidential third-party model
+(AWS Nova) as an auxiliary probabilistic knowledge source without compromising end-to-end
+confidentiality. In summary, our contributions are:
+• a secure Federated RAG system for cross-silo retrieval without data centralization
+• a confidential server-side aggregation and text generation using TEEs
+• a mixed-trust cascading inference mechanism integrating third-party models
+• an end-to-end protected remote LLM inference pipeline using Flower CRC
+∗Corresponding author: dimitris@flower.ai
+Presented at the Amazon Trusted AI Symposium 2026, New York, NY, USA.
+arXiv:2603.25374v1  [cs.IR]  26 Mar 2026
+2
+Related Work & Background
+Federated Learning. Federated Learning (FL) enables collaborative model training across decen-
+tralized data silos without requiring raw data sharing [8]. While FL has been widely studied for
+model training and fine-tuning, its application to inference-time retrieval and generation has received
+comparatively less attention. Flower [2] provides a flexible framework for federated workloads
+beyond training, including secure aggregation and orchestration across heterogeneous clients.
+Confidential Compute. Confidential computing leverages hardware-based Trusted Execution Envi-
+ronments (TEEs) to protect code and data during execution, even from privileged system software [9].
+Recent systems integrate TEEs into distributed ML pipelines to protect training [10], inference [3],
+and aggregation. However, many approaches focus on securing individual stages rather than end-to-
+end retrieval and generation pipelines. Flower CRC [7] extends confidential computing to remote
+LLM inference, enabling large-scale models to be executed with strong confidentiality guarantees.
+Federated RAG. Federated RAG (FedRAG) decentralizes retrieval by executing document search
+locally at each silo and aggregating retrieved results at a central server [1]. Prior work explores
+federated fine-tuning [4], encrypted retrieval and communication [5, 6], and secure aggregation [3].
+However, most existing systems either expose retrieved documents in plaintext at the server or
+do not protect the generation step itself. In contrast, our approach combines federated retrieval
+with confidential aggregation and generation, while additionally supporting mixed-trust cascading
+inference with external LLM providers.
+Threat Model. We assume an honest-but-curious or compromised server operator and infrastructure
+provider, while trusting hardware-enforced TEEs and remote attestation mechanisms [9, 11]. Clients
+(data silos) do not trust each other and never share raw documents, following standard federated learn-
+ing assumptions [8, 12]. Network adversaries may observe, replay, or tamper with communication
+but cannot break standard cryptographic protections such as TLS [13]. We follow prior confidential
+computing work in assuming the TEE implementation is correct and that side-channel attacks are out
+of scope [14, 15].
+3
+Methods
+For every query, the server, operating inside a TEE, broadcasts the query to a set of verified clients/si-
+los. Each client retrieves the top-k relevant documents from its local private document store and
+returns them to the server along with their retrieval scores. The server aggregates the results, merges
+and re-ranks the retrieved documents, and constructs an augmented context that is passed to the LLM.
+On the client side, retrieval is performed using a local FAISS index built over each client’s document
+corpus. The server merges the results into a single ranked list by sorting based on the retrieval score,
+computed as 1/(kRRF + doci + 1), where kRRF represents the value of the Reciprocal Rank
+Fusion and doci the document index. Figure 1 illustrates the overall FedRAG pipeline.
+Question
+Flower
+SuperNode
+Flower
+ClientApp
+Document
+Store
+Retriever
+Client 1
+Server with Confidential Compute
+Flower
+SuperLink
+Flower
+ServerApp
+LLM
+Standalone
+Inference
+Cascading Inference
+w/ 3rd Party Model
+Mode 2
+LLM
+Confidential
+Inference
+Mode 3
+Nova + 
+Answer
+Mode 1
+Flower
+SuperNode
+Flower
+ClientApp
+Document
+Store
+Retriever
+Client 4
+Flower CLI
+Client 2
+Client 3
+Figure 1: FedRAG with confidential server-side aggregation and various inference options.
+In our setting, we evaluate three inference modes (server always operates inside a TEE):
+• Standalone Inference: The augmented query is processed by a server-hosted LLM, which
+generates a response using the retrieved documents as context.
+2
+• Cascading Inference: The server-hosted LLM generates the final response using both the
+retrieved documents and an auxiliary answer obtained from a non-confidential third-party provider,
+which is treated as an additional contextual source.
+• Confidential Inference: The augmented query is processed by a large-scale LLM running inside
+Flower CRC, ensuring that both prompts and context remain protected during inference.
+4
+Evaluation
+Experimental Settings. We use the SmolLM 1.7B Instruct model as the server-hosted LLM. In the
+case of the cascading mode, the external 3rd party model was AWS Nova Micro, and in Flower CRC,
+we use the Qwen3 235B model. The entire server-side workload is CPU-bound; no GPU is employed
+to deploy SmolLM. In all experiments, the top-k value is set to 8 and the reciprocal rank fusion
+parameter kRRF to 60. The federation consists of four clients, each maintaining an independent
+document corpus: PubMed [16] (23.9M snippets), StatPearls [17] (301k snippets), Textbooks [18]
+(126k snippets), and Wikipedia [19] (29.9M snippets); sourced from the MedRAG Toolkit [20].
+Evaluation is performed on the MIRAGE benchmark [20]: PubMedQA (501 Y/N/maybe questions),
+BioASQ (619 Y/N questions), and MedQA (1272 A/B/C/D selection questions). Table 1 reports
+performance and mean end-to-end query time.
+Mode
+Dataset
+PubMedQA
+BioASQ
+MedQA
+Time
+Accuracy
+Time
+Accuracy
+Time
+Accuracy
+Standalone Inference
+43s
+0.32
+44s
+0.81
+43s
+0.39
+Cascaded Inference
+48s
+0.45
+45s
+0.83
+46s
+0.57
+Confidential Inference
+25s
+0.47
+26s
+0.82
+25s
+0.78
+Table 1: Mean query execution time and accuracy per benchmark dataset for each inference mode.
+Results Analysis. Compared to the standalone inference mode, cascading inference is especially
+compelling: even with the lightweight Amazon Nova Micro model, the additional context provided
+to SmolLM yields a ∼40% and ∼46% improvement on PubMedQA and MedQA, respectively, indi-
+cating that more powerful Nova Pro/Premier models are a promising direction for further evaluation.
+This result also highlights that despite the lower compute capabilities of CPU-based TEEs, their trust
+properties allow them to be used along with non-confidential external inference APIs to produce
+better performance.
+Confidential inference with Qwen3 275B in Flower CRC achieves the highest accuracy and lowest
+latency, consistent with running a large capacity model on an NVIDIA H100 GPU. In contrast,
+CPU-bound generation in SmolLM dominates latency in standalone and cascading modes. Finally,
+confidential inference benefits from receiving encrypted aggregated documents directly from the
+Server TEE, with documents only decrypted within Flower CRC’s hardened TEE. Overall, both the
+cascading and confidential inference modes outperform standalone while securely combining context.
+5
+Conclusion
+We present a secure Federated RAG architecture built on Flower that preserves data locality and
+protects aggregation and generation via confidential computing. Experiments show that cascading
+inference using a lightweight non-confidential third-party model for probabilistic contextual aug-
+mentation improves performance, highlighting the practicality of CPU-based TEEs for mixed-trust
+deployments. Leveraging high-capacity GPU-backed models inside hardened TEEs, confidential
+inference with Flower CRC achieves higher accuracy and lower latency, enabling a flexible, privacy-
+preserving RAG design that supports both confidential and third-party inference endpoints.
+3
+References
+[1] Abhijit Chakraborty, Chahana Dahal, and Vivek Gupta. Federated Retrieval-Augmented Gener-
+ation: A Systematic Mapping Study. arXiv preprint arXiv:2505.18906, 2025.
+[2] Daniel J Beutel, Taner Topal, Akhil Mathur, Xinchi Qiu, Javier Fernandez-Marques, Yan Gao,
+Lorenzo Sani, Kwing Hei Li, Titouan Parcollet, Pedro Porto Buarque De Gusmão, et al. Flower:
+A Friendly Federated Learning Research Framework. arXiv preprint arXiv:2007.14390, 2020.
+[3] Parker Addison, Minh-Tuan H Nguyen, Tomislav Medan, Jinali Shah, Mohammad T Manzari,
+Brendan McElrone, Laksh Lalwani, Aboli More, Smita Sharma, Holger R Roth, et al. C-
+FedRAG: A Confidential Federated Retrieval-Augmented Generation System. arXiv preprint
+arXiv:2412.13163, 2024.
+[4] Jincheol Jung, Hongju Jeong, and Eui-Nam Huh. Federated Learning and RAG Integration: a
+Scalable Approach for Medical Large Language Models. In 2025 International Conference on
+Artificial Intelligence in Information and Communication (ICAIIC), pages 0968–0973. IEEE,
+2025.
+[5] Dongfang Zhao. FRAG: Toward Federated Vector Database Management for Collaborative and
+Secure Retrieval-Augmented Generation. arXiv preprint arXiv:2410.13272, 2024.
+[6] Qianren Mao, Qili Zhang, Hanwen Hao, Zhentao Han, Runhua Xu, Weifeng Jiang, Qi Hu,
+Zhijun Chen, Tyler Zhou, Bo Li, et al. Privacy-Preserving Federated Embedding Learning for
+Localized Retrieval-Augmented Generation. arXiv preprint arXiv:2504.19101, 2025.
+[7] Flower Labs. Flower Intelligence. https://flower.ai/intelligence, 2025.
+[8] Brendan McMahan, Eider Moore, Daniel Ramage, Seth Hampson, and Blaise Aguera y Arcas.
+Communication-Efficient Learning of Deep Networks from Decentralized Data. In Aarti
+Singh and Jerry Zhu, editors, Proceedings of the 20th International Conference on Artificial
+Intelligence and Statistics, volume 54 of Proceedings of Machine Learning Research, pages
+1273–1282. PMLR, 20–22 Apr 2017.
+[9] Victor Costan and Srinivas Devadas. Intel sgx explained. Technical Report 2016/086, Cryptology
+ePrint Archive, 2016.
+[10] Anshul Aggarwal, Trevor E Carlson, Reza Shokri, and Shruti Tople. Soteria: In search of
+efficient neural networks for private inference. arXiv preprint arXiv:2007.12934, 2020.
+[11] Mohamed Sabt, Mehdi Achemlal, and Abdelmadjid Bouabdallah. Trusted execution environ-
+ment: What it is, and what it is not. IEEE TrustCom, 2015.
+[12] Peter et al. Kairouz. Advances and open problems in federated learning. Foundations and
+Trends in Machine Learning, 2021.
+[13] Eric Rescorla. The transport layer security (tls) protocol version 1.3, 2018.
+[14] Jo et al. Van Bulck. Foreshadow: Extracting the keys to the intel sgx kingdom. In USENIX
+Security, 2018.
+[15] Guoxing et al. Chen. Sgxpectre: Stealing intel secrets from sgx enclaves via speculative
+execution. In IEEE EuroS&P, 2019.
+[16] PubMed — pubmed.ncbi.nlm.nih.gov. https://pubmed.ncbi.nlm.nih.gov/.
+[17] StatPearls — ncbi.nlm.nih.gov. https://www.ncbi.nlm.nih.gov/books/NBK430685/.
+[18] Di Jin, Eileen Pan, Nassim Oufattole, Wei-Hung Weng, Hanyi Fang, and Peter Szolovits. What
+disease does this patient have? a large-scale open domain question answering dataset from
+medical exams. Applied Sciences, 11(14):6421, 2021.
+[19] Nandan Thakur, Nils Reimers, Andreas Rücklé, Abhishek Srivastava, and Iryna Gurevych. Beir:
+A heterogenous benchmark for zero-shot evaluation of information retrieval models. arXiv
+preprint arXiv:2104.08663, 2021.
+4
+[20] Guangzhi Xiong, Qiao Jin, Zhiyong Lu, and Aidong Zhang.
+Benchmarking Retrieval-
+Augmented Generation for Medicine.
+In Findings of the Association for Computational
+Linguistics ACL 2024, pages 6233–6251, 2024.
+5
+A
+Corpus Specifications
+The current implementation of document retrieval for the FAISS index is built with IndexFlatL2 and
+uses the faiss.METRICL2 metric for measuring dissimilarity distance; the lower the score for a
+retrieved document is, the closer semantically the document is to the received query. Table 2 gives an
+overview of the specifications of each corpus.
+Corpus
+Size
+#Snippets
+PubMed
+70GB
+23.9M
+StatPearls
+2GB
+301k
+Textbooks
+209MB
+126k
+Wikipedia
+44GB
+29.9M
+Table 2: Data Corpus Specifications.
+B
+Question & Prompt Sample
+When all documents are retrieved from the distributed data silos, they are used as context to answer
+the user query. A typical example is shown in the color box below, which presents the model’s role
+and instruction, the relevant documents/snippets retrieved from the document store of the participating
+silos, the original question, and the answering options.
+Sample Question Prompt
+As an expert doctor in clinical science and medical knowledge, can you tell me if the
+following statement is correct? Answer yes, no, or maybe.
+Here are the relevant documents:
+Document 1: Another set of strategies for improving quality involves changing the systems
+of care...
+Document 2: To enhance interprofessional healthcare team outcomes...
+Document 3: and surgical morbidity...
+Document 4: Social workers focus on educating families...
+Document 5: a supervisory capacity while creating a culture of safety...
+Document 6: a hospital setting. Many doctors prefer working in an ASC...
+Document 7: leaders using an empowering style may improve process...
+Document 8: Coordinated care involves seamless transitions...
+Question:
+Does a dedicated discharge coordinator improve the quality of hospital
+discharge?
+Options: A) yes B) no C) maybe
+Answer only with the correct option
+6

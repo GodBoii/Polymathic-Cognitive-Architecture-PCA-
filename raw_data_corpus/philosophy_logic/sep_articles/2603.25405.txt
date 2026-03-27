@@ -1,0 +1,1086 @@
+System Design for Maintaining Internal State Consistency in
+Long-Horizon Robotic Tabletop Games
+Guangyu Zhao1,2, Ceyao Zhang1,2, Chengdong Ma1, Tao Wu2,3, Yiyang Song1,2, Haoxuan Ru1,2, Yifan Zhong1,2,
+Ruilin Yan2, Lingfeng Li1,2, Ruochong Li2,4, Yu Li1,2, Xuyuan Han4, Yun Ding4, Ruizhang Jiang1,2,
+Xiaochuan Zhang4, Yichao Li4, Yuanpei Chen1,2,4∗, Yaodong Yang1,2,4∗, Yitao Liang1,2,4∗
+Fig. 1: Overview of the tabletop Mahjong system. The architecture centers on a maintained internal game state (perceptual,
+execution, and interaction state). A vision-language model performs strategic reasoning and rule interpretation at low frequency,
+while time-critical perception modules support real-time detection and pose estimation for manipulation. Action primitives are
+executed with tactile-based verification and recovery to prevent premature state updates. The bottom examples illustrate how
+game history informs reasoning and is grounded into verified physical actions within a closed-loop system.
+Abstract—Long-horizon tabletop games pose a distinct systems
+challenge for robotics: small perceptual or execution errors can
+invalidate accumulated task state, propagate across decision-
+1 Peking University. 2 PKU-PsiBot Joint Lab. 3 Nanyang Technological
+University. 4 PsiBot.
+making modules, and ultimately derail interaction. This paper
+studies how to maintain internal state consistency in turn-
+based, multi-human robotic tabletop games through deliberate
+system design rather than isolated component improvement.
+Using Mahjong as a representative long-horizon setting, we
+present an integrated architecture that explicitly maintains per-
+arXiv:2603.25405v1  [cs.RO]  26 Mar 2026
+ceptual, execution, and interaction state, partitions high-level
+semantic reasoning from time-critical perception and control,
+and incorporates verified action primitives with tactile-triggered
+recovery to prevent premature state corruption. We further
+introduce interaction-level monitoring mechanisms to detect
+turn violations and hidden-information breaches that threaten
+execution assumptions. Beyond demonstrating complete-game
+operation, we provide an empirical characterization of failure
+modes, recovery effectiveness, cross-module error propagation,
+and hardware–algorithm trade-offs observed during deployment.
+Our results show that explicit partitioning, monitored state
+transitions, and recovery mechanisms are critical for sustaining
+executable consistency over extended play, whereas monolithic or
+unverified pipelines lead to measurable degradation in end-to-end
+reliability. The proposed system serves as an empirical platform
+for studying system-level design principles in long-horizon, turn-
+based interaction.
+I. INTRODUCTION
+Tabletop games provide a structured yet demanding setting
+for robotic systems [39, 19, 37]. They require repeated manip-
+ulation of small objects, tight perception–action loops, strict
+turn-taking structure, and sustained operation over long hori-
+zons, often in the presence of multiple human participants [31].
+Mahjong is a particularly challenging instance of this class:
+gameplay is prolonged, objects are densely arranged, and
+execution repeatedly alternates between perception, decision-
+making, and manipulation [36]. In such settings, small per-
+ception or execution errors are not isolated events but can
+propagate across components, leading to state inconsistency
+that ultimately derails gameplay [17, 5]. This makes error
+recovery and state maintenance a system-level concern rather
+than a component-level one.
+This paper addresses a system-level research question: what
+system design choices enable a robotic system to maintain
+executable state consistency and recoverability during long-
+horizon, turn-based tabletop interactions with multiple hu-
+mans? In physical tabletop games, successful deployment
+further requires non-trivial game competence: a system that
+executes actions reliably but behaves indistinguishably from
+random play is unlikely to be acceptable in practice. Rather
+than aiming for optimal game-theoretic performance or exhaus-
+tive rule enforcement, we focus on sustained, robust operation
+under realistic physical and interactional conditions, treating
+executable state consistency as a prerequisite for meaningful,
+though not necessarily optimal, game performance. Answer-
+ing this question therefore requires integrating perception,
+decision-making, manipulation, recovery, and interaction into
+a single closed-loop system capable of tolerating errors without
+constant human supervision. Figure 1 provides an overview of
+the complete system.
+Early system prototyping revealed deployment-driven con-
+straints that are common in real-world tabletop interactions.
+Human players often needed clarification of the robot’s ac-
+tions and decisions during ongoing gameplay, and rule-related
+questions frequently arose mid-game, disrupting turn structure
+and execution flow. To reduce ambiguity and avoid ad-hoc in-
+terventions during long-horizon operation, the system provides
+two auxiliary interfaces: it records structured decision traces
+for post-hoc inspection after gameplay, and supports in-game
+rule queries when questions arise. Rather than treating these
+deployment-driven observations as human-centered modeling
+or behavioral research questions, we incorporate them as
+system-level requirements for deployment.
+To address the execution-time validity and robustness de-
+mands of physical gameplay, we adopt a hybrid system ar-
+chitecture. A vision–language model is used for high-level
+reasoning, strategy selection, rule interpretation, and semantic
+interaction, while specialized perception and control modules
+handle time-critical tasks such as small-object detection, seg-
+mentation, pose estimation, and tactile-based failure detection.
+For interaction-level perception that depends on game con-
+text and turn structure, we found high-level vision–language
+reasoning to be more reliable in practice than purely visual
+classifiers, despite lower temporal resolution. This partitioning
+reflects practical trade-offs observed during system develop-
+ment: while foundation models provide flexibility and seman-
+tic understanding, reliable execution with small physical ob-
+jects requires dedicated components optimized for latency and
+accuracy. Our evaluation shows that violating this partition—
+for example by relying on a single model across both semantic
+reasoning and time-critical perception—leads to measurable
+degradation in end-to-end system reliability.
+Human interaction introduces additional challenges for
+maintaining internal system state. Rather than attempting com-
+prehensive rule enforcement or adversarial behavior detection,
+we focus on a minimal set of interaction-level events—specif-
+ically, out-of-turn play and unauthorized inspection of other
+players’ hands—that directly violate the robot’s execution as-
+sumptions and can be handled through detection, alerting, and
+structured logging. These mechanisms surface potential state
+inconsistencies to human participants while preserving human
+authority over rule interpretation and resolution, reflecting the
+inherently social nature of tabletop games. The system does not
+interrupt execution flow or attempt to enforce outcomes during
+gameplay, but instead records sufficient context for post-hoc
+inspection. Other forms of misconduct, such as direct physical
+interference with the robot or its objects, are assumed to be
+mitigated through environmental design and social protocols,
+as is common in deployed robotic systems.
+We evaluate the proposed system across complete games.
+In addition to system executability, we assess game perfor-
+mance as a deployment-level acceptability signal rather than
+an optimization objective. The robot completes full games with
+minimal human intervention (e.g., over 122 games, the robot
+completed 89.3% full games without any human intervention)
+and maintains robust manipulation through tactile-triggered
+recovery (e.g., 99.8% grasp success after recovery). We further
+examine how violations of executable state consistency—such
+as perception or execution errors that are not successfully
+recovered—lead to measurable degradation in game outcomes,
+despite unchanged game strategy. Beyond aggregate success
+metrics, we report system-level measurements that clarify
+practical trade-offs in partitioning foundation-model reasoning
+from time-critical perception and control. These measurements
+are intended to expose system-level behavior rather than to
+benchmark individual components in isolation.
+Overall, this work contributes: (i) an empirical character-
+ization of failure modes and recovery mechanisms in long-
+horizon, turn-based tabletop robot games; (ii) evidence that
+partitioning foundation-model reasoning from time-critical
+perception and control is critical in practice to sustain state
+consistency in small-object manipulation tasks; and (iii) a
+deployed robotic tabletop game system that serves as an
+empirical vehicle for studying system-level design trade-offs in
+long-horizon, turn-based human–robot tabletop interactions.
+II. RELATED WORK
+A. Robotic tabletop and board-game systems
+Robotic tabletop games constitute a structured application
+domain in which perception, manipulation, and interaction
+must be integrated under strict turn-taking and repeated
+decision–execution cycles [37, 39, 19, 36, 31]. Prior sys-
+tems demonstrate autonomous or semi-autonomous play in
+board [39, 21] and card [37] games by combining state per-
+ception with robotic control, highlighting that rule-governed
+tabletop interactions place nontrivial demands on physical
+execution and sensing. Other systems emphasize interaction
+with human players, balancing game competence with turn
+structure, pacing, and social acceptability, and often evalu-
+ate performance through end-to-end autonomy or user-facing
+measures rather than isolated component metrics [38, 24].
+Framework-oriented efforts further explore how common per-
+ception, decision-making, and actuation components can be
+reused across multiple tabletop games.
+While these systems establish the feasibility of physical
+game-playing robots, they typically emphasize short-horizon
+operation or assume reliable state observability during game-
+play. In contrast, our work uses Mahjong as a prolonged, turn-
+based tabletop setting in which any perceptual or execution
+error can immediately induce internal state inconsistency. Ex-
+plicit state maintenance and recoverability are central system
+requirements for sustaining complete-game operation across
+multiple turns and participants.
+B. Partitioning perception, reasoning, and control in inte-
+grated robotic systems
+Integrated robotic systems increasingly rely on explicit
+partitioning between perception, reasoning, and control to
+balance semantic flexibility with reactive execution, especially
+in foundation-model-enabled deployments [14, 33]. Many re-
+cent systems ground high-level language or vision–language
+reasoning in modular perception and control components,
+translating semantic decisions into executable actions while
+preserving responsiveness to sensory feedback [9, 20, 14]. This
+architectural separation also provides explicit interfaces for
+execution monitoring, diagnosis, and localization of failures
+when system assumptions are violated [35].
+Recent approaches study how execution deviations can be
+detected and corrected at the granularity of skills or task
+segments, enabling structured recovery without corrupting
+downstream decision logic [35]. However, many evaluations
+still emphasize local recovery effectiveness, while the system-
+level consequences of unrecovered or partially recovered er-
+rors across perception, decision-making, and interaction loops
+remain underexplored in real deployments [14, 20]. In turn-
+based interaction settings, such cross-module propagation can
+invalidate downstream decisions even when individual actions
+appear locally successful, motivating explicit system-level
+state-consistency considerations [35, 20].
+Recent systems increasingly leverage large language models
+and vision–language models to expand semantic reasoning and
+generalization in embodied tasks [32, 1, 2]. Some approaches
+preserve modularity by using foundation models for high-
+level planning while delegating time-critical perception and
+control to specialized components [40, 30], whereas others
+pursue more unified mappings from multimodal observations
+directly to actions [15, 4, 13]. In practice, this separation
+becomes particularly important for time-critical loops and pre-
+cise grounding: grounding-oriented intermediate representa-
+tions (e.g., masks) can improve low-level manipulation fidelity,
+while end-to-end VLA models trade modular diagnosability
+for simplicity [7, 12, 15]. Our work complements these efforts
+by examining how deliberate partitioning supports executable
+state consistency and recovery in long-horizon, turn-based
+tabletop interaction. Specifically, we study how architectural
+separation, guarded state transitions, and monitored execution
+jointly constrain error propagation and preserve internal state
+validity over extended horizons.
+C. Game-playing agents and rule reasoning
+Game-playing agents for board and card games have
+achieved strong performance by optimizing decision-making
+under formal rules and well-defined state representations [28,
+6, 18]. In these settings, the game state is typically assumed
+to be accurately observable or digitally represented, allowing
+learning and search methods to focus on strategic reasoning
+and optimal play [10, 22]. Our focus differs in that game
+competence is treated as a deployment-level constraint within
+a physical robotic system operating under imperfect percep-
+tion, manipulation uncertainty, and multi-human interaction.
+Rather than optimizing for state-of-the-art game performance
+or exhaustively enforcing all rule variants, we study how a
+robotic system can sustain long-horizon execution by main-
+taining executable state consistency, identifying interaction-
+level events that threaten system assumptions, and supporting
+recovery without continuous human intervention.
+III. PROBLEM FORMULATION: INTERNAL STATE CONSISTENCY IN
+TABLETOP GAMES
+A. Tabletop Games as Long-Horizon Executable Systems
+Tabletop games constitute a distinct class of embodied
+robotic tasks that differ fundamentally from conventional
+manipulation or short-horizon interaction scenarios. While in-
+dividual actions—such as grasping, placing, or pushing objects
+—may resemble standard tabletop manipulation, gameplay
+unfolds as a structured execution process governed by turn-
+taking, persistent state, and repeated interaction with multiple
+human participants. Each action is interpreted not only by its
+physical outcome, but also by its implications for the evolving
+game state, which must remain consistent across perception,
+decision-making, and interaction over extended horizons.
+Three characteristics distinguish tabletop games as long-
+horizon executable systems. First, turn-taking imposes a strict
+temporal and causal structure: the validity of an action depends
+on whose turn it is, what actions have occurred previously, and
+what state transitions are expected next. Second, gameplay
+relies on persistent task-level state that must be maintained
+across turns. Object identities, ownership, and counts (e.g.,
+tiles held by each player) are not transient observations but
+must be maintained accurately across many turns. Third, table-
+top games are inherently multi-human. Human participants act
+autonomously, may behave unexpectedly, and often rely on
+implicit social conventions rather than explicit signaling. As a
+result, interaction-relevant events may occur without explicit
+machine-readable cues, violating execution assumptions and
+complicating state maintenance.
+In such settings, errors do not remain localized to the com-
+ponent in which they originate. A single perceptual, execution,
+or interaction error can invalidate shared assumptions about
+the game state and propagate across modules. For example,
+misidentifying a tile, missing a state transition due to sensing
+latency, or failing to execute a grasp can immediately corrupt
+the robot’s internal representation of the game, rendering
+subsequent decisions invalid even if later perception and
+control succeed. These failures are often irreversible within
+the execution logic of the game: an incorrect hand count or
+turn assumption cannot be corrected without explicit detection
+and recovery. As a result, sustaining long-horizon operation
+requires maintaining the consistency of internal state, rather
+than merely maximizing local action success.
+We use Mahjong as a representative instance of this prob-
+lem class. Mahjong involves dense arrangements of small
+objects, prolonged turn-based interaction, and repeated transi-
+tions between perception, decision-making, and manipulation.
+Although our system adopts several pragmatic constraints—
+including simplified scoring rules, and task-specific interaction
+conventions—these choices preserve the execution structure
+relevant to long-horizon state maintenance. The focus of this
+work is therefore not on optimal gameplay or exhaustive rule
+coverage, but on understanding how a robotic system can
+maintain executable state consistency under realistic physical
+and interactional conditions.
+B. Definition of Internal State Consistency
+We define internal state consistency as the alignment be-
+tween the robot’s maintained internal representation of the
+game and the actual physical and interaction state of the
+tabletop environment as gameplay unfolds. The internal state
+comprises multiple interdependent components, including (i)
+a perceptual state encoding hand tiles, discarding tile and
+game history, (ii) an execution state tracking completed and
+pending actions, and (iii) an interaction state encoding turn
+structure and human behavior. Consistency requires that these
+representations remain mutually coherent and grounded in the
+physical world.
+Inconsistencies arise when one or more components di-
+verge from reality or from each other. We distinguish three
+common classes of inconsistency. Perceptual inconsistencies
+occur when object identities or counts are misestimated or
+missed due to sensing errors or latency, leading to incorrect
+updates of the game state. Execution inconsistencies arise
+when physical actions fail or produce unintended outcomes—
+such as dropped or misplaced objects—causing discrepancies
+between the assumed and actual state of the game. Interaction
+inconsistencies occur when human actions violate the robot’s
+execution assumptions, for example through out-of-turn play
+or unauthorized inspection of hidden information, disrupting
+turn structure and state expectations.
+Fig. 2: Cross-module error propagation in long-horizon
+tabletop gameplay. Perceptual, execution, or interaction er-
+rors can propagate through the maintained game history and
+internal state, corrupting downstream reasoning and actions if
+not detected and recovered. The red dashed lines represent
+propagation paths that could immediately create visible inse-
+curity.
+Crucially, these inconsistencies propagate across modules
+rather than remaining isolated. A perceptual error may cor-
+rupt memory, which in turn invalidates downstream strategy
+reasoning; an execution failure may permanently alter hand
+counts, eliminating feasible game outcomes; an interaction
+violation may invalidate turn assumptions, leading to illegal
+actions. Figure 2 illustrates typical propagation pathways,
+showing how errors originating in perception, execution, or
+interaction can cascade through internal state updates and
+affect subsequent decisions and actions.
+This work treats internal state consistency as a system-level
+property that must be actively maintained and recovered, rather
+than an implicit assumption. Our system design, monitoring
+mechanisms, and evaluation are organized around identifying,
+tolerating, and recovering from state inconsistencies to enable
+sustained long-horizon gameplay. While certain setup steps
+(e.g., initial tile arrangement) and task simplifications are
+handled externally, they do not affect the consistency dynamics
+during gameplay, which is the focus of our analysis.
+IV. SYSTEM DESIGN FOR MAINTAINING STATE CONSISTENCY
+Maintaining state consistency in long-horizon tabletop
+gameplay requires explicit coordination between perception,
+reasoning, manipulation, and recovery. In Mahjong, every
+physical action alters object counts, turn structure, and fu-
+ture decision space. An undetected failure can corrupt the
+maintained internal state and invalidate subsequent reasoning.
+Therefore, the key points of the following specific system
+design all lie in reducing errors, reducing delays, and error
+recovery.
+Architectural partitioning. The final system deliberately
+separates high-level semantic reasoning from time-critical
+recognition and control. A vision–language model [3] fine-
+tuned by SFT, single-step RL and self-play, performs strate-
+gic decision-making, rule interpretation, turn validation, and
+context-dependent visual judgment. These operations occur
+at relatively low frequency and operate over the maintained
+game history. In contrast, latency-sensitive tasks—including
+tile detection, segmentation, and grasp pose estimation—are
+handled by specialized components: YOLO [25] for real-
+time tile detection, SAM [16] and FoundationPose [34] for
+pose estimation. Tactile sensing is used for grasp verification.
+This partition reflects deployment-driven constraints: while
+foundation models provide semantic flexibility and robustness
+to contextual variation, small-object detection and repeated
+manipulation demand deterministic latency and spatial pre-
+cision. Assigning these responsibilities to separate modules
+reduces cross-component interference and localizes failure
+modes within interpretable boundaries.
+State-conditioned action primitives. Gameplay is decom-
+posed into atomic action primitives (draw, place, discard, and
+meld). Each primitive is executed as a guarded state transition
+consisting of: (i) precondition validation against the maintained
+interaction and execution state, (ii) perceptual grounding of
+the target tile, (iii) pose estimation and motion execution, (iv)
+post-condition verification via tactile and force feedback, and
+only then (v) internal state update. Crucially, if execution fails,
+recovery procedures are triggered without committing state
+changes. This design prevents premature updates that would
+otherwise propagate inconsistencies across subsequent turns.
+Failure detection and recovery. As shown in Figure 2,
+physical manipulation errors are the most unsafe source of
+inconsistency. We found that integrating tactile sensing to
+detect incomplete grasps during hand closure can reduce the
+error rate. Upon failure detection, the target tile is re-localized
+using segmentation tracking [8], and a new grasp pose is
+estimated. Throughout this process, internal state variables—
+such as tile counts and turn progression—remain unchanged.
+By decoupling execution attempts from state commitment,
+excecution failures are converted from irreversible state cor-
+ruption into recoverable events.
+Interaction-level monitoring. Multi-human gameplay in-
+troduces events that violate execution assumptions. Rather than
+enforcing comprehensive rule compliance, the system monitors
+two interaction-level conditions that directly threaten internal
+consistency: out-of-turn play and unauthorized inspection of
+hidden tiles. These events are evaluated using vision–language
+reasoning conditioned on the maintained turn state. When
+detected, they are logged and surfaced to participants without
+forcibly interrupting gameplay. This preserves human authority
+in rule interpretation while maintaining transparency regarding
+potential state inconsistencies. The monitoring mechanism
+thus functions as a consistency safeguard rather than a rule-
+enforcement authority.
+V. RESULTS
+Fig. 3: Representative deployment environments and game-
+play settings. Including 1) Top-down views of the Mahjong
+table layout and per-player tile walls. 2) Close-up of manip-
+ulation during discarding and claiming. 3) Multi-human turn-
+based gameplay in laboratory conditions. 4) Public exhibition
+deployment with multiple participants.
+We evaluate the system across complete Mahjong games
+involving real human participants and autonomous robot op-
+eration under sustained, multi-human gameplay conditions.
+Experiments were conducted in both laboratory and public
+deployment environments, with multiple participants interact-
+ing around a shared tabletop setup, as illustrated in Figure 3.
+These settings reflect the long-horizon, turn-based interaction
+context studied in this work and include dense small-object
+manipulation, imperfect information, and human-driven turn
+dynamics.
+Our evaluation focuses on system-level executability, com-
+petitive game performance, perception reliability, and archi-
+tectural trade-offs. Rather than reporting isolated component
+benchmarks alone, we present end-to-end measurements that
+expose how perception, reasoning, execution, and recovery
+interact over extended horizons, and how failures propagate
+or are contained within the closed-loop system.
+A. Long-Horizon Executability
+Across 122 complete games, the robot successfully sus-
+tained gameplay for extended turn sequences involving re-
+peated perception–action loops. Of these, 109 games were
+completed without any human intervention, corresponding
+to 89.3% fully autonomous completion. Of the 13 games
+that did not complete without intervention, only 3 exhibited
+unrecoverable failures. The other 10 required only minor
+human intervention (e.g., manual tile repositioning) and were
+able to continue to completion thereafter. During the 122
+full games, the system executed 2596 action primitives and
+attempted more than 1000 grasps. The raw single-attempt
+grasp success rate was 99.2%. After enabling tactile-triggered
+recovery, overall grasp success increased to 99.8%.
+B. Game Performance
+Against human players, the robot achieved 34 wins over
+the 122 games, corresponding to a win rate of 27.9%, the
+highest among the four positions on the mahjong table. We
+adopt paired matches with role reversal to reduce positional
+bias. For each initial tile configuration, two games are played
+with swapped seating positions. A paired match is counted
+as a win only if one agent wins both games; otherwise, it
+is recorded as a draw. Under this protocol, across 40 paired
+matches against GPT-5.2, our system achieved 23 wins, GPT-
+5.2 achieved 3 wins, and 14 paired matches resulted in draws.
+Although optimal play is not the primary objective of
+this work, sustained competitive performance serves as a
+deployment-level acceptability signal. Notably, win rates de-
+grade measurably when execution inconsistencies remain un-
+recovered, even though strategic reasoning remains unchanged.
+To assess interpretability and post-hoc usefulness of the
+recorded decision traces, we conducted a human evaluation
+comparing our system’s traces with those generated by GPT-
+5.2 under identical game states. Human evaluators rated
+each trace along five dimensions—fluency, naturalness, rigor,
+correctness, and overall quality. Results are summarized in
+Table I.
+a) Impact of State Inconsistency: We further examine
+games in which execution inconsistencies were not success-
+fully recovered. A total of 8 such games were observed, among
+which the robot won only 1 game (12.5% win rate). Although
+the sample size is limited and does not permit strong statistical
+claims, the observed trend suggests that unrecovered misalign-
+ments—such as incorrect tile counts or turn assumptions—
+substantially degrade downstream game performance.
+In addition, during system debugging we occasionally dis-
+abled detecting each player’s declared missing suit. In these
+runs, the robot recorded the declared missing suit of all players
+as Characters for all games. Under this simplified configu-
+ration, 46 complete games were played, in which the robot
+won only once. This contrast suggests that maintaining state
+consistency in speech interaction and declared-missing-suit
+perception plays a nontrivial role in overall game performance.
+Table II summarizes the distribution of winning outcomes
+under both configurations.
+C. Architectural Trade-offs
+Before finalizing the system architecture, we conducted
+validation experiments to determine the allocation of re-
+sponsibilities between the vision–language model (VLM) and
+specialized perception modules.
+Tile perception. For full-frame Mahjong tile recognition,
+YOLO achieved 98.9% image-level accuracy with an inference
+latency of 15±2 ms per frame. In contrast, VLM-based recog-
+nition of individual tiles yielded lower accuracy and required
+at least 380 ms per image. Given the tight perception–action
+loop during draw and discard operations, the latency gap
+alone renders VLM-only detection impractical for sustained
+gameplay.
+Interaction-level violation detection. We further com-
+pared VLM-based reasoning with a DINO-v3 [29] feature
+extractor followed by a supervised classifier for detecting (i)
+unauthorized inspection and (ii) turn attribution. Results are
+summarized in Table III. VLM-based reasoning demonstrated
+higher performance, VLM never misclassified the identity of
+the inspecting player within positive samples, whereas the
+DINO-based classifier exhibited a 3.0% cross-identity error
+rate.
+These findings indicate that time-critical small-object per-
+ception benefits from lightweight detectors optimized for la-
+tency, whereas interaction-level reasoning requiring contextual
+interpretation benefits from semantic modeling. The resulting
+architecture therefore reflects empirical partitioning rather than
+arbitrary modular design.
+D. Perception and Interaction Monitoring Performance
+Across 122 real games, YOLO-based tile recognition pro-
+duced only 5 misdetections, supporting reliable real-time
+detection of small objects during gameplay. Turn violation
+detection achieved a precision of 0.872 and a recall of 0.867,
+while unauthorized inspection detection achieved a precision
+of 0.724 and a recall of 0.945. However, the negative predictive
+value (NPV) and specificity exceed 0.999 for both tasks.
+This is primarily due to the class imbalance observed during
+deployment, where negative samples substantially outnumber
+positive ones, resulting in a data distribution that differs from
+the training and held-out test sets.
+VI. DISCUSSION AND LIMITATIONS
+A. Failure Case Analysis
+Across all evaluated games, three fatal failures were ob-
+served that led to irreversible game termination. One case was
+TABLE I: Human evaluation of decision traces on a Likert scale. Fluency measures grammatical correctness and naturalness;
+Independence assesses whether the reasoning appears like human thought rather than tool-assisted; Rigor evaluates logical
+soundness and evidential support (including appropriate use of quantification and certainty); Interpretability measures whether
+the final decision is stepwise explainable and rule-consistent; Correctness assesses the strategic quality of the chosen action;
+Overall reflects the perceived human-likeness of the reasoning style. We randomly sampled 300 game states from 40 matches
+and distributed all model outputs evenly to six blinded annotators; five samples were incomplete. Values are reported as mean
+± standard deviation, and 𝑛denotes the number of evaluated states per model and decision context.
+Decision Context
+Model
+𝑛
+Evaluation Metrics (mean ± std)
+Fluency
+Independence
+Rigor
+Interpretability
+Correctness
+Overall
+Discard (Missing Suit)
+GPT-5.2
+74
+4.23±0.91
+4.05±1.16
+4.05±1.08
+3.82±1.28
+4.72±0.67
+3.91±1.09
+Ours
+85
+4.38±1.05
+4.27±1.13
+4.27±1.15
+4.0±1.23
+4.85±0.45
+4.31±1.03
+Discard (no Missing Suit)
+GPT-5.2
+55
+3.76±1.13
+3.6±1.43
+3.53±1.44
+3.4±1.43
+3.98±1.39
+3.49±1.26
+Ours
+44
+4.23±1.13
+4.27±1.12
+4.11±1.21
+4.09±1.28
+4.57±0.86
+4.2±0.94
+Claiming Decision
+GPT-5.2
+15
+3.47±1.02
+3.0±1.41
+2.8±1.56
+2.4±1.58
+3.13±1.5
+2.53±1.36
+Ours
+22
+4.09±1.04
+4.5±0.72
+4.23±1.24
+4.18±1.03
+4.86±0.34
+3.95±1.02
+TABLE II: Distribution of winning outcomes under two game-
+play configurations. In the Characters mode, used during
+debugging, the robot records the declared missing suit of all
+players as Characters. The Normal mode corresponds to the
+full system described earlier, where each player’s declared
+missing suit is determined through speech interaction and
+perception. Columns Right, Opp., and Left denote the three
+human players relative to the robot’s seating position. Multiple
+players may win from the same discard, so the sum of wins
+across players can exceed the number of games.
+Mode
+Games
+Robot
+Right
+Opp.
+Left
+Draw
+Characters
+46
+1
+19
+14
+8
+4
+Normal
+122
+34
+29
+27
+22
+13
+TABLE III: Comparison of architectural alternatives for tile
+perception and interaction-level violation detection. VLM
+achieves 94.3% per-tile recognition accuracy rather than per-
+image. Latency is measured per image. Precision/Recall are
+reported for positive-class detection.
+Task
+VLM
+YOLO / DINO
+Tile recognition accuracy
+< 94.3%
+98.9% (YOLO)
+Latency (ms)
+≥380
+15±2 (YOLO)
+Inspection P/R
+0.967 / 0.989
+0.956 / 0.960 (DINO)
+Turn attribution P/R
+0.937 / 0.976
+0.949 / 0.931 (DINO)
+Cross-identity error
+0%
+3.0% (DINO)
+caused by an error in speech recognition, which incorrectly de-
+tected that a player had declared a winning hand, prematurely
+terminating the game. The remaining two cases originated
+from visual misidentification by YOLO: in one instance, a
+tile was misdetected, leading the system to execute an illegal
+pung; in another, a misclassification resulted in an illegal
+concealed kong. These failures illustrate that long-horizon
+gameplay is vulnerable to cross-module error propagation.
+In certain cases, a fault in one component can cascade into
+others, influencing downstream action execution and degrading
+internal state consistency.
+As a result, tactile feedback during grasping and meld exe-
+cution plays a critical role in preventing such fatal outcomes.
+When grasp verification or placement confirmation fails, the
+system delays internal state updates and triggers recovery.
+Without this verification step, erroneous grasps or unintended
+tile movements would directly corrupt hand composition,
+leading to irreversible inconsistencies across subsequent turns.
+B. Hardware as a Reliability Bottleneck
+While it is often assumed that system reliability in em-
+bodied game playing is primarily limited by algorithmic or
+software performance, our empirical observations suggest a
+different picture. Across all recorded failures, 9 incidents
+were attributable to perception or reasoning errors, whereas
+11 failures were associated with hardware-related instability,
+including grasp closure variance and actuation imprecision.
+Fig. 4: Smoothed hardware error probability as a function of
+continuous operation time. Error frequency increases notice-
+ably after approximately 20,000 seconds of sustained execu-
+tion.
+To further analyze this effect, Figure 4 plots the frequency
+of hardware-induced minor errors as a function of continuous
+operation time within a single day. We observe a noticeable
+increase in hardware error rate after approximately 20,000
+seconds of sustained operation, indicating performance degra-
+dation under prolonged use.
+These results suggest that once perception and state es-
+timation reach moderate robustness, mechanical consistency
+and actuation stability become a dominant factor in end-to-
+end system reliability, particularly in long-horizon tabletop
+interaction.
+C. Limitations
+The system relies on partially structured environmental
+assumptions, including calibrated workspace geometry, which
+limits its adaptability to arbitrary setups. Only a minimal
+subset of interaction-level violations is monitored, and com-
+prehensive rule enforcement as well as adversarial robustness
+are beyond the current scope. Furthermore, while the system
+empirically characterizes failure propagation and recovery, it
+does not provide formal guarantees of state consistency under
+all contingencies. The findings should therefore be interpreted
+as deployment-driven system insights rather than theoretical
+guarantees. Although the VLM can generate interpretable
+reasoning traces that help humans understand the robot’s
+decisions, its cognitive assistance cannot yet be dynamically
+adjusted to match user needs. This limitation restricts the
+robot’s ability to provide progressive assistance for gradual
+skill development or to reduce challenge when a more relaxed
+experience is desired. In addition, the extent to which the
+decision traces generated by large models facilitate post-game
+reflection or provide meaningful educational value has not yet
+been systematically evaluated.
+REFERENCES
+[1] Figure AI.
+Helix: A vision-language-action model for
+generalist humanoid control. https://www.figure.ai/news/
+helix, 2025.
+[2] Figure AI.
+Scaling helix: a new state of the art
+in
+humanoid
+logistics.
+https://www.figure.ai/news/
+scaling-helix-logistics, 2025.
+[3] Shuai Bai, Keqin Chen, Xuejing Liu, Jialin Wang, Wen-
+bin Ge, Sibo Song, Kai Dang, Peng Wang, Shijie Wang,
+Jun Tang, Humen Zhong, Yuanzhi Zhu, Mingkun Yang,
+Zhaohai Li, Jianqiang Wan, Pengfei Wang, Wei Ding,
+Zheren Fu, Yiheng Xu, Jiabo Ye, Xi Zhang, Tianbao Xie,
+Zesen Cheng, Hang Zhang, Zhibo Yang, Haiyang Xu, and
+Junyang Lin. Qwen2.5-vl technical report, 2025. URL
+https://arxiv.org/abs/2502.13923.
+[4] Kevin Black, Noah Brown, Danny Driess, Adnan Es-
+mail, Michael Equi, Chelsea Finn, Niccolo Fusai, Lachy
+Groom, Karol Hausman, Brian Ichter, et al. 𝜋0: A vision-
+language-action flow model for general robot control.
+arXiv preprint arXiv:2410.24164, 2024.
+[5] Tim Bohne and Benjamin Kisliuk. Execution monitor-
+ing for long-term autonomous mobile robots in outdoor
+scenarios. In Workshop on Robot Execution Failures and
+Failure Management Strategies, ICRA, 2023.
+[6] Noam Brown and Tuomas Sandholm. Superhuman ai for
+multiplayer poker. Science, 365(6456):885–890, 2019.
+[7] Shizhe Chen, Ricardo Garcia, Paul Pacaud, and Cordelia
+Schmid. Gondola: Grounded vision language planning
+for generalizable robotic manipulation.
+arXiv preprint
+arXiv:2506.11261, 2025.
+[8] Ho Kei Cheng, Seoung Wug Oh, Brian Price, Joon-
+Young Lee, and Alexander Schwing. Putting the object
+back into video object segmentation.
+In Proceedings
+of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition (CVPR), 2024. Cutie.
+[9] Murtaza Dalal, Tarun Chiruvolu, Devendra Singh Chap-
+lot, and Ruslan Salakhutdinov. Plan-seq-learn: Language
+model guided rl for solving long horizon robotics tasks.
+In ICLR 2024 Workshop on Large Language Model
+(LLM) Agents, 2024.
+[10] Xidong Feng, Yicheng Luo, Ziyan Wang, Hongrui Tang,
+Mengyue Yang, Kun Shao, David Mguni, Yali Du, and
+Jun Wang.
+Chessgpt: Bridging policy learning and
+language modeling.
+Advances in Neural Information
+Processing Systems, 36:7216–7262, 2023.
+[11] Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song,
+Peiyi Wang, Qihao Zhu, Runxin Xu, Ruoyu Zhang,
+Shirong Ma, Xiao Bi, et al. Deepseek-r1: Incentivizing
+reasoning capability in llms via reinforcement learning.
+arXiv preprint arXiv:2501.12948, 2025.
+[12] Haifeng Huang, Xinyi Chen, Yilun Chen, Hao Li, Xi-
+aoshen Han, Zehan Wang, Tai Wang, Jiangmiao Pang,
+and Zhou Zhao. Roboground: Robotic manipulation with
+grounded vision-language priors. In Proceedings of the
+Computer Vision and Pattern Recognition Conference,
+pages 22540–22550, 2025.
+[13] Physical Intelligence, Kevin Black, Noah Brown, James
+Darpinian, Karan Dhabalia, Danny Driess, Adnan Es-
+mail, Michael Equi, Chelsea Finn, Niccolo Fusai, et al.
+𝜋0.5: a vision-language-action model with open-world
+generalization. arXiv preprint arXiv:2504.16054, 2025.
+[14] Kento Kawaharazuka, Tatsuya Matsushima, Andrew
+Gambardella, Jiaxian Guo, Chris Paxton, and Andy Zeng.
+Real-world robot applications of foundation models: A
+review. Advanced Robotics, 38(18):1232–1254, 2024.
+[15] Moo Jin Kim, Karl Pertsch, Siddharth Karamcheti, Ted
+Xiao, Ashwin Balakrishna, Suraj Nair, Rafael Rafailov,
+Ethan Foster, Grace Lam, Pannag Sanketi, et al. Openvla:
+An open-source vision-language-action model.
+arXiv
+preprint arXiv:2406.09246, 2024.
+[16] Alexander Kirillov, Eric Mintun, Nikhila Ravi, Hanzi
+Mao, Chloe Rolland, Laura Gustafson, Tete Xiao,
+Spencer Whitehead, Alexander C Berg, Wan-Yen Lo,
+et al.
+Segment anything.
+In Proceedings of the
+IEEE/CVF international conference on computer vision,
+pages 4015–4026, 2023.
+[17] Steven James Levine. Monitoring the execution of tempo-
+ral plans for robotic systems. PhD thesis, Massachusetts
+Institute of Technology, 2012.
+[18] Junjie Li, Sotetsu Koyamada, Qiwei Ye, Guoqing Liu,
+Chao Wang, Ruihan Yang, Li Zhao, Tao Qin, Tie-
+Yan Liu, and Hsiao-Wuen Hon.
+Suphx: Mastering
+mahjong with deep reinforcement learning.
+arXiv
+preprint arXiv:2003.13590, 2020.
+[19] Luca Marchionna, Giulio Pugliese, Mauro Martini, Si-
+mone Angarano, Francesco Salvetti, and Marcello Chi-
+aberge. Deep instance segmentation and visual servoing
+to play jenga with a cost-effective robotic system. Sen-
+sors, 23(2):752, 2023.
+doi: 10.3390/s23020752.
+Also
+available as arXiv:2211.07977.
+[20] Ruaridh Mon-Williams, Gen Li, Ran Long, Wenqian Du,
+and Christopher G Lucas.
+Embodied large language
+models enable robots to complete complex tasks in un-
+predictable environments. Nature Machine Intelligence,
+7(4):592–601, 2025.
+[21] Truong Duc Phuc and Bui Cao Son. Development of an
+autonomous chess robot system using computer vision
+and deep learning. Results in Engineering, 25:104091,
+2025.
+[22] Zhanyue Qin, Haochuan Wang, Deyuan Liu, Ziyang
+Song, Cunhang Fan, Zhao Lv, Jinlin Wu, Zhen Lei,
+Zhiying Tu, Dianhui Chu, et al. Uno arena for evaluating
+sequential decision-making capability of large language
+models.
+In Proceedings of the 2024 Conference on
+Empirical Methods in Natural Language Processing,
+pages 7630–7645, 2024.
+[23] Rafael Rafailov, Archit Sharma, Eric Mitchell, Christo-
+pher D Manning, Stefano Ermon, and Chelsea Finn.
+Direct preference optimization: Your language model is
+secretly a reward model. Advances in neural information
+processing systems, 36:53728–53741, 2023.
+[24] Diogo Rato, Filipa Correia, André Pereira, and Rui
+Prada. Robots in games. International Journal of Social
+Robotics, 15(1):37–57, 2023.
+[25] Joseph Redmon, Santosh Divvala, Ross Girshick, and Ali
+Farhadi. You only look once: Unified, real-time object
+detection.
+In Proceedings of the IEEE conference on
+computer vision and pattern recognition, pages 779–788,
+2016.
+[26] John Schulman, Filip Wolski, Prafulla Dhariwal, Alec
+Radford, and Oleg Klimov. Proximal policy optimization
+algorithms. arXiv preprint arXiv:1707.06347, 2017.
+[27] Guangming Sheng, Chi Zhang, Zilingfeng Ye, Xibin Wu,
+Wang Zhang, Ru Zhang, Yanghua Peng, Haibin Lin, and
+Chuan Wu.
+Hybridflow: A flexible and efficient rlhf
+framework. arXiv preprint arXiv: 2409.19256, 2024.
+[28] David Silver, Aja Huang, Chris J Maddison, Arthur
+Guez, Laurent Sifre, George Van Den Driessche, Julian
+Schrittwieser, Ioannis Antonoglou, Veda Panneershel-
+vam, Marc Lanctot, et al.
+Mastering the game of go
+with deep neural networks and tree search. nature, 529
+(7587):484–489, 2016.
+[29] Oriane Siméoni, Huy V Vo, Maximilian Seitzer, Federico
+Baldassarre, Maxime Oquab, Cijo Jose, Vasil Khalidov,
+Marc Szafraniec, Seungeun Yi, Michaël Ramamonjisoa,
+et al. Dinov3. arXiv preprint arXiv:2508.10104, 2025.
+[30] Ajay Sridhar, Jennifer Pan, Satvik Sharma, and Chelsea
+Finn. Memer: Scaling up memory for robot control via
+experience retrieval.
+arXiv preprint arXiv:2510.20328,
+2025.
+[31] Nikhil Srikanth.
+Gamesmanros: A generalized game-
+playing robotic system. Technical Report UCB/EECS-
+2025-128, EECS Department, University of California,
+Berkeley, May 2025. Masters Report. Editors: D. Garcia
+and K. Goldberg.
+[32] Gemini Robotics Team, Saminda Abeyruwan, Joshua
+Ainslie, Jean-Baptiste Alayrac, Montserrat Gonzalez
+Arenas, Travis Armstrong, Ashwin Balakrishna, Robert
+Baruch, Maria Bauza, Michiel Blokzijl, et al. Gemini
+robotics: Bringing ai into the physical world.
+arXiv
+preprint arXiv:2503.20020, 2025.
+[33] Jiaqi Wang, Enze Shi, Huawen Hu, Chong Ma, Yiheng
+Liu, Xuhui Wang, Yincheng Yao, Xuan Liu, Bao Ge,
+and Shu Zhang.
+Large language models for robotics:
+Opportunities, challenges, and perspectives. Journal of
+Automation and Intelligence, 4(1):52–64, 2025.
+[34] Bowen Wen, Wei Yang, Jan Kautz, and Stan Birchfield.
+Foundationpose: Unified 6d pose estimation and tracking
+of novel objects.
+In Proceedings of the IEEE/CVF
+conference on computer vision and pattern recognition,
+pages 17868–17879, 2024.
+[35] Christoph Willibald and Dongheui Lee.
+Hierarchical
+task decomposition for execution monitoring and er-
+ror recovery: Understanding the rationale behind task
+demonstrations. The International Journal of Robotics
+Research, page 02783649251352112, 2025.
+[36] Xingcheng Wu, Siyuan Jing, Xianwei Tang, Hao Yu,
+Yu Shen, Ke Wang, and Keren Fu.
+A human-robot
+interactive mahjong playing system based on visual
+recognition using a convolutional neural network.
+In
+Proceedings of the 2021 5th International Conference on
+Computer Science and Application Engineering (CSAE
+’21), pages 63:1–63:8. Association for Computing Ma-
+chinery, 2021. doi: 10.1145/3487075.3487188.
+[37] Kuan-Huang Yu. Integration of robotics, computer vi-
+sion, and algorithm design: A chinese poker self-playing
+robot. arXiv preprint arXiv:2312.09455, 2023.
+[38] Mateusz Żarkowski. Multi-party turn-taking in repeated
+human–robot interactions: an interdisciplinary evalua-
+tion.
+International Journal of Social Robotics, 11(5):
+693–707, 2019.
+[39] Renchi Zhang, Joost de Winter, Dimitra Dodou, Harleigh
+Seyffert, and Yke Bauke Eisma. An open-source repro-
+ducible chess robot for human-robot interaction research.
+Frontiers in Robotics and AI, 12:1436674, 2025.
+doi:
+10.3389/frobt.2025.1436674.
+[40] Yifan Zhong, Xuchuan Huang, Ruochong Li, Ceyao
+Zhang, Zhang Chen, Tianrui Guan, Fanlian Zeng,
+Ka Num Lui, Yuyao Ye, Yitao Liang, et al. Dexgraspvla:
+A vision-language-action framework towards general
+dexterous grasping.
+arXiv preprint arXiv:2502.20900,
+2025.
+APPENDIX
+A. Training Pipeline for Strategic Reasoning
+The multimodal semantic understanding module in Fig-
+ure 1 employs Qwen-2.5-VL-7B [3] as the backbone vision–
+Fig. 5: Training pipeline for strategic reasoning. Stage 1 distills a conventional RL-trained policy into the VLM via supervised
+fine-tuning with LLM-synthesized reasoning traces. Stage 2 applies single-step RL (GRPO) to optimize decision quality beyond
+imitation. Stage 3 uses self-play with DPO to discover strategies that surpass the original teacher policy.
+language model (VLM). For strategic reasoning, the model re-
+ceives a natural language description of the current game state
+and history, and produces both an explicit chain-of-thought
+rationale and a final action decision. We developed a three-
+stage training pipeline—supervised fine-tuning (SFT), single-
+step reinforcement learning (RL), and self-play optimization—
+that progressively improves game performance while preserv-
+ing human-readable reasoning traces. The overall pipeline is
+illustrated in Figure 5.
+Stage 1: Supervised Fine-Tuning: We first train a con-
+ventional MLP-and-CNN-based Mahjong policy 𝜋AI using
+Proximal Policy Optimization (PPO) [26] via self-play. This
+teacher policy generates a dataset of state–action pairs D0 =
+{(𝑠𝑖, 𝑎𝑖)}𝑁
+𝑖=1, where each state 𝑠𝑖encodes the player’s hand
+tiles, visible discards, and inferred missing-suit information,
+and 𝑎𝑖is the action selected by 𝜋AI.
+To equip the VLM with explicit reasoning capabilities, we
+use DeepSeek-R1 [11] to synthesize chain-of-thought (CoT)
+explanations for each state–action pair. Given (𝑠𝑖, 𝑎𝑖), the LLM
+generates a natural language reasoning trace 𝑇𝑖that articulates
+the strategic considerations behind action 𝑎𝑖. This yields an
+augmented dataset e
+D = {(𝑠𝑖,𝑇𝑖, 𝑎𝑖)}𝑁
+𝑖=1.
+We fine-tune the VLM on e
+D by minimizing the standard
+negative log-likelihood:
+LSFT(𝜃) = −E(𝑥, 𝑇, 𝑎) ∼e
+D
+h
+log 𝑝𝜃(𝑇, 𝑎| 𝑥)
+i
+,
+(1)
+where 𝜃denotes the VLM parameters. The resulting model
+𝜋SFT
+VLM learns to produce well-formatted, reasoned outputs.
+When evaluated against 𝜋AI in four-player games, 𝜋SFT
+VLM
+achieves a win rate of 28%.
+Stage 2: Single-Step Reinforcement Learning: The SFT
+stage teaches the model to generate structured, human-readable
+outputs, but the maximum-likelihood objective treats all tokens
+equally and does not directly optimize for decision quality.
+To improve gameplay performance, we apply GRPO [11] by
+VERL [27] as a single-step RL procedure, using 𝜋AI as a
+reward signal.
+For each state 𝑠(described by prompt 𝑥), the current policy
+generates 𝐺candidate responses {(𝑇𝑖, 𝑎𝑖)}𝐺
+𝑖=1 in parallel. Each
+response is scored by a composite reward:
+𝑅𝑖= 𝑅format(𝑇𝑖, 𝑎𝑖) + 𝑅accuracy(𝑠, 𝑎𝑖),
+(2)
+where 𝑅format(𝑇𝑖, 𝑎𝑖) ∈{0, 1} indicates whether the output
+satisfies predefined formatting constraints (parseable structure,
+valid action token), 𝑅accuracy(𝑠, 𝑎𝑖) = 𝜋AI(𝑎𝑖
+| 𝑠) is the
+probability assigned by the teacher policy to the chosen action.
+The group-level advantage for the 𝑖-th response is computed
+as:
+𝐴𝑖= 𝑅𝑖−𝜇G
+𝜎G
+,
+(3)
+where 𝜇G and 𝜎G are the mean and standard deviation of
+rewards within the group of 𝐺responses.
+Denoting the importance-sampling ratio 𝑟𝑖(𝜃) =
+𝜋𝜃(𝑇𝑖,𝑎𝑖|𝑥)
+𝜋ref(𝑇𝑖,𝑎𝑖|𝑥)
+with reference policy 𝜋ref = 𝜋SFT
+VLM, the GRPO objective is:
+LGRPO(𝜃) = −1
+𝐺
+𝐺
+Õ
+𝑖=1
+min
+
+𝑟𝑖(𝜃) 𝐴𝑖,
+clip 𝑟𝑖(𝜃), 1−𝜀, 1+𝜀 𝐴𝑖
+
++ 𝛽𝐷KL
+
+𝜋𝜃∥𝜋ref
+
+(4)
+where 𝜀is the clipping threshold and 𝛽controls the KL penalty
+strength.
+During this stage, the model generates rationales directly
+from the game state without relying on pre-written traces, and
+rewards are computed solely based on the final action and
+output format. The resulting model 𝜋RL
+VLM achieves a win rate
+of 44% against 𝜋AI, a substantial improvement over the SFT
+baseline.
+Stage 3: Self-Play Optimization: To enable the model to
+discover strategies beyond those captured by the teacher policy
+𝜋AI, we perform self-play optimization using Direct Preference
+Optimization (DPO) [23].
+We organize self-play games into groups of 𝐺games,
+where all games within a group share the identical initial wall
+arrangement and starting hands for all four players. Diver-
+gent trajectories therefore arise solely from different decision
+sequences. After completing all 𝐺games in a group, we
+construct a trie over their trajectories: each node corresponds
+to a state–action pair, and each root-to-leaf path represents
+one complete game. Every node records its empirical win rate
+across all games that pass through it.
+We extract preference pairs from nodes that have multiple
+children, i.e., states where 𝜋RL
+VLM selected different actions
+across games. Children are ranked by their empirical win rates;
+higher-win-rate actions are treated as preferred and lower-win-
+rate actions as dispreferred. For each such contrastive pair, we
+sample one reasoning trace from each child node, yielding
+a preferred response (𝑇+, 𝑎+) and a dispreferred response
+(𝑇−, 𝑎−) conditioned on the same state description 𝑥.
+The model is then optimized with the DPO loss:
+LDPO(𝜃) = −log 𝜎
+
+𝛽sp
+
+log
+𝜋𝜃(𝑇+, 𝑎+ | 𝑥)
+𝜋RL
+VLM(𝑇+, 𝑎+ | 𝑥)
+−log
+𝜋𝜃(𝑇−, 𝑎−| 𝑥)
+𝜋RL
+VLM(𝑇−, 𝑎−| 𝑥)
+ 
+(5)
+where 𝜋RL
+VLM serves as the reference policy and 𝛽sp controls
+the KL penalty strength, ensuring the model retains reasoning
+capabilities acquired in earlier stages.
+Through iterative rounds of self-play data collection and
+DPO updates, the final model achieves a win rate of 48%
+against the teacher policy 𝜋AI. This demonstrates that the self-
+play stage enables the VLM to surpass its original teacher,
+discovering strategies that were not present in the distillation
+data.

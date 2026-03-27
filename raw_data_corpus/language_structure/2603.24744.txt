@@ -1,0 +1,1361 @@
+Contrastive Learning Boosts Deterministic and Generative
+Models for Weather Data⋆
+Nathan Bailey1,
+Abstract
+Weather data, comprising variables such as temperature, geopotential, and wind speed,
+poses significant challenges due to its high dimensionality and multimodal nature. Cre-
+ating low-dimensional embeddings requires compressing this data into a compact, shared
+latent space. This compression is required to improve the efficiency and performance
+of downstream tasks, such as forecasting or extreme-weather detection. This has been
+highlighted more recently by the foundation model AlphaEarth [1], which demonstrates
+the need for a pre-trained model capable of generating robust representations of high-
+dimensional weather and climate data.
+Self-supervised learning, particularly contrastive learning, offers a way to generate low-
+dimensional, robust embeddings from unlabelled data, enabling downstream tasks when
+labelled data is scarce. Despite initial exploration of contrastive learning in weather
+data, particularly with the ERA5 dataset, the current literature does not extensively
+examine its benefits relative to alternative compression methods, notably autoencoders.
+Moreover, current work on contrastive learning does not investigate how these models
+can incorporate sparse data, which is more common in real-world data collection. It
+is critical to explore and understand how contrastive learning contributes to creating
+more robust embeddings for sparse weather data, thereby improving performance on
+downstream tasks.
+Our work extensively explores contrastive learning on the ERA5 dataset, aligning sparse
+samples with complete ones via a contrastive loss term to create SPARse-data augmented
+conTRAstive spatiotemporal embeddings (SPARTA). We show that our method and ex-
+periments improve performance over an autoencoder across a range of downstream tasks.
+This advance is achieved by introducing a temporally aware batch sampling strategy and
+a cycle-consistency loss to improve the structure of the latent space. Furthermore, we
+propose a novel graph neural network fusion technique to inject domain-specific physical
+knowledge, thereby further enhancing our contrastive learning method. Ultimately, our
+results demonstrate that contrastive learning is a feasible and advantageous compression
+method for sparse geoscience data, thereby enhancing performance in downstream tasks.
+⋆Adapted from an MSc thesis submitted by the same author to Imperial College London, 2025. The
+original thesis is available at https://www.nathanbaileyw.com/msc-thesis.
+Email address: nathanbaileyw@gmail.com (Nathan Bailey)
+1Supervised by Dr Sibo Cheng, Faculty of Engineering, Imperial College London and Dr Cesar
+Quilodran-Casas, The Grantham Institute for Climate Change, Faculty of Natural Sciences, Imperial
+College London.
+arXiv:2603.24744v1  [cs.LG]  25 Mar 2026
+Main Notations
+Notation
+Description
+Ex
+Autoencoder Encoder
+Dx
+Autoencoder Decoder
+f(·)
+SimCLR Encoder
+g(·)
+SimCLR Projector
+τ
+SimCLR Loss Temperature Hyperparameter
+Lr
+Decoder Loss
+ℓc
+Intermediate Contrastive Loss
+Lc
+Total Contrastive Loss
+L
+Total Loss
+ℓcycle
+Cycle Loss
+α
+Joint Loss Function Term for Blending Training Stage
+k
+Decay Hyperparameter for α
+ℓi,j
+Individual Loss for SimCLR pair (i, j)
+h
+Contrastive Embeddings (Latent Space)
+z
+Contrastive Projections
+x
+Ground Truth Data
+ˆx
+Reconstructed (Predicted) Data
+1. Introduction
+In recent years, machine learning (ML) has been increasingly deployed for weather fore-
+casting. Deep Learning models such as Pangu-Weather [2] and GraphCast [3] aim to
+replace or complement numerical weather prediction (NWP), a more traditional forecast-
+ing method. One of the main challenges with weather data is the sparsity of observations.
+This sparsity arises either from the high cost of collecting complete data or from sen-
+sor readings that provide only partial measurements [4, 5]. Sparsity poses significant
+challenges in machine learning applications, as samples are often unlikely to accurately
+reflect the underlying data distribution, leading to overfitting [6].
+Weather data samples often reside in high dimensions. Due to the curse of dimensional-
+ity, these tasks become more challenging, as the sheer volume of data needed to prevent
+overfitting grows exponentially. Additionally, this increases the computational require-
+ments for sample processing and model training. This compounds, as datasets often
+consist of multiple data variables (modes), substantially increasing the data’s dimension-
+ality, making downstream performance on raw data samples more difficult. Therefore,
+a unified model is needed that can reliably handle data sparsity and compress it into a
+shared low-dimensional latent space, enabling downstream tasks to run more efficiently
+and achieve higher performance.
+One method to achieve this shared latent space is to compress the data using an autoen-
+coder. However, an alternative method is contrastive learning, a type of self-supervised
+2
+learning (SSL) that learns data representations by contrasting positive and negative sam-
+ples. In this way, within the resulting reduced representation space, positive samples
+are pulled closer together, and negative samples are pushed apart, creating structure in
+the latent space [7]. Through this method, the model learns high-quality data embed-
+dings that can be utilised in downstream tasks such as classification or segmentation.
+Contrastive learning performance can match or exceed that of supervised learning [7],
+enabling the use of a range of datasets with sparse labels in tasks that would typically
+require extensive supervision.
+Self-supervised learning and, by extension, contrastive learning therefore naturally lend
+themselves to weather analysis datasets, as these are often collected without labels.
+Therefore, contrastive learning provides a means to create significantly smaller, more
+structured representations of weather data, thereby reducing dimensionality and im-
+proving downstream performance.
+Existing work has explored contrastive learning and general data compression for weather
+data; however, no extensive investigation of this topic has been conducted.
+Wang et al [8] build a SimCLR model to classify weather systems in the latent space,
+demonstrating the strength of contrastive learning on weather datasets compared to tra-
+ditional approaches. They also exhaustively evaluate various augmentation techniques
+using ERA5 data, proving that resizing and smoothing yield the best results. However,
+they only consider classifying weather systems using clustering or a linear classifier on
+the latent representations, with a subset of the data’s latitude and longitude. Further-
+more, an extensive evaluation using multiple downstream tasks and decoding back from
+the latent representation is not considered.
+Similarly, Wang et al [9] consider contrastive learning on ERA5 data using a hybrid
+fusion method. However, similar to Wang et al, they optimise the model on a single
+downstream task: tropical cyclone prediction.
+Han et al [10] create a VAE to compress the ERA5 dataset into a latent space, reduc-
+ing its size and thereby widening access to it. They demonstrate that this method can
+achieve comparable forecasting performance on latent data to that of full dimensionality.
+Whilst this is an important first step, they do not consider the benefit that contrastive
+learning methods could bring. Furthermore, they do not decode the resulting latent
+predictions back to their original dimensionality, a step that is important for real-world
+applications.
+The approaches highlighted consider only simple downstream tasks that do not require
+decoding the latent representations back to their original dimensionality. This limits the
+downstream tasks that can be utilised for evaluation. Tasks such as latent diffusion or
+forecasting require this decoding step to interpret the results. Moreover, they do not
+fully explore the available multimodal fusion methods. Contrastive learning approaches
+typically focus on a single data mode. However, weather data is inherently multimodal;
+therefore, to perform contrastive learning, it is necessary to fuse the data modalities.
+3
+Evaluating available fusion methods is a useful and necessary step toward contrastive
+learning for the ERA5 dataset.
+Finally, these methods treat the reanalysis dataset as-is and do not account for the spar-
+sity or noise in weather data. Existing methods addressing sparsity in weather datasets
+[11, 4, 12] focus on training masked autoencoders to reconstruct sparse data. While this
+is an important area of focus within weather datasets, none of these methods consider
+creating robust representations of sparse or noisy data within the latent space for down-
+stream tasks.
+Therefore, we can conclude that contrastive learning in geoscience applications, such
+as weather forecasting, has not been widely explored. We focus our work on this gap,
+exploring it in more detail to build an end-to-end model. Our model integrates mul-
+tiple sparse modalities via fusion techniques to generate robust latent representations,
+termed SPARse-data augmented conTRAstive spatiotemporal embeddings (SPARTA).
+Furthermore, to demonstrate the benefits of contrastive learning, we benchmark all our
+experiments against a representative autoencoder.
+Specifically, we make the following contributions:
+1. We construct a end-to-end contrastive learning model. Building on the
+literature, we integrate a decoder into the contrastive learning pipeline to create
+an end-to-end system that enables downstream predictions to be utilised in the
+input space.
+2. We highlight the benefits of contrastive learning to a multitude of down-
+stream tasks. To achieve our goal of creating a robust model and, consequently,
+a robust latent space, we evaluate our model on three downstream tasks: autore-
+gressive forecasting, conditional latent diffusion, and latent classification. Through
+the use of a novel hard negative sampling scheme and cycle consistency
+loss, we demonstrate that contrastive learning yields a superior latent space for
+all tasks compared to a representative autoencoder.
+3. We show that late-fusion offers substantial benefits over early-fusion.
+We integrate late-fusion techniques into our model and demonstrate that our novel
+graph neural network (GNN) approach outperforms the state-of-the-art self-
+attention method.
+The remainder of this paper is as follows. Section 2 introduces the ERA5 dataset. The
+proposed machine learning methodology is introduced in section 3. Finally, we perform
+a detailed evaluation in section 6, thoroughly analysing the latent space and performing
+ablation tests on our subcomponents to highlight their performance gains.
+2. Dataset
+Throughout our work, we utilise the ERA5 dataset. ERA5 is the fifth-generation Eu-
+ropean Centre for Medium-Range Weather Forecasting (ECMWF) reanalysis dataset,
+containing time-series data from 1959 onwards. A reanalysis dataset combines observa-
+tions and model data to create a complete dataset [13]. It therefore provides consistent
+4
+data for our experiments.
+Moreover, it has been used in early work on contrastive
+learning in geoscience [8, 9]. ERA5 consists of 62 data variables (modes) that span the
+complete longitude and latitude of the globe [14]. The ERA5 dataset can be used for a
+range of tasks, including weather forecasting, extreme event monitoring, and classifica-
+tion.
+For our experiments, we use the following five variables: air temperature at 2 me-
+tres above the surface, geopotential, horizontal and vertical wind speeds at 100 me-
+tres above the Earth’s surface, and specific humidity. All but temperature are asso-
+ciated with pressure levels, with the 850 hPa level used in accordance with [8]. We
+use the lowest-dimensional data, which corresponds to a resolution of 5.625° × 5.625°
+(64x32), which spans the full range of latitude and longitude, resulting in a dataset of
+size X ∈RB×5×64×32, where B is the batch size, and each variable is stacked as a channel.
+3. Machine Learning Methodology
+3.1. Model: Deterministic Autoencoder
+The fundamental goal of our work is to obtain a general embedding that is suitable for a
+variety of downstream tasks. One method to achieve this goal is to use an autoencoder.
+This is a type of neural network that aims to create a compressed representation by
+encoding and subsequently decoding data samples. The structure of an autoencoder
+consists of an encoder, denoted as Ex, that compresses the input vector (xi) to a repre-
+sentation (hi), often called the latent space, and a decoder, denoted as Dx, that maps
+this latent vector to a reconstruction of the input (ˆxi).
+xi
+hi
+ˆxi
+Ex
+Dx
+(1)
+A deterministic autoencoder involves no stochasticity and learns to map the compressed
+representation back to the original data point. This type of autoencoder is optimised
+using a mean squared error (MSE) loss computed between the reconstructed and ground-
+truth data, as shown in equation 2 where N is the size of the training dataset. Due to
+the model’s deterministic nature, the same data point maps to the same compressed
+point in the latent space.
+LMSE = 1
+N
+N
+X
+i=1
+∥ˆxi −xi∥2 = 1
+N
+N
+X
+i=1
+∥Dx(Ex(xi)) −xi∥2
+(2)
+Neural networks with enhanced structures, such as convolutional neural networks (CNNs),
+have been extended for use in autoencoders. Convolutional autoencoders (CAE) extend
+upon feedforward autoencoders by providing the benefits of locality, invariance and a
+reduction in parameters that are inherent to CNNs.
+In this study, we utilise a convolutional autoencoder as a benchmark for our more sophis-
+ticated contrastive learning method. Specifically, we utilise a single ResNet-18 encoder
+to jointly process all modes of a single data sample, providing a latent dimension of
+1000. Our decoder is constructed from five decoder blocks, each consisting of a trans-
+posed convolutional layer for upscaling, followed by a residual convolutional block with
+3 × 3 kernels and ReLU activation.
+5
+3.2. Model: SimCLR
+For our contrastive learning comparison, we utilised the popular SimCLR model [15].
+This methodology was initially used for computer vision (CV) applications and consists
+of an encoder network denoted as f(·) used to produce embeddings h and a projection
+network denoted as g(·) used to produce projections z (see equation 3).
+xi
+hi
+zi
+f
+g
+(3)
+SimCLR takes a batch of data samples and, for each, creates a positive pair (i, j) by
+augmenting the data sample twice. These are used to create intermediate embeddings
+(latent space) hi, hj and projections zi, zj. Within the batch (of size N), SimCLR opti-
+mises the network using the NT-Xent loss, as shown in equation 4. This maximises the
+cosine similarity (denoted by sim()) between normalised positive projections and min-
+imises the cosine similarity between normalised negative projections. This is computed
+across all positive pairs (both (i, j) and (j, i)) in a mini-batch and averaged across all
+2N pairs, as shown in equation 5. SimCLR demonstrated that utilising embeddings de-
+rived from this contrastive learning approach in downstream tasks achieved performance
+comparable to that of a ResNet-50 approach on labelled data [15].
+ℓi,j = −log
+exp (sim(zi, zj)/τ)
+P2N
+k=1 1[k̸=i] exp (sim(zi, zk)/τ)
+(4)
+Lsimclr =
+1
+2N
+X
+all positive pairs
+ℓi,j
+(5)
+SimCLR was chosen over other popular contrastive learning models for its simplicity
+and the explicit separation it induces in the latent space via positive and negative sam-
+ples. For example, alternatives such as supervised contrastive learning [16] introduce
+additional complexity because they require explicit labels. Barlow Twins [17] does not
+use positive and negative samples, meaning that SimCLR should lead to embeddings of
+different weather states that are better separated in the latent space, due to it explicitly
+pushing away distinct samples.
+A key consideration for SimCLR is the temperature hyperparameter τ introduced in the
+loss function; a smaller value, below 1, increases the similarity between negative sam-
+ples. This encourages the model to push negative samples farther from positive samples,
+creating more diverse representations. Tuning the temperature hyperparameter is key,
+and Chen et al [15] demonstrate that a tuned τ can help the model learn from hard
+negatives, that is, negatives that are closely similar to the data point. They find that a
+temperature parameter of 0.1 yields the best performance.
+To construct our SimCLR model, we utilise the same joint ResNet-18 encoder as in our
+deterministic autoencoder and build a small linear projection network comprising three
+linear layers, with batch normalisation using global statistics. This provides us with an
+embedding space of 1000 and a projection space of 128. As highlighted by Richemond et
+al. [18], batch normalisation harms the quality of the encoder embeddings in contrastive
+learning. Therefore, we replace all but the first layer with group normalisation layers
+6
+to provide batch-size independent normalisation.
+We make the same change to our
+autoencoder to enable a fair comparison.
+Figure 1: SimCLR Model Diagram
+3.3. Decoder Enhanced Contrastive Learning
+The utility of contrastive learning can be further expanded by jointly training a decoder
+on the contrastive embeddings. Typically, a decoder is not used with contrastive learning
+models, as they were initially developed for computer vision data, where the downstream
+tasks, such as classification, can be performed entirely in the latent space. However, in
+geoscience, downstream tasks such as forecasting require the latent-space results to be
+decoded for utilisation. In addition, it is essential to decode the embeddings to ensure
+that no information in the original space is lost in the latent space. Moreover, it has
+been shown that the representations and, therefore, performance can be enhanced by
+integrating a decoder into the model [19, 20]. As such, we train a decoder alongside
+the contrastive learning encoder. As contrastive learning approaches were not initially
+developed with an integrated decoder, this area of research is evolving. As such, several
+methods have been developed, which we summarise below.
+• The decoder can be trained alongside contrastive learning, blending the two losses
+in a form analogous to Ltotal = αLcontrastive + (1 −α)Ldecoder [19, 20, 21]. This
+can follow a pretraining approach, where the encoder is first trained solely on the
+contrastive objective.
+• The decoder can be trained alongside contrastive learning in two separate loops
+(inner and outer). In the outer loop, the contrastive objective is optimised, and in
+the inner loop, the autoencoder objective is optimised [22]. The outer loop uses
+a larger batch size, since contrastive learning methods often benefit from larger
+batch sizes.
+• Finally, the encoder can be split into a momentum and an online encoder. With
+the contrastive learning objective optimised across both encoders, the decoder
+reconstructs the online encoder’s embeddings [23].
+There is also the decision of which data to reconstruct, since the encoder is trained
+on augmented data to optimise the contrastive objective. Kadeethum et al [22] opt to
+reconstruct the non-augmented data, whereas Yao et al [20] opt to reconstruct the aug-
+mented data.
+7
+We choose to adopt the first training approach, reasoning that the other two methods
+may be too destructive to the weights already learned by first pretraining the contrastive
+learning model. We opt to reconstruct masked non-augmented data, since this better
+aligns with the non-augmented data that the downstream tasks will encounter.
+3.3.1. Sparse Observations
+As mentioned in section 1, the collected weather data is often sparse. During our work,
+we introduce sparse data into our training process as follows.
+First, SimCLR requires the creation of positive pairs through data augmentation. We
+take advantage of this by forming a positive pair between a sparse and a complete sam-
+ple. Specifically, in line with the work of [8], we construct a positive pair by first resizing
+the sample to 160 × 80, then randomly cropping it to 144 × 72, and finally smoothing
+it with a 5 × 5 average filter. Then, for one sample in the pair, we randomly mask a
+percentage of its data points. We use a variable masking ratio in [50%, 90%), sampled
+uniformly per sample.
+As SimCLR was initially proposed for computer vision data, it takes a single data point
+and applies two augmentations to produce a positive pair. However, ERA5 is a time-
+series dataset, and as such, samples closer in time to a given point are inherently more
+similar (and thus more positive) than those farther away.
+Therefore, we follow the
+current literature [24, 25] and construct two positive pairs on either side of the timestep
+t, i.e. [(t, t −∆t), (t, t + ∆t)]. We optimise the sum of the two contrastive losses for each
+pair, as shown in equations 6 and 7, where P is the set of all N positive pairs in the
+batch. ∆is selected in the range [1, 5] with a monotonically exponentially decreasing
+probability distribution, which is consistent with the initial contrastive work on the
+ERA5 data by Wang et al [8].
+ℓ(t, ∆t) = −log
+exp(sim(zt, zt−∆t)/τ)
+P2N
+k=1 1[k̸=t] exp(sim(zt, zk)/τ) −log
+exp(sim(zt, zt+∆t)/τ)
+P2N
+k=1 1[k̸=t] exp(sim(zt, zk)/τ) (6)
+ℓc =
+1
+2N
+X
+(t,∆t)∈P
+(ℓ(t, ∆t) + ℓ(∆t, t))
+(7)
+Secondly, when training the autoencoder and the decoder in the contrastive learning
+setting, we input a non-augmented sparse sample, using the same masking procedure
+as above, for reconstruction. This enables the decoder to learn to reconstruct complete
+data samples, similar to a masked autoencoder (MAE).
+3.4. Contributions
+In addition to developing a more comprehensive contrastive learning model, we propose
+the following novel contributions to enhance our solution.
+8
+3.4.1. Hard Negative Sampling Scheme
+Samples in a SimCLR batch are typically selected randomly.
+Whilst this would be
+adequate for image data, where all samples are equally negative with respect to one
+another, it is suboptimal for time-series data, where temporal proximity encodes mean-
+ingful structure. Therefore, we introduce explicit hard and soft negatives to the sampler
+during model training.
+Specifically, each sample (anchor) in the batch has a corre-
+sponding “hard” (within 30 timesteps of the anchor) and “soft” negative (outside 1000
+timesteps of the anchor).
+This approach mimics the effect of increasing the batch size in SimCLR, which increases
+the number of negative samples, making the separation task more challenging and pro-
+ducing higher-quality embeddings. We theorise that this approach similarly increases
+difficulty in the temporal domain, encouraging the model to learn more nuanced tempo-
+ral distinctions. The model now leverages a similar set of temporally spaced samples in
+each batch, ensuring consistent tasks across batches and forcing the model to learn to
+separate hard and soft negatives in the latent space, resulting in higher-quality embed-
+dings. In contrast, the previous sampling strategy left the range of negative samples to
+chance, potentially resulting in lower-quality embeddings.
+3.4.2. Cycle Consistency Loss
+Since we use two symmetric positive pairs around an anchor, this enables us to penalise
+the difference in distance between these points in the latent space. We formulate that
+better temporal smoothness in the latent space should boost downstream forecasting
+performance. Maintaining a constant distance between the embeddings of points that
+are the same timestep apart from an anchor should improve temporal smoothness.
+Inspired by the work proposed by Xie et al [26], which proposes a jerk penalty using the
+third-order finite difference, we adapt this idea to our positive samples by proposing a
+penalty to penalise the second-order central finite difference between these positive points
+with the anchor. Mathematically, we suggest the following loss on our embeddings shown
+in equation 8, denoting this as a cycle consistency loss. We add this to our contrastive
+loss, which is shown in equation 9.
+ℓcycle = 1
+N
+X
+(t,∆t)∈P
+1
+d
+d
+X
+i=1
+h
+hi
+t+∆t −2hi
+t + hi
+t−∆t
+i2
+(8)
+Lc = ℓcycle + ℓc
+(9)
+3.5. Graph Neural Network Fusion Method
+As mentioned in section 1, current ERA5 methods that utilise contrastive learning do
+not extensively consider the various fusion methods that exist for multiple modalities.
+In the simplest case, early-fusion fuses the modes of data by using a shared encoder for
+all modes [27]. Conversely, in late-fusion methods, an encoder is used for each mode,
+9
+and the embeddings are combined before projection [27], with the state of the art em-
+ploying a self-attention fusion mechanism. Finally, a hybrid approach combines the two
+fusion mechanisms, which can be more flexible but adds additional complexity to model
+training [27].
+In current literature, [8] only considers an early-fusion method, whereas [9] considers a
+hybrid fusion method. In the methodology detailed above, we utilised only an early-
+fusion method; we now also include late-fusion for ERA5.
+In the self-attention late-fusion method, which is shown in figure 2, each embedding
+for each mode is input into a self-attention block as a token, enabling each modal em-
+bedding to interact with the others. Typically, a ‘[CLS]’ token is included and used as
+the fused embedding, which serves as an average of all tokens in the block. Through
+the attention mechanism, the model can dynamically focus on specific modes, enabling
+better handling of noise and uncertainty in multimodal data [28].
+The self-attention method enables the creation of an embedding for each mode, with
+dynamic weighting across all modes. However, this becomes increasingly complex, as
+the weights are dynamically learned per sample, shifting the onus on the model to de-
+termine how best the modal embeddings should interact. To reverse this interaction
+decision, we introduce a novel graph neural network (GNN) methodology to fuse the
+embeddings, which we show in figure 3. Graph neural networks, specifically graph con-
+volutional networks (GCNs), were first introduced by Kipf et al. [29] and enable data
+samples to interact with one another through a defined graph structure, represented by
+an adjacency matrix and through repeated neural network layers. We extend the appli-
+cation of GCNs to build a sparse graph of embeddings, noting that both wind modes will
+be highly correlated, as will the temperature and geopotential modes. We construct the
+adjacency matrix so that each mode has a self-connection, and only the chosen modes
+can interact. We then pass this graph through a GCN with graph-attention layers, allow-
+ing the weights between interacting modes to be learned dynamically for each sample.
+Since we are working with a graph with at most one hop, only one layer is required
+for a node to reach its neighbours. Employing multiple layers introduces nonlinearity
+into the network. However, it would mean the node representations would suffer from
+oversmoothing, a phenomenon that occurs when too many layers are present [30]. The
+final GCN embeddings are averaged to produce the final latent space embedding, which
+is then fed into the projection network.
+We contrast our novel GNN approach with a self-attention model with 8 heads, in which
+each modal embedding is treated as a token, and a ‘[CLS]’ token is used to obtain a
+fused latent space representation for the projection network. To distinguish between
+the modes, we additionally utilise learned modal embeddings, which are added to each
+token.
+10
+Figure 2: Self Attention Fusion Method
+Figure 3: GNN Fusion Method
+4. Downstream Tasks
+Once trained, the resulting latent space of both our autoencoder and contrastive learning
+models can be used for downstream tasks. Performing downstream tasks in the latent
+space rather than the original high-dimensional space offers a significant computational
+efficiency advantage. We evaluate our models using the following tasks, detailed below.
+For all, we first freeze both the encoder and decoder of our model, so that during
+training, no weight updates are applied, enabling us to compare and contrast approaches
+accurately.
+4.1. Autoregressive Forecasting
+For forecasting, we construct a simple sequence-to-sequence (seq2seq) encoder-decoder
+LSTM model in the latent space, as shown in figure 4. To perform the forecasting,
+a set of timesteps, labelled the look-back period (LB), masked with a 70% ratio, are
+embedded (hcw) and used as the input to the seq2seq encoder (e = ELSTM(hcw)). The
+decoder of the seq2seq model predicts the latent embeddings of the future timesteps
+(ˆh
+t = DLSTM(ˆh
+t−1, ct−1)), where ct−1 is the hidden states of the LSTM for the previous
+11
+timestep. These are then decoded to produce the forecast in the original dimensionality
+(ˆxt = D(ˆh
+t)). During training, we predict only the embedding of the next timestep
+from the look-back window and minimise the MSE loss between the ground truth and
+the prediction, as shown in equation 10. During evaluation, we generate the next 100
+timesteps autoregressively, decode the results, and compare them against the ground
+truth.
+L = 1
+N
+N
+X
+i=1
+ˆh
+cw+1
+i
+−hcw+1
+i
+
+2
+(10)
+Figure 4: Forecasting Task
+4.2. Conditional Latent Diffusion
+Diffusion models were first introduced by Ho et al [31]. A class of generative models,
+they produce new images by denoising a signal over a series of time steps [32][p208].
+To achieve this, data is noised by adding a small amount of Gaussian noise over a fixed
+number of timesteps t. Specifically, given an image x0, the noised image at time t is
+given by √¯αt x0 + √1 −¯αt ϵ. Where a diffusion schedule gives ¯αt. A neural network,
+typically a U-Net, is then used to predict the added noise in the image, using an MSE
+loss. Given the trained network, a noisy signal is transformed into an image over a fixed
+number of timesteps by undoing the noise the model predicts.
+Rombach et al [33] extend upon this original work by performing diffusion in the latent
+space. During sampling, a latent code is generated and then decoded back to the full
+space to produce the sample. They further extend their work by introducing conditional
+diffusion models. These aim to condition the generation on a given input, such as text
+or representations. The encoded condition is used in cross-attention modules as keys
+and values, with queries derived from the hidden states that are inputs to the U-Net
+blocks.
+We construct a conditional latent diffusion model (ϵθ) for evaluation, as shown in figure
+5. Implementing latent diffusion is particularly important for ERA5 data, as the data’s
+high dimensionality makes training a full diffusion model substantially more complex.
+12
+For our diffusion model, we implement a linear U-Net in the latent space and condition
+each block on a 70% masked data point (hmask) via cross-attention. Conditioning on a
+sparse data sample should yield a reconstruction of the full sample, thereby providing
+an alternative way to recover it. We highlight our inference process in algorithm 1.
+Algorithm 1 Conditional Latent Diffusion Inference
+Require: Trained model ϵθ, conditioning hmask, noise schedule {αt}T
+t=1
+1: Sample initial latent: hT ∼N(0, I)
+2: for t = T ... 1 do
+3:
+Predict noise: ˆϵt ←ϵθ(ht, t, hmask)
+4:
+Denoise latent:
+ht−1 ←
+1
+√αt
+
+ht −1 −αt
+√1 −¯αt
+ˆϵt
+
++ σt ηt,
+ηt ∼N(0, I)
+5: end for
+6: Decode latent to data: xgen ←D(h0)
+Figure 5: Conditional Latent Diffusion U-Net Architecture
+4.3. Latent Classification
+Finally, we implement a classification model in the latent space to perform the inverse
+problem of season identification. In this task, given a masked data sample, the model
+will classify it into a season: ‘winter (0)’, ‘spring (1)’, ‘summer(2)’, ‘autumn (3)’ (see
+equation 11). To achieve this, we implement a small linear neural network (NNϕ) with
+a classification head in the latent space and input test data, masked at variable ratios
+of [20%, 90%). As per classification tasks, we optimise the cross-entropy loss as shown
+in equation 12.
+13
+si = NNϕ(hi)
+(11)
+LCE = −1
+N
+N
+X
+n=1
+K
+X
+i=1
+yn
+i log
+exp(sn
+i )
+PK
+j=1 exp(sn
+j )
+(12)
+5. Training Pipeline
+We summarise our final training pipeline for all SPARTA methods below, comprising the
+following stages. Additionally, we show the early-fusion final model diagram in figure 6.
+The late-fusion methods follow the same diagram, utilising the output of the GCN or
+self-attention block in place of the single encoder.
+1. Pretraining the encoder on the contrastive objective (ℓc) for 100 Epochs, where P
+is the set of all N positive pairs in the batch.
+2. Blending in the decoder and the autoencoder objective by decaying alpha in our
+loss term. We start (αstart) at 1.0 and use an exponential decay to decrease the
+value: α(epoch) = αstart · e−k·epoch, setting k to 0.01. We train this model for
+250 epochs with the following loss: L = αLc + (1 −α)Lr. For the reconstruction
+objective Lr, we mask the non-augmented data sample, enabling the decoder to
+reconstruct the full data. Additionally, we train the decoder to reconstruct the
+augmented masked points at t−∆t and t+∆t, as shown in equation 16, to enable
+more detailed embeddings when optimising the contrastive objective.
+3. Freezing the encoder and training the decoder on the frozen embeddings for 200
+epochs to reconstruct masked data. We optimise using only the reconstruction
+loss: Lr.
+4. Training each downstream model.
+• For the forecasting model, we optimise the MSE loss between the latent fore-
+cast and the latent ground truth and train for 100 epochs.
+• For the conditional latent diffusion model, we optimise the MSE loss between
+predicted and ground truth added noise, training for 300 epochs.
+• For the latent classification model, we optimise the cross-entropy loss between
+the outputs and ground truth labels over 100 epochs.
+ℓ(t, ∆t) = −log
+exp(sim(zt, zt−∆t)/τ)
+P2N
+k=1 1[k̸=t] exp(sim(zt, zk)/τ) −log
+exp(sim(zt, zt+∆t)/τ)
+P2N
+k=1 1[k̸=t] exp(sim(zt, zk)/τ) (13)
+ℓcycle = 1
+N
+X
+(t,∆t)∈P
+1
+d
+d
+X
+i=1
+h
+hi
+t+∆t −2hi
+t + hi
+t−∆t
+i2
+(14)
+ℓc =
+1
+2N
+X
+(t,∆t)∈P
+(ℓ(t, ∆t) + ℓ(∆t, t)) + ℓcycle
+(15)
+14
+Lc = ℓc +
+X
+x∈{t−∆t,t+∆t}
+C−1
+X
+c=0
+Lmse (ˆxc
+x, xc
+x)
+(16)
+Lr =
+C−1
+X
+c=0
+Lmse (ˆxc, xc)
+(17)
+Figure 6: Early-Fusion SPARTA Model Diagram
+This methodology is a significant advancement over current work. As mentioned in chap-
+ter 1, current contrastive learning approaches for downstream tasks on ERA5 data only
+train an encoder and evaluate solely in the latent space [8, 9]. Our method constructs
+a complete encoder-decoder framework, enabling downstream tasks such as forecasting
+that require decoding predictions. We also introduce sparsity, which none of the previous
+ERA5 contrastive learning methods considered. This significantly increases the utility
+of our model, as it better reflects how observations would be collected. Our method now
+enables sparse observations to be utilised directly in the latent space for downstream
+tasks, thereby further enhancing our framework’s utility.
+6. Experimentation
+6.1. Experimental Setup
+6.1.1. Dataset Setup
+Through all our experiments, we utilise the ERA5 dataset as outlined in section 2.
+We utilise all available samples from 1959 to 2023, allocating 60% to training, 20% to
+validation, and the remaining 20% to testing. Data is split chronologically, using ap-
+proximately 1959-1997 for training, 1998-2019 for validation, and 2010-2023 for testing.
+The testing data is used to train the downstream task, and we split it into training,
+validation, and test datasets in the same manner.
+15
+6.1.2. Model Training
+To ensure a fair comparison, we train both our benchmark autoencoder and our Sim-
+CLR models with a batch size of 128. Additionally, we utilise the same hard negative
+sampling for both the autonecoder and the SimCLR models. Given that the cycle con-
+sistency loss was proposed as a direct result of the pairs generated for the SimCLR loss,
+its application to the autoencoder loss is unwarranted.
+We found that the autoencoder performed best with a starting learning rate of 10−3 and
+trained the model for 180 epochs, optimising the MSE loss. Our contrastive learning
+models performed best at a learning rate of 10−4. In all models, we utilised a learning
+rate scheduler that reduced the learning rate by a factor of 10 when the validation
+loss plateaued for 10 epochs. Finally, for the contrastive learning models, we set the
+temperature hyperparameter to 0.3.
+6.1.3. Model Evaluation
+Our downstream models are all trained with a batch size of 64 and a learning rate of 1e−2.
+Specifically, for the forecasting task, we train three different models with different sam-
+pling intervals (S) and look-back windows (LB): LB 30 + S 1, LB 5 + S 5, LB 5 + S 10.
+We evaluate all models on the test set in an autoregressive manner, predicting the next
+100 timesteps, using three metrics: RRMSE, SSIM and PSNR for all modes jointly. For
+models with a sampling interval greater than 1, we note that this significantly reduces
+the amount of training data. To negate this issue, we train these models using three
+different seeds and average the results.
+For the diffusion task, we evaluate our model on the test data by measuring the RRMSE
+of the decoded data. To do this, we generate 20 batches and take the mean of the samples
+for decoding. This increases the vigour of our evaluation and allows us to compute the
+standard deviation of the generated latent data points, thereby enabling us to measure
+diffusion robustness. In addition, we also measure the realism and latent density scores
+in the embedding space. Latent density, proposed by Xu et al [34], is shown in equation
+18, where hg is the generated latent point and H is the set of ground truth latent points.
+This score measures the average Gaussian-kernelised Euclidean distance between the
+generated sample and each training sample, with higher scores indicating higher-quality
+generated samples. For our experiments, as per the original work, we set σ to 20. The
+realism score, shown in equation 19, where NNk is the kth nearest neighbour of hi in
+H, was initially proposed by Kynkäänniemi et al [35]. This measures how closely the
+generated sample aligns with the image manifold. The higher the score, the closer the
+generated image is to the image manifold. Kynkäänniemi et al. utilised feature vectors
+from the generated images using a pre-trained VGG network. Since we do not have
+access to a pre-trained network, we use the latent vectors as is and set k to 5. Therefore,
+our adaptation of the realism score quantifies the alignment between the generated latent
+codes and our learned manifold.
+16
+D(hg, H) =
+1
+|H|
+X
+hi∈H
+exp
+ 
+−∥hg −hi∥2
+2σ2
+!
+,
+(18)
+R(hg, H) = max
+hi
+(∥hi −NNk(hi, H)∥2
+∥hg −hi∥2
+)
+.
+(19)
+Finally, for the latent classification task, we evaluate our model on the test data and
+compute the cross-entropy metric.
+7. Results
+7.1. Early-Fusion
+7.1.1. Forecasting
+Table 1: Autoregressive Results - 100 Steps LB 30, S 1
+Look-Back Window 30, Sampling Interval 1
+RRMSE (%) T=25
+RRMSE (%) T=50
+RRMSE (%) T=75
+RRMSE (%) T=100
+SPARTA - Early-Fusion HN + Cycle
+15.71
+16.45
+16.84
+17.04
+Autoencoder
+19.73
+20.13
+20.09
+20.15
+Table 2: Autoregressive Results - 100 Steps LB 5, S 5
+Look-Back Window 5, Sampling Interval 5
+RRMSE (%) T=25
+RRMSE (%) T=50
+RRMSE (%) T=75
+RRMSE (%) T=100
+SPARTA - Early-Fusion HN + Cycle
+14.89
+17.30
+17.74
+17.71
+Autoencoder
+16.51
+17.02
+17.13
+17.30
+Table 3: Autoregressive Results - 100 Steps LB 5, S 10
+Look-Back Window 5, Sampling Interval 10
+RRMSE (%) T=25
+RRMSE (%) T=50
+RRMSE (%) T=75
+RRMSE (%) T=100
+SPARTA - Early-Fusion HN + Cycle
+13.62
+14.11
+14.75
+15.03
+Autoencoder
+18.83
+19.28
+19.05
+19.05
+From tables 1, 2, and 3, we see that our early-fusion SPARTA model outperforms the
+baseline autoencoder on the latent forecasting task. To understand why, we compute
+the following metrics to measure the smoothness of the latent space.
+1. Based on work by [36], we determine the temporal smoothness of our latent space
+by computing the squared Euclidean distance between adjacent points in the latent
+space: ∆ht = ∥ht −ht−1∥2
+2.
+This provides a first-order smoothness measure,
+analogous to velocity.
+2. Based on work by [37], we evaluate the cycle distance of points. This is analogous to
+acceleration and is achieved by computing the second-order central finite difference
+for embeddings: ∥ht−1 −2ht + ht+1∥2
+2.
+For all metrics, we evaluate our model by computing them on a batch of test embeddings
+with a batch size of 256. This enables us to plot the metrics and determine the overall
+trend of the data, as well as the mean and standard deviation.
+17
+We plot the temporal and cycle distances in figures 7 and 8 and additionally show the
+mean statistics in table 4. The table and figures show that our SPARTA model yields
+significantly lower temporal and cycle distances than the autoencoder, resulting in a
+smoother latent space.
+(a) Autoencoder
+(b) SPARTA - Early-Fusion HN + Cycle
+Figure 7: Temporal Distance - Autoencoder vs SPARTA
+(a) Autoencoder
+(b) SPARTA - Early-Fusion HN + Cycle
+Figure 8: Cycle Distance - Autoencoder vs SPARTA
+Table 4: Smoothness Metrics
+Mean Temporal Distance
+Mean Cycle Distance
+Autoencoder
+47.39 ± 7.53
+104.96 ± 20.12
+SPARTA - Early-Fusion HN + Cycle
+2.59 ± 0.57
+5.56 ± 1.45
+We further demonstrate the benefits of contrastive learning and SPARTA by plotting
+latent consecutive timesteps using PCA in figure 9, as well as latent TSNE trajectories
+in figure 10 for 70% masked look-back windows of size 5, using a sampling interval of 5.
+Here, we show the average embedding for the look-back window and the direction of the
+next point to be forecasted. The plots further corroborate our findings, showing that
+contrastive learning produces smoother, better-structured latent points and trajectories
+than the autoencoder, with reduced overlap between look-back windows.
+18
+(a) Autoencoder PCA
+(b) SPARTA - Early-Fusion HN + Cycle PCA
+Figure 9: PCA of Latent Points Autoencoder vs SIMCLR
+(a) Autoencoder
+(b) SPARTA - Early-Fusion HN + Cycle
+Figure 10: Latent Trajectories – CW 5, Sampling Interval 5 Autoencoder vs SIMCLR
+A smoother latent space with better temporally structured points yields more predictable
+embeddings over time, making the forecasting task easier for the LSTM model and, in
+turn, leading to better results, as shown in the tables.
+Figures 11 and 12 qualita-
+tively show the improvement in forecasting of early fusion SPARTA compared to the
+autoencoder for a look-back window of 30 and a sampling interval of 1, highlighting the
+significant reduction in absolute errors for forecasting of a random sample of data across
+all modes.
+19
+Figure 11: Forecasting Reconstruction Errors for Autoencoder - LB 30, S 1 at T=50
+20
+Figure 12: Forecasting Reconstruction Errors for SPARTA - Early-Fusion HN + Cycle - LB 30, S 1 at
+T=50
+7.1.2. Conditional Latent Diffusion and Latent Classification
+Table 5: Conditional Latent Diffusion and Latent Classification Results
+Conditional Latent Diffusion
+Latent Classification
+RRMSE (%)
+Latent Density Score
+Realism Score
+Std Dev
+Test Loss
+SPARTA - Early-Fusion HN + Cycle
+12.19
+0.92
+0.90
+0.4695
+0.1640
+Autoencoder
+12.15
+0.66
+1.13
+0.5358
+0.1935
+Table 5 shows the results for the latent diffusion task. Overall, our SPARTA model
+achieves an RRMSE comparable to that of the autoencoder. However, incorporating
+contrastive learning yields a better latent space for diffusion, as evidenced by a lower
+standard deviation of generated latent samples and a higher latent density score.
+Contrastive learning focuses on creating embeddings that preserve shared information
+across views, while ignoring the augmentations applied to create them. This leads to
+the applied augmentations (e.g. noise, jitter) being ignored in the latent space. This
+21
+produces a latent space that highlights the data’s semantic structure. Small perturba-
+tions do not move the latent code far from that of the clean data. Furthermore, Wang
+et al [38] show that contrastive learning produces latent codes that are aligned and uni-
+formly distributed on a hypersphere. Uniformity means that latent codes are evenly
+distributed, so adding noise will not move the latent vector far from the training distri-
+bution of encoded latent vectors. Alignment means that adding noise does not move the
+latent vector far from its clean counterpart. In addition, the introduction of contrastive
+loss ensures greater separation between negative samples, meaning that perturbing a
+latent vector slightly with noise will not move the vector into the realm of a vector of a
+different data sample.
+For these reasons, the denoised latent codes will be closer to clean samples than the au-
+toencoder’s latent codes. This is confirmed in table 5 by the higher latent density score
+of SPARTA compared to the autoencoder. As mentioned in section 6.1.3, the latent
+density score measures the Gaussian kernelised Euclidean distance between the gener-
+ated sample and the ground truth. A higher score indicates that the generated samples
+are closer to the ground-truth clean samples, confirming the findings of Wang et al [38],
+which show that contrastive learning creates a more uniform and aligned latent space.
+In addition, the reduced standard deviation in the generation of our samples, as shown
+in table 5, shows that SPARTA creates a more structured latent space, where the noised
+latent sample has a clearer and less ambiguous path back to the clean latent sample.
+Overall, our results in table 5 show that SPARTA creates a more robust latent space
+compared to the autoencoder.
+Table 5 also shows that our SPARTA model creates a latent space that is better primed
+for latent classification than the autoencoder benchmark. The discriminative objective
+of contrastive learning enforces an explicit separation between negative and positive
+samples, thereby increasing the linear separability of the latent space [39], thereby im-
+proving classification performance.
+Finally, we show the losses for training stage two of SPARTA in figure 13, as explained
+in section 5. This highlights a stable and convergent training process for SPARTA. The
+individual and total contrastive losses reach a plateau, indicating that our model has
+converged and that our samples are better separated in the latent space. Whilst there
+is a slight increase in cycle loss, we theorise that this is due to the alpha-decay term
+applied to the contrastive loss relative to the reconstruction loss. This is supported
+by figure 14, which highlights the losses for stage one of the training process. We can
+see from this figure that without the decaying alpha term, the cycle loss decreases and
+converges. Lastly, we observe a monotonic decrease in the reconstruction loss during
+stage two, indicating that the decoder is improving its ability to reconstruct the multi-
+modal embeddings.
+Similar to the contrastive losses, it also converges and reaches
+a plateau.
+As we observe both contrastive and reconstruction losses decreasing and
+plateauing, we conclude that our joint training procedure is successful and that SPARTA
+can couple contrastive and reconstruction learning.
+22
+Figure 13: Training Losses - Stage 2
+23
+Figure 14: Training Losses - Stage 1
+7.2. Ablation Test
+7.2.1. Forecasting
+Table 6: Autoregressive Results - 100 Steps LB 30, S 1
+Look-Back Window 30, Sampling Interval 1
+RRMSE (%) T=25
+RRMSE (%) T=50
+RRMSE (%) T=75
+RRMSE (%) T=100
+SPARTA - Early-Fusion
+22.92
+23.68
+24.17
+24.50
+SPARTA - Early-Fusion Cycle
+21.63
+22.06
+22.42
+22.92
+SPARTA - Early-Fusion HN
+18.44
+20.17
+20.39
+20.67
+SPARTA - Early-Fusion HN + Cycle
+15.71
+16.45
+16.84
+17.04
+Table 7: Autoregressive Results - LB 5, S 5
+Look-Back Window 5, Sampling Interval 5
+RRMSE (%) T=25
+RRMSE (%) T=50
+RRMSE (%) T=75
+RRMSE (%) T=100
+SPARTA - Early-Fusion
+18.87
+20.72
+21.57
+22.02
+SPARTA - Early-Fusion Cycle
+22.58
+25.01
+24.95
+25.16
+SPARTA - Early-Fusion HN
+17.48
+17.04
+16.61
+16.57
+SPARTA - Early-Fusion HN + Cycle
+14.89
+17.30
+17.74
+17.71
+Table 8: Autoregressive Results - 100 Steps LB 5, S 10
+Look-Back Window 5, Sampling Interval 10
+RRMSE (%) T=25
+RRMSE (%) T=50
+RRMSE (%) T=75
+RRMSE (%) T=100
+SPARTA - Early-Fusion
+18.91
+19.25
+19.03
+19.26
+SPARTA - Early-Fusion Cycle
+19.63
+20.45
+20.70
+21.54
+SPARTA - Early-Fusion HN
+18.64
+19.46
+19.51
+19.69
+SPARTA - Early-Fusion HN + Cycle
+13.62
+14.11
+14.75
+15.03
+24
+7.2.2. Conditional Latent Diffusion and Latent Classification
+Table 9: Conditional Latent Diffusion and Latent Classification Results
+Conditional Latent Diffusion
+Latent Classification
+RRMSE (%)
+Latent Density Score
+Realism Score
+Std Dev
+Test Loss
+SPARTA - Early-Fusion
+11.43
+0.91
+1.00
+0.4265
+0.1454
+SPARTA - Early-Fusion Cycle
+11.65
+0.92
+0.98
+0.4456
+0.1620
+SPARTA - Early-Fusion HN
+11.64
+0.91
+1.02
+0.4551
+0.1597
+SPARTA - Early-Fusion HN + Cycle
+12.19
+0.92
+0.90
+0.4695
+0.1640
+To highlight the impact of our novel contributions, we perform an ablation test by re-
+moving each contribution to assess its effect on performance.
+Interestingly, we find that the cycle consistency loss leads to a smoother latent space, as
+highlighted in table 10. We observe an improvement in forecasting only with a sampling
+interval of 1 and a look-back window of 30, as highlighted by table 6. The inclusion
+of the hard negative sampling scheme has a greater impact, as shown in tables 6 and
+7, improving performance across the first two forecasting experiments. Table 10 shows
+that introducing this sampling scheme actually makes the latent space less smooth.
+Whilst we would normally expect this to lead to a decrease in forecasting performance,
+the additional challenge of separating hard and soft negatives results in higher-quality
+embeddings. We theorise that this change in embedding quality thereby improves per-
+formance to a greater degree than the decrease in performance caused by the less smooth
+latent space.
+When combining both novel changes, tables 6, 7, and 8 show improvements across all
+forecasting experiments, as further explained by the increased smoothness highlighted
+in table 10. We qualitatively show the forecasting improvement of our novel changes in
+figures 12 and 15 for a look-back window of 30 and a sampling interval of 1.
+However, we note that introducing these changes negatively affects diffusion and classi-
+fication results, as shown in table 9, suggesting a trade-off in downstream task perfor-
+mance when encouraging a smoother latent space. In conclusion, we demonstrate that
+combining these two approaches is necessary to produce a smoother latent space and
+outperform the SimCLR benchmark on the forecasting task.
+Table 10: Smoothness Metrics - Ablation Test
+Mean Temporal Distance
+Mean Cycle Distance
+SPARTA - Early-Fusion
+4.25 ± 0.86
+8.77 ± 2.09
+SPARTA - Early-Fusion Cycle
+3.27 ± 0.70
+6.85 ± 1.72
+SPARTA - Early-Fusion HN
+4.36 ± 0.92
+9.22 ± 2.35
+SPARTA - Early-Fusion HN + Cycle
+2.59 ± 0.57
+5.56 ± 1.45
+25
+Figure 15: Forecasting Errors SPARTA - Early-Fusion - LB 30, S 1 at T=50
+7.3. Late-Fusion
+Table 11: Autoregressive Results - 100 Steps LB 30, S 1
+Look-Back Window 30, Sampling Interval 1
+RRMSE (%) T=25
+RRMSE (%) T=50
+RRMSE (%) T=75
+RRMSE (%) T=100
+SPARTA - Early-Fusion HN + Cycle
+15.71
+16.45
+16.84
+17.04
+SPARTA - Late-Fusion, Self-Attention
+16.97
+18.26
+19.00
+19.54
+SPARTA - Late-Fusion, GNN
+16.36
+18.78
+18.94
+18.76
+26
+Table 12: Autoregressive Results - 100 Steps LB 5, S 5
+Look-Back Window 5, Sampling Interval 5
+RRMSE (%) T=25
+RRMSE (%) T=50
+RRMSE (%) T=75
+RRMSE (%) T=100
+SPARTA - Early-Fusion HN + Cycle
+14.89
+17.30
+17.74
+17.71
+SPARTA - Late-Fusion, Self-Attention
+14.02
+15.60
+15.99
+15.93
+SPARTA - Late-Fusion, GNN
+11.41
+11.98
+12.56
+12.85
+Table 13: Autoregressive Results - 100 Steps LB 5, S 10
+Look-Back Window 5, Sampling Interval 10
+RRMSE (%) T=25
+RRMSE (%) T=50
+RRMSE (%) T=75
+RRMSE (%) T=100
+SPARTA - Early-Fusion HN + Cycle
+13.62
+14.11
+14.75
+15.03
+SPARTA - Late-Fusion, Self-Attention
+12.99
+13.20
+13.16
+13.36
+SPARTA - Late-Fusion, GNN
+12.11
+12.68
+12.63
+12.77
+7.3.1. Conditional Latent Diffusion and Latent Classification
+Table 14: Conditional Latent Diffusion and Latent Classification Results
+Conditional Latent Diffusion
+Latent Classification
+RRMSE (%)
+Latent Density Score
+Realism Score
+Std Dev
+Test Loss
+SPARTA - Early-Fusion HN + Cycle
+12.19
+0.92
+0.90
+0.4695
+0.1640
+SPARTA - Late-Fusion, Self-Attention
+12.47
+0.95
+0.91
+0.4352
+0.1264
+SPARTA - Late-Fusion, GNN
+12.23
+0.96
+0.90
+0.4378
+0.1412
+We contrast our early-fusion approach with the two late-fusion approaches mentioned
+in section 3.5. In both late-fusion methods, we utilise both the hard negative sampling
+scheme and the cycle consistency loss. The results ultimately show that the self-attention
+method offers improved latent classification results, as highlighted by table 14, whereas
+the graph neural network approach leads to better forecasting results, which are shown
+in tables 11, 12, and 13.
+Fundamentally, self-attention does not allow for prior knowledge to be inserted. In con-
+trast, our GNN approach offers an architecture that uniquely enables the incorporation
+of domain-specific knowledge via the adjacency matrix. This key distinction enhances
+the robustness of our model, making it a powerful alternative for forecasting. For each
+data sample, self-attention enables each mode to interact with one another. This al-
+lows for the creation of more flexible and richer embeddings. The GNN approach, on
+the other hand, adds regularisation by enforcing a prior on which modes can interact.
+This limits the flexibility of the embeddings but reduces temporal deviation, creating a
+better-structured, smoother latent space. The latent classification task is not concerned
+with how the embeddings evolve, but rather with identifying the most discriminative em-
+bedding for each data point. Forecasting benefits from a smoother latent space, where
+the embeddings evolve more predictably over time. This is evident in the reduced tem-
+poral and cycle distances, as shown in figures 16 and 17 and table 15, which highlight a
+smoother, more suitable latent space for forecasting.
+27
+(a) SPARTA - Late-Fusion, Self-Attention
+(b) SPARTA - Late-Fusion, GNN
+Figure 16: Temporal Distance - SPARTA - Late Fusion - Self Attention vs GNN
+(a) SPARTA - Late-Fusion, Self-Attention
+(b) SPARTA - Late-Fusion, GNN
+Figure 17: Cycle Distance - SPARTA - Late Fusion - Self Attention vs GNN
+Table 15: Smoothness Metrics - Self Attention vs GNN
+Mean Temporal Distance
+Mean Cycle Distance
+SPARTA - Late-Fusion, Self-Attention
+4.37 ± 0.73
+10.02 ± 2.11
+SPARTA - Late-Fusion, GNN
+3.57 ± 0.52
+8.24 ± 1.45
+8. Conclusion
+Overall, this work has extensively explored contrastive learning for ERA5 data, extend-
+ing the current literature by developing an end-to-end, early-fusion contrastive learning
+model that is compatible with sparse data.
+We demonstrated that this model sur-
+passes a simple autoencoder on the downstream forecasting task by leveraging a novel
+hard-negative sampling approach and a cycle-consistency loss, achieving up to a 32%
+improvement in forecasting performance.
+We further extended our evaluation, showing that contrastive learning yielded a latent
+space that outperformed the autoencoder across two additional diverse tasks: latent
+classification and latent diffusion. Our best contrastive learning model achieved up to a
+23% reduction in the standard deviation of latent diffusion and a 28% improvement in
+the latent classification loss.
+We further expanded on the current literature by proposing a novel GNN approach for
+multimodal fusion and demonstrating that regularisation with prior knowledge yields a
+smoother latent space, leading to performance improvements in forecasting compared to
+the self-attention fusion method.
+28
+9. Future Work
+This work has expanded the analysis of contrastive learning on ERA5 data. However,
+there remains scope for further iteration; specifically, the following ideas could be incor-
+porated for future work.
+1. Higher Resolution Data: Our methods only evaluated the models on the small-
+est resolution of ERA5 data: 64x32. This limits the usability of our solutions, pre-
+venting them from being used in tasks that require access to higher-resolution data.
+This was a practical consideration, as training on higher-resolution data, especially
+across all coordinates, requires significantly more computation. Future work, with
+access to additional computational resources, could train our contrastive learning
+models on higher-resolution ERA5 data to assess their scalability and performance
+at a finer scale.
+2. Incorporating More Modalities and Varying Resolutions: Our methods
+only used five modes of data. We therefore cannot assess how well our solution
+would perform if additional modalities were incorporated. Moreover, we assumed
+that each mode is collected at the same resolution, which may not always be
+valid. Future work could therefore expand our final model to include more modes
+at varying resolutions. The introduction of mixture-of-experts (MoE) encoders
+could enable sustainable expansion to more modes, thereby increasing the model’s
+capabilities.
+3. Application to Different Geoscience Tasks: We have only tested our model
+on a single dataset, ERA5.
+To further assess the robustness of our approach,
+we could expand our solution to different geoscience datasets, incorporating more
+specific downstream tasks and yielding a more generalisable solution.
+10. Data Availability Statement
+All code used to train and evaluate our models is available in a public repository:
+https://github.com/nathanwbailey/SPARTA.
+All ERA5 data can be found from the official documentation: https://weatherbench2.
+readthedocs.io/en/latest/data-guide.html. Additionally, we include scripts in our
+repository to convert these datasets into PyTorch tensors for use in our code.
+Bibliography
+[1] Brown CF, Kazmierski MR, Pasquarella VJ, Rucklidge WJ, Samsikova M, Zhang C, et al.. Al-
+phaEarth Foundations: An embedding field model for accurate and efficient global mapping from
+sparse label data arXiv [Preprint]; 2025.
+[2] Bi K, Xie L, Zhang H, Chen X, Gu X, Tian Q. Accurate medium-range global weather forecasting
+with 3D neural networks. Nature. 2023;619(7970):533-8.
+[3] Lam R, Sanchez-Gonzalez A, Willson M, Wirnsberger P, Fortunato M, Alet F, et al. Learning
+skillful medium-range global weather forecasting. Science. 2023;382(6677):1416-21.
+29
+[4] Agabin A, Prochaska JX, Cornillon PC, Buckingham CE. Mitigating Masked Pixels in a Climate-
+Critical Ocean Dataset. Remote Sensing. 2024;16(13).
+[5] Song J, Song Z, Ren P, Erichson NB, Mahoney MW, Li XS.
+Forecasting high-dimensional
+spatio-temporal systems from sparse measurements. Machine Learning: Science and Technology.
+2024;4:045067.
+[6] University of Colorado Boulder. Data Analytics Best Practices: Best Machine Learning Model
+for Sparse Data [Online]. Available from: https://www.colorado.edu/business/ms-programs/
+ms-blog/2023/01/24/data-analytics-best-practices-machiene-learning-sparse-data;.
+[Accessed: 2025-06-24].
+[7] Jaiswal A, Babu AR, Zadeh MZ, Banerjee D, Makedon F. A Survey on Contrastive Self-Supervised
+Learning. Technologies. 2021;9(1).
+[8] Wang L, Li Q, Lv Q. Self-Supervised Classification of Weather Systems Based on Spatiotemporal
+Contrastive Learning. Geophysical Research Letters. 2022;49(15):e2022GL099131. E2022GL099131
+2022GL099131.
+[9] Wang C, Yang N, Li X.
+Advancing forecasting capabilities: A contrastive learning model for
+forecasting tropical cyclone rapid intensification. Proceedings of the National Academy of Sciences.
+2025;122(4):e2415501122.
+[10] Han T, Chen Z, Guo S, Xu W, Bai L. CRA5: Extreme Compression of ERA5 for Portable Global
+Climate and Weather Research via an Efficient Variational Transformer arXiv [preprint]; 2024
+Version 2.
+[11] Goh E, Yepremyan A, Wang J, Wilson B. MAESSTRO: Masked Autoencoders for Sea Surface
+Temperature Reconstruction under Occlusion. Ocean Science. 2024;20(5):1309-23.
+[12] Vandal TJ, Duffy K, McDuff D, Nachmany Y, Hartshorn C. Global atmospheric data assimilation
+with multi-modal masked autoencoders arXiv [preprint]; 2024 Version 1.
+[13] Climate Data Store. ERA5 hourly data on single levels from 1940 to present [Online]. Available
+from:
+https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels?
+tab=overview;. [Accessed: 2025-04-28].
+[14] WeatherBench 2. WeatherBench 2 Data Guide [Online]. Available from: https://weatherbench2.
+readthedocs.io/en/latest/data-guide.html;. [Accessed: 2025-04-28].
+[15] Chen T, Kornblith S, Norouzi M, Hinton G.
+A simple framework for contrastive learning of
+visual representations. In: Proceedings of the 37th International Conference on Machine Learning.
+ICML’20. JMLR.org; 2020. .
+[16] Khosla P, Teterwak P, Wang C, Sarna A, Tian Y, Isola P, et al. Supervised contrastive learning.
+In: Proceedings of the 34th International Conference on Neural Information Processing Systems.
+NIPS ’20. Red Hook, NY, USA: Curran Associates Inc.; 2020. .
+[17] Zbontar J, Jing L, Misra I, LeCun Y, Deny S. Barlow Twins: Self-Supervised Learning via Redun-
+dancy Reduction. In: Meila M, Zhang T, editors. Proceedings of the 38th International Conference
+on Machine Learning. vol. 139 of Proceedings of Machine Learning Research. PMLR; 2021. p.
+12310-20.
+[18] Richemond PH, Grill JB, Altché F, Tallec C, Strub F, Brock A, et al.. BYOL works even without
+batch statistics arXiv [Preprint]; 2020 Version 1.
+[19] Quetin S, Ghosh T, Maleki F. Should we pre-train a decoder in contrastive learning for dense
+prediction tasks? arXiv [preprint]; 2025 Version 1.
+30
+[20] Yao Y, Desai N, Palaniswami M. Masked Contrastive Representation Learning arXiv [preprint];
+2022 Version 1.
+[21] Dippel J, Vogler S, Höhne J. Towards Fine-grained Visual Representations by Combining Con-
+trastive Learning with Image Reconstruction and Attention-weighted Pooling. CoRR. 2021.
+[22] Kadeethum T, Ballarin F, O’Malley D, Choi Y, Bouklas N, Yoon H.
+Reduced order model-
+ing for flow and transport problems with Barlow Twins self-supervised learning. Sci Rep. 2022
+Nov;12(1):20654.
+[23] Huang Z, Jin X, Lu C, Hou Q, Cheng MM, Fu D, et al. Contrastive Masked Autoencoders are
+Stronger Vision Learners. IEEE Trans Pattern Anal Mach Intell. 2024 Apr;46(4):2506–2517.
+[24] Shamba AK, Bach K, Taylor G. Dynamic Contrastive Learning for Time Series Representation
+arXiv [Preprint]; 2024 Version 1.
+[25] Lee S, Park T, Lee K. Soft contrastive learning for time series arXiv [Preprint]; 2024 Version 3.
+[26] Xie X, Mowlavi S, Benosman M. Smooth and Sparse Latent Dynamics in Operator Learning with
+Jerk Regularization arXiv [Preprint]; 2024 Version 1.
+[27] Tang Q, Liang J, Zhu F. A comparative review on multi-modal sensors fusion based on deep
+learning. Signal Processing. 2023;213:109165.
+[28] Li S, Tang H. Multimodal Alignment and Fusion: A Survey arXiv [Preprint]; 2024 Version 1.
+[29] Kipf TN, Welling M. Semi-Supervised Classification with Graph Convolutional Networks. In:
+International Conference on Learning Representations (ICLR); 2017. .
+[30] Rusch TK, Bronstein MM, Mishra S. A Survey on Oversmoothing in Graph Neural Networks arXiv
+[Preprint]; 2023 Version 1.
+[31] Ho J, Jain A, Abbeel P. Denoising diffusion probabilistic models. In: Proceedings of the 34th
+International Conference on Neural Information Processing Systems. NIPS ’20. Red Hook, NY,
+USA: Curran Associates Inc.; 2020. .
+[32] Foster D, Friston K. Generative deep learning : teaching machines to paint, write, compose, and
+play. Second edition. ed. Sebastopol, CA: O’Reilly Media, Incorporated; 2023 - 2023.
+[33] Rombach R, Blattmann A, Lorenz D, Esser P, Ommer B. High-Resolution Image Synthesis With
+Latent Diffusion Models. In: Proceedings of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition (CVPR); 2022. p. 10684-95.
+[34] Xu J, Le H, Samaras D. Assessing Sample Quality via the Latent Space of Generative Models.
+In: Leonardis A, Ricci E, Roth S, Russakovsky O, Sattler T, Varol G, editors. Computer Vision –
+ECCV 2024. Cham: Springer Nature Switzerland; 2025. p. 449-64.
+[35] Kynkäänniemi T, Karras T, Laine S, Lehtinen J, Aila T. Improved Precision and Recall Metric
+for Assessing Generative Models. CoRR. 2019;abs/1904.06991.
+[36] Tzaban R, Mokady R, Gal R, Bermano A, Cohen-Or D. Stitch it in Time: GAN-Based Facial
+Editing of Real Videos. In: SIGGRAPH Asia 2022 Conference Papers. SA ’22. New York, NY,
+USA: Association for Computing Machinery; 2022. .
+[37] Jayaraman D, Grauman K. Slow and Steady Feature Analysis: Higher Order Temporal Coherence
+in Video. In: 2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR); 2016.
+p. 3852-61.
+31
+[38] Wang T, Isola P. Understanding Contrastive Representation Learning through Alignment and
+Uniformity on the Hypersphere. In: III HD, Singh A, editors. Proceedings of the 37th International
+Conference on Machine Learning. vol. 119 of Proceedings of Machine Learning Research. PMLR;
+2020. p. 9929-39.
+[39] Widad Zizouan, Theo Michel. Summary Report : A Simple Framework for Contrastive Learning
+of Visual Representations [Online]. Available from:
+https://hal.science/hal-04175012/
+file/Summary_Report___A_Simple_Framework_for_Contrastive_Learning_of_Visual_
+Representations.pdf;. [Accessed: 2025-06-10].
+32

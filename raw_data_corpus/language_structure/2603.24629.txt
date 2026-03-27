@@ -1,0 +1,1587 @@
+SKETCH2SIMULATION: AUTOMATING FLOWSHEET GENERATION
+VIA MULTI AGENT LARGE LANGUAGE MODELS
+Abdullah Bahamdan
+Sargent Centre for Process Systems Engineering
+Imperial College London
+London, SW7 2AZ, United Kingdom
+a.bahamdan22@imperial.ac.uk
+Emma Pajak
+Sargent Centre for Process Systems Engineering
+Imperial College London
+London, SW7 2AZ, United Kingdom
+emma.pajak19@imperial.ac.uk
+John D. Hedengren
+Department of Chemical Engineering
+Brigham Young University
+Provo, Utah 84602, United States
+john.hedengren@byu.edu
+Antonio del Rio Chanona
+Sargent Centre for Process Systems Engineering
+Imperial College London
+London, SW7 2AZ, United Kingdom
+a.del-rio-chanona@imperial.ac.uk
+March 27, 2026
+ABSTRACT
+Converting process sketches into executable simulation models remains a major bottleneck in process
+systems engineering, requiring substantial manual effort, simulator-specific expertise, and iterative
+refinement. Although recent advances in generative AI have progressed both the automated inter-
+pretation of engineering diagrams and LLM-assisted flowsheet generation, these two lines remain
+largely disconnected: diagram-understanding methods typically stop at extracted graphs or semantic
+representations, while text-to-simulation workflows assume structured inputs rather than raw visual
+artifacts. Bridging this gap requires recovering structured process meaning from heterogeneous
+diagrams and instantiating simulator objects that satisfy strict creation, connectivity, and initial-
+ization rules. To address this, we present an end-to-end multi-agent large language model system
+that converts process diagrams directly into executable Aspen HYSYS flowsheets. The system
+decomposes the task across three coordinated layers: diagram parsing and interpretation, simulation
+model synthesis, and multi-level validation. Each layer consists of specialized agents handling visual
+interpretation, construction of a graph-based intermediate representation, code generation for the
+HYSYS COM interface, execution, and structural verification. This decomposition enables execution
+grounding and explicit error localization, reducing hallucination risk while keeping failure modes
+transparent. We evaluate the framework on four chemical engineering case studies of increasing
+complexity, from a simple desalting process to an industrial-scale aromatic production flowsheet
+with multiple recycle loops. The system produces executable HYSYS models in all cases, achieving
+complete structural fidelity (F1 = 1.00 across all metrics) on the two simpler cases and maintaining
+high performance on the more complex ones (connection consistency ≥0.93, stream consistency
+≥0.96). Ablation analysis confirms that each architectural component contributes meaningfully to
+robustness, with sensitivity increasing alongside diagram complexity. These results establish a viable
+end-to-end sketch-to-simulation automation in process systems engineering, while indicating that
+remaining challenges lie primarily in handling dense recycle structures, implicit diagram semantics,
+and simulator-interface constraints.
+Keywords Chemical Process Simulation · Large Language Model (LLMs) · Multi Agent System · Aspen HYSYS
+arXiv:2603.24629v1  [cs.SE]  25 Mar 2026
+A PREPRINT - MARCH 27, 2026
+1
+Introduction
+1.1
+Problem Context
+Process simulation stands as the computational backbone of modern chemical engineering practice, providing a sound
+basis for process design, analysis, and operational decision-making. Looking ahead, its importance is likely to grow
+further as emerging paradigms such as digital twins, real-time optimization, and more autonomous modes of operation
+depend increasingly on continuously updated, high-quality, reliable process models Peterson et al. 2025.
+However, developing a high-fidelity simulation model remains a major practical bottleneck. The process often requires
+time-intensive manual effort, simulator-specific expertise, and repeated refinement, with even minor structural or
+specification errors capable of preventing valid execution. These challenges are further amplified when the starting
+point is a high-level process diagram rather than a structured digital representation. Methods and tools that automate
+simulation model generation are therefore becoming increasingly important for enabling faster, more reliable engineering
+workflows and for supporting the broader shift towards digitalization and automation in process systems engineering
+(PSE) Liang et al. 2026; Tian et al. 2026.
+1.2
+Research Gap
+Process diagrams encode valuable engineering information, including major unit operations, material streams, and the
+overall topology of a process system. As such, they serve as a standard high-level representation for communicating
+process structure and design intent. However, despite the value of this information, converting diagrams into executable
+simulation models remains a largely manual task: substantial interpretation, inference, and iterative refinement are
+required to yield a valid simulation Towler and Sinnott 2013.
+A fundamental challenge arises from the gap between the information provided by process diagrams and the requirements
+of process simulation software. Diagrams are intended to support human understanding of process structure, whereas
+simulation environments require explicit, machine-interpretable definitions of units, stream connections, specifications,
+and initialization conditions. As a result, important information may be missing, implicit, or ambiguous in the source
+diagram. Therefore, converting such diagrams into executable models requires more than extraction; it requires
+engineering interpretation and a structured synthesis process that organizes, supplements, and translates diagram content
+into simulator-compatible form.
+This work is motivated by the need to bridge the gap between diagram understanding and automated model generation.
+Recent advances in computer vision, including optical character recognition and multimodal artificial intelligence, have
+improved the identification and extraction of symbols, labels, and visual relationships from technical diagrams Bray
+et al. 2026; Shteriyanov et al. 2025. In parallel, prior approaches to automated model generation have shown how
+structured inputs can be converted into executable models Liang et al. 2026; Tian et al. 2026. However, these two lines
+of work remain only partially connected. The former generally ends at recognition and extraction, whereas the latter
+typically assumes explicit, structured process inputs rather than raw diagrams. As a result, end-to-end frameworks
+capable of transforming raw visual inputs into validated, executable process simulation models remain limited.
+1.3
+Objective, Scope, and Contributions
+To address the challenges of manual model development, this work proposes a multi-agent system for transforming
+process diagrams into executable process simulation models. The proposed workflow is designed to bridge the gap
+between high-level engineering diagrams and simulator-ready process models through coordinated stages of diagram
+interpretation, structured model generation, and validation. The scope of the study is restricted to steady-state chemical
+process simulation, with Aspen HYSYS used as the target environment for model construction and execution.
+Within this scope, the main contributions of this work are threefold. First, it presents an end-to-end multi-agent
+architecture for automated process model generation from visual diagrams in chemical engineering. Second, it
+introduces a structured intermediate representation for converting diagram-level information into simulator-compatible
+model elements. Third, it integrates automated model generation with validation and execution in Aspen HYSYS, and
+demonstrates the resulting workflow across four case studies of increasing complexity.
+The remainder of this paper is organized as follows: Section 2 reviews the background and related work on automated
+model generation. Section 3 presents the proposed multi-agent methodology. Section 4 describes the case studies used
+for evaluation. Section 5 presents the results and discusses workflow performance, robustness, and limitations. Finally,
+Section 6 concludes the work and outlines directions for future work.
+2
+A PREPRINT - MARCH 27, 2026
+2
+Background and Related Work
+2.1
+Process Simulation Environments
+Process simulation environments are software platforms used to construct, specify, and execute computational models
+of process systems. Originating from early computer-aided flowsheeting tools, they have evolved into mature systems
+with integrated thermodynamic methods, unit-operation libraries, and graphical interfaces. In chemical engineering,
+they are widely used across process design, analysis, optimization, and operational support, making them a central part
+of modern engineering workflows Towler and Sinnott 2013. As computing capabilities advance, their role has expanded
+beyond steady-state design calculations to include dynamic simulation and broader digital engineering applications.
+In practice, process simulation platforms are often categorized by their underlying computational architecture. Commer-
+cial environments such as Aspen HYSYS, Aspen Plus, and AVEVA PRO/II typically follow a Sequential Modular (SM)
+approach, in which unit operations are solved individually in a specified sequence AspenTech 2026; AVEVA 2026.
+This architecture aligns closely with the visual logic of engineering diagrams. By contrast, platforms such as gPROMS
+employ an Equation-Oriented (EO) formulation, in which the full system of algebraic and differential equations is
+solved simultaneously Siemens 2026. Although EO platforms offer greater flexibility for high-fidelity modeling and
+complex optimization, SM environments remain the industrial standard for general process design and analysis because
+of their robustness and intuitive flowsheet-based construction Dimian et al. 2014.
+Within this class of sequential-modular platforms, different environments have developed distinct areas of industrial
+emphasis. Aspen HYSYS is widely used and often preferred, particularly in oil and gas and broader energy applications,
+whereas Aspen Plus is more general-purpose and commonly associated with chemical process applications, including
+specialty chemicals and pharmaceuticals Chukwu et al. 2025. AVEVA PRO/II occupies a similar steady-state simulation
+space and has long been used across refining and chemical applications. These distinctions are not absolute, but they
+illustrate how commercial simulation platforms with similar underlying architectures often evolve toward different
+sectoral strengths.
+A key differentiating feature of these environments is their support for external integration and automation. Modern
+commercial platforms expose their internal object models through application programming interfaces or interoperability
+layers such as COM (Component Object Model) or Python-based wrappers. These interfaces allow external software,
+including the agents considered in this research, to programmatically construct and modify flowsheets without manual
+graphical intervention Kumar et al. 2025; Santos Bartolome and Van Gerven 2022. In addition, international standards
+such as CAPE-OPEN have sought to formalize interoperability across simulation platforms, enabling thermodynamic
+methods and unit-operation models to be exchanged more consistently between environments CO-LaN 2026.
+Within this landscape, Aspen HYSYS is selected as the target simulation environment for the present study. This
+choice is motivated by its extensive industrial use and strong exposure in practice, particularly within the broader
+energy and manufacturing industry, where it is widely used and often preferred for steady-state hydrocarbon process
+modeling. Although integrating automated workflows with a commercial platform such as HYSYS presents practical
+implementation challenges, including the orchestration of its COM-based object model, its industrial relevance ensures
+that the proposed framework is evaluated against a rigorous real-world benchmark. Consequently, HYSYS provides a
+meaningful testbed for assessing the feasibility of translating diagrammatic intent into executable, simulator-compatible
+flowsheets.
+2.2
+Prior Work on Diagram Understanding (Automated Interpretation of Engineering Diagrams)
+Prior work on engineering diagram understanding has evolved from low-level visual extraction toward increasingly
+structured and semantically informed forms of analysis. In chemical engineering, this progression has been driven by a
+transition from rule-based and classical vision techniques to deep-learning, graph-aware, and multimodal approaches
+that enable richer reasoning over process diagrams.
+The first stage focuses on element extraction. Early approaches treated process diagrams as visual documents whose
+basic components, such as text labels, symbols, arrows, and line objects, had to be identified separately. To achieve
+this, they typically combined OCR, template matching, Hough-transform-based line extraction, and rule-based visual
+processing to identify the visible building blocks of the diagram Kang et al. 2019; Moon et al. 2021; Rahul et al. 2019.
+While these methods performed well on relatively clean and standardized drawings, they were often sensitive to clutter,
+inconsistent notation, overlapping lines, and the variability common in legacy scans and industrial diagrams. More
+recent deep-learning-based approaches improved the robustness of this stage by learning symbol, text, and feature
+representations directly from data, often using convolutional neural networks or transformer-based vision models. This
+has been especially useful for dense or heterogeneous diagrams. Examples include deep-learning-based symbol and
+3
+A PREPRINT - MARCH 27, 2026
+text recognition in high-density P&IDs Kim, Lee, et al. 2021, feature recognition from image-format P&IDs Yu et al.
+2019, and broader deep neural-network-based recognition of image-format P&IDs Su et al. 2024.
+The second stage extends beyond isolated recognition toward topology reconstruction. At this point, the objective is no
+longer only to detect visible elements, but to recover how they are connected and what process structure they represent.
+This includes associating labels with symbols, tracing pipelines, identifying stream connectivity, and representing
+the result as a graph or other digital process structure. End-to-end digitization frameworks such as Kim, Kim, et al.
+2022 and Digitize-PID Paliwal et al. 2021 illustrate this transition by combining object recognition with topology
+reconstruction. Similar ideas appear in chemical PFD digitization, where deep-learning-based detection is followed by
+connectivity recovery to obtain a structured process representation Theisen et al. 2023. More recent work also moves
+toward joint structural prediction and highlights the need to identify omissions and inconsistencies after the initial
+parsing stage Kim, Moon, et al. 2025, reflecting a broader recognition that reliable engineering diagram interpretation
+often requires explicit validation when the output is intended for downstream technical use.
+The third stage focuses on semantic interpretation. Rather than stopping at the extracted structure, this stage treats
+the diagram as a semantic object that can support querying, higher-level reasoning, and downstream engineering
+use. This is reflected in recent multimodal and graph-grounded systems that transform static diagrams into structured
+knowledge representations and enable question answering or language-based interaction over them Gupta et al. 2025.
+These methods mark a clear shift from perception and topology recovery toward semantic interpretation. However,
+even at this level, the output typically remains a graph, knowledge base, or semantic representation rather than a
+simulator-ready model specification. In particular, current systems may identify that a unit, stream, or connection
+exists without supplying the domain-specific parameters, initialization conditions, and simulator constraints required
+for executable model synthesis.
+Taken together, these stages reveal a clear pattern in the literature: the field has progressed from extracting visible
+elements, to reconstructing process topology, and more recently to interpreting engineering meaning. This progression
+is highly relevant to the present work. Diagram understanding is a necessary foundation for automated model generation,
+but it is not sufficient on its own. A significant gap remains between diagram interpretation and executable simulation
+models. The scope of current frameworks generally stops at extracted structures, graphs, or semantic representations,
+whereas simulation-model synthesis requires parameter inference, initialization logic, and simulator-specific mapping.
+In this sense, the remaining challenge is not only diagram understanding, but also bridging the symbol-to-parameter
+gap between recognized engineering elements and executable process-model definitions.
+2.3
+Prior Work on Automated Model Generation
+2.3.1
+Optimization and Reinforcement Learning Approaches
+Early work in this area emerged from classical process synthesis, where automated flowsheet generation was formulated
+as an optimization problem over a predefined superstructure of candidate units and connections. Within this framework,
+mathematical programming was used to select a feasible or optimal substructure from that design space Grossmann
+1985; Pistikopoulos and Tian 2024; Westerberg 1989. Similarly, more recent symbolic approaches replace explicit
+superstructures with machine-readable encodings. For example, eSFILES represents process structures through
+symbolic flowsheet strings and uses these encodings as the basis for intelligent synthesis Mann et al. 2024.
+Rather than solving a fixed optimization problem directly, a second line of work casts flowsheet generation as a
+sequential decision problem. A reinforcement learning agent constructs the flowsheet step by step by adding units and
+connections within a predefined synthesis environment Göttl et al. 2022. This perspective has since been extended
+to include downstream design and control decisions, allowing generation to be coupled more closely with process
+performance and operability Reynoso-Donzelli and Ricardez-Sandoval 2025. Although these methods enable more
+flexible exploration of the design space than classical optimization-based synthesis, they still rely on predefined actions,
+candidate units, and constraints. Moreover, reinforcement learning is primarily designed for learning decision policies
+through repeated interaction, rather than for one-off design synthesis tasks. In both cases, the process must first be
+represented in machine-readable form, and the output is typically a flowsheet configuration rather than a fully executable
+simulation model.
+2.3.2
+Semi-Automatic, LLM, and Multi-Agent Approaches
+A transition toward semi-automatic modules can be seen in the work of Sierla et al. 2020, where a digitalized P&ID
+is transformed into a directed graph and then into a simulator-specific flowsheet skeleton. However, the workflow
+remained semi-automatic, since experts still had to choose the appropriate simulator blocks for the generated structure
+and complete the initialization and parameter settings needed to finalize the model.
+4
+A PREPRINT - MARCH 27, 2026
+LLMs and agentic systems extend automation further by shifting the interface from structured engineering data toward
+natural-language instructions and higher-level task orchestration. In the work Liang et al. 2026, for example, an
+LLM agent is integrated with AVEVA Process Simulation to support natural-language interaction, guided flowsheet
+construction, data extraction, and optimization support. Their results show that step-by-step interaction is more reliable
+for guided model building, whereas single-prompt generation is faster but still requires expert oversight because of
+oversimplification and calculation errors. A more automated approach is proposed by Tian et al. 2026, who formulated
+text-to-simulation as a multi-agent workflow with specialized agents for task understanding, topology generation,
+parameter configuration, and evaluation analysis. Their system reports improved convergence and reduced design time,
+but it still begins from textual process specifications as opposed to visual engineering inputs.
+A further extension appears in Srinivas et al. 2025, which adopts a more integrated, physics-aware framework for the
+scale-up of chemical manufacturing. Rather than acting only as a simulator assistant or text-to-simulation pipeline,
+it generates PFDs and P&IDs from textual or retrieved process descriptions and validates them through a simulator-
+supported closed-loop workflow using DWSIM. This makes it one of the closest examples of closed-loop, agentic
+engineering generation, though it still starts from text or retrieved knowledge rather than from raw visual engineering
+diagrams.
+A related extension of this trend appears in CeProAgents, which proposes a broader multi-agent framework that spans
+knowledge retrieval, concept-level diagram reasoning, and simulator-based parameter optimization across the process
+development lifecycle. Conceptually, it is more integrated than simulator-assistant or text-to-simulation workflows,
+since it attempts to connect natural-language objectives, process-diagram abstractions, and Aspen-based optimization
+within one architecture. However, the released implementation appears closer to a collection of partially connected
+modules than to a fully seamless end-to-end pipeline, with stronger support for parsing and optimization than for
+complete abstract-to-simulator model generation. As a result, it is best understood as an ambitious step toward integrated
+agentic process development rather than a complete solution for converting raw engineering diagrams directly into
+executable simulation models Yang, Li, Ma, et al. 2026.
+Collectively, this literature shows that automated model generation in chemical engineering is already well developed
+once the process has been expressed in a machine-readable form. Classical synthesis methods, symbolic representations,
+sequential generation frameworks, digital-twin pipelines, and agentic workflows all demonstrate different ways of
+automating flowsheet or model construction. The main limitation, however, is that most of these approaches begin
+only after the representation problem has already been resolved. They automate the transition from formal process
+description to flowsheet or simulator model, but not the earlier transition from ambiguous visual engineering input to a
+structured, simulator-ready representation. This is the distinction addressed in the present work, which connects visual
+interpretation with structured synthesis and validation within a single workflow.
+2.4
+Multi-Agent Systems for Complex Engineering Workflows
+A multi-agent system (MAS) is a system composed of multiple autonomous agents that perceive their environment,
+make local decisions, and act in pursuit of individual or collective goals. An agent, in this context, is a computational
+entity capable of sensing relevant inputs, reasoning over them, and performing actions directed toward a defined
+objective. The broader contemporary literature often discusses such goal-directed autonomous behavior under the term
+Agentic AI, particularly when agents operate with planning, tool use, and limited human supervision Rupprecht et al.
+2026.
+The defining feature of MAS is that problem solving is distributed rather than centralized: specialized agents interact
+through coordination, cooperation, or negotiation, and their collective behavior can achieve outcomes beyond those of
+isolated components. This makes MAS well-suited to complex, multi-step engineering problems that require distributed
+reasoning, modular task allocation, and coordination across various computational tools.
+In practice, MAS can take different forms depending on how knowledge, decision-making, and coordination are
+organized. Information may be distributed across agents or shared through a common state, with agents updating their
+local or global view of the problem as new information becomes available. Agents can be instances of rule-based
+logic, optimization routines, reinforcement-learning policies, or large language models, depending on the role they are
+intended to perform. Coordination may be imposed through a centralized orchestrator or arise from direct interaction
+among agents. As a result, MAS can support both deterministic workflows, where execution order is predefined, and
+more adaptive settings, where routing, sequencing, and task assignment evolve in response to intermediate results or
+changing system conditions.
+A key advantage of multi-agent systems lies in their ability to support specialization and coordination at the same
+time. Here, architecture refers to the organizational structure through which agents are arranged, responsibilities are
+allocated, and interactions are coordinated. Such architectures may be sequential, hierarchical, or orchestrated through
+5
+A PREPRINT - MARCH 27, 2026
+a central controller, depending on how task dependencies and information flow are managed. Different agents can be
+assigned different reasoning modes, representations, or external tools, while higher-level coordination mechanisms
+allow their outputs to be combined into a coherent workflow. This is especially useful when solving problems that
+require both local task expertise and global consistency. Rather than forcing all subtasks into a single representation
+or model, a multi-agent architecture allows perception, structure recovery, parameter inference, and validation to be
+treated as related but distinct forms of reasoning. In chemical engineering, multi-agent systems have evolved across
+several generations. Early studies used agents as modular carriers of engineering knowledge, decomposing complex
+tasks into specialized decision units for process design and fault diagnosis Eo et al. 2000; Han et al. 1995. Later work
+extended the scope toward interoperability, enterprise coordination, distributed optimization, refinery applications, and
+fault diagnosis in transient operations to solve more complex engineering tasks Julka et al. 2002; Seng and Srinivasan
+n.d.; Siirola et al. 2003; Stalker and Fraga 2004; Yang, Braunschweig, et al. 2008.
+More recent research has introduced learning-enabled architectures, particularly reinforcement-learning-based multi-
+agent systems, in which agents adapt their behavior in response to intermediate results and support data-driven
+coordination in tasks such as process control and scheduling Hong et al. 2024; Yue and Lakshminarayanan 2023.
+Building on this shift toward adaptive computation, the latest contributions have expanded MAS further through agentic
+architectures that incorporate multimodal large language models, retrieval-augmented generation, graph-based retrieval,
+and tool use for tasks such as process improvement, industrial control, operational assistance, process optimization,
+and PFD/P&ID generation from text or multimodal inputs Du and Yang 2025; Gowaikar et al. 2024; Lee et al. 2024;
+Srinivas et al. 2025; Tian et al. 2026; Vyas and Mercangöz 2025; Zeng et al. 2025.
+This evolution is directly relevant to the present work. Transforming a visual engineering diagram into an executable
+simulation model is not a single inference task, but a sequence of heterogeneous subtasks that includes visual interpreta-
+tion, structural reconstruction, simulator-specific mapping, specification completion, and execution-oriented validation.
+These subtasks differ not only in their inputs and outputs, but also in the type of reasoning they require. A multi-agent
+system, therefore, provides a natural architectural basis for this problem, because it allows these stages to be handled by
+specialized agents while still maintaining coordination across the overall workflow.
+For this reason, the present work adopts a multi-agent system not simply as an implementation choice, but as a
+methodological response to the structure of the problem itself. The proposed workflow uses specialized agents to bridge
+visual engineering inputs and simulator-ready model generation through coordinated interpretation, synthesis, and
+validation.
+2.5
+Research Gap and Positioning
+The literature has advanced along two directions that remain insufficiently integrated. On one side, engineering-diagram
+understanding has progressed from element extraction to topology reconstruction and semantic interpretation, but
+most methods still terminate at a graph or descriptive representation rather than an executable simulation model. On
+the other hand, recent multi-agent and agentic workflows have enabled increasingly capable text-to-simulation and
+simulator-assisted design, but they usually begin from textual specifications, structured engineering data, or standardized
+intermediate forms. The unresolved gap lies in connecting these directions: transforming raw visual engineering
+diagrams directly into simulator-ready models.
+A further limitation is that many existing workflows are tied either to specific input formats or to non-industrial modeling
+environments. In practice, however, engineering diagrams vary widely in notation, layout, completeness, and degree of
+standardization. A practically useful framework should therefore not rely exclusively on highly standardized exchange
+formats, but should be able to operate across a broader range of engineering diagrams, including those encountered in
+less structured industrial settings. At the same time, industrial relevance depends on compatibility with widely used
+commercial simulators rather than only research-oriented platforms or custom prototypes. For this reason, the present
+work targets visual engineering inputs more broadly and uses Aspen HYSYS as the simulation environment.
+This work is positioned at the intersection of these gaps. It proposes an end-to-end multi-agent workflow that begins
+from visual engineering diagrams rather than textual specifications and aims to generate executable simulation models
+rather than only topological or semantic representations. By combining diagram interpretation, structured synthesis,
+specification completion, and simulator-based validation within a single coordinated framework, the proposed system
+treats the simulator not as a passive output target but as an active component of the generation and verification loop. In
+this way, the framework seeks to connect visual engineering inputs to simulator-ready model generation in a form that
+is both technically executable and industrially relevant.
+6
+A PREPRINT - MARCH 27, 2026
+3
+Methodology
+This work proposes a multi-agent system for transforming process diagrams into executable process simulation
+models. This section presents the methodology underlying the proposed framework, beginning with the overall system
+architecture, followed by detailed descriptions of the interpretation, synthesis, and validation layers. It then outlines the
+rationale for model selection and deployment, and concludes with the system implementation.
+3.1
+Multi-Agent System Architecture
+The automated transformation of process diagrams into ready-to-use process simulation models is a complex reasoning
+task; it requires visual interpretation, information extraction, semantic parsing, and model synthesis, each with distinct
+logic and failure modes. Monolithic approaches built around a single LLM agent, therefore, tend to lose robustness as
+diagram complexity increases. More concretely, in multi-step reasoning tasks, as intermediate states accumulate within
+a single context window, attention allocation and context utilization become less reliable over dispersed evidence, while
+composing multiple dependent subtasks within a single reasoning path makes errors harder to isolate, trace, and correct
+Brinkmann et al. 2024; Dziri et al. 2023; Liu et al. 2024.
+To address these limitations, this study proposes a modular multi-agent system architecture, motivated by prior literature
+that emphasizes the value of task decomposition, specialization, and error isolation in complex reasoning workflows Guo
+et al. 2024. The architecture is organized into three functional layers, each composed of specialized agents. As shown in
+Figure 1, the Diagram Parsing and Interpretation Layer transforms the visual input into a structured representation. The
+Simulation Model Synthesis Layer then translates this representation into an executable process model in the simulator
+environment. Throughout the workflow, the Multi-level Validation Layer applies targeted validation procedures to
+assess structural and semantic consistency at key stages. This layered design improves reliability, supports systematic
+error localization, and limits error propagation across stages.
+Simulator Environment
+Aspen HYSYS
+V11
+Diagram Parsing & Interpretation Layer
+Descriptor
+A1
+Extractor
+A2
+Normalization
+A3
+Simulation Model Synthesis Layer
+Basis
+B1
+Instantiation
+B2
+Configuration
+B3
+Execution
+B4
+Intermediate
+Representation
+Description Validation
+A1.1
+COM API
+Workflow
+Fixer
+B4.1
+Orchestrator
+Process Diagram
+Multi-level
+Validation Layer
+Figure 1: Multi agent system architecture
+Workflow execution is governed by a central orchestrator that manages state transitions between agents in a deterministic
+sequence. Each agent operates as a state transformer: it consumes a validated state from the preceding stage and returns
+a refined state for the next. This design enforces controlled and reproducible information flow while enabling targeted
+trace-based issue localization at any point in the workflow Deshpande et al. 2025. Formally, let sk denote the workflow
+state after stage k, and let Ak denote the transformation implemented by the agent at that stage. The workflow then
+evolves as
+sk+1 = Ak(sk),
+where the orchestrator defines the ordered sequence of transformations {A1, A2, . . . , An}. The final workflow state can
+therefore be written as
+sn = (An ◦An−1 ◦· · · ◦A1)(s0).
+By assigning well-defined responsibilities to specialized agents, the architecture improves traceability, enables targeted
+validation, and supports modular extension. It thereby enables automated process model synthesis directly from process
+diagrams, while also allowing additional capabilities to be incorporated without redesign, supporting future extensions
+toward broader automated process design workflows.
+7
+A PREPRINT - MARCH 27, 2026
+3.2
+Diagram Parsing and Interpretation Layer
+The Diagram Parsing and Interpretation Layer is the entry point of the workflow. Process flow diagrams encode rich
+design information through symbols, annotations, stream labels, and spatial arrangements. However, they often exhibit
+visual clutter, inconsistent formatting, non-standard conventions, and implicit connectivity assumptions, which make
+direct automated interpretation challenging. The role of this layer is to transform the unstructured visual input into a
+formalized Intermediate Representation (IR) that captures the process topology in a structured, simulator-compatible
+form. Formally, the IR is represented as a directed graph, G = (V, E), where V denotes the set of unit operations and
+E ⊆V × V denotes the directed material streams connecting source and destination units. In implementation, this
+graph is instantiated as a structured JSON schema comprising two principal collections: a set of units representing graph
+nodes, V , and a set of material streams representing directed edges, E. This representation preserves flow directionality
+and provides a clear interface to downstream synthesis agents.
+The interpretation layer workflow comprises three agents: the Descriptor Agent (A1), the Extractor Agent (A2), and the
+Normalization Agent (A3), each discussed in the following subsections.
+3.2.1
+Descriptor Agent (A1)
+The Descriptor Agent (A1) uses a multimodal LLM to generate a detailed description of the process depicted in the input
+diagram. Prior to inference, the diagram is standardized to a fixed resolution to improve computational efficiency while
+preserving the spatial relationships required for process interpretation. The prompt enforces a left-to-right traversal
+heuristic and instructs the model to explicitly enumerate all visible process elements.
+To improve consistency, the prompt incorporates a self-evaluation instruction that encourages the model to assess
+whether each described element is supported by observable visual evidence in the diagram Madaan et al. 2023; Weng
+et al. 2023. The resulting description captures the overall process intent, identified unit operations, material streams,
+and their inlet-outlet relationships.
+3.2.2
+Extractor Agent (A2)
+Building on the output of Agent A1, the Extractor Agent (A2) employs a multimodal LLM to construct the JSON-based
+Intermediate Representation. Both the original diagram and description produced by Agent A1 are parsed by this agent.
+The diagram remains the primary source of ground truth, while the generated description serves as a semantic prior that
+helps reduce ambiguity and improve extraction reliability.
+To improve robustness, extraction is performed in two inference passes. In the first pass, the agent identifies all visible
+unit operations and assigns unique identifiers. In the second pass, it extracts material streams, classifies them as feed,
+intermediate, or product streams, and restricts source-destination assignments to the unit set established in the first pass.
+This staged extraction procedure strengthens topological consistency and mitigates common LLM failure modes,
+including equipment hallucination, label misinterpretation, and inconsistent connectivity assignments. It also localizes
+extraction errors, thereby limiting cross-stage error propagation. The output of Agent A2 is a structured Intermediate
+Representation that encodes the extracted process topology.
+3.2.3
+Normalization Agent (A3)
+Before the IR is passed to the synthesis layer, it is processed by the Normalization Agent (A3), a rule-based agent that
+enforces topological consistency and simulator-specific structural requirements.
+One responsibility of Agent A3 is to resolve implicit junctions commonly found in process diagrams. In many process
+diagrams, multiple streams converge directly into unit operations that are designed to accept a single inlet stream, such
+as pumps or compressors. Although visually intuitive, such representations violate the nodal constraints imposed by the
+simulator. Agent A3 detects these multi-stream convergences and inserts explicit mixing or splitting units into the IR,
+rerouting the associated streams to preserve process intent while satisfying simulator requirements.
+A second responsibility of Agent A3 is to align extracted process structures with simulator templates. Certain unit
+operations may appear in the diagram as multiple functional elements, but must be instantiated in the simulator as a
+single object. Distillation systems are an example of this: the column tower, condenser, and reboiler may be extracted
+as separate elements, but they must be consolidated into a predefined unit operations template. Agent A3 therefore
+restructures the IR into a cohesive, template-compliant representation that can be instantiated as the corresponding
+simulator object. At the conclusion of the interpretation layer, the system produces a normalized, simulator-compatible
+Intermediate Representation of the process flowsheet. This IR then serves as the controlled input to the synthesis layer,
+where it is translated into an executable process simulation model.
+8
+A PREPRINT - MARCH 27, 2026
+3.3
+Simulation Model Synthesis Layer
+The Simulation Model Synthesis Layer translates the formalized Intermediate Representation into an executable process
+simulation model in Aspen HYSYS. To achieve this, four specialized coding agents sequentially construct a Python
+automation script that interacts with the Aspen HYSYS Component Object Model (COM) interface. The agents operate
+on a shared Python template and modify only predefined execution blocks. This guided synthesis strategy enforces
+adherence to simulator-specific conventions.
+The synthesis layer workflow comprises four agents: the Basis Agent (B1), the Instantiation Agent (B2), the Configura-
+tion Agent (B3), and the Execution Agent (B4), each discussed in the following subsections.
+3.3.1
+Basis Agent (B1)
+The Basis Agent (B1) is a code-oriented LLM agent that establishes the simulation case basis by defining the case name,
+selecting the appropriate fluid property package, and constructing the component list required for the process. A key
+responsibility of the agent is translating the extracted feed components into valid Aspen HYSYS component names.
+This translation is performed using a Retrieval-Augmented Generation (RAG) module that queries a curated knowledge
+base to align extracted material names with exact entries in the HYSYS pure-component database, thereby ensuring
+that only simulator-compatible components are introduced into the simulation environment.
+3.3.2
+Instantiation Agent (B2)
+Once the simulation basis is established, the Instantiation Agent (B2), a code-oriented LLM agent, constructs the
+structural skeleton of the process flowsheet. Operating directly on the IR graph, it translates the node set V and edge
+set E into executable code. Using the Aspen HYSYS COM automation interface, the agent maps unit operations and
+material streams to their corresponding simulator object classes. Dedicated instruction files guide object creation patterns
+for each supported unit type, ensuring compliance with the simulator object hierarchy and preventing unsupported
+operations. By the end of this stage, the structural flowsheet has been instantiated within the simulation environment.
+3.3.3
+Configuration Agent (B3)
+Building on the instantiated flowsheet, the Configuration Agent (B3), also a code-oriented LLM agent, establishes the
+topological connectivity of the process model. Guided by the source-destination relationships encoded in the edge set E,
+it links material streams to the appropriate inlet and outlet ports of each unit operation through the COM automation
+interface. Unit-specific instruction files govern the connection logic for each object class, ensuring that streams are
+attached to valid ports in a simulator-consistent manner. As a result, the generated automation script defines a fully
+connected process model.
+3.3.4
+Execution Agent (B4)
+The synthesis layer concludes with the Execution Agent (B4), a hybrid agent that combines a rule-based execution step
+with an LLM-based fixing step. The rule-based step executes the generated Python automation script without modifying
+the underlying model logic and records solver status, runtime diagnostics, and execution logs. If execution fails, a
+code-oriented LLM agent analyzes the execution trace and applies targeted corrections to the script before reattempting
+execution.
+This stage serves as an execution-level validation step, confirming whether the generated model can run successfully
+within the simulator environment while supporting systematic issues tracing of the automated modeling workflow. It
+therefore completes the transformation from a structured process representation into an executable process simulation
+model.
+3.4
+Multi-Level Validation Layer
+To improve the reliability, robustness, and traceability of the proposed framework, validation is embedded at multiple
+levels of the workflow. These validation procedures do not replace the core generative steps; rather, they act as diagnostic
+checkpoints that identify inconsistencies, improve transparency, and support error localization. A summary of these
+procedures is provided in Table 1.
+9
+A PREPRINT - MARCH 27, 2026
+Table 1: Summary of validation mechanisms used in the proposed workflow
+Mechanism
+Purpose
+Stage
+Description validation (A1.1)
+Assess alignment between the visual
+input and the generated description
+Post-descriptor (A1)
+Schema and prompt safeguards
+Enforce structured outputs, object
+constraints, and internal consistency
+Interpretation and synthesis agents
+Execution validation and fixing
+Validate executability and apply tar-
+geted runtime corrections
+Execution (B4)
+Within the interpretation layer, an auxiliary Description Validation Agent (A1.1) evaluates the output of the primary
+Descriptor Agent (A1). Operating on the original diagram, this secondary LLM acts as an independent evaluator that
+assesses whether the generated process description is aligned with the visual content of the diagram. Although it does
+not modify the description itself, it provides a confidence signal regarding its consistency with the source diagram.
+Additional safeguards are embedded directly within the prompts and output constraints used across the workflow. In
+the interpretation layer, agents operate under strict JSON schemas to enforce properly structured intermediate outputs.
+In the synthesis layer, coding agents follow guided instruction files and constrained templates to maintain adherence
+to simulator requirements. Furthermore, internal consistency checks are embedded in selected prompts to encourage
+self-assessment before final output generation.
+Finally, end-to-end validation is performed during model execution, as discussed in Section 3.3.4. At this stage,
+execution logs, solver diagnostics, and correction outcomes provide a final check on model executability and support
+error localization. Together, these procedures strengthen the reliability and traceability of the overall workflow.
+3.5
+Model Selection and Deployment
+Model selection follows three design criteria: (i) modality alignment, ensuring that each model matches the form of
+its input data; (ii) computational efficiency, prioritizing models that enable reliable and scalable inference; and (iii)
+data governance, requiring sensitive simulation logic to remain within a controlled local environment. Based on these
+criteria, the interpretation and synthesis layers are assigned to different model classes and deployment environments.
+3.5.1
+Interpretation Models and Cloud Deployment
+The interpretation layer, comprising the Descriptor Agent (A1) and Extractor Agent (A2), uses Gemini 3 Flash, a
+proprietary multimodal LLM capable of joint reasoning over images and text Google DeepMind 2025. This capability
+is essential for interpreting process diagrams, which require scientific visual reasoning and strong optical character
+recognition (OCR) for the proper interpretation of symbols, stream labels, spatial connectivity, and textual annotations.
+This model selection is further supported by reported benchmark performance on demanding scientific reasoning
+tasks. Gemini 3 Flash achieved 81.2% on the MMMU-Pro benchmark and 90.4% on GPQA Diamond, both of which
+evaluate reasoning over complex visual and scientific content Google DeepMind 2025; Rein et al. 2023; Yue, Zheng,
+et al. 2025. These capabilities are directly relevant to the interpretation of process diagrams. In comparison, the
+open-weight multimodal alternatives considered in this study, such as Qwen 3.5 series, showed lower performance
+on these benchmark categories Qwen Team 2026. The interpretation layer is deployed in a cloud environment since
+multimodal inference is computationally intensive.
+By contrast, the Normalization Agent (A3) operates locally and applies deterministic rule-based transformations to
+enforce structural consistency and simulator-specific requirements. Since this stage is algorithmic rather than generative,
+it does not require language model inference.
+3.5.2
+Synthesis Models and Local Deployment
+To comply with industrial data-sensitivity requirements established by the project partner, the synthesis and execution
+tasks are deployed locally. This ensures that proprietary simulation structures and generated automation scripts remain
+within a controlled execution environment. With the exception of one confidential instruction file, the code used to
+reproduce the reported results is made available.
+For the foundational code-synthesis tasks handled by the Basis Agent (B1) and Instantiation Agent (B2), the system
+uses Qwen2.5-Coder-7B, Hui et al. 2024. This model was selected for its efficient local inference and reliable structured
+code generation, while also avoiding unnecessary computational cost.
+10
+A PREPRINT - MARCH 27, 2026
+For more demanding code reasoning tasks, the Configuration Agent (B3) and the fixing component associated with
+the Execution Agent (B4) use Qwen3-Coder-30B, Yang, Li, Yang, et al. 2025. These tasks require stronger multi-step
+reasoning to interpret connectivity relationships between unit operations, resolve simulator-specific dependencies, and
+analyze runtime errors during automated error tracing.
+This hybrid deployment strategy isolates computationally intensive multimodal interpretation tasks in the cloud
+environment while ensuring that proprietary simulation synthesis remains secure within a local execution environment.
+Table 2 summarizes the deployed models across the workflow.
+Table 2: Model selection and deployment across workflow components
+Agent
+Model / logic core
+Agent type
+Environment
+Descriptor (A1)
+Gemini 3 Flash
+Multimodal LLM
+Cloud
+Validation (A1.1)
+Gemini 3 Flash
+Multimodal LLM
+Cloud
+Extractor (A2)
+Gemini 3 Flash
+Multimodal LLM
+Cloud
+Normalization (A3)
+Rule-based logic
+Rule-based agent
+Local
+Basis (B1)
+Qwen2.5-Coder-7B
+Code-oriented LLM
+Local
+Instantiation (B2)
+Qwen2.5-Coder-7B
+Code-oriented LLM
+Local
+Configuration (B3)
+Qwen3-Coder-30B
+Code-oriented LLM
+Local
+Execution and Fixing (B4)
+Rule-based logic + Qwen3-Coder-30B
+Hybrid
+Local
+3.6
+System Implementation
+The multi-agent workflow is implemented in Python and orchestrated using LangGraph, which models the system
+architecture as a directed computational graph LangChain AI 2024. Within this structure, nodes represent individual
+workflow agents, including both LLM-based and rule-based agents, while edges define the execution sequence and data
+dependencies.
+Intermediate data is encapsulated in structured state objects that propagate systematically between agents. These states
+contain the evolving workflow state, including extracted unit operations, material streams, normalized intermediate
+representations, and generated simulation code. Each agent reads the current state, applies its designated transformation,
+and returns an updated state to the subsequent node.
+At the agent level, LangChain provides abstractions for prompt construction, message handling, and structured output
+parsing. The implementation deliberately separates probabilistic reasoning from algorithmic execution: LLMs are
+invoked only for tasks that require model-based reasoning, such as diagram interpretation and code synthesis, while
+rule-based agents operate directly on the workflow state through deterministic Python transformations.
+Model inference is managed through Ollama, which provides a unified serving interface for both local and cloud-based
+models Ollama Team 2023. Locally hosted code-synthesis models are served through Ollama on dedicated hardware
+to satisfy industrial data-governance constraints, while the multimodal interpretation model is accessed through the
+Ollama cloud tier. Using a common serving interface simplifies integration within the orchestration layer and reduces
+infrastructure complexity.
+Aspen HYSYS was selected as the simulation environment because it is widely regarded as the industry gold standard
+for steady-state process modeling and provides a programmable Component Object Model (COM) automation interface
+suitable for script-based flowsheet generation. Through this interface, the system can synthesize flowsheets, configure
+process connectivity, and execute simulations without manual interaction with the graphical user interface.
+The system operates on the dedicated workstation environment summarized in Table 3. Together, these software and
+hardware components operationalize the multi-agent framework described in Section 3.1, enabling automated diagram
+interpretation, model synthesis, validation, and simulation execution within a unified workflow.
+11
+A PREPRINT - MARCH 27, 2026
+Table 3: Computational environment and software stack
+Category
+Component
+Specification
+Hardware environment
+CPU
+Intel Xeon Gold 6442Y (2.60 GHz)
+Memory
+256 GB RAM
+GPU
+NVIDIA RTX A4000 (16 GB VRAM)
+Operating system
+Windows 11 (64-bit)
+Compute platform
+CUDA 12.8
+Software stack
+Programming language
+Python 3.11.13
+Agent framework
+LangChain
+Agent orchestration
+LangGraph 1.0.9
+LLM serving framework
+Ollama 0.17.4 (local and cloud)
+Process simulator
+Aspen HYSYS V11
+4
+Case Studies
+The multi-agent system is evaluated using four case studies representing common chemical engineering processes. The
+selected diagrams span increasing levels of process and topological complexity, including variations in the number
+of unit operations, stream interconnectivity, labeling clarity, and layout density. The case studies, shown in Table 4
+are presented in order of increasing complexity to enable a systematic evaluation of the robustness, scalability, and
+structural reasoning capability of the workflow.
+Table 4: Characteristics of the case study diagrams
+Case
+Process
+Unit operations
+Stream
+density
+Recycle
+loops
+Diagram characteristics
+1
+Desalting
+Low
+Sparse
+None
+Missing labels, implicit mixing
+2
+Merox Sweetening
+Moderate
+Moderate
+One
+Compact layout, ambiguous con-
+nectivity
+3
+Atmospheric
+Distillation
+Moderate
+Moderate
+One
+Non-standard symbols, partially
+labeled units
+4
+Aromatic Production
+High
+Dense
+Multiple
+Industrial-scale flowsheet with
+complex interconnections
+Taken together, the four case studies provide a structured evaluation across progressively increasing levels of process
+and topological complexity. The selected diagrams range from a simple baseline process to industrial-scale flowsheets
+with dense interconnections and multiple recycle loops. This progression enables a systematic assessment of the
+system’s robustness, scalability, and limitations when applied to diverse process diagrams encountered in chemical
+engineering practice.
+4.1
+Case Study 1: Desalting Process
+The first case study considers a simplified crude oil desalting process obtained from a published process diagram (Figure
+2) Pereira et al. 2015. In this process, crude oil and fresh water are pressurized by dedicated pumps, combined with a
+demulsifier agent, and routed to an electrostatic separator that produces desalted crude oil and effluent water.
+This case serves as a baseline scenario due to its low structural complexity and limited number of unit operations.
+Despite its simplicity, the diagram presents several interpretation challenges, including unlabeled pumps, an implicitly
+represented mixing operation, and missing stream labels. These features test the workflow’s ability to correctly identify
+equipment and infer stream connectivity under minimal topological complexity.
+12
+A PREPRINT - MARCH 27, 2026
+Figure 2: Desalting process (Pereira et al. 2015)
+4.2
+Case Study 2: Jet Fuel Sweetening (Merox) Process
+The second case study examines a jet fuel mercaptan oxidation treating process, commonly referred to as the Merox pro-
+cess. The corresponding process flow diagram was obtained from a publicly available source drawn using ConceptDraw,
+a diagramming platform (Figure 3) ConceptDraw 2026.
+The feed enters a caustic prewash vessel, after which it is routed to the Merox reactor, where mercaptan oxidation
+occurs in the presence of an alkaline catalyst and compressed air. Reactor effluent flows to a caustic settler for phase
+separation, after which the hydrocarbon stream passes through water washing, salt bed drying, and clay bed polishing
+units before exiting as the final product. A portion of the aqueous caustic phase is recycled to maintain caustic strength.
+Relative to the baseline case, this flowsheet introduces moderate topological complexity. Although it follows stan-
+dardized conventions, the flowsheet includes an internal recycle loop and ambiguous stream connectivity. In addition,
+dense textual annotations and reaction equations increase visual clutter, requiring the workflow to distinguish structural
+elements from explanatory content. This combination of features provides a useful stress test for the framework’s ability
+to interpret compact layouts and infer non-linear flow paths while maintaining structural consistency.
+Figure 3: Merox process (ConceptDraw 2026)
+13
+A PREPRINT - MARCH 27, 2026
+4.3
+Case Study 3: Atmospheric Crude Oil Distillation Process
+The third case study considers a classical atmospheric crude oil distillation process sourced from an undergraduate
+chemical engineering thesis (Figure 4) Ogunleye 2021. The diagram represents a crude oil processing sequence
+consisting of crude preheating, desalting, fired heating, and atmospheric distillation.
+In this process, crude oil is withdrawn from a storage tank and pressurized by a feed pump before entering a preheating
+train. The preheated crude is mixed with wash water and routed to a desalter, where salts and entrained water are
+removed. The desalted crude then passes through a second preheating train and a fired heater before entering the
+atmospheric distillation column. Within the column, the feed is separated into multiple fractions, including overhead
+products, side draws such as naphtha, kerosene, diesel, and atmospheric gas oil, and a bottom residue stream.
+Compared with the previous cases, this example introduces additional interpretation challenges due to its non-standard
+formatting and limited equipment labeling. While process streams are identified, most equipment items are not explicitly
+labeled, creating ambiguity in unit recognition. The diagram also incorporates color-coded elements and unconventional
+symbols that deviate from standardized industrial flowsheet conventions. As a result, the workflow must rely more
+heavily on spatial relationships and contextual cues to infer unit roles and connectivity, thereby highlighting sensitivity
+to diagram quality rather than process complexity alone.
+Figure 4: Crude distillation process (Ogunleye 2021)
+4.4
+Case Study 4: Aromatic Production Process
+The final case study considers a fully integrated, industrial-scale aromatic production process, obtained from a chemical
+engineering design textbook (Figure 5) Turton 2009.The flowsheet encompasses a dense network of reactor systems,
+separation columns, heat exchangers, rotating equipment, and multiple recycle streams.
+In this process, toluene is withdrawn from a storage drum and pressurized by feed pumps before being heated in a
+feed preheater and feed heater. The heated feed enters a reactor, where the primary reaction occurs in the presence of
+hydrogen. Reactor effluent is cooled and separated in a high-pressure separator, with part of the vapor phase compressed
+and recycled to the reactor. The liquid stream flows to a low-pressure separator, after which the hydrocarbon stream is
+routed to a benzene distillation column. Overhead vapor from the column is condensed and collected in a reflux drum,
+where a portion is returned as reflux while the remainder is withdrawn as benzene product. A reboiler provides heat
+input to maintain column separation.
+Among the selected case studies, this flowsheet exhibits the highest level of process and topological complexity.
+The flowsheet contains many unit operations, dense stream interconnections, and multiple recycle loops linking
+reaction and separation sections. The compact arrangement of equipment and numerous crossing streams increases
+visual layout density and makes connectivity more difficult to interpret. Accordingly, this case tests the framework’s
+14
+A PREPRINT - MARCH 27, 2026
+ability to maintain global structural consistency across large, interconnected flowsheets, thereby providing a realistic
+representation of industrial process diagrams.
+Figure 5: Aromatic production process (Turton 2009)
+5
+Results and Discussion
+This section presents the results of applying the multi-agent system across four case studies. It first defines the evaluation
+criteria, then discusses overall workflow performance and ablation results. It next examines model behavior, robustness,
+and variability at the multimodal reasoning level, and concludes with practical limitations and a summary of key
+findings.
+5.1
+Evaluation Criteria
+A combination of quantitative and qualitative criteria is used to systematically assess the performance of the multi-agent
+system. The quantitative metrics measure structural fidelity relative to reference diagrams, while the qualitative criteria
+assess model behavior, robustness, and failure characteristics observed across the four case studies. For the quantitative
+analysis, four metrics are defined to evaluate the accuracy of a process simulation model: Unit Consistency (UC),
+Stream Consistency (SC), Connection Consistency (CC), and Material Consistency (MC), as summarized in Table 5.
+Table 5: Quantitative evaluation metrics
+Metric
+Evaluated element
+Purpose
+Unit Consistency (UC)
+Unit operations
+Evaluates the correctness of extracted unit operations
+Stream Consistency
+(SC)
+Material streams
+Evaluates the correctness of extracted material flows
+Connection
+Consistency (CC)
+Directed unit-to-unit
+connectivity
+Evaluates the correctness of process topology
+Material Consistency
+(MC)
+Feed and process material
+components
+Evaluates the correctness of extracted material and com-
+ponent identities
+Each consistency metric is computed using the F1-score formulation Van Rijsbergen 1979:
+F1 = 2PR
+P + R
+15
+A PREPRINT - MARCH 27, 2026
+The F1-score provides a harmonic mean of precision and recall, ensuring balanced penalization of both error types. For
+a given structural element set X (units, streams, connections, or materials), precision (P) represents the proportion of
+extracted elements that are correct, and recall (R) represents the proportion of reference elements that are successfully
+extracted, defined as:
+P =
+TP
+TP + FP ,
+R =
+TP
+TP + FN
+where True Positives, TP, denote correctly extracted elements present in the reference diagram, False Positives, FP,
+denote extracted elements not present in the reference diagram (hallucinated elements), and False Negatives, FN,
+denote reference elements that were not extracted (missing elements). This formulation ensures that omissions and
+hallucinations are penalized simultaneously, rather than rewarding structural completeness alone. The quantitative
+metrics alone do not fully capture system behavior; therefore, qualitative analysis is also used to interpret the results.
+Section 5.2 evaluates performance across the four case studies, focusing on structural accuracy and execution stability.
+Section 5.3 then examines the contribution of individual agents through controlled ablation analysis. Section 5.4
+analyzes model behavior, reproducibility, and multimodal benchmarking. Finally, Section 5.5 discusses practical
+limitations and deployment considerations. Together, these analyses provide a comprehensive assessment of the system.
+5.2
+Overall Performance
+Across all four case studies, the multi-agent system successfully generated executable process simulation models. As
+summarized in Figure 6.
+Units
+Streams
+Units
+Streams
+Connections
+Materials
+Case Complexity
+Extraction Performance (F1)
+Aromatic Production (CS4)
+Crude Distillation (CS3)
+Merox (CS2)
+Desalting (CS1)
+1.00
+0.96
+0.98
+1.00
+1.00
+1.00
+0.93
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+1.00
+4
+Figure 6: Overall structural performance across the four case studies
+For Case Study 1 (Desalting Process), the system achieved full structural consistency, correctly identifying all feed
+materials, unit operations, streams, and connections. The resulting simulation model, shown in Figure 7, executed
+without errors and required no fixing-loop intervention. To ensure simulator compatibility, the system introduced
+a mixer and an intermediate stream to formalize the mixing operation. This modification reflects simulator-driven
+structural normalization rather than hallucinated model content. Overall, this case demonstrates that the system can
+recover simple process topologies with complete accuracy and stable execution.
+Crude Oil Pump
+Fresh Water Pump
+Mixer
+Mixing Valve
+Electrostatic Separator
+Crude oil
+Fresh water
+Demulsifier agent
+Fresh water
+discharge
+Oil-water mixture
+Mixer to Valve
+Desalted crude oil
+Effluent Water
+Crude oil
+discharge
+Figure 7: Generated HYSYS flowsheet corresponding to the desalting process
+16
+A PREPRINT - MARCH 27, 2026
+For Case Study 2 (Merox Process), structural consistency remained complete and the generated model executed
+successfully, as shown in Figure 8. The system correctly inferred connectivity between the caustic prewash vessel and
+the Merox reactor, although this connection was omitted from the diagram. This result demonstrates robust topological
+reconstruction under moderate visual ambiguity, showing that the system can recover process-consistent connections
+while preserving executability.
+Caustic prewash
+Merox reactor
+E
+Caustic settler
+Caustic
+circulation
+pump
+Water wash
+Salt bed
+Clay bed
+Jet fuel
+feed
+Fresh caustic batch
+Compressed air
+Prewashed fuel
+Reactor
+effluent
+Caustic
+phase
+Recycled caustic
+Fuel
+phase
+Washed
+fuel
+Dried fuel
+Spent caustic
+drain
+Water wash drain
+Salt bed
+drain
+Sweetened jet
+fuel
+Figure 8: Generated HYSYS flowsheet corresponding to the Merox process
+In Case Study 3 (Atmospheric Crude Oil Distillation Process), the system remained accurate in identifying the core
+structural elements of the flowsheet. A slight reduction in connection consistency was observed, as shown in Figure
+9, primarily in relation to side-draw connections from the distillation column. This discrepancy originated at the
+automation interface rather than the interpretation stage. As discussed in Section 3.2.3, distillation columns in Aspen
+HYSYS are instantiated using predefined internal templates that encapsulate stage-level connectivity, thereby limiting
+direct programmatic control over certain side-stream attachments through the Python COM automation interface.
+Consequently, the deviation reflects simulator-interface limitations rather than errors in diagram interpretation, since the
+relevant side-draw streams were correctly represented in the graph-based Intermediate Representation.
+Crude_Oil_Storage_Tank
+Feed_Pump
+Pre-heat_Train_1
+Mixer
+Desalter
+Pre-heat_Train_2
+Fired_Heater
+Atmospheric_Distillation_Column
+Crude_Feed
+Water_Feed
+S1
+F-102
+F-103
+F-104
+F-105
+F-106
+Salt_Water
+Flue_Gas
+Off-gas
+Waste_Water
+Naphtha
+Kero
+Diesel
+AGO
+Residue
+F-101
+Figure 9: Generated HYSYS flowsheet corresponding to the crude distillation process
+Case Study 4 (Aromatic Production Process) represents the most complex industrial-scale flowsheet evaluated. Structural
+fidelity remained high (F1 ≈0.98), with minor deviations in stream and connection consistency, as shown in Figure 10.
+The generated model omitted the fuel gas header and one recycle stream between the feed pump and storage drum.
+Additionally, the quench stream source was misassigned from the recycle gas compressor to the feed heater. These
+discrepancies occurred within densely interconnected recycle sections, where multiple overlapping streams increase
+tracing difficulty. Despite these minor structural deviations, the overall model executed successfully in HYSYS. This
+result indicates that the system remains highly robust even in industrial-scale flowsheets, despite minor connection
+errors in branched stream networks.
+17
+A PREPRINT - MARCH 27, 2026
+Toluene Storage
+Drum
+Toluene Feed
+Pumps
+Mixer to
+E-101
+Feed
+Preheater
+Feed
+Heater
+Reactor
+E
+Reactor
+Effluent
+Cooler
+High-Pres. Phase
+Sep.
+Recycle Gas
+Compressor
+Low-Pres. Phase
+Sep.
+Tower
+Feed
+Heater
+Benzene
+Column
+Product
+Cooler
+Fresh
+Toluene
+Hydrogen
+Feed
+Recycle
+Toluene
+Toluene
+Feed
+Reactor
+Feed
+Preheated
+Feed
+Hot
+Feed
+Quench
+Stream
+Reactor
+Effluent
+Two-Phase
+Mixture
+Separator Overhead
+Gas
+Recycle
+Gas
+Separator
+Liquid
+Liquid
+Bottoms
+Column
+Feed
+Product
+Flow
+Mixer outlet
+to E-101
+Fuel Gas
+Purge
+Overhead
+Gas
+Benzene
+Product
+Figure 10: Generated HYSYS flowsheet corresponding to the aromatic production process
+Overall, the results demonstrate strong structural fidelity across case studies of increasing complexity. Minor reductions
+in performance are primarily associated with interconnection density and simulator-specific limitations rather than
+errors in diagram interpretation. Execution stability remained consistent across all cases, underscoring the robustness of
+the multi-agent system across diverse process flow diagrams.
+5.3
+Ablation Analysis
+Four ablation studies were designed to assess the contribution of individual components within the multi-agent workflow.
+As summarized in Table 6, each configuration selectively disables or modifies a specific agent within either the diagram
+interpretation layer or the model synthesis layer. This setup enables a systematic assessment of how disabling a given
+component affects structural consistency and simulation executability relative to the full-workflow baseline (C0). The
+analysis is conducted across Case Study 2 (Merox Process) and Case Study 4 (Aromatic Production Process) to evaluate
+architectural robustness under moderate and high process complexity.
+Table 6: Ablation configurations
+Configuration
+Target
+Purpose
+C0 – Full Workflow
+All
+Baseline configuration
+C1 – Remove Descriptor
+A1
+Evaluate the contribution of visual-text grounding
+C2 – Remove Normalization
+A3
+Evaluate the contribution of structural refinement
+C3 – Merge Coding Agents
+B1–B3
+Evaluate the contribution of modular code decomposition
+C4 – Disable RAG
+B1
+Evaluate the contribution of retrieval-based material mapping
+Figure 11 reports precision and recall for units, streams, connections, and material components across the ablation
+configurations (C1–C4) relative to the full-workflow baseline (C0). These plots provide a metric-level view of structural
+degradation under controlled architectural perturbations. Reductions in recall indicate missing structural elements,
+whereas declines in precision reflect the introduction of incorrect or hallucinated elements.
+18
+A PREPRINT - MARCH 27, 2026
+0.5
+1.0
+C0
+C1
+C2
+C3
+C4
+0.5
+1.0
+C0
+C1
+C2
+C3
+C4
+0.5
+1.0
+C0
+C1
+C2
+C3
+C4
+0.5
+1.0
+C0
+C1
+C2
+C3
+C4
+Merox (CS2)
+Aromatic Production (CS4)
+Recall
+Precision
+Recall
+Precision
+Units
+Streams
+Connections
+Materials
+Figure 11: Ablation results across two case studies: CS2 and CS4
+The ablation analysis shows that architectural sensitivity increases with process complexity. In Case Study 2 (Merox
+Process), unit and stream consistency remain largely preserved across configurations; however, connection consistency
+decreases substantially under coding consolidation (C3), indicating that modular code separation is essential for
+maintaining correct topology. Disabling RAG (C4) results in complete execution failure because Aspen HYSYS
+constructs models sequentially; unresolved material components therefore prevent successful case initialization and
+terminate simulation.
+In Case Study 4 (Aromatic Production Process), which is characterized by dense interconnections and recycle structures,
+architectural modifications produce more pronounced degradation. Removal of the descriptor agent (C1) or consolidation
+of coding agents (C3) significantly reduces connection consistency, while omission of the normalization stage (C2)
+introduces hallucinated structural elements that lower precision. In contrast to Case Study 2, disabling RAG (C4)
+does not affect performance, as the Aromatic Production Process relies on pure components rather than mixtures.
+Taken together, these results indicate that structural fidelity in highly interconnected flowsheets depends critically on
+coordinated multi-agent processing rather than the performance of isolated agents.
+The normalized impact dumbbell chart, shown in Figure 12, provides a consolidated view of the relative importance of
+individual workflow components. The impact score is defined as the mean absolute change in F1-score (∆F1) relative
+to the baseline, where ∆F1 captures the deviation introduced by each ablation across units, streams, connections, and
+materials. Higher values, therefore, correspond to greater workflow disruption. The dumbbell chart further indicates
+that each component contributes meaningfully to overall robustness, with different components becoming critical as
+diagram complexity increases.
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Normalized Impact (Mean | F1|)
+C1  Remove Descriptor
+C2  Remove Normalization
+C3  Merge Coding
+C4  Disable RAG
+0.07
+0.21
+0.00
+0.09
+0.05
+0.19
+0.00
+1.00
+CS2 (Merox)
+CS4 (Aromatic Production)
+Figure 12: Normalized impact across ablation configurations
+19
+A PREPRINT - MARCH 27, 2026
+5.4
+Model Behavior, Robustness, and Variability
+To complement the previous analysis, this section examines model stability and sensitivity at the multimodal reasoning
+level. It focuses on reproducibility under deterministic decoding and on the influence of model architecture on
+connectivity reconstruction in complex process diagrams.
+5.4.1
+Reproducibility Analysis
+Reproducibility was evaluated by executing the Descriptor Agent five times per case study under strictly deterministic
+decoding conditions, as shown in Table 7. Temperature was set to 0.0, top-k to 1, top-p to 1.0, and the random seed
+was fixed at 42 to eliminate stochastic sampling. Under these settings, any observed variation reflects interpretive
+differences arising from visual reasoning rather than probabilistic decoding.
+Table 7: Deterministic inference parameters
+Parameter
+Value
+Purpose
+Temperature
+0.0
+Removes probabilistic sampling
+Top-k
+1
+Selects only the highest-probability token
+Top-p
+1.0
+Disables variability from nucleus sampling
+Seed
+42
+Ensures consistent behavior across executions
+The consistency across runs was quantified using cosine similarity between sentence embeddings of the generated
+descriptions, reporting both mean pairwise similarity and worst-case deviation Reimers and Gurevych 2019. Case
+Studies 1, 3, and 4 exhibit near-perfect reproducibility (mean similarity ≥0.9889). Case Study 2 (Merox Process)
+shows the only noticeable variability (mean = 0.9594; worst case = 0.8986), which is attributed to diagram-specific
+ambiguity rather than model instability. The Merox flowsheet contains dense textual annotations and reaction equations,
+increasing visual clutter, while the connection between the caustic prewash vessel and the reactor is only implicitly
+represented. Across trials, this ambiguous connectivity was occasionally interpreted differently, producing minor
+structural variation.
+5.4.2
+Model Benchmark or Multimodal Architecture Benchmark
+A benchmarking study was conducted to evaluate the influence of multimodal model selection on reconstruction quality.
+The analysis focused on the interpretation layer, specifically the Descriptor Agent (A1) and Extractor Agent (A2),
+since their underlying multimodal models were previously identified as the primary determinants of reconstruction
+accuracy. The deployed model, Gemini 3 Flash, was benchmarked against two state-of-the-art open-weight alternatives:
+Qwen 3-VL:235B and Qwen 3.5: 397B Bai et al. 2025; Qwen Team 2026. The evaluation was performed on Case
+Study 2 (Merox Process), which was selected as a controlled stress test because of its intermediate complexity, implicit
+connectivity, and dense annotation, making it well-suited for assessing multimodal spatial reasoning.
+0.7
+0.8
+0.9
+1.0
+Units
+Streams
+Connections
+Materials
+Gemini Flash 3
+Qwen 3.5
+Qwen 3-VL
+Figure 13: Comparison of F1 scores across different LLMs
+20
+A PREPRINT - MARCH 27, 2026
+Figure 13 summarizes the performance of the evaluated models according to the metrics defined in Section 5.1.
+Gemini 3 Flash achieved complete consistency across all evaluated elements, accurately reconstructing units, streams,
+connections, and material components. Qwen 3.5 recovered the overall topology with high fidelity but exhibited
+connection-level inconsistencies, including misrouting of the compressed air stream and incorrect placement of liquid
+drain outlets. While these errors did not collapse the topology, they reduced connectivity accuracy. In contrast,
+Qwen 3-VL showed substantially lower robustness, hallucinating an additional equipment unit (the coalescer section)
+and misplacing multiple stream connections. The resulting topology required extensive manual intervention before
+simulation, indicating insufficient cross-modal structural alignment.
+The observed performance reflects underlying architectural differences. Qwen 3-VL employs a classical late-fusion
+vision-language paradigm in which visual features are encoded independently before being interpreted by the language
+model. This separation increases susceptibility to spatial ambiguity and weakens connectivity inference. Qwen 3.5
+adopts a native early-fusion multimodal architecture with improved attention mechanisms, enabling tighter cross-modal
+alignment and reducing connectivity errors. Gemini 3 Flash further extends multimodal integration through an iterative
+visual inspection mechanism, referred to as agentic vision, which enables localized refinement of ambiguous or densely
+annotated regions before structural commitment Google DeepMind 2026. Overall, these findings indicate that model
+architecture and fusion strategy are critical to object recognition and spatial reasoning in the reconstruction of complex
+flowsheets.
+5.5
+Practical Implications and Limitations
+Despite strong overall performance, a few limitations were observed. These limitations can be grouped into three
+categories: diagram interpretation challenges, simulator constraints, and infrastructure deployment considerations.
+From a visual standpoint, performance is sensitive to diagram quality and formatting. Implicit or partially drawn
+elements, such as units or connections, increase ambiguity and complicate process interpretation. Dense textual
+overlays, such as embedded reaction equations, increase OCR sensitivity and visual clutter, occasionally affecting
+stream tracing. In complex flowsheets, recycle loops and non-linear routing amplify small parsing deviations into
+measurable topological inconsistencies. Internal elements embedded within vessels, such as catalyst beds, may also
+be misinterpreted as standalone units in weaker multimodal models. Diagrams with omitted connections, implied
+operations, or under-labeled stream routing may therefore require engineering inference beyond the directly visible
+structure.
+Simulator constraints also affect executability. Aspen HYSYS constructs models sequentially, so incorrect material
+component definitions can prevent case initialization and terminate execution. In addition, complex unit operations
+such as distillation columns rely on predefined template structures that limit dynamic stream assignment through
+the automation interface. As a result, the correct interpretation of the diagram does not always guarantee a directly
+executable simulator model because of restrictions in the simulator interface and object hierarchy.
+Moreover, the system depends on carefully designed prompts, structured schemas, and simulator-specific instruction
+files. Consequently, transferring the multi-agent system to a different simulator or process domain may require additional
+adaptation. Likewise, substituting the currently deployed models may necessitate prompt refinements, as the existing
+prompts are tailored to the reasoning style, response behavior, and complexity-handling capabilities of those models.
+From an infrastructure perspective, multimodal reasoning over high-resolution process flow diagrams is computationally
+intensive. Cloud-based inference introduces dependence on external compute allocation and dynamic batching, which
+may affect latency and reproducibility (runtime consistency). LLM inference requires increased processing time when
+resolving dense diagrams or performing iterative visual reasoning. Practical deployment, therefore, requires balancing
+structural accuracy with computational cost, response time, and hardware availability. This creates an operational
+trade-off in which higher reconstruction accuracy may require larger multimodal models, longer inference times, and
+greater hardware demand, particularly for visually dense or industrial-scale diagrams.
+6
+Conclusion
+The proposed framework demonstrates the feasibility of transforming raw process diagrams into executable Aspen
+HYSYS simulation models through a coordinated multi-agent workflow. This claim is supported by the fact that the
+system successfully generated executable models in all four case studies, spanning flowsheets of increasing process
+and topological complexity. Structural fidelity remained perfect in the first two cases, with recovered units, streams,
+connections, and material components all equal to 1.00, while the more challenging Crude Distillation (CS3) and
+Aromatics Production (CS4) cases still maintained high performance, with only limited reductions in connection and
+stream consistency (CS3: CC = 0.93; CS4: SC = 0.96, CC = 0.98). In addition, the generated models remained
+21
+A PREPRINT - MARCH 27, 2026
+executable even in the most complex industrial-scale case, despite dense recycle structures and minor connection
+deviations. By integrating multimodal extraction, structural normalization, code generation, and execution-based
+validation, the system therefore extends prior diagram-understanding approaches beyond descriptive reconstruction
+toward executable model synthesis.
+Nevertheless, the study also makes clear that the central challenge is not merely visual recognition. The more difficult
+problem lies in preserving engineering intent while translating imperfect, ambiguous, and sometimes implicit visual
+structures into forms that satisfy the rigid logical and object-level constraints of a commercial simulator. Errors arise
+not only from missed symbols or incorrect stream tracing, but also from mismatches between diagram conventions and
+simulator requirements. As a result, successful automation depends on the joint handling of perception, engineering
+reasoning, and simulator compatibility rather than on any one of these in isolation.
+Future work should therefore focus on improving generality, robustness, and engineering realism. One important
+direction is to extend the framework beyond relatively clean process flow diagrams toward noisier and more het-
+erogeneous industrial artifacts, including scanned diagrams, legacy documents, and mixed diagram-text engineering
+records. A second direction is to develop simulator-agnostic intermediate abstractions that can support deployment
+across multiple process simulation environments rather than a single commercial platform. A third direction is to
+strengthen self-correction through confidence-aware extraction, retrieval of engineering design rules, and more explicit
+simulator-in-the-loop repair cycles. Finally, broader validation on larger and more diverse industrial case studies will be
+needed to assess scalability, transferability, and practical deployment readiness. Taken together, these directions point
+toward a broader class of engineering systems in which visual interpretation, domain reasoning, and executable model
+synthesis are integrated into a unified automation pipeline.
+7
+Data Availability & Reproducibility
+The project codebase is publicly available in the open-source GitHub repository https://github.com/
+OptiMaL-PSE-Lab/Sketch2Simulation. The repository also includes the case study diagrams required for the
+analysis. With access to the necessary language models and a HYSYS licence, the results presented in this work
+can therefore be reproduced. Certain agent instruction files, including instantiation_instructions_*.txt and
+configuration_instructions_*.txt, are not included in the repository. These files contain proprietary HYSYS-
+domain prompt engineering materials and must therefore be obtained separately.
+8
+Acknowledgments
+Financial support provided by BASF SE, EPSRC IConIC Prosperity Partnership (EP/X025292/1), and EPSRC CDT
+(EP/S023232/1) is acknowledged.
+References
+AspenTech (2026). Aspen HYSYS. URL: https://www.aspentech.com/en/products/engineering/aspen-
+hysys.
+AVEVA (2026). AVEVA PRO/II Simulation – The Trusted Steady-State Process Simulator. URL: https://www.aveva.
+com/en/products/pro-ii-simulation/.
+Bai, Shuai, Yuxuan Cai, Ruizhe Chen, Keqin Chen, Xionghui Chen, Zesen Cheng, Lianghao Deng, Wei Ding, Chang
+Gao, Chunjiang Ge, Wenbin Ge, Zhifang Guo, Qidong Huang, Jie Huang, Fei Huang, Binyuan Hui, Shutong Jiang,
+Zhaohai Li, Mingsheng Li, Mei Li, Kaixin Li, Zicheng Lin, Junyang Lin, Xuejing Liu, Jiawei Liu, Chenglong
+Liu, Yang Liu, Dayiheng Liu, Shixuan Liu, Dunjie Lu, Ruilin Luo, Chenxu Lv, Rui Men, Lingchen Meng,
+Xuancheng Ren, Xingzhang Ren, Sibo Song, Yuchong Sun, Jun Tang, Jianhong Tu, Jianqiang Wan, Peng Wang,
+Pengfei Wang, Qiuyue Wang, Yuxuan Wang, Tianbao Xie, Yiheng Xu, Haiyang Xu, Jin Xu, Zhibo Yang, Mingkun
+Yang, Jianxin Yang, An Yang, Bowen Yu, Fei Zhang, Hang Zhang, Xi Zhang, Bo Zheng, Humen Zhong, Jingren
+Zhou, Fan Zhou, Jing Zhou, Yuanzhi Zhu, and Ke Zhu (Nov. 27, 2025). Qwen3-VL Technical Report. DOI:
+10.48550/arXiv.2511.21631. arXiv: 2511.21631[cs]. URL: http://arxiv.org/abs/2511.21631
+(visited on 03/15/2026).
+Bray, Nick, Michael Hempel, Matthew Boeding, and Hamid Sharif (Feb. 2026). “Decoding Technical Diagrams: A
+Survey of AI Methods for Image Content Extraction and Understanding”. In: Information 17.2, p. 165. ISSN:
+2078-2489. DOI: 10.3390/info17020165. URL: https://www.mdpi.com/2078-2489/17/2/165 (visited on
+03/15/2026).
+22
+A PREPRINT - MARCH 27, 2026
+Brinkmann, Jannik, Abhay Sheshadri, Victor Levoso, Paul Swoboda, and Christian Bartelt (June 30, 2024). A Mecha-
+nistic Analysis of a Transformer Trained on a Symbolic Multi-Step Reasoning Task. DOI: 10.48550/arXiv.2402.
+11917. arXiv: 2402.11917[cs]. URL: http://arxiv.org/abs/2402.11917 (visited on 03/14/2026).
+Chukwu, Arinze JohnPaul, Obumneme Okwonna, and Peter Muwarure (Mar. 30, 2025). “Optimising the gas-oil ratio
+for enhanced production”. In: Global Journal of Engineering and Technology Advances 22.3, pp. 131–142. ISSN:
+25825003. DOI: 10.30574/gjeta.2025.22.3.0052. URL: https://gjeta.com/node/815 (visited on
+03/15/2026).
+ConceptDraw (2026). Jet fuel mercaptan oxidation treating - PFD | Process Diagrams | Chemical and Process
+Engineering | Merox Process Flow Diagram. URL: https://www.conceptdraw.com/examples/merox-
+process-flow-diagram (visited on 03/14/2026).
+Deshpande, Darshan, Varun Gangal, Hersh Mehta, Jitin Krishnan, Anand Kannappan, and Rebecca Qian (June 23,
+2025). TRAIL: Trace Reasoning and Agentic Issue Localization. DOI: 10.48550/arXiv.2505.08638. arXiv:
+2505.08638[cs]. URL: http://arxiv.org/abs/2505.08638 (visited on 03/14/2026).
+Dimian, Alexandre C., Costin Sorin Bildea, and Anton A. Kiss (2014). Integrated Design and Simulation of Chemical
+Processes. Vol. 35. Computer Aided Chemical Engineering. Elsevier. URL: https://www.sciencedirect.com/
+bookseries/computer-aided-chemical-engineering/vol/35/suppl/C.
+Du, Wenli and Shaoyi Yang (Oct. 2025). “The potential and challenges of large language model agent systems in
+chemical process simulation: from automated modeling to intelligent design”. In: Frontiers of Chemical Science
+and Engineering 19.10, p. 99. ISSN: 2095-0179, 2095-0187. DOI: 10 . 1007/ s11705 - 025- 2587 - 5. URL:
+https://link.springer.com/10.1007/s11705-025-2587-5 (visited on 03/15/2026).
+Dziri, Nouha, Ximing Lu, Melanie Sclar, Xiang Lorraine Li, Liwei Jiang, Bill Yuchen Lin, Peter West, Chandra
+Bhagavatula, Ronan Le Bras, Jena D. Hwang, Soumya Sanyal, Sean Welleck, Xiang Ren, Allyson Ettinger, Zaid
+Harchaoui, and Yejin Choi (Oct. 31, 2023). Faith and Fate: Limits of Transformers on Compositionality. DOI:
+10.48550/arXiv.2305.18654. arXiv: 2305.18654[cs]. URL: http://arxiv.org/abs/2305.18654
+(visited on 03/14/2026).
+Eo, Soo Young, Tae Suk Chang, Dongil Shin, and En Sup Yoon (2000). “Cooperative Problem Solving in Di-
+agnostic Agents for Chemical Processes”. In: Computers & Chemical Engineering 24.2, pp. 729–734. DOI:
+10.1016/S0098-1354(00)00329-X. URL: https://www.sciencedirect.com/science/article/pii/
+S009813540000329X.
+Google DeepMind (Dec. 2025). Gemini 3 Flash. Version 3.0. URL: https://deepmind.google/models/gemini/
+flash/.
+— (Jan. 27, 2026). Introducing Agentic Vision in Gemini 3 Flash. URL: https://blog.google/innovation-and-
+ai/technology/developers-tools/agentic-vision-gemini-3-flash/.
+Göttl, Quirin, Dominik G. Grimm, and Jakob Burger (2022). “Automated Synthesis of Steady-State Continuous
+Processes Using Reinforcement Learning”. In: Frontiers of Chemical Science and Engineering 16, pp. 288–302.
+DOI: 10.1007/s11705-021-2055-9. URL: https://link.springer.com/article/10.1007/s11705-
+021-2055-9.
+Gowaikar, Shreeyash, Srinivasan Iyengar, Sameer Segal, and Shivkumar Kalyanaraman (Dec. 17, 2024). An Agentic
+Approach to Automatic Creation of P&ID Diagrams from Natural Language Descriptions. DOI: 10.48550/arXiv.
+2412.12898. arXiv: 2412.12898[cs]. URL: http://arxiv.org/abs/2412.12898 (visited on 03/15/2026).
+Grossmann, Ignacio E. (1985). “Mixed-Integer Programming Approach for the Synthesis of Integrated Process
+Flowsheets”. In: Computers & Chemical Engineering. DOI: 10.1016/0098-1354(85)80023-5. URL: https:
+//www.sciencedirect.com/science/article/pii/0098135485800235.
+Guo, Taicheng, Xiuying Chen, Yaqi Wang, Ruidi Chang, Shichao Pei, Nitesh V. Chawla, Olaf Wiest, and Xiangliang
+Zhang (Apr. 19, 2024). Large Language Model based Multi-Agents: A Survey of Progress and Challenges. DOI:
+10.48550/arXiv.2402.01680. arXiv: 2402.01680[cs]. URL: http://arxiv.org/abs/2402.01680
+(visited on 03/14/2026).
+Gupta, Mohit, Chialing Wei, Thomas Czerniawski, and Ricardo Eiris (2025). “PIDQA—Question Answering on Piping
+and Instrumentation Diagrams”. In: Machine Learning and Knowledge Extraction 7.2, p. 39. DOI: 10.3390/
+make7020039. URL: https://www.mdpi.com/2504-4990/7/2/39.
+Han, Chonghun, James M. Douglas, and George Stephanopoulos (1995). “Agent-Based Approach to a Design Support
+System for the Synthesis of Continuous Chemical Processes”. In: Computers & Chemical Engineering 19 (Sup-
+plement 1), S63–S69. DOI: 10.1016/0098-1354(95)87016-4. URL: https://www.sciencedirect.com/
+science/article/pii/0098135495870164.
+Hong, Sunghoon, Deunsol Yoon, Whiyoung Jung, Jinsang Lee, Hyundam Yoo, Jiwon Ham, Suhyun Jung, Chanwoo
+Moon, Yeontae Jung, Kanghoon Lee, Woohyung Lim, Somin Jeon, Myounggu Lee, Sohui Hong, Jaesang Lee,
+Hangyoul Jang, Changhyun Kwak, Jeonghyeon Park, Changhoon Kang, and Jungki Kim (2024). “Naphtha Crack-
+ing Center Scheduling Optimization Using Multi-Agent Reinforcement Learning”. In: Proceedings of the 23rd
+23
+A PREPRINT - MARCH 27, 2026
+International Conference on Autonomous Agents and Multiagent Systems (AAMAS 2024), pp. 2806–2808. URL:
+https://www.ifaamas.org/Proceedings/aamas2024/pdfs/p2806.pdf.
+Hui, Binyuan, Jian Yang, Zeyu Cui, Jiaxi Yang, Dayiheng Liu, Lei Zhang, Tianyu Liu, Jiajun Zhang, Bowen Yu, Keming
+Lu, Kai Dang, Yang Fan, Yichang Zhang, An Yang, Rui Men, Fei Huang, Bo Zheng, Yibo Miao, Shanghaoran Quan,
+Yunlong Feng, Xingzhang Ren, Xuancheng Ren, Jingren Zhou, and Junyang Lin (Nov. 12, 2024). Qwen2.5-Coder
+Technical Report. DOI: 10.48550/arXiv.2409.12186. arXiv: 2409.12186[cs]. URL: http://arxiv.org/
+abs/2409.12186 (visited on 03/14/2026).
+Julka, Nirupam, Iftekhar A. Karimi, and Rajagopalan Srinivasan (2002). “Agent-Based Supply Chain Manage-
+ment—2: A Refinery Application”. In: Computers & Chemical Engineering 26.12, pp. 1771–1781. DOI: 10.
+1016/S0098-1354(02)00151-5. URL: https://www.sciencedirect.com/science/article/abs/pii/
+S0098135402001515.
+Kang, Sung-O, Eul-Bum Lee, and Hum-Kyung Baek (2019). “A Digitization and Conversion Tool for Imaged
+Drawings to Intelligent Piping and Instrumentation Diagrams (P&ID)”. In: Energies 12.13, p. 2593. DOI: 10.
+3390/en12132593. URL: https://www.mdpi.com/1996-1073/12/13/2593.
+Kim, Ji-Beob, Yoochan Moon, Seung-Tae Han, and Duhwan Mun (2025). “Automated Inspection of P&ID Object
+Recognition Using Deep Learning”. In: Scientific Reports 15.1, p. 39031. DOI: 10.1038/s41598-025-25506-2.
+URL: https://www.nature.com/articles/s41598-025-25506-2.
+Kim, Byung Chul, Hyungki Kim, Yoochan Moon, Gwang Lee, and Duhwan Mun (2022). “End-to-End Digitiza-
+tion of Image Format Piping and Instrumentation Diagrams at an Industrially Applicable Level”. In: Journal
+of Computational Design and Engineering 9.4, pp. 1298–1326. DOI: 10.1093/jcde/qwac056. URL: https:
+//academic.oup.com/jcde/article/9/4/1298/6611631.
+Kim, Hyungki, Wonyong Lee, Mijoo Kim, Yoochan Moon, Taekyong Lee, Mincheol Cho, and Duhwan Mun (2021).
+“Deep-Learning-Based Recognition of Symbols and Texts at an Industrially Applicable Level from Images of
+High-Density Piping and Instrumentation Diagrams”. In: Expert Systems with Applications 183, p. 115337. DOI:
+10.1016/j.eswa.2021.115337. URL: https://www.sciencedirect.com/science/article/abs/pii/
+S0957417421007661.
+Kumar, Anikesh, Chi Hung Vo, Md Shahabuddin Ahmmad, Sushant Suhas Garud, and Ifthekar Karimi (2025).
+Integrating Coding Platforms with Process Simulators for Custom Applications. DOI: 10.2139/ssrn.5189453.
+URL: https://www.ssrn.com/abstract=5189453 (visited on 03/15/2026).
+CO-LaN (2026). CAPE-OPEN Laboratories Network. URL: https://www.colan.org/.
+LangChain AI (2024). LangGraph: Building stateful, multi-actor applications with LLMs. Version 0.2.0. URL: https:
+//github.com/langchain-ai/langgraph.
+Lee, Donghyeon, Joon Lee, and Donggil Shin (2024). “GPT Prompt Engineering for a Large Language Model-Based
+Process Improvement Generation System”. In: Korean Journal of Chemical Engineering 41.12, pp. 3263–3286.
+DOI: 10.1007/s11814-024-00276-1. URL: https://link.springer.com/article/10.1007/s11814-
+024-00276-1.
+Liang, Jingkang, Niklas Groll, and Gürkan Sin (Jan. 30, 2026). Large Language Model Agent for User-friendly
+Chemical Process Simulations. DOI: 10.48550/arXiv.2601.11650. arXiv: 2601.11650[physics]. URL:
+http://arxiv.org/abs/2601.11650 (visited on 03/15/2026).
+Liu, Nelson F., Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua, Fabio Petroni, and Percy Liang
+(2024). “Lost in the Middle: How Language Models Use Long Contexts”. In: Transactions of the Association for
+Computational Linguistics 12, pp. 157–173. DOI: 10.1162/tacl_a_00638. URL: https://aclanthology.
+org/2024.tacl-1.9/ (visited on 03/14/2026).
+Madaan, Aman, Niket Tandon, Prakhar Gupta, Skyler Hallinan, Luyu Gao, Sarah Wiegreffe, Uri Alon, Nouha Dziri,
+Shrimai Prabhumoye, Yiming Yang, Shashank Gupta, Bodhisattwa Prasad Majumder, Katherine Hermann, Sean
+Welleck, Amir Yazdanbakhsh, and Peter Clark (May 25, 2023). Self-Refine: Iterative Refinement with Self-Feedback.
+DOI: 10.48550/arXiv.2303.17651. arXiv: 2303.17651[cs]. URL: http://arxiv.org/abs/2303.17651
+(visited on 03/14/2026).
+Mann, Vipul, Mauricio Sales-Cruz, Rafiqul Gani, and Venkat Venkatasubramanian (2024). “eSFILES: Intelligent
+Process Flowsheet Synthesis Using Process Knowledge, Symbolic AI, and Machine Learning”. In: Computers &
+Chemical Engineering 181, p. 108505. URL: https://www.sciencedirect.com/science/article/abs/
+pii/S0098135423003757.
+Moon, Yoochan, Jinwon Lee, Duhwan Mun, and S. Lim (2021). “Deep Learning-Based Method to Recognize Line
+Objects and Flow Arrows from Image-Format Piping and Instrumentation Diagrams for Digitization”. In: Applied
+Sciences 11.21, p. 10054. DOI: 10.3390/app112110054. URL: https://www.mdpi.com/2076-3417/11/21/
+10054.
+Ogunleye, Tobiloba (Oct. 21, 2021). MODELING, SIMULATION AND CONTROL OF A MODULAR REFINERY. DOI:
+10.31224/3846.
+24
+A PREPRINT - MARCH 27, 2026
+Ollama Team (2023). Ollama: Get up and running with large language models locally. Version 0.18.0. URL: https:
+//github.com/ollama/ollama.
+Paliwal, Shubham, Arushi Jain, Monika Sharma, and Lovekesh Vig (2021). “Digitize-PID: Automatic Digitization of
+Piping and Instrumentation Diagrams”. In: vol. 12705, pp. 168–180. DOI: 10.1007/978-3-030-75015-2_17.
+arXiv: 2109.03794[cs]. URL: http://arxiv.org/abs/2109.03794 (visited on 03/15/2026).
+Pereira, Juan, Ingrid Velásquez, Ronald Blanco, Meraldo Sanchez, César Pernalete, and Carlos Canelon (Sept. 30,
+2015). “Crude Oil Desalting Process”. In: pp. 67–84. ISBN: 978-953-51-2176-3. DOI: 10.5772/61274.
+Peterson, Luisa, Ion Victor Gosea, Peter Benner, and Kai Sundmacher (2025). “Digital twins in process engineering: An
+overview on computational and numerical methods”. In: Computers & Chemical Engineering 193, p. 108917. DOI:
+10.1016/j.compchemeng.2024.108917. URL: https://www.sciencedirect.com/science/article/
+pii/S0098135424003351.
+Pistikopoulos, Efstratios N. and Yuhe Tian (July 24, 2024). “Advanced Modeling and Optimization Strategies for Process
+Synthesis”. In: Annual Review of Chemical and Biomolecular Engineering 15.1, pp. 81–103. ISSN: 1947-5438,
+1947-5446. DOI: 10.1146/annurev-chembioeng-100522-112139. URL: https://www.annualreviews.
+org/content/journals/10.1146/annurev-chembioeng-100522-112139 (visited on 03/15/2026).
+Qwen Team (Feb. 2026). Qwen3.5: Towards Native Multimodal Agents. URL: https://qwen.ai/blog?id=qwen3.5.
+Rahul, Rohit, Shubham Paliwal, Monika Sharma, and Lovekesh Vig (2019). “Automatic Information Extraction
+from Piping and Instrumentation Diagrams”. In: Proceedings of the 8th International Conference on Pattern
+Recognition Applications and Methods (ICPRAM), pp. 163–172. DOI: 10.5220/0007376401630172. URL:
+https://www.scitepress.org/Papers/2019/73764/73764.pdf.
+Reimers, Nils and Iryna Gurevych (Aug. 27, 2019). Sentence-BERT: Sentence Embeddings using Siamese BERT-
+Networks. DOI: 10.48550/arXiv.1908.10084. arXiv: 1908.10084[cs]. URL: http://arxiv.org/abs/
+1908.10084 (visited on 03/14/2026).
+Rein, David, Betty Li Hou, Asa Cooper Stickland, Jackson Petty, Richard Yuanzhe Pang, Julien Dirani, Julian
+Michael, and Samuel R. Bowman (Nov. 20, 2023). GPQA: A Graduate-Level Google-Proof Q&A Benchmark.
+DOI: 10.48550/arXiv.2311.12022. arXiv: 2311.12022[cs]. URL: http://arxiv.org/abs/2311.12022
+(visited on 03/14/2026).
+Reynoso-Donzelli, Simone and Luis A. Ricardez-Sandoval (2025). “A Reinforcement Learning Approach for Simul-
+taneous Generation, Design and Control of Reaction-Separation Process Flowsheets”. In: IFAC-PapersOnLine
+59.6, pp. 247–252. ISSN: 24058963. DOI: 10.1016/j.ifacol.2025.07.153. URL: https://linkinghub.
+elsevier.com/retrieve/pii/S2405896325005130 (visited on 03/15/2026).
+Rupprecht, Sophia, Qinghe Gao, Tanuj Karia, and Artur M Schweidtmann (Mar. 2026). “Multi-agent systems for
+chemical engineering: a review and perspective”. In: Current Opinion in Chemical Engineering 51, p. 101209. ISSN:
+22113398. DOI: 10.1016/j.coche.2025.101209. URL: https://linkinghub.elsevier.com/retrieve/
+pii/S2211339825001212 (visited on 03/15/2026).
+Santos Bartolome, Pedro and Tom Van Gerven (2022). “A Comparative Study on Aspen Hysys Interconnection
+Methodologies for Chemical Engineering Purposes”. In: Computers & Chemical Engineering 162, p. 107785. DOI:
+10.1016/j.compchemeng.2022.107785. URL: https://www.sciencedirect.com/science/article/
+abs/pii/S0098135422001260.
+Seng, Ng Yew and Rajagopalan Srinivasan (n.d.). “Multi-agent Framework for Fault Detection & Diagnosis in Transient
+Operations”. In: ().
+Shteriyanov, Vasil I., R. Dzhusupova, Jan Bosch, and Helena Holmström-Olsson (Dec. 2025). “Enhancing OCR-based
+Engineering Diagram Analysis by Integrating Diverse External Legends with VLMs”. In: Journal of Software:
+Evolution and Process 37.12, e70072. DOI: 10.1002/smr.70072. URL: https://onlinelibrary.wiley.com/
+doi/10.1002/smr.70072.
+Siemens (2026). gPROMS Process. URL: https://www.siemens.com/en-us/products/gproms/.
+Sierla, Sami et al. (2020). “Towards Semi-Automatic Generation of a Steady State Digital Twin from Process and
+Instrumentation Diagram”. In: Applied Sciences 10.19, p. 6959. DOI: 10.3390/app10196959. URL: https:
+//research.aalto.fi/files/52421947/ELEC_Sierla_etal_Towards_Semi_Automatic_AppSci_
+2020_10_finalpublishedversion.pdf.
+Siirola, John D., Steinar Hauan, and Arthur W. Westerberg (2003). “Toward Agent-Based Process Systems Engineering:
+Proposed Framework and Application to Non-Convex Optimization”. In: Computers & Chemical Engineering
+27.12, pp. 1801–1811. DOI: 10.1016/S0098-1354(03)00152-2. URL: https://www.sciencedirect.com/
+science/article/abs/pii/S0098135403001522.
+Srinivas, Sakhinana Sagar, Shivam Gupta, and Venkataramana Runkana (Aug. 18, 2025). AutoChemSchematic AI:
+Agentic Physics-Aware Automation for Chemical Manufacturing Scale-Up. DOI: 10.48550/arXiv.2505.24584.
+arXiv: 2505.24584[cs]. URL: http://arxiv.org/abs/2505.24584 (visited on 03/15/2026).
+25
+A PREPRINT - MARCH 27, 2026
+Stalker, Iain D. and Eric S. Fraga (2004). “COGents Support for Automation in Process Design”. In: Computer
+Aided Chemical Engineering. Vol. 18, pp. 1141–1146. DOI: 10.1016/S1570-7946(04)80256-6. URL: https:
+//www.sciencedirect.com/science/article/pii/S1570794604802566.
+Su, Guanqun, Shuai Zhao, Tao Li, Shengyong Liu, Yaqi Li, Guanglong Zhao, and Zhongtao Li (2024). “Image Format
+Pipeline and Instrument Diagram Recognition Method Based on Deep Learning”. In: Biomimetic Intelligence and
+Robotics 4.1, p. 100142. DOI: 10.1016/j.birob.2023.100142. URL: https://www.sciencedirect.com/
+science/article/pii/S2667379723000566.
+Theisen, Maximilian F., Kenji Nishizaki Flores, Lukas Schulze Balhorn, and Artur M. Schweidtmann (2023). “Digiti-
+zation of Chemical Process Flow Diagrams Using Deep Convolutional Neural Networks”. In: Digital Chemical
+Engineering 6, p. 100072. DOI: 10.1016/j.dche.2022.100072. URL: https://www.sciencedirect.com/
+science/article/pii/S2772508122000631.
+Tian, Xufei, Wenli Du, Shaoyi Yang, Han Hu, Hui Xin, Shifeng Qu, and Ke Ye (Jan. 11, 2026). From Text to Simulation:
+A Multi-Agent LLM Workflow for Automated Chemical Process Design. DOI: 10.48550/arXiv.2601.06776.
+arXiv: 2601.06776[cs]. URL: http://arxiv.org/abs/2601.06776 (visited on 03/15/2026).
+Towler, Gavin and Ray Sinnott (2013). Chemical Engineering Design: Principles, Practice, and Economics of Plant and
+Process Design. 2nd ed. Oxford: Butterworth-Heinemann. ISBN: 978-0-08-096659-5. URL: https://ptgmedia.
+pearsoncmg.com/images/9780132618120/samplepages/0132618125.pdf.
+Turton, Richard, ed. (2009). Analysis, synthesis, and design of chemical processes. 3rd ed. Prentice Hall PTR interna-
+tional series in the physical and chemical engineering sciences. Upper Saddle River, N.J: Prentice Hall. 1068 pp.
+ISBN: 978-0-13-512966-1.
+Van Rijsbergen, C. J. (1979). Information Retrieval. Butterworths.
+Vyas, Javal and Mehmet Mercangöz (2025). “Autonomous Industrial Control using an Agentic Framework with Large
+Language Models”. In: IFAC-PapersOnLine 59.6, pp. 349–354. ISSN: 24058963. DOI: 10.1016/j.ifacol.
+2025.07.170. URL: https://linkinghub.elsevier.com/retrieve/pii/S2405896325005300 (visited on
+03/15/2026).
+Weng, Yixuan, Minjun Zhu, Fei Xia, Bin Li, Shizhu He, Shengping Liu, Bin Sun, Kang Liu, and Jun Zhao (Oct. 19,
+2023). Large Language Models are Better Reasoners with Self-Verification. DOI: 10.48550/arXiv.2212.09561.
+arXiv: 2212.09561[cs]. URL: http://arxiv.org/abs/2212.09561 (visited on 03/14/2026).
+Westerberg, Arthur W. (1989). “Synthesis in Engineering Design”. In: Computers & Chemical Engineering 13.4,
+pp. 365–376. DOI: 10.1016/0098-1354(89)85016-1. URL: https://www.sciencedirect.com/science/
+article/pii/0098135489850161.
+Yang, Aidong, Benoit Braunschweig, Eric S. Fraga, Zahia Guessoum, Wolfgang Marquardt, Otmane Nadjemi, David
+Paen, Daniel Piñol, Philippe Roux, Sergio Sama, Marta Serra, and Iain Stalker (2008). “A Multi-Agent System
+to Facilitate Component-Based Process Modeling and Design”. In: Computers & Chemical Engineering 32.10,
+pp. 2290–2305. DOI: 10.1016/j.compchemeng.2007.11.005. URL: https://www.sciencedirect.com/
+science/article/abs/pii/S009813540700289X.
+Yang, An, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang,
+Chenxu Lv, Chujie Zheng, Dayiheng Liu, Fan Zhou, Fei Huang, Feng Hu, Hao Ge, Haoran Wei, Huan Lin, Jialong
+Tang, Jian Yang, Jianhong Tu, Jianwei Zhang, Jianxin Yang, Jiaxi Yang, Jing Zhou, Jingren Zhou, Junyang Lin, Kai
+Dang, Keqin Bao, Kexin Yang, Le Yu, Lianghao Deng, Mei Li, Mingfeng Xue, Mingze Li, Pei Zhang, Peng Wang,
+Qin Zhu, Rui Men, Ruize Gao, Shixuan Liu, Shuang Luo, Tianhao Li, Tianyi Tang, Wenbiao Yin, Xingzhang Ren,
+Xinyu Wang, Xinyu Zhang, Xuancheng Ren, Yang Fan, Yang Su, Yichang Zhang, Yinger Zhang, Yu Wan, Yuqiong
+Liu, Zekun Wang, Zeyu Cui, Zhenru Zhang, Zhipeng Zhou, and Zihan Qiu (May 14, 2025). Qwen3 Technical Report.
+DOI: 10.48550/arXiv.2505.09388. arXiv: 2505.09388[cs]. URL: http://arxiv.org/abs/2505.09388
+(visited on 03/14/2026).
+Yang, Yuhang, Ruikang Li, Jifei Ma, Kai Zhang, Qi Liu, Jianyu Han, Yonggan Bu, Jibin Zhou, Defu Lian, Xin Li,
+and Enhong Chen (Mar. 2, 2026). CeProAgents: A Hierarchical Agents System for Automated Chemical Process
+Development. DOI: 10.48550/arXiv.2603.01654. arXiv: 2603.01654[cs]. URL: http://arxiv.org/abs/
+2603.01654 (visited on 03/15/2026).
+Yu, Eun-Seop, Jae-Min Cha, Taekyong Lee, Jinil Kim, and Duhwan Mun (2019). “Features Recognition from Piping
+and Instrumentation Diagrams in Image Format Using a Deep Learning Network”. In: Energies 12.23, p. 4425. DOI:
+10.3390/en12234425. URL: https://www.mdpi.com/1996-1073/12/23/4425.
+Yue, Xiang, Tianyu Zheng, Yuansheng Ni, Yubo Wang, Kai Zhang, Shengbang Tong, Yuxuan Sun, Botao Yu, Ge Zhang,
+Huan Sun, Yu Su, Wenhu Chen, and Graham Neubig (May 22, 2025). MMMU-Pro: A More Robust Multi-discipline
+Multimodal Understanding Benchmark. DOI: 10.48550/arXiv.2409.02813. arXiv: 2409.02813[cs]. URL:
+http://arxiv.org/abs/2409.02813 (visited on 03/14/2026).
+Yue, Yifei and Samavedham Lakshminarayanan (2023). “Multi-Agent Reinforcement Learning for Process Control:
+Exploring the Intersection Between Fields of Reinforcement Learning, Control Theory, and Game Theory”. In:
+26
+A PREPRINT - MARCH 27, 2026
+The Canadian Journal of Chemical Engineering. DOI: 10.1002/cjce.24878. URL: https://onlinelibrary.
+wiley.com/doi/10.1002/cjce.24878.
+Zeng, Tong, Srivathsan Badrinarayanan, Janghoon Ock, Cheng-Kai Lai, and Amir Barati Farimani (Oct. 16, 2025).
+LLM-guided Chemical Process Optimization with a Multi-Agent Approach. DOI: 10.48550/arXiv.2506.20921.
+arXiv: 2506.20921[cs]. URL: http://arxiv.org/abs/2506.20921 (visited on 03/15/2026).
+27

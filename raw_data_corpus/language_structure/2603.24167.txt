@@ -1,0 +1,1092 @@
+Walma: Learning to See Memory Corruption in WebAssembly
+Oussama Draissi
+oussama.draissi@uni-due.de
+paluno – the Ruhr Institute for Software Technology
+University of Duisburg-Essen
+Essen, Germany
+Mark Günzel
+mark.guenzel@uni-due.de
+University of Duisburg-Essen
+Essen, Germany
+Ahmad-Reza Sadeghi
+ahmad.sadeghi@trust.tudarmstadt.de
+Technical University of Darmstadt
+Darmstadt, Germany
+Lucas Davi
+lucas.davi@uni-due.de
+paluno – the Ruhr Institute for Software Technology
+University of Duisburg-Essen
+Essen, Germany
+Abstract
+WebAssembly’s (Wasm) monolithic linear memory model facilitates
+memory corruption attacks that can escalate to cross-site script-
+ing in browsers or go undetected when a malicious host tampers
+with a module’s state. Existing defenses rely on invasive binary
+instrumentation or custom runtimes, and do not address runtime
+integrity verification under an adversarial host model. We present
+Walma, a framework for WebAssembly Linear Memory Attestation
+that leverages machine learning to detect memory corruption and
+external tampering by classifying memory snapshots. We evaluate
+Walma on six real-world CVE-affected applications across three
+verification backends (cpu-wasm, cpu-tch, gpu) and three instru-
+mentation policies. Our results demonstrate that CNN-based classi-
+fication can effectively detect memory corruption in applications
+with structured memory layouts, with coarse-grained boundary
+checks incurring as low as 1.07× overhead, while fine-grained mon-
+itoring introduces higher (1.5×–1.8×) but predictable costs. Our
+evaluation quantifies the accuracy and overhead trade-offs across
+deployment configurations, demonstrating the practical feasibility
+of ML-based memory attestation for WebAssembly.
+ACM Reference Format:
+Oussama Draissi, Mark Günzel, Ahmad-Reza Sadeghi, and Lucas Davi. 2026.
+Walma: Learning to See Memory Corruption in WebAssembly. In . ACM,
+New York, NY, USA, 9 pages. https://doi.org/10.1145/nnnnnnn.nnnnnnn
+1
+Introduction
+WebAssembly (Wasm) [15] has evolved beyond its browser origins
+into a universal binary format for edge computing, smart contracts,
+serverless functions, and embedded systems. Its adoption is ac-
+celerating across diverse environments, from high-performance
+web applications to decentralized cloud platforms, including large-
+scale enterprise deployments such as American Express’s internal
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+Conference’17, Washington, DC, USA
+© 2026 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-x-xxxx-xxxx-x/YYYY/MM
+https://doi.org/10.1145/nnnnnnn.nnnnnnn
+WebAssembly-based FaaS platform [4]. Recent reports indicate that
+Wasm accounts for over 5.6% of all Chrome page loads [44]. Be-
+yond browsers, the WebAssembly cloud platform market grew to
+$1.82 billion in 2025, with projections reaching $5.75 billion by
+2029 [50]. Wasm is now deployed in production by major enter-
+prises including Figma, Google, Zoom, and Visa [13, 43], while edge
+providers like Cloudflare Workers and Fastly process billions of
+daily invocations [51].
+This growth poses a significant security challenge because the
+ecosystem is dominated by code originally written in memory-
+unsafe languages like C and C++ [16, 19]. Recent studies demon-
+strate that exploits within Wasm modules can be escalated to attack
+the host environment [12, 24, 27]. Such attacks are possible because
+the host implicitly trusts data returned from the Wasm sandbox.
+A memory corruption bug can enable a data-only attack [20, 21],
+allowing an adversary to overwrite a trusted data structure with-
+out violating control-flow integrity (CFI). The Wasm sandbox only
+isolates the module from the host but does not enforce memory
+safety within the module’s own monolithic linear memory, which
+co-locates the stack, heap, and global data. Conversely, this pro-
+tection is unidirectional: it provides no guarantee for the module’s
+integrity against a malicious host. In cloud and edge deployments,
+a privileged adversary controlling the infrastructure can directly
+tamper with the module’s linear memory to subvert its internal
+logic, for instance bypassing authorization checks or manipulating
+computation results before they are returned to the client.
+Protecting Wasm modules in these scenarios is an open challenge.
+Mitigations such as ASLR [42] are incompatible with Wasm’s linear
+memory model, and Wasm’s built-in CFI does not cover data-only
+attacks [12, 24, 27]. Existing Wasm defenses require source-level
+modifications, custom compilers, or dedicated hardware [22, 23,
+26, 30, 31], or use binary rewriting to detect pre-defined bug pat-
+terns [25, 52]; none address the malicious host threat model. While
+remote attestation is well-established for confidential computing [8,
+28, 29, 47], embedded systems [7, 10, 11, 36], and control-flow in-
+tegrity [3, 40, 53], these techniques have not been applied to Wasm.
+Moreover, existing control flow attestation (CFA) schemes generate
+cryptographic logs of the execution path but, as noted in recent
+literature [5], struggle to detect data-oriented attacks where the
+logic is subverted but the path remains valid. None of these ap-
+proaches provide continuous verification of the memory state itself,
+arXiv:2603.24167v1  [cs.CR]  25 Mar 2026
+Conference’17, July 2017, Washington, DC, USA
+Oussama Draissi, Mark Günzel, Ahmad-Reza Sadeghi, and Lucas Davi
+yet a malicious input may only trigger corruption deep into a long-
+running execution. What is needed is continuous state verification
+that detects corruption before it crosses trust boundaries.
+In this paper, we present Walma, a framework for state-centric
+runtime verification via linear memory attestation (LMA). Inspired
+by the principles of remote attestation [5], we shift the verification
+focus from static code properties to dynamic memory state. Walma
+operates on the insight that memory corruption events and external
+tampering leave distinct structural artifacts in the linear memory.
+We leverage this by treating memory snapshots as images and
+employing convolutional neural networks (CNNs) [39] to classify
+runtime integrity. Walma decouples execution from verification, a
+design that is runtime-agnostic and versatile across threat models.
+We address two deployment scenarios: (1) protecting sensitive com-
+putations from untrusted infrastructure by performing verification
+in a trusted execution environment (TEE), and (2) auditing poten-
+tially compromised modules in the browser to prevent privilege
+escalation via XSS.
+Our evaluation validates Walma as a first step towards con-
+tinuous memory attestation. We tested Walma on six real-world
+applications with known CVEs, including the audio encoder flac
+and other libraries representative of the performance-critical code
+that powers platforms like Google Earth and Twitch.tv. For work-
+loads with structured memory layouts, such as audio frames and
+pixel buffers, Walma achieves 100% verdict accuracy. We also
+demonstrate that a single generalized model can detect corrup-
+tion across different applications without program-specific train-
+ing. In terms of performance, we conducted an ablation study
+across three instrumentation policies: boundary defense (before
+host interactions), internal logic monitoring (at function entries),
+and fine-grained validation (every memory write). Boundary de-
+fense incurs only 7% overhead, making Walma practical for pro-
+duction deployment. To foster research, we open-source Walma at
+https://anonymous.4open.science/r/walma-5270.
+2
+Background
+2.1
+Wasm Security
+Wasm’s security model [49] is built on three principles: software
+fault isolation (SFI) [45], control flow integrity (CFI) [2], and code im-
+mutability. These mechanisms create a strong sandbox that isolates
+the Wasm module from the host, preventing code-reuse [6, 9, 38]
+and code-injection attacks [32]. However, Wasm’s monolithic linear
+memory, a single, contiguous, and resizable array of bytes, remains
+a single point of failure. It co-locates the stack, heap, and global data
+without runtime-enforced separation. Unlike native architectures
+where program state is distributed across registers and memory,
+Wasm’s entire mutable state resides in linear memory, making it a
+comprehensive attestation target. This allows vulnerabilities such
+as buffer overflows to corrupt adjacent data structures, enabling
+cross-region attacks [12, 24, 27]. As Wasm adoption expands into
+cloud and edge environments, this architectural weakness becomes
+increasingly critical: the same memory model that enables high
+performance also creates a unified attack surface for both memory
+corruption and external tampering.
+Untrusted Host
+(OS / Hypervisor / Cloud Provider)
+Trusted Wasm Module (TCB)
+Data
+Heap
+...
+Stack
+Linear Memory
+Malicious Admin
+(Controls OS/Hardware)
+Trusted Enclave (e.g., SGX)
+WALMA / Veriﬁer
+[Memory Integrity Check]
+Direct Memory 
+Access
+Trusted Host (TCB)
+(User Browser / Runme / DOM)
+Untrusted / Vulnerable Wasm
+Module
+Data
+Heap
+...
+Stack
+Linear Memory
+WALMA / Veriﬁer
+[Memory Integrity Check]
+Aacker
+Malicious
+Input
+Scenario A: Untrusted Cloud Host
+Scenario B: Compromised Web Module
+Memory
+Snapshots
+Verdict
+Memory
+Snapshots
+Verdict
+Figure 1: Walma’s dual deployment models. (A) Untrusted
+Cloud Host: Walma runs in a TEE to detect external tamper-
+ing of the linear memory. (B) Compromised Web Module:
+Walma runs in the browser to detect memory corruption
+before it exploits the host.
+2.2
+Remote Attestation
+Remote attestation enables a trusted verifier to determine the in-
+tegrity of a remote, untrusted attester, often also referred to as
+prover. While traditional schemes verify static properties like code
+identity [36, 37], detecting runtime exploits requires monitoring ex-
+ecution behavior. To this end, control-flow attestation (CFA) mech-
+anisms [3, 8, 11, 40, 53] cryptographically record the sequence
+of executed instructions. By comparing this trace against the ap-
+plication’s control-flow graph, CFA confirms that branches and
+function calls adhere to legitimate program logic. However, even
+these advanced methods do not fully cover data-only attacks [5, 20,
+21]: an adversary can manipulate decision-making variables within
+Wasm’s linear memory to subvert logic without diverting the valid
+control-flow graph. This limitation motivates our state-centric ap-
+proach, which validates the integrity of the memory footprint itself
+rather than the execution path.
+3
+Threat Model
+We consider two deployment scenarios, reflecting established ad-
+versarial models in cloud [28, 29, 47] and web security [12, 24, 27]
+Walma : Learning to See Memory Corruption in WebAssembly
+Conference’17, July 2017, Washington, DC, USA
+research. These scenarios capture the bidirectional nature of Wasm
+security: the module may be a victim of its environment, or a threat
+to it.
+3.1
+Scenario A: Untrusted Cloud Host
+In this setting (Figure 1-A), a user deploys a trusted Wasm workload
+to a third-party cloud or edge infrastructure. The untrusted Host
+encompasses the OS, hypervisor, and physical administrators [28,
+29, 47]. The adversary is a privileged actor (e.g., a malicious admin)
+with full control over the hardware. The attack goal is to manipu-
+late the workload’s internal state, such as bypassing access control
+checks, without crashing the application or violating CFI. Unlike
+software exploits [6, 9, 32, 38] that break out of a sandbox, this ad-
+versary attacks externally via the host interface: directly modifying
+linear memory via system-level privileges (e.g., ptrace or DMA),
+tampering with data exchanged at the host-module boundary, or
+controlling execution timing to facilitate race conditions. To de-
+fend against these attacks, the verifier operates within a trusted
+execution environment (TEE). Our approach establishes a hardware-
+rooted trust anchor that validates memory snapshots, ensuring that
+even a root-privileged host cannot tamper with the module’s state
+without being detected. This scenario is particularly relevant as
+enterprises increasingly deploy sensitive Wasm workloads to third-
+party edge infrastructure [4, 51]. For such high-value targets, the
+overhead of continuous attestation is negligible compared to the
+cost of undetected state manipulation.
+3.2
+Scenario B: Compromised Web Module
+In the browser environment (Figure 1-B), the trust relationship is
+inverted [12, 24, 27]. The browser forms the trusted computing base,
+while the Wasm Module is potentially vulnerable or compromised
+by malicious inputs. The adversary exploits a vulnerability (e.g.,
+memory corruption) within the module to corrupt its internal state,
+aiming to escalate privileges or hijack the embedded web applica-
+tion (e.g., via XSS on shared memory). Walma acts as a security
+monitor: the browser acts as the verifier, periodically checking the
+module’s memory state to detect corruption before it escapes the
+sandbox. Given that major web applications like Figma rely on
+Wasm for performance-critical operations [13], detecting corrup-
+tion before it can be exploited is essential for protection.
+In both scenarios, the goal of Walma is to provide continuous
+attestation of the computation state, detecting integrity violations
+regardless of whether they originate from within the module or
+from external tampering.
+4
+System Design
+The design of Walma addresses the challenge of verifying exe-
+cution integrity in environments where either the module or the
+host cannot be trusted. As illustrated in Figure 2, the architecture
+operates in two phases: an offline training phase to construct a
+robust classifier from synthetically generated states, and an on-
+line inference phase where the attester and verifier cooperate to
+detect corruption at runtime. The decoupled design allows Walma
+to adapt to both threat scenarios described in Section 3 by placing
+the verifier in the appropriate trust domain.
+4.1
+Offline Phase: Model Training
+To distinguish between benign and corrupted memory states, Walma
+relies on a supervised learning pipeline (Figure 2, top).
+Dataset Generation. Since valid Wasm memory layouts are highly
+application-specific, we cannot rely on generic heuristics. Instead,
+we employ binary instrumentation to inject snapshot hooks at deter-
+ministic points, followed by coverage-guided fuzzing. This allows us
+to explore the application’s state space systematically, generating a
+diverse corpus of memory snapshots that represent real execution
+paths. Crucially, we use sanitizers (e.g., AddressSanitizer [35]) as
+a ground-truth oracle during this phase: inputs that trigger san-
+itizer violations are automatically labeled corrupted, while valid
+executions are labeled benign.
+Image Transformation & Learning. We interpret Wasm’s linear
+memory as a grayscale image, where byte values correspond to
+pixel intensities. This is feasible because Wasm’s entire mutable
+state resides in linear memory, unlike native architectures where
+state is distributed across registers and memory regions. This trans-
+formation allows us to leverage convolutional neural networks
+(CNNs) to detect structural anomalies that manifest as disruptions
+in the visual texture of the memory layout. Since the model learns
+the distribution of benign memory states, it can detect deviations
+regardless of their origin—whether from memory corruption or
+tampering by a malicious host. We employ two model architectures
+to balance detection capability against resource constraints: VGG-
+16 (134M parameters) as a high-capacity baseline, and a custom
+ResNet (1.9M parameters) optimized for deployment in TEEs and
+other constrained environments.
+4.2
+Online Phase: Runtime Attestation
+The runtime architecture (Figure 2, bottom) consists of the attester
+and the verifier. Their placement depends on the threat model:
+in Scenario A, the verifier resides in a TEE to protect against a
+malicious host; in Scenario B, the verifier runs on the trusted host
+to monitor a potentially compromised module.
+4.2.1
+The Attester. The attester operates on the untrusted host. It
+executes a Wasm binary instrumented to invoke a snapshot function
+at deterministic boundaries. When triggered, the attester captures
+the linear memory and performs a lightweight run-length encoding
+(RLE) compression. This step is critical to address the bandwidth
+bottleneck inherent in remote attestation [5]; by stripping zero-byte
+runs (common in sparse Wasm memory), we significantly reduce
+the data transfer cost before transmission to the verifier.
+4.2.2
+The Verifier & Verification Architectures. The verifier is the
+root of trust, responsible for reconstructing the memory image,
+performing inference, and issuing a verdict. To support the diver-
+gent trust boundaries defined in Section 3, we developed three
+verification backends:
+In-Runtime (cpu-wasm). The verifier executes directly inside the
+Wasm runtime using WASI-NN. This configuration is designed for
+Scenario A, where the cloud host is untrusted. By moving verifica-
+tion into the TEE, we avoid transmitting large memory snapshots
+externally. The remote user establishes trust in the enclave’s code
+during deployment; the embedded verifier then acts as a trusted
+Conference’17, July 2017, Washington, DC, USA
+Oussama Draissi, Mark Günzel, Ahmad-Reza Sadeghi, and Lucas Davi
+Training
+Offline: Dataset Generation & Model Training
+Binary 
+Instrumentation
+Inject callbacks at 
+instrumentation points
+Coverage-guided
+Fuzzing
+Generates snapshots at 
+callbacks
+Image
+Tranformation
+Model Training
+ResNet (1.9M)
+VGG-16 (134M)
+Trained 
+Classifier
+Labeled Linear 
+Memory Snapshots
+Inference
+Online: Runtime Memory Attestation
+Attester
+Wasm
+Runtime
+Instrumented
+binary
+Execution
+Verifier
+CPU-WASM (OpenVino)
+CPU-TCH (TorchScript)
+GPU (CUDA)
+Deploy 
+model
+Instrumentation
+Point Reached
+(e.g., import
+function is called)
+Capture 
+Snapshots
+Transmit
+Verdict
+Aggregation
+Sliding Window
+Terminate
+Continue
+Figure 2: Walma overview. (Top) Offline Training uses fuzzing and sanitizers to generate labeled datasets. (Bottom) Online
+Inference performs runtime attestation via a decoupled Verifier.
+proxy, performing continuous local analysis within the hostile en-
+vironment.
+Native Host (cpu-tch). The verifier executes as a native process
+on the host OS. This configuration targets Scenario B, where the
+browser (host) is the trust anchor monitoring a potentially malicious
+module. It leverages the host’s native performance but implicitly
+trusts the OS.
+Accelerated (gpu). This mode offloads inference to a hardware
+accelerator. While offering high throughput, it requires transferring
+raw memory over the PCIe bus. This introduces a security trade-off
+in Scenario A, as a privileged adversary with physical access could
+snoop on the bus, making it suitable only when the GPU is also
+within the trust boundary.
+4.3
+Verdict Aggregation
+Single-snapshot classification can be noisy due to transient valid
+states that visually resemble corruption. To mitigate false positives,
+Walma implements a verdict aggregation module which applies a
+sliding window mechanism. Sequential classifications are aggre-
+gated to form a final execution verdict. An execution is flagged
+as malicious only if a threshold of snapshots within the window
+are classified as corrupted, ensuring robust detection even in the
+presence of minor inferential noise.
+5
+Implementation
+We implemented Walma as an end-to-end pipeline comprising 2088
+lines of Rust for runtime components and Wasm module instru-
+mentation, and 657 lines of Python for ML infrastructure.
+Instrumentation Policies: We use Walrus [46] to instrument
+Wasm binaries without modifying the source code. To balance per-
+formance and security visibility, we implemented three policies.
+Import Function triggers snapshots before host calls; this acts as a
+boundary defense, preventing the host from processing corrupted
+data residing in linear memory, which mitigates most attacks [24,
+27]. Local Function instruments Wasm functions entries to approxi-
+mate control-flow monitoring. Finally, Memory Instruction triggers
+verification before every write operation (e.g., i32.store), provid-
+ing fine-grained attestation of state mutations.
+Fuzzing & Data Generation: We integrated LibAFL [14] with
+the runtime to generate training data, using AddressSanitizer [35]
+as an oracle to label execution states as corrupted or benign. We
+constructed program-specific datasets, which allow the classifier
+to learn the unique memory layout and allocation patterns of a
+specific application, as well as a generalized dataset pooled from
+diverse applications to test cross-program transferability.
+Runtime & Verifier Backends: The attester extends the Wasm
+runtime Wasmtime with snapshotting and RLE compression. The
+verifier supports three backends. cpu-wasm runs directly inside the
+runtime via WASI-NN [48] (OpenVINO); by keeping data within
+the sandbox, it minimizes the TCB for Scenario A. cpu-tch uses
+LibTorch for native execution, optimizing performance for the
+trusted host in Scenario B. Finally, the GPU backend uses Torch-
+Script to offload inference; while providing high throughput, it
+incurs latency from PCIe transfers. For secure cloud deployment,
+we package the cpu-wasm pipeline within Gramine [1] to execute
+inside Intel SGX enclaves.
+6
+Evaluation
+We evaluated Walma to answer two key questions: (1) Can visual
+analysis of linear memory reliably distinguish corrupted states
+from benign execution, even across different applications? (2) Is
+the runtime cost permissible for production deployment in latency-
+sensitive environments?
+6.1
+Experimental Setup
+For security validation, we compiled a corpus of six real-world
+Wasm applications with known memory safety vulnerabilities.
+These applications—spanning audio encoding, image decoding, and
+document manipulation—are representative of the performance-
+critical libraries that power major websites like Google Earth, Zoom,
+and Twitch.tv. Our targets include:
+• abc2mtex (CVE-2004-125), a text processor.
+• flac (CVE-2017-6888), an audio encoder.
+Walma : Learning to See Memory Corruption in WebAssembly
+Conference’17, July 2017, Washington, DC, USA
+Table 1: Verdict-Level Performance (Program-Specific Mod-
+els). Structured workloads (flac, pal2rgb) show near-perfect
+detection.
+ResNet
+VGG-16
+Target
+Acc.
+F1
+Acc.
+F1
+flac
+100.00%
+100.00
+100.00%
+100.00
+pal2rgb
+99.21%
+99.50
+100.00%
+100.00
+pnm2png
+94.00%
+93.94
+97.00%
+97.06
+jbig2dec
+85.43%
+87.22
+85.43%
+87.22
+pdfresurrect
+65.50%
+69.06
+73.50%
+79.05
+abc2mtex
+50.50%
+1.98
+50.00%
+0.00
+• jbig2dec (CVE-2020-12268), an image decoder.
+• pal2rgb (OpenJPEG, CVE-2016-10504), an image converter.
+• pdfresurrect (CVE-2019-14267), a PDF manipulator.
+• pnm2png (libpng, CVE-2018-14550), an image converter.
+For performance profiling, we used the PolyBenchC suite [34].
+Experiments were conducted on an Intel Xeon w7-3445 workstation
+with an NVIDIA RTX 5000 GPU. We compared three verification
+backends: cpu-wasm (in-runtime via WASI-NN), cpu-tch (native
+host via LibTorch), and gpu (accelerated offloading via CUDA).
+6.2
+Security Effectiveness
+We evaluated whether visual analysis of linear memory can reli-
+ably distinguish corrupted states from benign execution. For each
+target, we used coverage-guided fuzzing to generate inputs that
+trigger known CVEs, labeling the resulting memory snapshots as
+corrupted (sanitizer violation) or benign. We trained two model vari-
+ants: (1) program-specific models trained on a single application’s
+data, and (2) generalized models trained on a pooled corpus from all
+applications. Both were evaluated on held-out test sets to measure
+verdict-level accuracy and F1 score.
+Program-Specific Detection. Table 1 summarizes the verdict-level
+performance. Our results reveal a strong correlation between the
+structural regularity of a workload’s data and detection accuracy.
+Applications manipulating highly structured data, such as the audio
+encoder flac and image converter pal2rgb, achieved near-perfect
+F1 scores (>99%). In these programs, memory corruption disrupts
+well-defined data patterns (e.g., audio frames or pixel buffers), creat-
+ing distinct visual artifacts easily learned by the CNN. Conversely,
+unstructured text-processing workloads like abc2mtex proved more
+challenging (∼50% accuracy), as small buffer overflows in dense,
+irregular memory layouts generate fewer obvious visual anomalies.
+Cross-Program Generalization. We evaluated a generalized model
+trained on a pooled corpus of all evaluated applications. As shown
+in Table 2, while overall accuracy decreased compared to special-
+ized models, the system demonstrated significant transferability.
+Notably, the generalized ResNet model maintained a high verdict
+accuracy of 94.50% on flac and 85.43% on jbig2dec. This suggests
+that certain memory corruption signatures, such as the fragmen-
+tation of large heap buffers, share common visual traits across
+Table 2: Verdict-Level Performance (Generalized Models).
+Shows a decrease in accuracy but retains high performance
+on some targets.
+ResNet
+VGG-16
+Target
+Acc.
+F1
+Acc.
+F1
+flac
+94.50%
+94.18
+87.50%
+85.71
+pal2rgb
+78.74%
+84.39
+98.43%
+98.99
+pnm2png
+77.00%
+72.29
+82.50%
+80.00
+jbig2dec
+85.43%
+87.22
+85.43%
+87.22
+pdfresurrect
+66.50%
+70.74
+50.50%
+66.89
+abc2mtex
+49.50%
+1.94
+50.00%
+0.00
+different applications. While program-specific tuning remains opti-
+mal for high-assurance contexts, these results validate the potential
+for a generic, application-agnostic model.
+6.3
+Performance Analysis
+Inference Latency & Memory Scaling. Figure 3 illustrates the rela-
+tionship between memory size and inference time across all binaries.
+We observed a strictly linear correlation (𝑅2 ≈0.9) across all back-
+ends. Crucially, the in-runtime cpu-wasm backend proved the most
+efficient, averaging 6.42 ms per inference for the ResNet model.
+In contrast, gpu offloading resulted in significantly higher latency
+(42.94 ms average), as shown in Figure 4. This counter-intuitive
+result is due to the data transfer bottleneck: the overhead of se-
+rializing and moving megabytes of linear memory over the PCIe
+bus outweighs the GPU’s parallel processing speed for these light-
+weight models. This confirms that for high-frequency attestation,
+data locality is the dominant performance factor.
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+20.0
+Memory Snapshot Size (MB)
+0
+20
+40
+60
+80
+100
+Inference Latency (ms)
+Inference Latency vs. Snapshot Size
+ResNet (In-Runtime) (R2 = 0.44)
+VGG-16 (In-Runtime) (R2 = 0.11)
+ResNet (GPU) (R2 = 0.31)
+VGG-16 (GPU) (R2 = 0.67)
+Figure 3: Inference latency vs. memory snapshot size. The
+steep slope of GPU offloading highlights the PCIe transfer
+bottleneck, while in-runtime execution (cpu-wasm) remains
+efficient by maximizing data locality.
+Runtime Overhead. We executed each PolyBench benchmark 25
+times per configuration and report the geometric mean overhead
+in Table 3. The Import Function policy, which acts as a boundary de-
+fense, incurs negligible cost with a geometric mean overhead of just
+Conference’17, July 2017, Washington, DC, USA
+Oussama Draissi, Mark Günzel, Ahmad-Reza Sadeghi, and Lucas Davi
+In-Runtime
+(CPU-WASM)
+Accelerator
+(GPU)
+Native Host
+(CPU-TCH)
+0
+10
+20
+30
+40
+50
+Latency (ms) - Lower is Better
+5.3 ms
+27.1 ms
+32.0 ms
+7.5 ms
+23.1 ms
+47.7 ms
+Average Inference Latency by Backend
+Model Architecture
+ResNet
+VGG-16
+Figure 4: Average inference latency by backend. In-runtime
+execution (cpu-wasm) is significantly faster due to the absence
+of I/O overhead.
+1.07× using the optimized cpu-wasm backend. Even fine-grained
+monitoring via the Memory Instruction policy remains within a
+practical range (1.82×), offering a viable path for high-security
+contexts. Comparing backends, the external verification modes
+incur prohibitive overheads (up to 4.55× for VGG-16 on Host), fur-
+ther validating our architectural decision to move verification into
+the runtime (Scenario A) or the browser (Scenario B) to minimize
+context-switching penalties. This confirms that Walma is practical
+for production, offering tunable security policies with predictable
+performance costs.
+Table 3: Summary of relative runtime overheads for Poly-
+Bench benchmarks. The table shows the geometric mean of
+overheads and average number of attestations.
+Backend
+Model
+Instr.
+G. Mean
+Avg. Att.
+cpu-wasm
+ResNet
+Import
+1.07
+2
+Local
+1.50
+16
+Memory
+1.82
+131
+VGG-16
+Import
+1.10
+2
+Local
+1.58
+16
+Memory
+2.17
+131
+gpu
+ResNet
+Import
+1.13
+2
+Local
+2.31
+16
+Memory
+3.98
+130
+VGG-16
+Import
+1.14
+2
+Local
+2.41
+16
+Memory
+3.56
+131
+cpu-tch
+ResNet
+Import
+1.15
+2
+Local
+2.71
+16
+Memory
+3.57
+131
+VGG-16
+Import
+1.44
+2
+Local
+3.54
+16
+Memory
+4.55
+131
+7
+Discussion & Limitations
+Verdict Aggregation & Robustness. Individual snapshot classifi-
+cations can be noisy, but Walma mitigates this through temporal
+verdict aggregation. By analyzing sequences of memory states, the
+system absorbs transient misclassifications without false alarms,
+achieving 100% verdict accuracy on targets like flac even when
+individual snapshot accuracy is lower.
+Performance Trade-offs. The runtime overhead of Walma is highly
+dependent on the instrumentation granularity. Our ablation study
+demonstrates that for coarse-grained policies (e.g., import checks),
+the relative overhead is efficient at 1.07× (7%). Even for fine-grained
+monitoring of internal function calls or memory instructions, the
+overhead remains acceptable for security-critical applications, rang-
+ing from 1.50× (50%) to 1.82× (82%). The tunability of Walma al-
+lows users to balance security visibility against performance. For
+integrity-critical deployments, this overhead is a reasonable price
+for continuous assurance.
+Deployment & Architecture. While Walma supports TEE-based
+verification for high assurance, our results highlight a critical ar-
+chitectural insight: for lightweight models like our Custom ResNet,
+data transfer costs dominate inference time. Consequently, in-runtime
+execution (cpu-wasm) proved significantly faster than external GPU
+offloading. This suggests that future secure runtime designs should
+prioritize maximizing locality, running verification logic as close to
+the execution context as possible, rather than offloading to acceler-
+ators.
+8
+Related Work
+WebAssembly Security. Research in Wasm security has primarily
+focused on hardening the runtime or binary against exploitation.
+Defenses like MS-Wasm [23, 30] and library-level isolation frame-
+works like RLBox [31] enforce fine-grained compartmentalization,
+while hardware-based approaches like PKUWA [26] and Wave [22]
+provide memory protection. However, these approaches often re-
+quire custom runtimes, specialized compilers, or modifications to
+source code. Binary instrumentation approaches like WBSan [52],
+and others [12, 17, 18, 25] instrument binaries with runtime checks
+to detect memory errors, but are designed for bug discovery. In con-
+trast, Walma provides continuous runtime attestation of memory
+state integrity for deployed Wasm modules on untrusted hosts.
+Remote Attestation & CFA. Traditional remote attestation schemes
+such as SWATT [36] and Pioneer [37] verify static code identity,
+ensuring that the loaded binary has not been tampered with. To
+detect runtime attacks, CFA mechanisms like C-FLAT [3], OAT [40],
+and LiteHAX [11] generate cryptographic traces of the execution
+path. DIALED [10] extends this by attesting the integrity of data
+inputs. DMA’n’Play [41] uses hardware-based DMA to validate
+critical data in memory on embedded devices, demonstrating the
+value of state-centric attestation for detecting data-only attacks. In
+contrast, Walma is the first to enable state-centric attestation for
+complex software systems by attesting Wasm linear memory in the
+browser and on the edge.
+Memory Forensics & ML. Our work builds on offline memory
+forensics [33, 39], which demonstrated the utility of CNNs for de-
+tecting malware in static memory dumps. Walma is inspired by this
+concept to enable state-centric attestation, overcoming the latency
+Walma : Learning to See Memory Corruption in WebAssembly
+Conference’17, July 2017, Washington, DC, USA
+challenges of deep learning by employing lightweight ResNet archi-
+tectures and optimized snapshot transmission to enable continuous,
+online verification.
+9
+Conclusion
+Walma presents a state-centric approach to WebAssembly security
+that detects data-oriented corruption and external tampering by
+classifying linear memory snapshots. Our evaluation demonstrates
+up to 100% verdict accuracy on structured targets while maintaining
+runtime overhead between 1.07× and 1.82× depending on attes-
+tation frequency. As Wasm adoption grows in security-sensitive
+contexts and existing defenses remain insufficient against data-only
+attacks and malicious hosts, this overhead is a necessary cost for
+continuous integrity assurance. Future work will focus on improv-
+ing detection for unstructured workloads and exploring temporal
+models to track state evolution.
+Acknowledgments
+This work was partially funded by the Deutsche Forschungsge-
+meinschaft (DFG, German Research Foundation) through SFB 1119
+– 236615297, project S2.
+References
+[1]
+A library OS for Linux multi-process applications, with Intel
+SGX support. url: https : / / github. com / gramineproject /
+gramine (visited on 09/01/2026).
+[2]
+Martín Abadi, Mihai Budiu, Ulfar Erlingsson, and Jay Ligatti.
+“CFI: Principles, implementations, and applications”. In: Proc.
+of the ACM Conference on Computer and Communications
+Security (CCS). 2005. doi: 10.1145/1609956.1609960.
+[3]
+Tigist Abera, N. Asokan, Lucas Davi, Jan-Erik Ekberg, Thomas
+Nyman, Andrew Paverd, Ahmad-Reza Sadeghi, and Gene
+Tsudik. “C-FLAT: Control-Flow Attestation for Embedded
+Systems Software”. In: Proc. of the ACM Conference on Com-
+puter and Communications Security (CCS). 2016. doi: 10.1145/
+2976749.2978358.
+[4]
+American Express Revolutionizes FaaS with WebAssembly.
+2024. url: https://talent500.com/blog/amex-webassembly-
+faas-platform-innovation/.
+[5]
+Mahmoud Ammar, Adam Caulfield, and Ivan De Oliveira
+Nunes. “SoK: Integrity, Attestation, and Auditing of Program
+Execution”. In: Proc. of the IEEE Symposium on Security and
+Privacy (S&P). 2025. doi: 10.1109/SP61157.2025.00077.
+[6]
+Andrea Bittau, Adam Belay, Ali Mashtizadeh, David Maz-
+ières, and Dan Boneh. “Hacking Blind”. In: Proc. of the IEEE
+Symposium on Security and Privacy (S&P). 2014. doi: 10.1109/
+SP.2014.22.
+[7]
+Marco Chilese, Richard Mitev, Meni Orenbach, Robert Thor-
+burn, Ahmad Atamli, and Ahmad-Reza Sadeghi. “One for all
+and all for one: GNN-based control-flow attestation for em-
+bedded devices”. In: Proc. of the IEEE Symposium on Security
+and Privacy (S&P). 2024. doi: 10.1109/sp54263.2024.00251.
+[8]
+Tobias Cloosters, Sebastian Surminski, Gerrit Sangel, and
+Lucas Davi. “Salsa: SGX Attestation for Live Streaming Ap-
+plications”. In: IEEE Secure Development (SecDev). 2022. doi:
+10.1109/secdev53368.2022.00019.
+[9]
+Lucas Davi, Ahmad-Reza Sadeghi, Daniel Lehmann, and
+Fabian Monrose. “Stitching the gadgets: On the ineffective-
+ness of coarse-grained control-flow integrity protection”. In:
+USENIX Security Symposium. 2014.
+[10]
+Ivan De Oliveira Nunes, Sashidhar Jakkamsetti, and Gene
+Tsudik. “DIALED: Data Integrity Attestation for Low-end
+Embedded Devices”. In: Proc. of the ACM/IEEE Design and
+Automation Conference (DAC). 2021. doi: 10.1109/DAC18074.
+2021.9586180.
+[11]
+Ghada Dessouky, Tigist Abera, Ahmad Ibrahim, and Ahmad-
+Reza Sadeghi. “LiteHAX: lightweight hardware-assisted at-
+testation of program execution”. In: Proc. of the International
+Conference on Computer-Aided Design (ICCAD). 2018. doi:
+10.1145/3240765.3240821.
+[12]
+Oussama Draissi, Tobias Cloosters, David Klein, Michael
+Rodler, Marius Musch, Martin Johns, and Lucas Davi. “Wemby’s
+Web: Hunting for memory corruption in WebAssembly”.
+In: Proc. of the ACM SIGSOFT International Symposium on
+Software Testing and Analysis (ISSTA). 2025. doi: 10.1145/
+3728937.
+[13]
+Figma. WebAssembly cut Figma’s load time by 3x. 2017. url:
+https://www.figma.com/blog/webassembly-cut-figmas-
+load-time-by-3x/.
+[14]
+Andrea Fioraldi, Dominik Christian Maier, Dongjia Zhang,
+and Davide Balzarotti. “LibAFL: A framework to build mod-
+ular and reusable fuzzers”. In: Proc. of the ACM Conference
+on Computer and Communications Security (CCS). doi: 10.
+1145/3548606.3560602.
+[15]
+Andreas Haas, Andreas Rossberg, Derek L Schuff, Ben L
+Titzer, Michael Holman, Dan Gohman, Luke Wagner, Alon
+Zakai, and J F Bastien. “Bringing the web up to speed with
+WebAssembly”. In: Proc. of the ACM SIGPLAN Conference on
+Programming Language Design and Implementation (PLDI).
+2017. doi: 10.1145/3062341.3062363.
+[16]
+Ningyu He, Shangtong Cao, Haoyu Wang, Yao Guo, and
+Xiapu Luo. “The promise and pitfalls of WebAssembly: Per-
+spectives from the industry”. In: Proc. of the ACM SIGSOFT
+Symposium on the Foundations of Software Engineering. 2025.
+doi: 10.1145/3696630.3728570.
+[17]
+Ningyu He, Zhehao Zhao, Hanqin Guan, Jikai Wang, Shuo
+Peng, Ding Li, Haoyu Wang, Xiangqun Chen, and Yao Guo.
+“SeeWasm: An efficient and fully-functional symbolic execu-
+tion engine for WebAssembly binaries”. In: Proc. of the ACM
+SIGSOFT International Symposium on Software Testing and
+Analysis (ISSTA). 2024. doi: 10.1145/3650212.3685300.
+[18]
+Ningyu He, Zhehao Zhao, Jikai Wang, Yubin Hu, Shengjian
+Guo, Haoyu Wang, Guangtai Liang, Ding Li, Xiangqun Chen,
+and Yao Guo. “Eunomia: Enabling User-Specified Fine-Grained
+Search in Symbolically Executing WebAssembly Binaries”.
+In: Proc. of the ACM SIGSOFT International Symposium on
+Software Testing and Analysis (ISSTA). 2023. doi: 10.1145/
+3597926.3598064.
+[19]
+Aaron Hilbig, Daniel Lehmann, and Michael Pradel. “An Em-
+pirical Study of Real-World WebAssembly Binaries: Security,
+Languages, Use Cases”. In: Proc. of the ACM Web Conference
+(WWW). 2021. doi: 10.1145/3442381.3450138.
+Conference’17, July 2017, Washington, DC, USA
+Oussama Draissi, Mark Günzel, Ahmad-Reza Sadeghi, and Lucas Davi
+[20]
+Hong Hu, Zheng Leong Chua, Sendroiu Adrian, Prateek
+Saxena, and Zhenkai Liang. “Automatic generation of data-
+oriented exploits”. In: USENIX Security Symposium. 2015.
+[21]
+Hong Hu, Shweta Shinde, Sendroiu Adrian, Zheng Leong
+Chua, Prateek Saxena, and Zhenkai Liang. “Data-Oriented
+Programming: On the Expressiveness of Non-control Data
+Attacks”. In: Proc. of the IEEE Symposium on Security and
+Privacy (S&P). 2016. doi: 10.1109/SP.2016.62.
+[22]
+Evan Johnson, Evan Laufer, Zijie Zhao, Dan Gohman, Shra-
+van Narayan, Stefan Savage, Deian Stefan, and Fraser Brown.
+“WaVe: a verifiably secure WebAssembly sandboxing run-
+time”. In: Proc. of the IEEE Symposium on Security and Privacy
+(S&P). 2023. doi: 10.1109/SP46215.2023.10179357.
+[23]
+Maxime Legoupil, June Rousseau, Linn Georges, Jean Pichon-
+Pharabod, and Lars Birkedal. “Iris-MSWasm: Elucidating
+and mechanising the security invariants of memory-safe
+WebAssembly”. In: Proceedings of the ACM on Programming
+Languages OOPSLA2 (2024).
+[24]
+Daniel Lehmann, Johannes Kinder, and Michael Pradel. “Ev-
+erything Old is New Again: Binary Security of WebAssembly”.
+In: USENIX Security Symposium. 2020.
+[25]
+Daniel Lehmann, Martin Toldam Torp, and Michael Pradel.
+Fuzzm: Finding Memory Bugs through Binary-Only Instrumen-
+tation and Fuzzing of WebAssembly. 2021. arXiv: 2110.15433.
+[26]
+Hanwen Lei, Ziqi Zhang, Shaokun Zhang, Peng Jiang, Zhi-
+neng Zhong, Ningyu He, Ding Li, Yao Guo, and Xiangqun
+Chen. “Put your memory in order: Efficient domain-based
+memory isolation for WASM applications”. In: Proc. of the
+ACM Conference on Computer and Communications Security
+(CCS). 2023. doi: 10.1145/3576915.3623205.
+[27]
+Brian McFadden, Tyler Lukasiewicz, Jeff Dileo, and Justin
+Engler. “Security chasms of wasm”. In: Proc. of Black Hat
+USA (2018).
+[28]
+James Ménétrey, Marcelo Pasin, Pascal Felber, and Valerio
+Schiavoni. “Twine: An Embedded Trusted Runtime for Web-
+Assembly”. In: IEEE International Conference on Data Engi-
+neering (ICDE). 2021. doi: 10.1109/ICDE51399.2021.00025.
+[29]
+James Ménétrey, Marcelo Pasin, Pascal Felber, and Valerio
+Schiavoni. “Watz: A trusted webassembly runtime environ-
+ment with remote attestation for trustzone”. In: IEEE Interna-
+tional Conference on Distributed Computing Systems (ICDCS).
+2022, pp. 1177–1189.
+[30]
+Alexandra E Michael, Anitha Gollamudi, Jay Bosamiya, Evan
+Johnson, Aidan Denlinger, Craig Disselkoen, Conrad Watt,
+Bryan Parno, Marco Patrignani, Marco Vassena, and Deian
+Stefan. “MSWasm: Soundly enforcing memory-safe execu-
+tion of unsafe code”. In: Proc. of the ACM on Programming
+Languages (POPL). doi: 10.1145/3571208.
+[31]
+Shravan Narayan, Craig Disselkoen, Tal Garfinkel, Nathan
+Froyd, Eric Rahm, Sorin Lerner, Hovav Shacham, and Deian
+Stefan. “Retrofitting fine grain isolation in the Firefox ren-
+derer”. In: USENIX Security Symposium. 2020.
+[32]
+Aleph One. “Smashing the stack for fun and profit”. In:
+Phrack magazine (1996).
+[33]
+Rachel Petrik, Berat Arik, and Jared M. Smith. “Towards
+Architecture and OS-Independent Malware Detection via
+Memory Forensics”. In: Proc. of the ACM Conference on Com-
+puter and Communications Security (CCS). 2018. doi: 10.1145/
+3243734.3278527.
+[34]
+Louis-No"el Pouchet and Tomofumi Yuki. The polyhedral
+benchmark suite. 2012. url: http://www.cse.ohiostate.edu/
+pouchet/software/polybench.
+[35]
+Konstantin Serebryany, Derek Bruening, Alexander Potapenko,
+and Dmitry Vyukov. “AddressSanitizer: a fast address sanity
+checker”. In: Proc. of the USENIX Annual Technical Conference
+(ATC). 2012. doi: 10.5555/2342821.2342849.
+[36]
+A. Seshadri, A. Perrig, L. van Doorn, and P. Khosla. “SWATT:
+softWare-based attestation for embedded devices”. In: Proc.
+of the IEEE Symposium on Security and Privacy (S&P). 2004.
+doi: 10.1109/SECPRI.2004.1301329.
+[37]
+Arvind Seshadri, Mark Luk, Elaine Shi, Adrian Perrig, Leen-
+dert Van Doorn, and Pradeep Khosla. “Pioneer: verifying
+code integrity and enforcing untampered code execution on
+legacy systems”. In: Proc. of the ACM Symposium on Oper-
+ating Systems Principles (SOSP). 2005. doi: 10.1145/1095809.
+1095812.
+[38]
+Hovav Shacham et al. “The geometry of innocent flesh on the
+bone: return-into-libc without function calls (on the x86)”.
+In: Proc. of the ACM Conference on Computer and Communi-
+cations Security (CCS). 2007. doi: 10.1145/1315245.1315313.
+[39]
+Karen Simonyan and Andrew Zisserman. Very Deep Con-
+volutional Networks for Large-Scale Image Recognition. 2015.
+arXiv: 1409.1556.
+[40]
+Zhichuang Sun, Bo Feng, Long Lu, and Somesh Jha. “OAT:
+Attesting Operation Integrity of Embedded Devices”. In: 2020
+IEEE Symposium on Security and Privacy (SP). 2020, pp. 1433–
+1449. doi: 10.1109/SP40000.2020.00042.
+[41]
+Sebastian Surminski, Christian Niesler, Lucas Davi, and Ahmad-
+Reza Sadeghi. “DMA’n’Play: Practical Remote Attestation
+Based on Direct Memory Access”. In: Proc. of the Applied
+Cryptography and Network Security (ACNS)). 2023. doi: 10.
+1007/978-3-031-33491-7_2.
+[42]
+PaX Team. PaX Address Space Layout Randomization (ASLR).
+2001. url: https://pax.grsecurity.net/docs.
+[43]
+The State of WebAssembly – 2025 and 2026. 2026. url: https:
+//platform.uno/blog/the- state- of- webassembly- 2025-
+2026/.
+[44]
+The States of WebAssembly. 2026. url: https://webassembly.
+org/news/2026-01-21-states-of-webassembly/.
+[45]
+Robert Wahbe, Steven Lucco, Thomas E Anderson, and Su-
+san L Graham. “Efficient software-based fault isolation”. In:
+Proc. of the ACM Symposium on Operating Systems Principles
+(SOSP). 1993. doi: 10.1145/168619.168635.
+[46]
+Walrus: WebAssembly transformation library. Accessed: 2026-
+01-20. url: https://github.com/wasm-bindgen/walrus.
+[47]
+Weili Wang, Honghan Ji, Peixuan He, Yao Zhang, Ye Wu,
+and Yinqian Zhang. “WAVEN: WebAssembly Memory Virtu-
+alization for Enclaves”. In: Network and Distributed System
+Security Symposium (NDSS). 2025.
+[48]
+wasi-nn: WebAssembly System Interface API for machine learn-
+ing (ML). Accessed: 2026-01-20. url: https://github.com/
+WebAssembly/wasi-nn.
+[49]
+Wasm Security. Accessed: 2026-01-20. url: https://webassembly.
+org/docs/security/.
+Walma : Learning to See Memory Corruption in WebAssembly
+Conference’17, July 2017, Washington, DC, USA
+[50]
+WebAssembly Cloud Platform Global Market Report 2025. 2025.
+url: https://www.researchandmarkets.com/reports/6215521/
+webassembly-cloud-platform-global-market-report.
+[51]
+WebAssembly Production 2025: WasmGC and Enterprise Adop-
+tion. 2025. url: https://byteiota.com/webassembly-production-
+2025-wasmgc-and-enterprise-adoption/.
+[52]
+Xiao Wu, Junzhou He, Liyan Huang, Cai Fu, and Weihang
+Wang. “WBSan: WebAssembly bug detection for sanitization
+and binary-only fuzzing”. In: Proc. of the ACM Web Confer-
+ence (WWW). 2025. doi: 10.1145/3696410.3714622.
+[53]
+Shaza Zeitouni, Ghada Dessouky, Orlando Sullivan, Srdjan
+Capkun, and Ahmad-Reza Sadeghi. “Atrium: Runtime at-
+testation resilient under memory attacks”. In: Proc. of the
+International Conference on Computer-Aided Design (ICCAD).
+2017.

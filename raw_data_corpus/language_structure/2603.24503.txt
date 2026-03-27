@@ -1,0 +1,920 @@
+Towards Safe Learning-Based Non-Linear Model Predictive Control
+through Recurrent Neural Network Modeling
+Mihaela-Larisa Clement1,2, M´onika Farsang1, Agnes Poks3, Johannes Edelmann3, Manfred Pl¨ochl3, Radu Grosu1,
+Ezio Bartocci1
+Abstract— The practical deployment of nonlinear model pre-
+dictive control (NMPC) is often limited by online computation:
+solving a nonlinear program at high control rates can be expensive
+on embedded hardware, especially when models are complex
+or horizons are long. Learning-based NMPC approximations
+shift this computation offline but typically demand large expert
+datasets and costly training. We propose Sequential-AMPC, a
+sequential neural policy that generates MPC candidate control
+sequences by sharing parameters across the prediction horizon.
+For deployment, we wrap the policy in a safety-augmented online
+evaluation and fallback mechanism, yielding Safe Sequential-
+AMPC. Compared to a naive feedforward policy baseline across
+several benchmarks, Sequential-AMPC requires substantially
+fewer expert MPC rollouts and yields candidate sequences with
+higher feasibility rates and improved closed-loop safety. On high-
+dimensional systems, it also exhibits better learning dynamics and
+performance in fewer epochs while maintaining stable validation
+improvement where the feedforward baseline can stagnate.
+I. INTRODUCTION
+Modern safety-critical systems (e.g., autonomous vehicles
+and robots) increasingly rely on NMPC to satisfy strict state
+and input constraints while optimizing performance. Yet these
+controllers often must run on embedded or edge hardware with
+tight latency and compute budgets, motivating learning-based
+MPC methods that accelerate or approximate NMPC while
+aiming to retain its robustness and safety properties.
+Within this landscape, several lines of research have emerged
+to integrate machine learning on different axes: (i) learning an
+approximation of the MPC policy to avoid online optimization,
+(ii) learning models used inside MPC to improve MPC pre-
+diction quality, and (iii) learning or tuning MPC formulations
+(costs, constraints, parameters) from data to improve closed-
+loop performance.
+A common learning-based NMPC approach is to mimic the
+MPC feedback policy through supervised learning on offline
+MPC rollouts: solve MPC for many initial conditions to obtain
+state–action (or history–action) pairs, then train a function
+approximator to replace online optimization at runtime [1]–[6].
+Most prior work uses feedforward NNs, with recurrent policies
+explored only in [6]. We also follow this direction, but we
+focus on robustness and safety guarantees not addressed in [6].
+A complementary line of work learns the predictive dy-
+namics model used within MPC, typically via RNN variants
+(LSTM/GRU) for system identification, and then embeds
+the learned model in MPC optimization, often with stability
+1Institute of Computer Engineering, TU Wien, Vienna, Austria
+2 AIT Austrian Institute of Technology, Vienna, Austria
+3Institute of Mechanics and Mechatronics, TU Wien, Vienna, Austria
+Corr. author: mihaela-larisa.clement@tuwien.ac.at
+Encoder
+RNN cell
+Linear head
+...
+RNN cell
+RNN cell
+RNN cell
+...
+...
+System
+Dynamics
+Safe Online Evaluation
+Sequential Approximate MPC
+(Seq-AMPC)
+Fig. 1.
+Proposed Sequential Approximate MPC (Seq-AMPC) generates
+the horizon recursively with a shared simple RNN cell (hidden size 256)
+and output head, preserving the same final output format ˆUt ∈RN×nu.
+Seq-AMPC replaces ΠAMPC of [5], resulting in a better-aligned controller,
+particularly in producing feasible horizon proposals. For deployment, Seq-
+AMPC is embedded in a safety-augmented online evaluation and fallback
+wrapper: candidate sequences are checked for feasibility and cost, and, if
+necessary, a safe fallback candidate and terminal controller are applied. We
+refer to the overall wrapped controller as Safe Seq-AMPC.
+or safety validation [7]–[9]. In contrast, we assume known
+dynamics and do not address model learning.
+Beyond model learning, several works pursue performance-
+oriented learning of MPC by tuning costs, constraints, or
+parameters to optimize closed-loop objectives, often while
+preserving safety via constrained updates [10], [11]. Neural
+networks also support MPC by warm-starting solvers or via
+safety filters, but warm-starting still requires online optimization
+with potentially unpredictable runtimes [12]–[14], and safety
+filters beyond linear systems typically add further online
+optimization or require uniform approximation error bounds [2],
+[3], [15]. In contrast, Hose et al. remove online optimization
+by predicting the full input sequence and applying a fast
+feasibility/stability check; if the proposal fails, a shifted
+previous solution plus terminal controller is executed [5]. We
+take this approach as our starting point and extend it with a
+sequential policy architecture.
+Our work bridges two strands that are typically studied in
+isolation: safety-certified approximations of MPC policies and
+sequential (recurrent) policy parameterizations that capture
+temporal dependence. Building on safe online evaluation for
+approximate MPC [5], we replace the feedforward horizon
+arXiv:2603.24503v1  [cs.LG]  25 Mar 2026
+policy with an autoregressive RNN that generates the input
+sequence recursively, as illustrated in Fig. 1. We call the
+RNN horizon policy Sequential-AMPC (Seq-AMPC). When
+deployed inside the safety-augmented evaluation and fallback
+mechanism of Algorithm 1, we refer to the overall controller as
+Safe Seq-AMPC. Seq-AMPC consistently outperforms naive
+AMPC across benchmarks in both open-loop feasibility and
+closed-loop safety. This suggests that sequential policy structure
+alone can materially improve the reliability of safe learning-
+based MPC, without modifying the safety filter.
+II. BACKGROUND
+In this section, we present the robust NMPC formulation,
+describe how it can be approximated using safety-augmented
+neural networks, and provide further details on the architectures
+and training of feedforward and recurrent neural networks.
+A. Robust Nonlinear Model Predictive Control
+We formulate a robust nonlinear model predictive control
+(NMPC) scheme for the considered dynamics model. The
+discrete-time dynamics are given by
+xk+1 = f(xk, uk),
+where xk ∈X ⊂Rnx denotes the state and uk ∈U ⊂
+Rnu the control input. A robust MPC formulation aims
+to guarantee closed-loop stability and recursive constraint
+satisfaction for all admissible bounded disturbances [16]. To
+model actuator uncertainty and model mismatch, we assume
+that the implemented input is perturbed as uk = ¯uk + dk with
+bounded disturbance ∥dk∥∞≤ε.
+a) Tube-based feedback parameterization: Instead of
+directly optimizing over uk, we use an affine pre-stabilizing
+parameterization uk = Kδxk + vk, where Kδ is computed
+offline by solving a set of linear matrix inequalities (LMIs)
+to guarantee contraction of the deviation dynamics and robust
+stability. The feedback term Kδxk guarantees contraction of
+the deviation dynamics, while vk determines the nominal
+performance. This decomposition enables robust constraint
+tightening while preserving the original optimization structure.
+b) Finite-horizon optimal control problem: Given the
+current state x0, we solve at each sampling instant the
+optimization problem
+V ⋆(x0) = min
+v0:N−1
+N−1
+X
+k=0
+ℓ(xk, Kδxk + vk) + Vf(xN)
+(1)
+s.t.
+xk+1 = f(xk, Kδxk + vk),
+(2)
+xk ∈¯
+X,
+vk ∈¯U,
+(3)
+xN ∈Xf.
+(4)
+Here, ¯
+X and ¯U denote tightened constraint sets that guarantee
+robust feasibility of the original constraints X and U. The stage
+cost is quadratic,
+ℓ(x, u) = (x −xref)⊤Q(x −xref) + (u −uref)⊤R(u −uref),
+with Q ⪰0 and R ≻0 chosen to balance tracking performance
+and control effort. The terminal cost is given by Vf(x) =
+x⊤Px, where P is obtained from the terminal LMI design
+and is chosen as an ellipsoid Xf = {x | x⊤Px ≤α} with
+terminal controller u = Kfx and P ⪰0. The matrices (P, Kf)
+are computed offline to ensure local stability and recursive
+feasibility of the closed-loop system.
+c) Receding-horizon implementation: At each time step,
+the optimal sequence v⋆
+0:N−1 is computed, and only the first
+control input u(t) = Kδx(t) + v⋆
+0 is applied. The horizon is
+then shifted forward. This robust NMPC controller serves as
+the ground-truth policy for dataset generation and defines the
+feasible input set UN(x) used in the approximate MPC scheme
+described next.
+B. Approximate MPC with Safety-Augmented Neural Networks
+We approximate the MPC with a NN policy ΠAMPC, which
+learns to map a state x to an input control sequence u with
+horizon length N, following the work of Hose et al. [5].
+We augment the NN for safe online evaluation by checking
+whether ΠAMPC is feasible and selecting between the NN’s
+sequence and a safe fallback. This ensures closed-loop safety
+and convergence, as implemented in Algorithm 1. We call
+Algorithm 1 instantiated with ΠAMPC the Safe AMPC controller.
+For each state x(t), the NN predicts a sequence ˆu(t) in line 3,
+which is checked for feasibility. If safe, the lower-cost sequence
+between ˆu(t) and a fallback ˜u(t) is selected in line 5, and the
+first input u0(t) is executed while updating the safe candidate
+for the next step in line 9.
+Algorithm
+1:
+Approximate
+MPC
+with
+safety-
+augmented NN [5]
+Require:
+Approximate mapping ΠAMPC : X →UN,
+Set of feasible input trajectories:
+UN : X ⇒UN,
+x 7→UN(x) ⊆UN,
+Terminal feedback controller Kf : Xf →U,
+Cost function V : X × UN →R,
+Safe initial candidate input ˜u(0) = uinit
+1 for t ∈N do
+2
+x ←x(t)
+// state at time t
+3
+ˆu(t) ←ΠAMPC(x)
+// eval. approx.
+4
+if ˆu(t) ∈UN(x) then
+5
+u(t) ←arg minu(t)∈{˜u(t),ˆu(t)} V (x, u(t))
+// choose input with min. cost
+6
+else
+7
+u(t) ←˜u(t)
+// keep candidate seq.
+8
+u(t) ←u0(t)
+9
+˜u(t + 1) ←{u(t)1:N−1, Kf(ϕ(N; x; u(t)))}
+10 end
+C. Feed-forward Neural Networks
+Feed-forward neural networks are parametric function ap-
+proximators formed by composing multiple nonlinear trans-
+formations. In the most common setting for tabular or vector
+inputs, a multi-layer perceptron (MLP) maps an input vector
+x ∈Rnx to an output ˆy ∈Rny through a sequence of affine
+maps and pointwise nonlinearities, where nx is the input and
+ny is the output dimension, as follows:
+z(0) = x,
+z(ℓ) = ϕ
+
+W (ℓ)z(ℓ−1) + b(ℓ)
+ˆy = ψ
+
+W (L+1)z(L) + b(L+1)
+.
+(5)
+where ℓ= {1, . . . , L}, W (ℓ) and b(ℓ) denote trainable weights
+and biases, ϕ(·) is a hidden-layer activation (e.g., ReLU or
+tanh), and ψ(·) is an output map chosen for the task (e.g.,
+identity for regression). Training typically minimizes a loss
+function minθ
+P
+i L(ˆyi, yi) of the prediction ˆy based on all
+weights denoted by θ and the ground truth value y by gradient-
+based optimization, with gradients computed efficiently via
+backpropagation.
+D. Recurrent Neural Networks
+Recurrent neural networks (RNNs) extend this framework to
+sequential data by introducing a hidden (latent) state h ∈Rnh
+as a memory component of the network. Given a sequence
+{xt}N
+t=1 ∈Rnx, an RNN updates a hidden state {ht}N
+t=1 ∈
+Rnh and produces outputs {ˆyt}N
+t=1 ∈Rny according to
+ht = σh(Wxxt + Whht−1 + bh) ,
+(6)
+ˆyt = σy(Wyht + by) ,
+(7)
+with shared parameters across time steps. This weight sharing
+enables the model to represent temporal dependencies and to
+condition predictions on past information encoded in ht−1. The
+new hidden state ht at time step t is calculated from the past
+hidden state ht−1 and the current input xt. Wx ∈Rnh×nx,
+Wh ∈Rnh×nh and bh ∈Rnh are the trainable weights and
+bias for the hidden state update calculation. Wy ∈Rny×nh
+and by ∈Rny are used for calculating the output prediction
+ˆyt ∈Rny based on the current hidden state ht.
+Training RNNs follows the same minimization principle as
+for feedforward networks, but the loss is typically accumulated
+over the sequence,
+min
+θ
+N
+X
+t=1
+L(ˆyt, yt),
+(8)
+where θ = {Wx, Wh, Wy, bh, by} denotes the shared model
+parameters. Gradients are computed using backpropagation
+through time (BPTT) [17], which consists of unrolling the
+recurrent computation over the time horizon N and applying
+the chain rule through the resulting computational graph.
+Due to the recurrence in h, the gradient of the loss with
+respect to a parameter (e.g., Wh) accumulates contributions
+from all time steps,
+∂L
+∂Wh
+=
+N
+X
+t=1
+∂L
+∂ht
+∂ht
+∂Wh
+.
+(9)
+E. Training Neural Networks
+Training neural networks involves optimizing model parame-
+ters to minimize a task-specific loss function on a given dataset.
+A challenge in this process is preventing overfitting, where the
+model learns patterns only specific to the training data but fails
+to generalize to unseen samples. Overfitting is particularly
+relevant when using large models or limited datasets. A
+common strategy to mitigate this effect is early stopping, where
+training is stopped once the validation performance no longer
+improves.
+Dataset size plays a crucial role in determining both
+generalization performance and model capacity. Larger datasets
+typically allow the use of more expressive models, while smaller
+datasets require careful control of model complexity to avoid
+overfitting. Consequently, the choice of model size should
+balance representational power and generalization ability.
+From a computational perspective, training efficiency is in-
+fluenced by both the number of parameters and the architecture
+of the model. Larger models generally require more memory
+and longer training times per epoch. Additionally, certain
+architectures, such as recurrent neural networks, incur higher
+computational cost per epoch due to sequential processing
+and BPTT. Therefore, model design must consider not only
+predictive performance but also computational resources and
+training time constraints.
+III. SEQUENTIAL APPROXIMATE MPC DESIGN
+We replace the feedforward predictor with an RNN-based
+policy to better match NMPC’s sequential structure and improve
+robustness to distribution shift. We call this Seq-AMPC which
+when wrapped by Algorithm 1 yields Safe Seq-AMPC.
+In purely MLP-based AMPC solutions, the model lacks
+memory of the learned control from one time step to the next.
+Due to this, the authors of [5] proposed to learn ny = nc · N
+sized output, where nc denotes the control dimensionality and
+N the horizon length. This implies that ˆyt and ˆyt+k k ∈
+N+ are not directly dependent on each other, but are only
+linked through the one before the final layer of the MLP
+z(L), on which they both depend. Consequently, the output
+predictions share a common latent representation but do not
+interact temporally, i.e., ˆyt⊥ˆyt+k|z(L).
+To overcome this limitation, we propose an RNN-based
+solution. In this case, the model predicts an output of size
+ny = nc, and due to its recurrent nature, it can be applied
+recursively to generate predictions over the horizon of length
+N, resulting in the same overall output dimensionality as
+the MLP-based approach. The key difference is the presence
+of a memory component (hidden state), which preserves
+temporal dependencies between time steps. In the RNN case,
+temporal dependencies are captured through the hidden state
+recursion ht = fθ(ht−1, xt), implying that future predictions
+ˆyt+k depend recursively on past states and inputs, unlike the
+conditionally independent outputs produced by the MLP-based
+approach.
+While both MLP- and RNN-based architectures are universal
+function approximators [18], [19], RNNs introduce parameter
+sharing across time steps and impose a temporal inductive bias
+consistent with dynamical systems. This structural constraint re-
+duces the effective model complexity and aligns the architecture
+with the sequential nature of the control problem. Therefore,
+although no formal guarantee of superior performance exists,
+theoretical considerations regarding parameter efficiency and in-
+ductive bias motivate the investigation of RNN-based solutions
+in this setting.
+Proposition 1. (Parameter Scaling with Respect to the
+Horizon Length). Consider (i) an MLP that predicts a horizon
+of length N at once, producing ny = nc · N outputs, and
+(ii) an RNN that predicts nc outputs per time step with
+shared parameters across time. Assume both models use hidden
+dimension nh and input dimension nx. Then, for sufficiently
+large N, the number of trainable parameters of the MLP grows
+linearly in N, whereas the number of trainable parameters of
+the RNN is independent of N.
+Proof. Consider an L-layer MLP with hidden width nh and
+output dimension ny = ncN. The last layer’s parameter
+contribution comes from
+W (L+1) ∈R(ncN)×nh,
+b(L+1) ∈R(ncN).
+Hence, the parameter count of this layer is
+|θMLP| = ncNnh + ncN = ncN(nh + 1),
+which grows linearly with N.
+For the RNN,
+ht = σh(Wxxt + Whht−1 + bh),
+ˆyt = σy(Wyht + by),
+with Wx ∈Rnh×nx,
+Wh ∈Rnh×nh,
+Wy ∈Rnc×nh.
+The total parameter count is
+|θRNN| = nhnx + n2
+h + ncnh + nh + nc,
+which does not depend on N.
+Conclusion. For increasing horizon length N, the MLP
+parameter count grows linearly, |θMLP| = O(N), whereas the
+RNN parameter count remains constant, |θRNN| = O(1). Hence,
+for sufficiently large N, the RNN is strictly more parameter-
+efficient than the horizon-wide MLP.
+Proposition 2. (Inductive Bias of RNNs for Sequential
+Control). Consider a discrete-time dynamical system governed
+by
+xt+1 = f(xt, ut),
+where xt ∈Rnx is the system state and ut ∈Rnc the control
+input at time t. Let the objective be to predict a sequence of
+control inputs {ut}N
+t=1 given the initial state x0 and possibly
+intermediate observations.
+An RNN that updates its hidden state as
+ht = σh(Wxxt + Whht−1 + bh),
+ˆut = σy(Wyht + by)
+naturally captures the temporal dependence of the system,
+whereas an MLP predicting the entire horizon at once does
+not explicitly encode this sequential structure.
+Claim: The RNN architecture introduces an inductive bias
+aligned with the system dynamics, which allows it to more
+efficiently represent the class of sequential control policies that
+obey the Markov property of the system.
+Proof (Argument by Structural Alignment).
+1) System Dynamics. In a Markovian system, the optimal
+control at time t depends on the current state xt, which
+itself is a function of all previous states and controls:
+xt = f (t)(x0, u0, . . . , ut−1).
+2) RNN Recurrence. The RNN recursively encodes the
+history of states and controls in its hidden state ht:
+ht = gθ(ht−1, xt),
+ˆut = gθ(ht),
+where gθ is the learned transition function. By con-
+struction, ht contains information about the entire past
+trajectory, allowing ˆut to condition on the relevant history
+without explicitly concatenating all previous inputs.
+3) MLP Limitation. An MLP predicting the full horizon
+{ˆu1, . . . , ˆuT } treats the outputs as conditionally inde-
+pendent given a shared latent vector z(L). Temporal
+dependencies must be encoded implicitly in z(L), which
+may require a larger number of parameters and more
+data to capture sequential structure.
+4) Conclusion. Because the RNN recurrence mirrors the
+sequential, causal structure of the system dynamics, it
+imposes an inductive bias that aligns with the Markov
+property. This structural bias reduces the effective hy-
+pothesis space needed to represent valid control policies,
+which can lead to more sample-efficient learning and
+better generalization in sequential tasks.
+IV. PROBLEM SETUPS
+The selected benchmarks represent high-performance control
+scenarios with increasing complexity. The quadcopter and
+single-track vehicle tasks emphasize obstacle avoidance and
+operate near dynamic and safety limits, making feasibility and
+constraints management essential.
+A. Quadcopter Model
+As a benchmark, we consider the quadcopter model
+described in [5]. The state vector is defined as x
+=
+[x1, x2, x3, v1, v2, v3, ϕ1, ω1, ϕ2, ω2]⊤∈R10, and the input
+vector as u = [u1, u2, u3]⊤∈R3. The continuous-time
+dynamics are given by
+˙xi = vi,
+i = 1, 2, 3,
+(10)
+˙vi = g tan(ϕi),
+i = 1, 2,
+(11)
+˙v3 = −g + kT
+m u3,
+(12)
+˙ϕi = −d1ϕi + ωi,
+˙ωi = −d0ϕi + n0ui,
+i = 1, 2.
+(13)
+The steady-state thrust required for hover is ue,3 =
+gm
+kT .
+The parameters are chosen as d0 = 80, d1 = 8, n0 = 40,
+kT = 0.91, m = 1.3, and g = 9.81. Input constraints are
+|u1,2| ≤π
+4 and u3 ∈[0, 2g], while the attitude is bounded
+by |ϕ1,2| ≤
+π
+9 . The system is discretized with sampling
+time Ts = 0.1 s and prediction horizon N = 10. We use
+quadratic weights Q = diag(20, 1, 3, 1, 3, 0.01, 1, 4, 1, 4) and
+R = diag(8, 8, 0.8), placing stronger emphasis on horizontal
+position and attitude regulation. We use a dataset of 9.6M
+feasible initial conditions generated by the NMPC expert.
+B. Single-Track Vehicle Models
+1) Kinematic Model: We use a kinematic ground vehicle
+model for planar navigation with
+x = [px, py, ψ, v]⊤∈R4,
+u = [δ, a]⊤∈R2,
+and Euler forward discretization
+px,k+1 = px,k + Tsvk cos ψk,
+py,k+1 = py,k + Tsvk sin ψk,
+ψk+1 = ψk + Tsδ,
+vk+1 = vk + Tsak.
+We set Ts = 0.01s and horizon N = 40. Inputs are bounded
+by a ∈[−6.0, 3.2] m/s2. and δ ∈[−25◦, 25◦], and the speed
+is constrained by v ∈[0, ⟨vmax⟩]. The operating region is
+restricted to px, py ∈[⟨pmin⟩, ⟨pmax⟩].
+Obstacle avoidance is imposed using the same circular
+constraints as above,
+(px −oix)2 + (py −oiy)2 ≥r2
+safe,
+i = 1, . . . , nobs,
+with obstacle centers sampled within the arena and inactive
+obstacles placed outside. Initial conditions are sampled from
+px, py windows around the start and bounded heading/speed
+uncertainty, e.g., ψ ∈[ψ0 ± γψ], v ∈[v0 ± γv]. We use a
+quadratic tracking cost with Q = diag([10, 10, 0.2, 5]) and
+R = diag([2, 4]). We generate 55K NMPC-expert demonstra-
+tions from feasible initial conditions.
+2) Dynamic Model: For the dynamic formulation, we
+employ a single-track model with steering dynamics,
+x = [px, py, ψ, v, r, β, ˙v, δ]⊤∈R8,
+u = [ ˙δ, a]⊤∈R2.
+The nonlinear dynamics capture yaw-rate coupling, lateral tire
+forces, and actuator lag, and are discretized with sampling time
+Ts = 0.01 and prediction horizon N = 40. We use vehicle
+geometry ℓf = 1.35m, ℓr = 1.21m. This model explicitly
+represents lateral velocity via the side-slip angle β and yaw-rate
+r, allowing the controller to regulate stability-relevant quantities.
+Control inputs are constrained by ˙δ ∈[−1.0, 1.0] rad/s and
+a ∈[−6.0, 3.2] m/s2. The steering angle is bounded by δ ∈
+[−25◦, 25◦]. The operating region is restricted to px, py ∈
+[⟨pmin⟩, ⟨pmax⟩] and v ∈[0, ⟨vmax⟩]. Obstacle avoidance is
+enforced by nobs circular obstacles with centers oi = (oix, oiy)
+and safety radius rsafe,
+(px −oix)2 + (py −oiy)2 ≥r2
+safe,
+i = 1, . . . , nobs,
+imposed at every stage. Initial conditions are sampled from
+a bounded set around the start state, e.g., px, py ∈[px,0 ±
+γp], ψ ∈[ψ0 ± γψ], v ∈[v0 ± γv], with remaining states
+initialized consistently. The quadratic state and input cost terms
+TABLE I
+OPEN-LOOP COMPARISON OF NAIVE AMPC (MLP) AND NAIVE
+SEQ-AMPC (RNN) USING 1,000 UNIFORMLY SAMPLED POINTS FROM A
+DISJOINT TEST DATASET. Epochs DENOTE THE NUMBER OF EPOCHS UNTIL
+EARLY STOPPING (PATIENCE =1,000) OR TERMINATION
+AMPC
+Seq-AMPC
+Epochs
+Feas.
+Epochs
+Feas.
+Task
+[103]
+[%]
+[103]
+[%]
+Quadcopter
+100
+72
+2.75
+83.6
+ST-Vehicle Kinematic
+7.9
+35.3
+4.1
+36.4
+ST-Vehicle Dynamic
+3.7
+35.6
+7.9
+39.5
+TABLE II
+CLOSED-LOOP COMPARISON OF SAFE AMPC (MLP) AND SAFE
+SEQ-AMPC (RNN) FROM 1,000 RANDOM FEASIBLE INITIAL STATES. WE
+REPORT THE PERCENTAGE OF SAFE ROLLOUTS (SAFE) GIVEN BY THE
+NAIVE NN AND THE PERCENTAGE OF ROLLOUTS WHERE THE SAFE
+CANDIDATE WAS APPLIED (INTERV.).
+AMPC
+Seq-AMPC
+Task
+Safe [%] Interv. [%] Safe [%] Interv. [%]
+Quadcopter
+84.8
+8.2
+89.1
+78.8
+ST-Vehicle Kinematic
+92.2
+90.6
+92.9
+90.0
+ST-Vehicle Dynamic
+54.1
+94.4
+58.7
+95.6
+have weights Q = diag([10, 10, 0.5, 0.5, 0.2, 5, 1, 5]) and R =
+diag([2, 4]) and a terminal cost Vf(x) = x⊤Px with terminal
+ingredients computed offline. The size of the expert dataset is
+116K.
+V. RESULTS
+Across benchmarks, we compare the AMPC policy (MLP
+layers with 1 million trainable parameters) [5] to the proposed
+Sequential-AMPC (RNN with only 0.5 million parameters)
+under the same safety-augmented wrapper (Alg. 1). We report
+(i) open-loop feasibility of the predicted sequence with respect
+to the feasible set UN(x) (Table I), and (ii) closed-loop safety
+under the wrapper measured by the fraction of safe rollouts and
+the fraction of rollouts in which the safe candidate is applied
+(Table II and Table III).
+As an open-loop statistical evaluation, Table I reports
+feasibility when initialized from the successor state reached by
+applying the naive controller’s predicted control action at the
+initial feasible test state. The test set is disjoint from training.
+In the closed-loop experiments, we define the safety per-
+centage as the proportion of test rollouts whose closed-loop
+trajectories satisfy the state and input constraints at all time
+steps (and, where applicable, the terminal constraint). Each
+rollout is initialized from the post-action state obtained by
+applying the dataset’s safe initial candidate.
+A. Quadcopter
+On the quadcopter task, naive Sequential-AMPC attains
+substantially higher feasibility than AMPC while requiring
+Fig. 2.
+Learning curves of AMPC (MLP) and Seq-AMPC (RNN) on the single-track vehicle model tasks, for the kinematic model on the left and the dynamic
+model on the right. Seq-AMPCs converged to lower validation losses. Early stopping was used to avoid overfitting to the training datasets.
+TABLE III
+QUADCOPTER SEQ-AMPC (RNN) SCALING WITH DECREASING TRAINING
+SAMPLE SIZES. WE REPORT TRAINING COMPUTE (EPOCHS), OPEN-LOOP
+FEASIBILITY RATE (FEAS.), AND CLOSED-LOOP METRICS (SAFE, INTERV.).
+Training
+Closed-loop
+Samples
+Epochs [103]
+Feas. [%]
+Safe [%]
+Interv. [%]
+1x
+2.75
+83.6
+89.1
+78.8
+1/4x
+4.92
+83.5
+87.5
+78.4
+1/10x
+6.59
+79.9
+82.8
+78.2
+≈97% fewer training epochs (Table I). In closed loop, it
+also improves safety to 89.1% safe rollouts (Table II). To test
+whether recurrence can reduce data requirements by leveraging
+memory, we trained with smaller datasets. Even at 1/10×
+data, Seq-AMPC achieves 82.8% closed-loop safety (Table III),
+remaining close to the AMPC baseline at full data (84.8%,
+Table II).
+B. Single-Track Vehicle Models
+For the vehicle benchmarks with obstacles, Fig. 2 presents
+the training curves for AMPC and Seq-AMPC, where the Seq-
+AMPC demonstrates better learning capabilities, achieving
+lower validation loss on both benchmarks. Table I shows
+that Seq-AMPC improves feasibility over AMPC, with mixed
+training-epoch requirements depending on task. Importantly, the
+lower AMPC epoch count on the dynamic benchmark reflects
+early stopping triggered by stagnating/diverging validation loss
+(Fig. 2), not faster convergence; Seq-AMPC trains longer
+because its validation loss continues to improve. For the
+kinematic vehicle benchmark with obstacles, with half the
+amount of training epochs, the Seq-AMPC (RNN) yields
+a modest feasibility improvement (36.4% vs. 35.3%) For
+the dynamic bicycle model with obstacles, the Seq-AMPC
+(RNN) improves feasibility to 39.5% compared to 35.6%,
+albeit requiring longer training since validation loss continues
+improving.
+Fig. 3 shows the closed-loop performance of a naive NN
+versus a safety NN in a vehicle obstacle-avoidance task. Both
+controllers start from the same initial state and aim to reach a
+target while avoiding circular obstacles. The naive (in orange)
+initially navigates well but eventually collides with an obstacle
+(marked by a red cross). In contrast, the safety NN (in blue)
+maintains a safe distance from obstacles and successfully
+reaches the target without violations.
+TABLE IV
+REASONS FOR APPLYING THE SAFE CANDIDATE ON THE VEHICLE
+BENCHMARKS (MULTIPLE REASONS MAY APPLY). PERCENTAGES ARE
+COMPUTED OVER ROLLOUTS WHERE THE SAFE CANDIDATE IS APPLIED.
+AMPC
+Seq-AMPC
+Task
+State Term. Cost State Term. Cost
+Quadcopter
+72.5
+2.6
+40.6
+9.2
+98.5
+44.5
+ST-Vehicle Kinematic
+0.0
+90.5
+57.7
+0.0
+89.5
+64.0
+ST-Vehicle Dynamic
+0.0
+90.0
+79.6
+0.0
+90.0
+71.6
+0
+1
+2
+3
+4
+5
+0
+1
+2
+3
+x2
+x1
+Safe Trajectory
+Naive Trajectory
+Target
+Collision
+0
+0.1
+0.2
+crash
+dist. collision [m]
+Safe NN
+Naive NN
+−20
+0
+20
+δ [rdeg]
+0
+1
+2
+3
+4
+−2
+0
+2
+time [s]
+acmd [m/s2]
+Fig. 3.
+Examples of a naive and a safe trajectory are shown. Two blue-colored
+blocks are the obstacles that the vehicle needs to avoid. The non-safe trajectory
+collides at the red cross while the safe trajectory is able to reach and stop at
+the target point without collision.
+In the right side of Fig. 3, the closed-loop signals show
+that the naive controller’s distance to collision falls below
+zero, indicating a crash, while the safety-augmented controller
+remains viable. This highlights how naive execution can lead to
+unsafe behavior, while the safety mechanism prevents violations
+by rejecting unsafe NN proposals.
+Such safety features are critical in vehicle control, where
+small steering and acceleration errors can accumulate, leading
+to significant deviations. The safety NN controller continuously
+enforces constraints to ensure reliable trajectory tracking and
+safe maneuver execution in dynamic scenarios.
+In closed loop (Table II), Seq-AMPC consistently improves
+the fraction of safe rollouts on both vehicle benchmarks. For the
+kinematic model, safety increases from 92.2% to 92.9% while
+slightly reducing interventions (90.6% →90.0%), indicating
+that the learned sequential policy is marginally more reliable
+under the safety wrapper. For the dynamic model, Seq-AMPC
+yields a larger safety gain (54.1% →58.7%) but interventions
+remain near-saturated for both methods (≈95%), suggesting
+that the safety wrapper is frequently falling back to the shifted
+candidate.
+Table IV breaks down, over time steps where the safe
+candidate is applied, which acceptance checks the NN proposal
+fails: State (predicted state/input feasibility along the rollout),
+Term. (terminal-set membership of XN), and Cost (does not
+reduce total MPC cost relative to the shifted-and-appended
+stored candidate). On the quadcopter, AMPC interventions are
+mainly feasibility-driven (State 72.5%, Term. 2.6%), while Seq-
+AMPC largely removes feasibility violations (State 9.2%) but
+is rejected mostly for terminal-set failures (Term. 98.5%), with
+both often failing the cost gate (Cost 40-45%). On both vehicle
+benchmarks, State is 0.0% for AMPC and Seq-AMPC, so
+interventions are not caused by predicted constraint (including
+obstacle) violations but by Term. and Cost: proposals are
+typically feasible yet frequently neither reach the terminal
+region within the horizon nor improve on the conservative
+shifted candidate.
+VI. SUMMARY AND CONCLUSIONS
+The proposed Safe Seq-AMPC is a safe learning-based
+approximation of robust NMPC that shifts online optimization
+to offline training while preserving safety and convergence
+through a safety-augmented evaluation wrapper. We introduce
+Seq-AMPC to replace horizon-wide feedforward prediction
+using a sequential RNN policy that generates the control
+horizon recursively with shared parameters. This introduces a
+temporal bias aligned with the structure of NMPC solutions and
+avoids parameter growth with the horizon length, a significant
+issue with feedforward AMPC.
+Across all benchmarks, Seq-AMPC improves over the
+feedforward AMPC baseline under the safety-augmented
+deployment: it achieves higher open-loop feasibility and higher
+closed-loop safety rates, while exhibiting more stable learning
+dynamics (continued validation improvement rather than early
+stagnation on the harder vehicle models). Moreover, on the
+quadcopter data, Seq-AMPC attains higher feasibility and safety
+with substantially fewer training epochs, and remains effective
+under significant reductions in training data.
+At the same time, the closed-loop statistics show that
+interventions can remain high, particularly on the obstacle-
+avoidance vehicle tasks (and near-saturated on the dynamic
+model), meaning the wrapper still frequently relies on the
+shifted candidate plus terminal controller. Together with the
+intervention-reason breakdown, this suggests that the main
+bottleneck is producing proposals that satisfy the wrapper’s
+acceptance tests, especially on terminal-set attainment. Future
+work will therefore focus on reducing terminal-set failures
+and improving cost improvement rates (e.g., terminal-aware
+objectives, curriculum sampling near Xf, and losses that better
+align with the MPC value), with the goal of maintaining safety
+while reducing fallback frequency which is computationally
+more expensive.
+REFERENCES
+[1] M. Hertneck, J. K¨ohler, S. Trimpe, and F. Allg¨ower, “Learning an
+approximate model predictive controller with guarantees,” IEEE Control
+Systems Letters, vol. 2, no. 3, pp. 543–548, 2018.
+[2] B. Karg and S. Lucia, “Efficient representation and approximation of
+model predictive control laws via deep learning,” IEEE transactions on
+cybernetics, vol. 50, no. 9, pp. 3866–3878, 2020.
+[3] J. A. Paulson and A. Mesbah, “Approximate closed-loop robust model
+predictive control with guaranteed stability and constraint satisfaction,”
+IEEE Control Systems Letters, vol. 4, no. 3, pp. 719–724, 2020.
+[4] H. Alsmeier, L. Theiner, A. Savchenko, A. Mesbah, and R. Findeisen,
+“Imitation learning of mpc with neural networks: Error guarantees and
+sparsification,” in 2024 IEEE 63rd Conference on Decision and Control
+(CDC).
+IEEE, 2024, pp. 4777–4782.
+[5] H. Hose, J. K¨ohler, M. N. Zeilinger, and S. Trimpe, “Approximate
+non-linear model predictive control with safety-augmented neural
+networks,” IEEE Transactions on Control Systems Technology, vol. 33,
+no. 6, pp. 2490–2497, Nov. 2025, arXiv:2304.09575 [eess]. [Online].
+Available: http://arxiv.org/abs/2304.09575
+[6] Z. Liu, J. Duan, W. Wang, S. E. Li, Y. Yin, Z. Lin, and B. Cheng,
+“Recurrent model predictive control: Learning an explicit recurrent
+controller for nonlinear systems,” IEEE Transactions on Industrial
+Electronics, vol. 69, no. 10, pp. 10 437–10 446, 2022.
+[7] F. Bonassi, M. Farina, J. Xie, and R. Scattolini, “On Recurrent Neural
+Networks for learning-based control: Recent results and ideas for future
+developments,” Journal of Process Control, vol. 114, pp. 92–104, Jun.
+2022. [Online]. Available: https://linkinghub.elsevier.com/retrieve/pii/
+S0959152422000610
+[8] E. Terzi, F. Bonassi, M. Farina, and R. Scattolini, “Model predictive
+control design for dynamical systems learned by Long Short-Term
+Memory Networks,” Aug. 2020, arXiv:1910.04024 [eess]. [Online].
+Available: http://arxiv.org/abs/1910.04024
+[9] K. Huang, K. Wei, F. Li, C. Yang, and W. Gui, “LSTM-MPC:
+A Deep Learning Based Predictive Control Method for Multimode
+Process
+Control,”
+IEEE
+Transactions
+on
+Industrial
+Electronics,
+vol. 70, no. 11, pp. 11 544–11 554, Nov. 2023. [Online]. Available:
+https://ieeexplore.ieee.org/document/9994755/
+[10] S.
+Gros
+and
+M.
+Zanon,
+“Learning
+for
+MPC
+with
+stability
+&
+safety
+guarantees,”
+Automatica,
+vol.
+146,
+p.
+110598,
+Dec.
+2022. [Online]. Available: https://linkinghub.elsevier.com/retrieve/pii/
+S0005109822004605
+[11] S. Sawant, A. S. Anand, D. Reinhardt, and S. Gros, “Learning-based
+MPC from Big Data Using Reinforcement Learning,” Jan. 2023,
+arXiv:2301.01667 [eess]. [Online]. Available: http://arxiv.org/abs/2301.
+01667
+[12] M. Klauˇco, M. Kal´uz, and M. Kvasnica, “Machine learning-based warm
+starting of active set methods in embedded model predictive control,”
+Engineering Applications of Artificial Intelligence, vol. 77, pp. 1–8, 2019.
+[13] S. W. Chen, T. Wang, N. Atanasov, V. Kumar, and M. Morari, “Large
+scale model predictive control with neural networks and primal active
+sets,” Automatica, vol. 135, p. 109947, 2022.
+[14] Y. Vaupel, N. C. Hamacher, A. Caspari, A. Mhamdi, I. G. Kevrekidis,
+and A. Mitsos, “Accelerating nonlinear model predictive control through
+machine learning,” Journal of process control, vol. 92, pp. 261–270,
+2020.
+[15] A. Didier, R. C. Jacobs, J. Sieber, K. P. Wabersich, and M. N.
+Zeilinger, “Approximate Predictive Control Barrier Functions using
+Neural Networks: A Computationally Cheap and Permissive Safety
+Filter,” Jul. 2023, arXiv:2211.15104 [eess]. [Online]. Available:
+http://arxiv.org/abs/2211.15104
+[16] J. Rawlings, D. Mayne, and M. Diehl, Model Predictive Control:
+Theory, Computation, and Design.
+Nob Hill Publishing, 2017. [Online].
+Available: https://books.google.at/books?id=MrJctAEACAAJ
+[17] P. J. Werbos, “Backpropagation through time: what it does and how to
+do it,” Proceedings of the IEEE, vol. 78, no. 10, pp. 1550–1560, 2002.
+[18] K. Hornik, M. Stinchcombe, and H. White, “Multilayer feedforward
+networks are universal approximators,” Neural networks, vol. 2, no. 5,
+pp. 359–366, 1989.
+[19] A. M. Sch¨afer and H. G. Zimmermann, “Recurrent neural networks are
+universal approximators,” in International conference on artificial neural
+networks.
+Springer, 2006, pp. 632–640.

@@ -1,0 +1,3535 @@
+A Deep Dive into Scaling RL for Code
+Generation with Synthetic Data and Curricula
+Cansu Sancaktar1,2,∗, David Zhang3, Gabriel Synnaeve3, Taco Cohen3
+1University of Tübingen, 2Max Planck Institute for Intelligent Systems, 3Meta FAIR
+∗Work done during an internship at Meta
+Reinforcement learning (RL) has emerged as a powerful paradigm for improving large language
+models beyond supervised fine-tuning, yet sustaining performance gains at scale remains an open
+challenge, as data diversity and structure, rather than volume alone, become the limiting factor.
+We address this by introducing a scalable multi-turn synthetic data generation pipeline in which
+a teacher model iteratively refines problems based on in-context student performance summaries,
+producing structured difficulty progressions without any teacher fine-tuning. Compared to single-turn
+generation, this multi-turn approach substantially improves the yield of valid synthetic problems and
+naturally produces stepping stones, i.e. easier and harder variants of the same core task, that support
+curriculum-based training. We systematically study how task difficulty, curriculum scheduling, and
+environment diversity interact during RL training across the Llama3.1-8B Instruct and Qwen3-8B
+Base model families, with additional scaling experiments on Qwen2.5-32B. Our results show that
+synthetic augmentation consistently improves in-domain code and in most cases out-of-domain math
+performance, and we provide empirical insights into how curriculum design and data diversity jointly
+shape RL training dynamics.
+Date: March 26, 2026
+Correspondence: Cansu Sancaktar at cansu.sancaktar@tuebingen.mpg.de
+Random Code Snippets
+Teacher generates 
+initial problem
+Real Coding Puzzles
+[Student attempts to solve problem] x k
+Inspiration seed
+Frame
+Teacher iterates on problem
+based on student
+ success/failure summary
+Turn = 1
+def is_lig(atom):
+    # Non-hydrogen
+    if atom.residue.name == "UNL" and atom.atomic_number > 1:
+        return True
+def find_atom(res_atom=None, prot_file=None, combined_pmd=None):
+    # Parse the input data like this -> "A_LYS_311_N"
+    chain = res_atom.split("_")[0]
+    res_name = res_atom.split("_")[1]
+    res_number = int(res_atom.split("_")[2])
+    atom_name = res_atom.split("_")[3]
+Turn > 1
+Synthetic Data Generation Pipeline
+Filter &
+Deduplicate
+Error when running code
+Formatting errors
+Input-output pairs are not diverse enough
+Student never solved
+Given an array arr of n positive integers lesser
+than 1000, check if there exists at least one
+subarray, the product of whose elements is a power
+of 2.
+Input format:
+n
+arr
+Output format:
+boolean
+Note:
+1. 1 <= n <= 99
+Student Summary
+## Task: Mutate Python Code Snippet Based on
+Student Responses to Previous Challenge and
+Create a New Challenge
+### Previous Code, input-output pairs and
+message:
+[....]
+Previous message:
+[....]
+### Student answers summary:
+Pass rate for the student over 8 attempts
+was:
+Example solved:
+[....]
+Example failed:
+[....]
+### Progression Strategy:
+The student almost always solved the previous
+task with a pass rate of 0.875. Either the input-
+output relationship was too trivial (maybe not
+diverse enough or incomplete such that a much
+easier function also passes the tests), or the
+function was relatively easy to implement.
+Try to mutate this problem into a medium problem:
+student should have a pass rate of 0.35-0.65.
+0.875.
+Figure 1 Overview of the multi-turn synthetic data pipeline. A seed snippet, sampled from random code or real
+coding puzzles, serves as inspiration for the teacher. In the first turn, the teacher generates an initial problem according
+to the current environment’s rules, and the student attempts to solve it multiple times. In later turns, the teacher
+receives a summary of the student’s performance (pass rate and representative solutions) and adapts the problem
+accordingly. Invalid or redundant generations are filtered and deduplicated before inclusion in the dataset.
+1
+arXiv:2603.24202v1  [cs.LG]  25 Mar 2026
+1
+Introduction
+Reinforcement learning (RL) has become a central paradigm for improving large language models (LLMs)
+beyond supervised fine-tuning. Yet as RL scales, a key challenge emerges: how can we sustain performance
+gains, and where should new training data come from? Addressing this question requires understanding what
+defines an effective RL task and environment. Recent works explore asymmetric play in the LLM post-training
+era, where a teacher dynamically generates data tailored to the student model’s learning progress, aiming
+for open-ended RL at scale. However, effectively training such a teacher remains elusive. As shown in Zhao
+et al. (2025), training the teacher does not result in substantial improvements over training only the student.
+Although there are positive gains from dynamically generating synthetic tasks, we are still bottlenecked by a
+limited teacher such that initial performance gains plateau.
+RL with real data is not easy to scale.
+One fundamental challenge with RL post-training is that naively
+increasing the number of problems does not guarantee further performance gains, as results are confounded
+by RL dynamics as well as the difficulty distribution of the problem set at hand. Typically, each problem set
+has a mix of easy and medium-level problems, accompanied by very hard problems. The latter split poses a
+hard exploration challenge that cannot be solved by the initial model, such that the computation spent on
+these samples early on in training hurts efficiency. However, on the other end of the spectrum, the very easy
+questions give early gradient updates, but dominate training while the model’s entropy collapses.
+A common strategy proposed in the literature is curriculum sampling, where the model is first trained on
+easier problems, gradually shifting towards the hard ones (Kimi Team et al., 2025). However, in the case of
+real data, there is often no guarantee that the hard problems build upon the easy ones in a meaningful way.
+Moreover, since model entropy naturally decreases during RL training (Cui et al., 2025), spending too much
+of the exploration budget on easy problems can reduce the model’s capacity to learn from more challenging
+ones later. These factors limit the effectiveness of naive curriculum-based sampling in practice.
+Taking inspiration from the idea of stepping stones in goal-based exploration (Forestier et al., 2022), we
+incorporate easier variants of hard problems to help alleviate the hard exploration challenge. We propose a
+multi-turn approach to generate synthetic data (Fig. 1). Similar to Magicoder (Wei et al., 2023), we make use
+of actual code snippets to ground the problem generation and ensure diversity and coverage. Unlike standard
+single-turn generation, where multiple problem instances are independently sampled from a seed snippet and
+later filtered for solvability, formatting, and diversity, our method introduces an additional iteration axis. The
+teacher revisits and mutates the initially generated problem over multiple turns, adjusting its difficulty at each
+step. This process produces structured variants of the same core task, yielding easier and harder counterparts
+that serve as targeted augmentations. Crucially, this adaptation happens purely through in-context learning,
+requiring no gradient updates to the teacher. Multi-turn data generation provides a practical pipeline for
+producing high-quality synthetic data at scale, reducing invalid generations and naturally introducing problem
+variants of varying difficulty. Augmenting real code-contest questions with such synthetic data results in
+consistent performance gains on both in-domain (code) and out-of-domain (math) benchmarks.
+To better understand the individual factors contributing to RL improvements, we systematically isolate the
+effects of different design choices. In particular, we address the following research questions:
+• Do stepping stones, i.e. intermediate problems of varying difficulty, improve downstream generalization?
+• How does the difficulty level of RL problems influence training dynamics and convergence?
+• To what extent does the choice of curriculum schedule matter?
+• Given a limited compute budget, is it more effective to scale the number of problems within a single
+environment, or to scale across multiple environments; and can environment diversity serve as an
+independent axis of improvement?
+Our main contributions are a scalable multi-turn framework for synthetic data creation and a systematic
+experimental study of how task difficulty, curriculum design, and environment diversity affect RL for code
+generation. Through extensive experiments across model families (Llama3.1-8B Instruct, Qwen3-8B Base, and
+2
+Qwen2.5-32B Base), we analyze convergence and generalization under different data generation and training
+setups.
+2
+Related Work
+Synthetic Data.
+Synthetic data generation has become a powerful tool both in supervised fine-tuning (SFT)
+and reinforcement learning (RL) for large language models (LLMs). Magicoder (Wei et al., 2023) demonstrates
+that large-scale synthetic code data can substantially enhance code generation capabilities of a model in an
+SFT setting, motivating the use of automatically generated problem instances for RL. Similarly, Havrilla
+et al. (2025) present SPARQ, which generates over 20 million synthetic math problems using quality–diversity
+algorithms and studies how problem difficulty and diversity affect generalization in fine-tuning. Jiang et al.
+(2025) explore generative data refinement, transforming noisy real-data corpora into higher-utility training
+data for model adaptation.
+At the RL stage, Guo et al. (2025) propose a framework for RL using only synthetic question-answer
+pairs derived from task definitions and retrieved documents, reporting large improvements across reasoning
+benchmarks. Liang et al. (2025) introduce SwS, which identifies model weakness areas and synthesizes targeted
+problems to improve reasoning performance. Goldie et al. (2025) further address multi-step reasoning and
+tool-use tasks via synthetic data generation in a multi-step RL pipeline. Together, these works highlight
+the increasing role of synthetic data in scaling adaptation and reasoning for LLMs. Our approach builds on
+this line of work by combining structured RL environments with teacher–student generation and curriculum
+control to optimize both in-domain performance and out-of-domain generalization.
+Asymmetric Self-Play.
+Asymmetric self-play in LLMs has been explored across several domains, including
+coding and verification (Zhao et al., 2025; Lin et al., 2025), tool use (Zhou et al., 2025), alignment (Ye et al.,
+2025), and theorem proving (Dong and Ma, 2025; Poesia et al., 2024). These works leverage the interaction
+between a generator (teacher) and a solver (student) to create adaptive task distributions, an idea closely
+related to our teacher–student setup for multi-turn data generation.
+Curriculum Learning.
+Curriculum learning remains an active area of research in RL for LLM post-training.
+Wang et al. (2025) propose a distribution-level curriculum learning framework, where the sampling probabilities
+are dynamically adjusted, prioritizing either distributions with high average advantage (exploitation) or low
+sample count (exploration). Bae et al. (2025) introduce adaptive sampling strategies that remove overly
+easy or hard examples to focus on intermediate difficulty. In the context of alignment, Pattnaik et al. (2024)
+introduce curricula that gradually increase task difficulty, while Kimi Team et al. (2025) employ manually
+defined heuristic curriculum stages, starting with easy problems and gradually progressing to harder ones.
+They also use a prioritized sampling strategy, where problems with lower success rates receive higher sampling
+probabilities. Xie et al. (2025) study the effectiveness of reasoning with RL on synthetic logic puzzles, showing
+that under a fixed data budget, well-designed curricula consistently outperform random shuffling. Finally,
+reverse curricula have been shown to improve exploration, where the start state of reasoning progressively
+slides from a demonstration’s end to its beginning (Xi et al., 2024).
+3
+Synthetic Data Generation Pipeline
+3.1
+Environments
+Each environment is framed as a teacher–student interaction: the teacher generates task instances, and the
+student attempts to solve them. The RL environments used throughout this work are: Induction, Abduction,
+Deduction (inspired by Zhao et al. (2025)) and Fuzzing.
+Induction
+Program synthesis environment. This can be seen as a variant of classical code puzzle environments
+used for RL post-training.
+3
+Abduction
+Input prediction environment. Given a function f() and an output o, the task is to predict the
+input i that produced o.
+Deduction
+Output prediction environment. Given a function f() and an input i, the task is to predict the
+output o obtained upon execution.
+Fuzzing
+Fuzzing environment inspired by property-based testing. Given f(), pre_test_f(), and test_f(),
+the task is to find an input such that test_f() fails while pre_test_f() passes. The function pre_test_f()
+acts as a type checker, e.g. verifying correct input types to ensure that test_f() fails for non-trivial reasons.
+The corresponding teacher–student specifications and reward definitions for each environment are summarized
+in Table 1.
+Table 1 Overview of RL environments. The teacher column specifies how each task instance is generated, while the
+student column describes the corresponding RL problem to be solved. The final column shows the reward function
+used for evaluation. Here, ˆ· denotes the student’s prediction, and I[·] is the indicator function.
+Environment
+Teacher: Generator
+Student: Solver
+Reward
+Induction
+Generates function f(), a natural
+language message, and k input cases
+i1, ..., ik.
+The corresponding gold
+outputs o1, ..., ok are computed by
+execution: ok = f(ik).
+Given k′ < k input-output pairs
+{i1, o1}..., {i′
+k, o′
+k}
+(the
+remaining
+k −k′ are held out as private test
+cases) and the message, student syn-
+thesizes f().
+r = I
+h
+∀k, ˆf(ik) = ok
+i
+Abduction
+Generates function f() and one in-
+put case i. The gold output is com-
+puted as o = f(i).
+Given f() and the output o, infers
+the input i that produced the given
+output.
+r = I[f(ˆi) = o]
+Deduction
+Generates function f() and one in-
+put case i. The gold output is com-
+puted as o = f(i).
+Given f() and the input i, infers
+the output o to be obtained when
+executing f(i).
+r = I[ˆo = o]
+Fuzzing
+Generates a function f(), which con-
+tains a subtle bug to be exploited,
+and tests pre_test_f() and test_-
+f().
+Given
+f(),
+pre_test_f()
+and
+test_f(), finds an input test case
+such that test_f() fails while pass-
+ing pre_test_f().
+r = I[pre_test_f(ˆi) ∧¬ test_f(ˆi)]
+3.2
+Inspiration seeds
+We use seed data as inspiration for synthetic data generation to ensure diversity and grounding. We use two
+different classes of seed data: (1) we extract successful solutions to real coding problems solved during an
+initial RL training run, and (2) random open source code snippets collected from the wild.
+For (2), similar to Wei et al. (2023), we adopt starcoderdata as our seed corpus. In order to generate a
+synthetic question, we randomly select 25–50 consecutive lines to be our seed snippet for inspiration, and the
+teacher model is asked to try to incorporate the core logic of this example snippet for data generation.
+3.3
+Generating Multi-Turn Synthetic Data
+We perform multi-turn data generation, where the teacher iteratively adapts task difficulty based on the
+student’s performance (Fig. 2).
+In the first turn, given a seed snippet (see Sec. 3.2) and a task description, the teacher is prompted to generate
+a valid problem instance following the rules of the current RL environment. The resulting problem t1 is then
+presented to the student, who attempts to solve it M times (e.g. M = 32).1
+1In practice, we use M = 32. We also experimented with M = 8, but found that student pass rate estimates become noisy for
+small M.
+4
+t = int(input())
+for _ in range(t):
+    x = int(input())
+    # The minimum number of rolls is 1 (since minimum face is 2)
+    # The maximum number of rolls is x // 2 (since each roll is
+at least 2)
+    # We can return any number of rolls between 1 and x//2
+    # For simplicity, we return x // 2
+    print(x // 2)
+from typing import List
+def f(total: int) -> int:
+    """
+    Return the number of unordered combinations of dice rolls
+that sum to `total`,
+    where each die can show a value from 2 to 6 (inclusive).
+    The algorithm is a classic unbounded-knapsack / coin-change
+DP:
+    - `dp[s]` holds the count of ways to obtain sum `s`.
+    - We iterate over the allowed face values first, then over
+      increasing sums, which guarantees that the order of faces
+does not
+      create duplicate permutations.
+    """
+    if total < 2:          # cannot reach a sum smaller than the
+smallest face
+        return 0
+    faces: List[int] = [2, 3, 4, 5, 6]
+    dp = [0] * (total + 1)
+    dp[0] = 1               # one way to reach sum 0 – choose no
+dice
+    for face in faces:
+        for s in range(face, total + 1):
+            dp[s] += dp[s - face]
+    return dp[total]
+Turn 1
+Turn 1 → 2
+Seed
+Figure 2 Example of multi-turn data generation. The top-left panel shows the seed snippet provided to the teacher,
+taken from a real coding puzzle. In turn 1, the teacher generates a puzzle with a student pass rate of 0.875 (M = 8).
+In turn 2, after observing the student’s performance, the teacher produces a harder variant with a pass rate of 0.25.
+In the second turn, the student’s attempts from turn 1 are summarized as the pass rate p =
+1
+M
+PM
+m=1 rm,
+together with representative examples of both successful and failed solutions (if available). The teacher
+then receives the original question and this performance summary, and is prompted to adapt the problem
+accordingly for the next iteration. The adaptation follows a progression strategy that adjusts task difficulty
+based on the observed pass rate (e.g. increasing complexity if p > 0.65, or decreasing complexity if p = 0).
+Subsequent turns follow the same iterative structure, with each turn conditioned on the immediately preceding
+question and student summary rather than the full history (in practice, we use 6 turns per seed). A full
+example of this in-context adaptation, including the teacher prompt and reasoning, is provided in Sec. F.
+Currently, the data generation pipeline is decoupled from the RL runs and the actual student. During
+multi-turn generation, the same model used as teacher takes on the role of the student. In our experiments,
+we use GPT-OSS 120B high reasoning mode as our teacher and the same model is used in low reasoning mode
+as the student. We expect further performance gains from having the teacher in the loop and learning from
+the mistakes of the student on-the-go, resulting in more effective augmentations.
+3.4
+Reinforcement Learning with Verifiable Rewards
+We employ an asynchronous variant of Group Relative Policy Optimization (GRPO) (Shao et al., 2024) as our
+reinforcement learning algorithm. GRPO replaces the value function with a Monte Carlo–based estimation,
+sampling G outputs from the model and computing the advantage of each oi (i ∈{1, . . . , G}) by normalizing
+its reward relative to others within the group. In our implementation, we omit both the standard-deviation
+normalization in the advantage computation and the KL-regularization term (see Sec. E for more details).
+5
+4
+Results
+We train Llama3.1-8B Instruct (Grattafiori et al., 2024), Qwen3-8B Base (non-thinking mode) (Yang et al.,
+2025), and Qwen2.5-32B Base (Yang et al., 2024) with reinforcement learning on code tasks without explicit
+reasoning traces, and evaluate both in-domain (code) and out-of-domain (math) performance to analyze
+performance across model families and scales. For code, we use LiveCodeBench (LCB) (Jain et al., 2024),
+aggregating queries between 08.2024 and 05.2025 (454 problems), as well as the LCBv5 splits (easy, medium,
+hard; 05.2023–01.2025). For math, we evaluate on the Math500 (Hendrycks et al., 2021) and AIME2024
+benchmarks.
+4.1
+Scaling and Augmenting RL with Synthetic Data
+We begin by examining whether scaling reinforcement learning with additional real coding problems alone
+leads to sustained performance gains. Figure 3 compares RL training on 25K and 81K real coding problems
+in Qwen3-8B Base.
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.280
+0.300
+0.320
+0.340
+0.360
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.660
+0.680
+0.700
+0.720
+0.740
+0.760
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+0.180
+AIME2024 Pass@1
+REAL 25K
+REAL 81K
+Qwen 3 8B Base (baseline)
+Figure 3 Scaling with real data in Qwen3-8B Base. We compare RL training on 25K and 81K real coding problems
+using GRPO (3 seeds). Performance is tracked on in-domain (LCB) and out-of-domain (Math500 and AIME2024)
+benchmarks throughout training. Performance gains plateau early, indicating limited benefit from scaling real data
+alone.
+During RL training, performance improvements plateau early as policy entropy decreases. Increasing the
+number of RL problems does not yield proportional gains (Figure 3), suggesting that data diversity or
+structure, rather than volume alone, becomes the limiting factor.
+4.1.1
+Does augmenting real coding problems with synthetic problems help boost performance?
+We show that augmenting real coding questions with synthetic problems leads to faster and more stable
+convergence in-domain (code) for Llama3.1-8B Instruct (Fig. 4), Qwen3-8B Base (Fig. 5), and Qwen2.5-32B
+Base (Fig. 6), and improves out-of-domain (math) performance for Llama3.1-8B Instruct and Qwen2.5-32B.
+For RL runs with augmented data, the total number of training problems is increased by 20K, while keeping
+the overall training budget fixed. Consequently, each problem is encountered fewer times within the same
+number of RL steps shown in the plots. Notably, synthetic augmentation also outperforms the larger 81K
+real-data baseline on most in-domain LCB metrics, underscoring the efficiency of diverse synthetic additions
+even under a fixed compute budget (see Fig. 19).
+To test whether the choice of seed affects these gains, we perform an ablation comparing synthetic problems
+seeded with answers to real questions versus random code snippets from starcoderdata (see Fig. 5). We
+match dataset difficulty across conditions to ensure that observed trends are not driven by easier questions.
+Training on synthetic problems seeded with starcoderdata increases data diversity compared to augmenting
+real problems with their own variations. Consequently, we observe higher pass@1 and pass@10 in-domain,
+indicating that greater diversity boosts performance and that random-code seeding can be competitive with
+real data for synthetic augmentation. Next, we analyze performance when training exclusively on synthetic
+problems.
+6
+0
+10K
+20K
+30K
+Training Steps
+0.050
+0.075
+0.100
+0.125
+0.150
+0.175
+0.200
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.420
+0.440
+0.460
+0.480
+0.500
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.060
+0.080
+0.100
+0.120
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.120
+0.140
+0.160
+0.180
+0.200
+0.220
+0.240
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.630
+0.640
+0.650
+0.660
+0.670
+Math500 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.120
+0.140
+0.160
+0.180
+0.200
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.300
+0.400
+0.500
+0.600
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.040
+0.050
+0.060
+0.070
+0.080
+0.090
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.005
+0.010
+0.015
+0.020
+0.025
+0.030
+lcb_codegen_hard/pass@1
+REAL 25K
+REAL 25K + SYNTH-AUG 20K Solved
+Llama 3.1 8B Instruct (baseline)
+Figure 4 Synthetic data augmentations in Llama3.1-8B Instruct. RL training on 25K real code-contest problems
+(baseline) versus 25K real plus 20K synthetic problem augmentations seeded from solved real questions (3 seeds).
+Synthetic augmentation improves performance across both in-domain (code: LCB) and out-of-domain (math: Math500,
+AIME2024) benchmarks.
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.280
+0.300
+0.320
+0.340
+0.360
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.625
+0.650
+0.675
+0.700
+0.725
+0.750
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+0.180
+AIME2024 Pass@1
+REAL 25K
+REAL 25K + SYNTH-Real-Aug 20K
+REAL 25K + SYNTH*-Aug 20K
+Qwen 3 8B Base (baseline)
+Figure 5 Synthetic data augmentations in Qwen3-8B Base. RL training on real code-contest problems (baseline)
+versus with synthetic problem augmentation (3 seeds). Synthetic data are seeded either with answers to real questions
+(SYNTH-Real-Aug) or with random code snippets from starcoderdata (SYNTH*-Aug). Performance improves primarily
+on in-domain (code: LCB), while out-of-domain (math: Math500, AIME2024) benchmark performance remains comparable
+or slightly lower.
+4.1.2
+Are synthetic RL problems alone sufficient, and does seeding matter?
+Figure 16 and Figure 17 show that RL training on fully synthetic problems can match the LCB scores achieved
+with real data. As seen in Fig. 5, the difference between using real code-contest questions and random
+starcoderdata snippets as seeds for synthetic data generation is minimal. In the in-domain code setting
+(LCB), we observe slightly faster convergence when synthetic problems are seeded with real data. For all
+7
+0
+10K
+20K
+30K
+40K
+50K
+Training Steps
+0.22
+0.24
+0.26
+0.28
+0.30
+0.32
+LCB Pass@1
+0
+10K
+20K
+30K
+40K
+50K
+Training Steps
+0.30
+0.32
+0.34
+0.36
+0.38
+LCB Pass@10
+0
+10K
+20K
+30K
+40K
+50K
+Training Steps
+0.55
+0.60
+0.65
+0.70
+Math500 Pass@1
+0
+10K
+20K
+30K
+40K
+50K
+Training Steps
+0.06
+0.08
+0.10
+0.12
+0.14
+AIME2024 Pass@1
+REAL 25K
+REAL 25K + SYNTH-AUG 20K Induction
+Qwen 2.5 32B Base (baseline)
+Figure 6 Synthetic data augmentations in Qwen2.5-32B Base. RL training on 25K real code-contest problems
+(baseline) versus 25K real plus 20K synthetic problem augmentations seeded from solved real questions (2 seeds).
+Synthetic augmentation shows improved performance trends for both in-domain (code: LCB) and out-of-domain (math:
+Math500, AIME2024) benchmarks.
+experiments, we match the difficulty histograms (based on student pass rates) between the starcoderdata-
+and real-seeded datasets to ensure a fair comparison.
+Closer inspection reveals that most of the LCB gains are correlated with performance on the LCBv5-easy split,
+while performance on medium decreases. We hypothesize that this stems from the distribution of generated
+question difficulties: during filtering, we include all questions with pass rates between 0.01 and 0.97 without
+explicitly flattening the difficulty distribution. In practice, this results in a dataset dominated by easier
+questions, leading to overfitting on simpler tasks. We further analyze the effects of difficulty filtering and
+curriculum strategies in the following sections.
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.280
+0.300
+0.320
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.640
+0.660
+0.680
+0.700
+0.720
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.090
+0.100
+0.110
+0.120
+0.130
+0.140
+AIME2024 Pass@1
+SYNTH* Induction 20K
+SYNTH-Real-Aug 20K
+Qwen 3 8B Base (baseline)
+Figure 7 RL with pure synthetic data in Qwen3-8B Base. Instead of augmenting the 25K real code-contest questions,
+RL is performed solely on synthetic induction problems generated with two seeding strategies: (1) real questions as
+inspiration seeds (SYNTH-Real-Aug), and (2) random code snippets from starcoderdata (SYNTH*-Aug). Results shown
+for 3 seeds. Performance is comparable across both setups, with slightly faster in-domain convergence (LCB) when
+seeding with real data.
+Takeaway
+• Augmenting real code-contest questions with synthetic RL problems from a custom induction
+environment helps obtain better and faster convergence in-domain across model families, while also
+showing gains out-of-domain on Math benchmarks with Llama3.1-8B Instruct and Qwen2.5-32B
+Base.
+• Diversifying inspiration snippets and using starcoderdata instead of the real data itself for
+augmentation shows improved trends in LCB.
+• Synthetic RL problems alone are competitive; however, the difficulty distribution of the generated
+data might need explicit curation to avoid overfitting on easy problems.
+• Seeding with real code-contest questions instead of starcoderdata provides slightly faster conver-
+gence on LCB.
+8
+Chain Example 1
+hard
+Your task is to write an algorithm that, given a set of geographic nodes and directed edges between them,
+determines for each node the smallest angular sector that contains all bearings of its outgoing edges. The challenge lies
+in handling circular wrap-around (e.g., bearings near 0° and 359°) and producing exact degree spans efficiently.
+medium
+Your challenge is to write a function that, given a list of compass bearings (in degrees), finds the smallest
+angular sector that covers them all. The sector may need to wrap around the 0°/360° boundary, so careful handling of
+circular wrap-around is required. Return the sector size rounded to one decimal place.
+easy
+Your task is to write a function that, given two compass bearings (in degrees), returns the smallest angular
+distance between them. The distance must be between 0° and 180°, and you should round the answer to one decimal place.
+Think carefully about the circular nature of a compass when the two bearings lie on opposite sides of the 0°/360° line.
+Chain Example 2
+hard
+Your task is to implement f that computes the minimum number of node insertions and deletions needed to
+transform one ordered tree into another. Both trees are encoded as strings consisting solely of ‘(’ and ‘)’, where each pair
+represents a node. The challenge lies in handling arbitrary tree shapes, deriving the correct post-order indices, left-most leaf
+descendants, and keyroots, and then applying the Zhang-Shasha dynamic programming recurrence. Think carefully about
+the 1-based indexing used by the algorithm and ensure your implementation runs efficiently for the provided test cases.
+medium
+Your challenge is to implement f that, given two strings consisting only of ‘(’ and ‘)’, builds the corresponding
+ordered trees and returns the size (number of nodes) of the biggest rooted sub-tree that appears identically at the top of both
+trees. In other words, start from the two roots and walk down the left-most children as long as the sub-trees match perfectly;
+sum the nodes you encounter. Think about how to parse the parenthesis representation into a tree and how to compare
+two sub-trees for exact structural equality. No randomisation or I/O is involved—just careful recursion and tree traversal.
+easy
+Your challenge is to write f that takes a single string made only of ‘(’ and ‘)’, builds the ordered tree encoded
+by that parenthesis representation, and returns the total number of nodes in the tree. Think about how each ‘(’ creates
+a new node and each ‘)’ finishes the current node, then recursively count the nodes. No I/O, randomness, or date/time
+operations are needed—just careful parsing and a simple recursion.
+Figure 8 Examples of easy–medium–hard question chains. Each chain illustrates a progression in task complexity
+within the same conceptual domain, derived by starting from a hard question and generating simpler variants that
+capture its core subproblems.
+This reverse construction ensures that easy and medium questions correspond to
+meaningful components of the original hard task rather than trivial simplifications.
+0
+5720
+11436
+17152
+22856
+28572
+34288
+39996
+RL Training Step
+0
+20
+40
+60
+80
+Cumulative Solve Rate (%)
+Complete Chains
+Disjoint Chains
+(a) Hard curriculum
+0
+5724
+11440
+17156
+22872
+28588
+34292
+39996
+RL Training Step
+0
+20
+40
+60
+80
+Cumulative Solve Rate (%)
+Complete Chains
+Disjoint Chains
+(b) Soft curriculum
+Figure 9 Qwen3-8B Base: Solve rates across easy–medium–hard splits under different curriculum strategies.
+(a) Hard curriculum with abrupt transitions between difficulty levels. (b) Soft curriculum with gradual transitions
+between difficulty levels. Curves depict cumulative solve rates for easy, medium, and hard questions during RL training.
+Solid lines correspond to training on complete easy–medium–hard chains, while dashed lines show the disjoint-chain
+ablation.
+4.2
+Does multi-turn data generation help over single-turn data generation?
+Multi-turn data generation improves both the quality and retention of synthetic problems. By allowing the
+teacher model to iteratively refine previous outputs, we reduce invalid generations caused by formatting
+9
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.260
+0.270
+0.280
+0.290
+0.300
+0.310
+0.320
+LCB Pass@10
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.660
+0.680
+0.700
+0.720
+Math500 Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+AIME2024 Pass@1
+SYNTH* Chains curriculum -- hard
+SYNTH* Disjoint curriculum -- hard
+Qwen 3 8B Base (baseline)
+(a) Hard curriculum: hard transitions between easy–medium–hard splits.
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.260
+0.270
+0.280
+0.290
+0.300
+0.310
+0.320
+LCB Pass@10
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.660
+0.680
+0.700
+0.720
+0.740
+Math500 Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.080
+0.100
+0.120
+0.140
+0.160
+0.180
+AIME2024 Pass@1
+SYNTH* Chains curriculum -- soft
+SYNTH* Disjoint curriculum -- soft
+Qwen 3 8B Base (baseline)
+(b) Soft curriculum: soft transitions between easy–medium–hard splits.
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.260
+0.280
+0.300
+0.320
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.640
+0.660
+0.680
+0.700
+0.720
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.100
+0.110
+0.120
+0.130
+0.140
+0.150
+AIME2024 Pass@1
+SYNTH* Chains - uniform
+SYNTH* Disjoint - uniform
+Qwen 3 8B Base (baseline)
+(c) No curriculum: uniform sampling from easy–medium–hard splits throughout RL training.
+Figure 10 Qwen3-8B Base: RL on chains of easy–medium–hard questions with different curriculum strategies.
+Each row shows a different curriculum setup: (a) hard transitions between difficulty levels, (b) soft transitions, and
+(c) no curriculum (uniform sampling). Results are shown for LCB (in-domain) and Math500, AIME2024 (out-of-domain)
+with pass@1 and pass@10 metrics plotted over RL training steps.
+errors or overly difficult tasks, increasing the fraction of viable problems by approximately fourfold after
+filtering compared to the same number of independent single-turn samples per seed. Beyond this practical
+improvement, multi-turn generation introduces a second, conceptual advantage: it naturally produces stepping
+stones, i.e. progressively refined task variants that can act as intermediate challenges during RL training.
+Hard problems pose a significant exploration challenge under binary rewards, where positive feedback is
+only obtained for fully correct solutions. We therefore test whether the stepping-stone structure induced by
+multi-turn generation helps mitigate this challenge and facilitates more effective learning for RL.
+Building complete chains of easy-medium-hard questions.
+To evaluate whether stepping stones help
+mitigate the hard-exploration challenge, we compare RL training on problem sets with and without explicit
+stepping-stone structure. This process builds on the multi-turn generation pipeline (Sec. 3.3), but reverses the
+direction: rather than generating problems across turns and filtering post-hoc, we start from hard questions
+and explicitly prompt the teacher to produce progressively easier variants, filtering between turns to ensure
+valid difficulty transitions (see Sec. B for details on the filtering). This yields 1012 coherent easy–medium–hard
+question chains (3036 problems total) built around the same underlying task. Some examples are shown in
+Fig. 8. Starting from hard questions ensures that we do not obtain artificially inflated difficulties (e.g. by
+trivially modifying easy questions), and that the generated variants reflect meaningful variations in problem
+10
+complexity.
+In order to isolate the effect of explicit stepping-stone structure, we construct a baseline consisting of disjoint
+easy–medium–hard problems that share the same difficulty distribution as the chained data but are not
+derived from one another. Note that this is a strong baseline, as disjoint problems are drawn from independent
+seeds and thus offer greater overall diversity. In this baseline, the easy, medium, and hard splits are matched
+by their empirical student pass-rate histograms, ensuring comparable difficulty levels across datasets. While
+these problems do not form explicit chains, some implicit skill overlap may still occur, as certain questions
+may target similar problem types.
+To ensure that the easy and medium counterparts are sufficiently reinforced before attempting harder variants,
+we replace uniform sampling across difficulty levels with curriculum-based scheduling. We design two variants:
+(1) Hard curriculum, where transitions between difficulty levels are sharp, i.e. training begins almost exclusively
+on easy tasks, shifts predominantly to medium, and finally focuses on hard tasks. (2) Soft curriculum, where
+easy and medium problems continue to appear throughout training, allowing for smoother transitions and
+mixed exposure. The exact sampling weights for both curricula are provided in Appendix B.1.
+As shown in Fig. 9, training on full chains with explicit stepping stones improves the model’s ability to solve
+medium and hard questions for both curriculum strategies. However, when inspecting downstream benchmark
+performance, we observe nuanced differences across curricula (Fig. 10).
+Although overall differences remain marginal, training with explicit stepping stones yields modest improvements
+under the hard curriculum, while effects under the soft and uniform setups are less consistent, particularly on
+out-of-domain benchmarks.
+Zhang and Zuo (2025) show that for GRPO, if rewards are applied uniformly across problems regardless of
+their difficulty, models end up excessively optimizing simpler tasks while neglecting more challenging problems
+that require deeper reasoning. Similarly, Qu et al. (2026) show that optimization on easier, already-solvable
+problems can actively inhibit progress on harder ones. Echoing their findings, we also find that performance
+is often dominated by the easy split in our experiments, and mixing the splits throughout training hurts
+performance gains.
+In the context of stepping stones, however, this trade-off becomes a double-edged sword. Ideally, the model
+should continue to see the easy and medium variants of hard problems often enough to learn the underlying
+structure before attempting the hardest instances. This effect is evident in Fig. 9, where the soft curriculum,
+which maintains exposure to the easy split later into training, achieves higher solve rates. Yet, mixing
+gradients from problems of varying difficulty can reduce the effectiveness of gradient updates across difficulty
+levels, resulting in solve-rate improvements that do not translate into downstream gains. Overall, these
+results suggest that while explicit stepping stones offer mild benefits, their effectiveness depends strongly on
+curriculum design and the balance of rewards across difficulty levels.
+Takeaway
+Multi-turn generation introduces intermediate problem variants that can marginally improve learning
+under structured curricula. Their benefit is most evident with hard curricula, while mixed-difficulty
+training can limit these gains by creating interference across tasks.
+4.3
+How much does the difficulty of questions matter for RL?
+So far, we have operated under the assumption that solving harder questions provides a more valuable
+learning signal than solving easier ones. We test this hypothesis by examining how question difficulty shapes
+RL dynamics. Instead of using mixed chains of 3036 questions across difficulty levels (easy, medium, hard;
+1012 each), we train models exclusively on questions from a single difficulty level (3036 per difficulty level)
+(Fig. 11). Training on easy questions yields early gains and faster convergence, as expected. However, training
+on medium questions achieves comparable or better overall performance despite slightly slower convergence.
+Notably, models trained on medium-level questions perform better on the LCBv5-medium and LCBv5-hard
+splits. This suggests that the apparent early gains from easy questions may reflect overfitting to simpler
+problem types. Training on the hard split, in contrast, results in much slower convergence due to the sparsity
+11
+0
+10K
+20K
+30K
+Training Steps
+0.180
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.640
+0.660
+0.680
+0.700
+0.720
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.260
+0.280
+0.300
+0.320
+0.340
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.810
+0.820
+0.830
+0.840
+0.850
+0.860
+0.870
+Math500 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.675
+0.700
+0.725
+0.750
+0.775
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.260
+0.280
+0.300
+0.320
+0.340
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.030
+0.035
+0.040
+0.045
+0.050
+lcb_codegen_hard/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.780
+0.800
+0.820
+0.840
+0.860
+0.880
+lcb_codegen_easy/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.380
+0.400
+0.420
+0.440
+0.460
+0.480
+lcb_codegen_medium/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.040
+0.050
+0.060
+0.070
+0.080
+0.090
+0.100
+lcb_codegen_hard/pass@10
+SYNTH* Chains - uniform
+SYNTH easy only
+SYNTH medium only
+SYNTH hard only
+Qwen 3 8B Base (baseline)
+Figure 11 Qwen3-8B Base: RL on easy, medium, hard splits. Comparison of RL training when restricted to questions
+of a single difficulty level (3036 per level) across easy, medium, and hard subsets, with the uniform chain baseline (3036
+total, 1012 per level) for reference. Performance shown on in-domain (code: LCB) and out-of-domain (math: Math500,
+AIME2024) benchmarks across 3 seeds.
+of positive rewards. Although models trained on hard questions remain competitive on out-of-domain math
+benchmarks, their performance lags behind on LCB. These results highlight the importance of training on
+non-trivial problems that still provide a dense enough learning signal for effective RL optimization.
+12
+Takeaway
+Training on medium-level questions offers the best balance between convergence speed and generalization,
+while easy questions risk overfitting and hard ones suffer from sparse rewards.
+4.4
+Does the curriculum matter?
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+LCB Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.640
+0.660
+0.680
+0.700
+0.720
+0.740
+Math500 Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+0.180
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.260
+0.280
+0.300
+0.320
+0.340
+LCB Pass@10
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.830
+0.840
+0.850
+0.860
+0.870
+Math500 Pass@5
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.675
+0.700
+0.725
+0.750
+0.775
+0.800
+0.825
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.225
+0.250
+0.275
+0.300
+0.325
+0.350
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.030
+0.035
+0.040
+0.045
+0.050
+0.055
+lcb_codegen_hard/pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.775
+0.800
+0.825
+0.850
+0.875
+0.900
+lcb_codegen_easy/pass@10
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.300
+0.350
+0.400
+0.450
+0.500
+lcb_codegen_medium/pass@10
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.060
+0.070
+0.080
+0.090
+0.100
+lcb_codegen_hard/pass@10
+REAL 25K
+Classic curriculum
+Uniform
+Reverse curriculum [medium start]
+Qwen 3 8B Base (baseline)
+Figure 12 Comparing different curriculum strategies in Qwen3-8B Base. The figure compares RL training with
+different curriculum strategies over extended difficulty splits (easy, easy–medium, medium, hard). Curves show pass@1
+and pass@10 on the in-domain benchmark (LCB, including LCBv5-easy, medium, and hard splits) and pass@1 and
+pass@5 on the out-of-domain benchmarks (Math500, AIME2024), averaged across three seeds. Reverse curricula starting
+from medium-level questions mitigate overfitting to easy tasks and maintain stronger performance on harder splits.
+13
+As observed in our earlier experiments with stepping-stones, the choice of curriculum can influence RL
+dynamics, although the performance differences were not always significant. Here, we further investigate the
+extent to which the curriculum schedule affects training outcomes.
+In these experiments, we expand the dataset by adopting a broader binning for easy, medium, and hard
+questions. To retain more data, we do not homogenize the number of examples per split.
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+LCB Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.660
+0.680
+0.700
+0.720
+0.740
+Math500 Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.260
+0.280
+0.300
+0.320
+0.340
+LCB Pass@10
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.830
+0.840
+0.850
+0.860
+0.870
+Math500 Pass@5
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.675
+0.700
+0.725
+0.750
+0.775
+0.800
+0.825
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.220
+0.240
+0.260
+0.280
+0.300
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.030
+0.035
+0.040
+0.045
+0.050
+0.055
+lcb_codegen_hard/pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.775
+0.800
+0.825
+0.850
+0.875
+0.900
+0.925
+lcb_codegen_easy/pass@10
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.300
+0.350
+0.400
+0.450
+lcb_codegen_medium/pass@10
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.060
+0.070
+0.080
+0.090
+0.100
+lcb_codegen_hard/pass@10
+Classic curriculum
+Reverse curriculum [hard start]
+Reverse curriculum [medium start]
+Qwen 3 8B Base (baseline)
+Figure 13 Reversed curriculum experiments in Qwen3-8B Base. The figure compares RL training with different
+reverse curriculum strategies over extended difficulty splits (easy, easy–medium, medium, hard). We evaluate two
+variants: starting with the medium split (“medium-start”) and starting with the hard split (“hard-start”). Curves show
+pass@1 and pass@10 on the in-domain benchmark (LCB, including LCBv5-easy, medium, and hard splits) and pass@1
+and pass@5 on the out-of-domain benchmarks (Math500, AIME2024), averaged across three seeds. The medium-start
+reverse curriculum shows faster convergence and lower variance across seeds compared to the hard-start variant.
+14
+We test the following hypothesis: conventional curricula typically progress from easier to harder problems
+(easy →medium →hard). However, as the model’s entropy naturally decreases during RL training, starting
+with easy problems may waste exploration capacity on tasks that the model can already solve, potentially
+reducing its ability to solve harder questions later.
+Motivated by this intuition, we evaluate a reverse
+curriculum, in which training proceeds from harder to easier problems (hard →medium →easy). Given that
+medium-level questions previously showed strong generalization performance (Fig. 11), we also experiment
+with a medium-start reverse curriculum (medium →easy-medium). Exact sampling schedules for all curricula
+are provided in Table 4. The difficulty bins and corresponding data sizes are summarized in Table 3 (see
+Appendix Sec. C).
+Results in Fig. 12 show that: (1) uniform sampling across difficulty levels is suboptimal, as performance is
+largely driven by the easy split; (2) the classic curriculum yields faster convergence and stronger performance
+on easier problems, but tends to underperform on more challenging splits; and (3) the reverse curriculum
+achieves a more balanced outcome, improving stability and yielding higher scores on LCBv5-medium, though
+gains on LCBv5-hard remain limited. These findings suggest that reversing the curriculum order can help
+maintain exploration and prevent overfitting to trivial cases without sacrificing convergence speed. Notably,
+in the medium-start reverse curriculum: once the training transitions towards the easy–medium split (after
+∼20K steps), both medium and hard performance begin to plateau, and in some cases degrade slightly. This
+suggests that while reverse curricula help maintain exploration early on, continued exposure to easier tasks
+later in training may again bias optimization toward simpler problems.
+We also evaluate a reverse curriculum that starts directly from the hard split, which poses a challenging
+exploration problem early in training (Fig. 13). This setup leads to slightly slower convergence compared to
+the medium-start variant, as the model initially struggles to obtain positive rewards on the hardest problems.
+More notably, we observe substantially higher variance across random seeds, reflecting the sensitivity of early
+learning to rare successful samples when rewards are sparse. These results suggest that while reverse curricula
+can encourage exploration, beginning from excessively difficult tasks may destabilize optimization.
+Takeaway
+Uniform and classic curricula tend to overfit to easy-level questions. Reverse curricula that begin from
+medium tasks encourage broader exploration and more stable learning, though their advantage over
+training solely on medium-level data requires further investigation.
+4.5
+How does environment diversity affect RL performance?
+So far, we have seen that increasing data diversity improves performance. The gains observed from synthetic
+data augmentation can also be viewed as a form of diversity injection: although the induction environment
+shares the core principles of typical coding puzzles, it differs in input–output structure and question templates.
+We now ask: given a fixed RL problem budget, is it more beneficial to allocate it entirely to one environment
+with sufficient internal diversity, or to distribute it across multiple environments to introduce structural
+variation? To test this, we compare two settings: (1) RL training on 20K problems from the induction
+environment, and (2) training on 5K problems each from four distinct environments: induction, abduction,
+deduction, and fuzzing.
+As shown in Fig. 14, distributing the data budget across environments yields significant improvements on
+out-of-domain benchmarks. Even in in-domain evaluations, where pass@1 slightly lags behind the single-
+environment baseline, the multi-environment setup surpasses it in pass@10. Notably, unlike pure induction
+training, we observe no overfitting on the easy split, which otherwise harms performance on medium. The
+same trends hold when compared to RL training on 25K real code-contest questions (Fig. 23). Fig. 15 shows
+a similar trend for Llama3.1-8B Instruct: training on 20K problems distributed across the four environments
+outperforms RL on 25K real code-contest questions, with higher out-of-domain generalization and improved
+pass@10 scores on LCB.
+15
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.660
+0.680
+0.700
+0.720
+0.740
+0.760
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+0.180
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.260
+0.280
+0.300
+0.320
+0.340
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.820
+0.840
+0.860
+0.880
+Math500 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+0.300
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.675
+0.700
+0.725
+0.750
+0.775
+0.800
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.240
+0.260
+0.280
+0.300
+0.320
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.030
+0.035
+0.040
+0.045
+0.050
+lcb_codegen_hard/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.775
+0.800
+0.825
+0.850
+0.875
+0.900
+lcb_codegen_easy/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.350
+0.400
+0.450
+lcb_codegen_medium/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.060
+0.070
+0.080
+0.090
+0.100
+lcb_codegen_hard/pass@10
+SYNTH* Induction 20K
+SYNTH* Envs[x4] 20K
+Qwen 3 8B Base (baseline)
+Figure 14 Scaling the number of RL environments in Qwen3-8B Base. The figure compares RL training on 20K
+synthetic problems from a single environment (induction) with training on an equal total of 20K synthetic problems
+distributed across four environments: induction, abduction, deduction, and fuzzing. Curves show pass@1 and
+pass@10 on in-domain (LCB) and pass@1 and pass@5 out-of-domain (Math500, AIME2024) benchmarks throughout RL
+training. Distributing the data budget across environments improves out-of-domain generalization and yields higher
+pass@10 scores in-domain, while reducing overfitting on the easy split.
+Takeaway
+The number of RL environments can be viewed as an additional scaling axis:
+• Our experiments show that the diversity injected via increasing the number of RL environments
+leads to performance gains in pass@k scores, with less overfitting on easy tasks in LCBv5.
+• Different environments can target/aid different skill sets, as shown in our improved performance on
+out-of-domain math benchmarks when training across multiple environments.
+16
+0
+10K
+20K
+30K
+Training Steps
+0.060
+0.080
+0.100
+0.120
+0.140
+0.160
+0.180
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.420
+0.440
+0.460
+0.480
+0.500
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.060
+0.080
+0.100
+0.120
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.120
+0.140
+0.160
+0.180
+0.200
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.630
+0.640
+0.650
+0.660
+0.670
+Math500 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.120
+0.140
+0.160
+0.180
+0.200
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.250
+0.300
+0.350
+0.400
+0.450
+0.500
+0.550
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.040
+0.050
+0.060
+0.070
+0.080
+0.090
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.010
+0.015
+0.020
+0.025
+lcb_codegen_hard/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.350
+0.400
+0.450
+0.500
+0.550
+0.600
+lcb_codegen_easy/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.080
+0.090
+0.100
+0.110
+0.120
+0.130
+lcb_codegen_medium/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.015
+0.020
+0.025
+0.030
+lcb_codegen_hard/pass@10
+REAL 25K
+SYNTH* Envs[x4] 20K
+Llama 3.1 8B Instruct (baseline)
+Figure 15 Scaling the number of RL environments in Llama3.1-8B Instruct compared to real data. The figure
+compares RL training on 25K real code-contest problems with training on a total of 20K synthetic problems distributed
+across four environments: induction, abduction, deduction, and fuzzing. Curves show pass@1 and pass@10 on the
+in-domain benchmark (LCB) and pass@1 and pass@5 on out-of-domain benchmarks (Math500, AIME2024) throughout RL
+training. Despite using less data, training across multiple synthetic environments improves out-of-domain generalization
+and yields higher in-domain pass@10 scores compared to real-only training.
+5
+Discussion
+Our experiments highlight several factors that influence the effectiveness of RL fine-tuning in the coding
+domain. First, synthetic augmentation of real coding problems consistently improves both convergence speed
+and final performance. The gains stem not merely from additional data but from the diversity introduced
+17
+by varying input–output structures and templates. Synthetic data generated from random starcoderdata
+snippets perform comparably to those seeded with real questions, underscoring the importance of diversity.
+When used alone, synthetic RL problems remain competitive, though their difficulty distribution requires
+explicit control to avoid overfitting on easy problems.
+Second, multi-turn data generation provides an additional advantage by increasing the proportion of valid
+problems generated and implicitly introducing intermediate problem variants that can serve as stepping stones
+during RL. While these stepping stones offer modest benefits under structured curricula, their impact depends
+strongly on how difficulty levels are mixed during training. Hard curricula benefit most, whereas excessive
+interleaving of easy and hard problems introduces interference that weakens the benefits of stepping stones.
+Third, our results show that problem difficulty and curriculum design jointly determine the efficiency of
+RL optimization: training on medium-level problems offers the best balance between convergence speed and
+generalization, while easy problems lead to overfitting and hard ones suffer from sparse rewards. Results
+indicate that the apparent early gains from easy problems in RL data mixes provide limited long-term benefit
+and may even hinder generalization. Reverse curricula that begin from medium tasks mitigate early overfitting,
+though their advantage over training solely on medium-level data requires further investigation.
+Finally, we find that scaling the number of RL environments serves as a complementary axis of improvement.
+Distributing the data budget across diverse environments (induction, abduction, deduction, fuzzing)
+improves out-of-domain generalization and reduces overfitting on easy in-domain splits. These results suggest
+that environment diversity can play a role comparable to data scale in shaping robust RL behavior.
+References
+Sanghwan Bae, Jiwoo Hong, Min Young Lee, Hanbyul Kim, JeongYeon Nam, and Donghyun Kwak. Online difficulty
+filtering for reasoning oriented reinforcement learning. arXiv preprint arXiv:2504.03380, 2025.
+Jade Copet, Quentin Carbonneaux, Gal Cohen, Jonas Gehring, Jacob Kahn, Jannik Kossen, Felix Kreuk, Emily
+McMilin, Michel Meyer, Yuxiang Wei, et al. Cwm: An open-weights llm for research on code generation with world
+models. arXiv preprint arXiv:2510.02387, 2025.
+Ganqu Cui, Yuchen Zhang, Jiacheng Chen, Lifan Yuan, Zhi Wang, Yuxin Zuo, Haozhan Li, Yuchen Fan, Huayu Chen,
+Weize Chen, et al. The entropy mechanism of reinforcement learning for reasoning language models. arXiv preprint
+arXiv:2505.22617, 2025.
+Kefan Dong and Tengyu Ma. Stp: Self-play llm theorem provers with iterative conjecturing and proving. arXiv
+preprint arXiv:2502.00212, 2025.
+Sébastien Forestier, Rémy Portelas, Yoan Mollard, and Pierre-Yves Oudeyer. Intrinsically motivated goal exploration
+processes with automatic curriculum learning. Journal of Machine Learning Research, 23(152):1–41, 2022. http:
+//jmlr.org/papers/v23/21-0808.html.
+Anna Goldie, Azalia Mirhoseini, Hao Zhou, Irene Cai, and Christopher D Manning. Synthetic data generation &
+multi-step rl for reasoning & tool use. arXiv preprint arXiv:2504.04736, 2025.
+Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha
+Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al.
+The llama 3 herd of models.
+arXiv preprint
+arXiv:2407.21783, 2024.
+Yiduo Guo, Zhen Guo, Chuanwei Huang, Zi-Ang Wang, Zekai Zhang, Haofei Yu, Huishuai Zhang, and Yikang Shen.
+Synthetic data rl: Task definition is all you need. arXiv preprint arXiv:2505.17063, 2025.
+Alex Havrilla, Edward Hughes, Mikayel Samvelyan, and Jacob D Abernethy. Sparq: Synthetic problem generation for
+reasoning via quality-diversity algorithms. CoRR, 2025.
+Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn Song, and Ja-
+cob Steinhardt.
+Measuring mathematical problem solving with the math dataset.
+In J. Vanschoren and
+S. Yeung, editors, Proceedings of the Neural Information Processing Systems Track on Datasets and Bench-
+marks, volume 1, 2021.
+https://datasets-benchmarks-proceedings.neurips.cc/paper_files/paper/2021/
+file/be83ab3ecd0db773eb2dc1b0a17836a1-Paper-round2.pdf.
+18
+Naman Jain, King Han, Alex Gu, Wen-Ding Li, Fanjia Yan, Tianjun Zhang, Sida Wang, Armando Solar-Lezama,
+Koushik Sen, and Ion Stoica. Livecodebench: Holistic and contamination free evaluation of large language models
+for code. arXiv preprint arXiv:2403.07974, 2024.
+Minqi Jiang, João GM Araújo, Will Ellsworth, Sian Gooding, and Edward Grefenstette. Generative data refinement:
+Just ask for better data. arXiv preprint arXiv:2509.08653, 2025.
+Kimi Team, Angang Du, Bofei Gao, Bowei Xing, Changjiu Jiang, C Chen, C Li, C Xiao, C Du, C Liao, et al. Kimi k1.
+5: Scaling reinforcement learning with llms, 2025. URL https://arxiv. org/abs/2501.12599, 2025.
+Xiao Liang, Zhong-Zhi Li, Yeyun Gong, Yang Wang, Hengyuan Zhang, Yelong Shen, Ying Nian Wu, and Weizhu
+Chen. Sws: Self-aware weakness-driven problem synthesis in reinforcement learning for llm reasoning. arXiv preprint
+arXiv:2506.08989, 2025.
+Zi Lin, Sheng Shen, Jingbo Shang, Jason Weston, and Yixin Nie. Learning to solve and verify: A self-play framework
+for code and test generation. arXiv preprint arXiv:2502.14948, 2025.
+Pulkit Pattnaik, Rishabh Maheshwary, Kelechi Ogueji, Vikas Yadav, and Sathwik Tejaswi Madhusudhan. Curry-dpo:
+Enhancing alignment using curriculum learning & ranked preferences. arXiv preprint arXiv:2403.07230, 2024.
+Gabriel Poesia, David Broman, Nick Haber, and Noah Goodman.
+Learning formal mathematics from intrinsic
+motivation. Advances in Neural Information Processing Systems, 37:43032–43057, 2024.
+Yuxiao Qu, Amrith Setlur, Virginia Smith, Ruslan Salakhutdinov, and Aviral Kumar. Pope: Learning to reason on
+hard problems via privileged on-policy exploration. arXiv preprint arXiv:2601.18779, 2026.
+Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang, YK Li,
+Yang Wu, et al. Deepseekmath: Pushing the limits of mathematical reasoning in open language models. arXiv
+preprint arXiv:2402.03300, 2024.
+Zhenting Wang, Guofeng Cui, Yu-Jhe Li, Kun Wan, and Wentian Zhao.
+Dump: Automated distribution-level
+curriculum learning for rl-based llm post-training. arXiv preprint arXiv:2504.09710, 2025.
+Yuxiang Wei, Zhe Wang, Jiawei Liu, Yifeng Ding, and Lingming Zhang. Magicoder: Empowering code generation with
+oss-instruct. arXiv preprint arXiv:2312.02120, 2023.
+Zhiheng Xi, Wenxiang Chen, Boyang Hong, Senjie Jin, Rui Zheng, Wei He, Yiwen Ding, Shichun Liu, Xin Guo, Junzhe
+Wang, et al. Training large language models for reasoning through reverse curriculum reinforcement learning. arXiv
+preprint arXiv:2402.05808, 2024.
+Tian Xie, Zitian Gao, Qingnan Ren, Haoming Luo, Yuqian Hong, Bryan Dai, Joey Zhou, Kai Qiu, Zhirong Wu,
+and Chong Luo.
+Logic-rl: Unleashing llm reasoning with rule-based reinforcement learning.
+arXiv preprint
+arXiv:2502.14768, 2025.
+An Yang, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chengyuan Li, Dayiheng Liu, Fei Huang,
+et al. Qwen2.5 technical report. arXiv:2412.15115, 2024.
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang,
+Chenxu Lv, et al. Qwen3 technical report. arXiv preprint arXiv:2505.09388, 2025.
+Ziyu Ye, Rishabh Agarwal, Tianqi Liu, Rishabh Joshi, Sarmishta Velury, Qijun Tan, and Yuan Liu. Evolving alignment
+via asymmetric self-play, 2025. https://openreview.net/forum?id=TMYe4rUuTc.
+Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo, Yu Yue, Weinan Dai, Tiantian Fan, Gaohong Liu,
+Lingjun Liu, et al. Dapo: An open-source llm reinforcement learning system at scale. arXiv preprint arXiv:2503.14476,
+2025.
+Jixiao Zhang and Chunsheng Zuo. Grpo-lead: A difficulty-aware reinforcement learning approach for concise mathe-
+matical reasoning in language models. arXiv preprint arXiv:2504.09696, 2025.
+Andrew Zhao, Yiran Wu, Yang Yue, Tong Wu, Quentin Xu, Matthieu Lin, Shenzhi Wang, Qingyun Wu, Zilong Zheng,
+and Gao Huang. Absolute zero: Reinforced self-play reasoning with zero data. arXiv preprint arXiv:2505.03335,
+2025.
+Yifei Zhou, Sergey Levine, Jason Weston, Xian Li, and Sainbayar Sukhbaatar. Self-challenging language model agents.
+arXiv preprint arXiv:2506.01716, 2025.
+19
+A
+Extended Results for RL with Synthetic Data
+Here, we provide extended results for the synthetic data experiments discussed in Section 4.1. Figure 16–Fig-
+ure 17 show detailed in-domain and out-of-domain performance for augmentations seeded with real questions
+and random code snippets, respectively, while Figure 18 compares RL training using purely synthetic datasets.
+Figure 19 further contrasts scaling real data (25K vs. 81K problems) with augmenting real data using 20K
+synthetic problems, showing that synthetic augmentation can outperform even the larger real-data baseline.
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.640
+0.660
+0.680
+0.700
+0.720
+0.740
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+0.180
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.280
+0.300
+0.320
+0.340
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.820
+0.830
+0.840
+0.850
+0.860
+0.870
+Math500 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.700
+0.750
+0.800
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.250
+0.300
+0.350
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.030
+0.035
+0.040
+0.045
+0.050
+0.055
+lcb_codegen_hard/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.775
+0.800
+0.825
+0.850
+0.875
+0.900
+lcb_codegen_easy/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.300
+0.350
+0.400
+0.450
+0.500
+lcb_codegen_medium/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.060
+0.070
+0.080
+0.090
+0.100
+lcb_codegen_hard/pass@10
+REAL 25K
+REAL 25K + SYNTH-Real-Aug 20K
+SYNTH-Real-Aug 20K
+Qwen 3 8B Base (baseline)
+Figure 16 RL with synthetic data augmentation seeded from real problems in Qwen3-8B Base. RL training on
+25K real code-contest questions (baseline) versus the same data augmented with 20K synthetic induction problems
+generated using real questions as inspiration seeds (Real 25K + SYNTH-Real-Aug 20K), as well as training solely on
+the synthetic partition (SYNTH-Real-Aug 20K). Performance shown on in-domain (LCB) and out-of-domain (Math500,
+AIME2024) benchmarks.
+20
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.625
+0.650
+0.675
+0.700
+0.725
+0.750
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+0.180
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.800
+0.820
+0.840
+0.860
+Math500 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.180
+0.200
+0.220
+0.240
+0.260
+0.280
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.700
+0.750
+0.800
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.240
+0.260
+0.280
+0.300
+0.320
+0.340
+0.360
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.030
+0.035
+0.040
+0.045
+0.050
+lcb_codegen_hard/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.800
+0.825
+0.850
+0.875
+0.900
+0.925
+lcb_codegen_easy/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.350
+0.400
+0.450
+0.500
+lcb_codegen_medium/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.060
+0.070
+0.080
+0.090
+0.100
+lcb_codegen_hard/pass@10
+REAL 25K
+REAL 25K + SYNTH* Induction 20K
+SYNTH* Induction 20K
+Qwen 3 8B Base (baseline)
+Figure 17 RL with synthetic data augmentation seeded from random code snippets in Qwen3-8B Base. RL
+training on 25K real code-contest questions (baseline) versus the same data augmented with 20K synthetic induction
+problems generated using random snippets from starcoderdata (Real 25K + SYNTH* Induction 20K), as well as
+training solely on the synthetic partition (SYNTH* Induction 20K). Performance shown on in-domain (LCB) and
+out-of-domain (Math500, AIME2024) benchmarks.
+21
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.640
+0.660
+0.680
+0.700
+0.720
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.090
+0.100
+0.110
+0.120
+0.130
+0.140
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.280
+0.300
+0.320
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.820
+0.830
+0.840
+0.850
+0.860
+Math500 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.210
+0.220
+0.230
+0.240
+0.250
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.675
+0.700
+0.725
+0.750
+0.775
+0.800
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+0.300
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.030
+0.035
+0.040
+0.045
+0.050
+0.055
+lcb_codegen_hard/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.775
+0.800
+0.825
+0.850
+0.875
+0.900
+lcb_codegen_easy/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.300
+0.350
+0.400
+0.450
+lcb_codegen_medium/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.060
+0.070
+0.080
+0.090
+lcb_codegen_hard/pass@10
+SYNTH* Induction 20K
+SYNTH-Real-Aug 20K
+Qwen 3 8B Base (baseline)
+Figure 18
+RL with pure synthetic data in Qwen3-8B Base. Instead of augmenting the 25K real code-contest
+questions, RL is performed solely on synthetic induction problems generated with two seeding strategies: (1) real
+questions as inspiration seeds (SYNTH-Real-Aug), and (2) random code snippets from starcoderdata (SYNTH*-Aug, 3
+seeds).
+22
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.625
+0.650
+0.675
+0.700
+0.725
+0.750
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+0.180
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.280
+0.300
+0.320
+0.340
+0.360
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.800
+0.820
+0.840
+0.860
+Math500 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.180
+0.200
+0.220
+0.240
+0.260
+0.280
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.700
+0.750
+0.800
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.260
+0.280
+0.300
+0.320
+0.340
+0.360
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.030
+0.035
+0.040
+0.045
+0.050
+lcb_codegen_hard/pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.775
+0.800
+0.825
+0.850
+0.875
+0.900
+0.925
+lcb_codegen_easy/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.400
+0.420
+0.440
+0.460
+0.480
+0.500
+0.520
+lcb_codegen_medium/pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.060
+0.070
+0.080
+0.090
+0.100
+lcb_codegen_hard/pass@10
+REAL 25K
+REAL 81K
+REAL 25K + SYNTH* Induction 20K
+Qwen 3 8B Base (baseline)
+Figure 19 Scaling with real data vs. synthetic augmentation in Qwen3-8B Base. Comparison of RL training on
+25K and 81K real code-contest problems, and on 25K real data augmented with 20K synthetic problems generated
+from random starcoderdata snippets (Real 25K + SYNTH*-Aug 20K). Performance is shown on in-domain (LCB) and
+out-of-domain (Math500 and AIME2024) benchmarks throughout training. Synthetic augmentation yields additional
+gains over the 81K real-data baseline across all LCB splits except medium.
+23
+B
+Stepping Stones with Easy-Medium-Hard Chains
+To construct the easy, medium, and hard categories used for building question chains, we bin problems
+according to their empirical student pass rates, computed over 32 solution attempts per problem. Problems
+with average pass rates in the range 0.81–0.91 are labeled as easy, those between 0.41–0.59 as medium, and
+those between 0.05–0.16 as hard. These thresholds ensure a clear separation between difficulty levels.
+B.1
+Curriculum Strategies for Easy–Medium–Hard Chains
+We provide details of the hard and soft curriculum strategies used in Sec. 4.2 and Fig. 10. Sampling probabilities
+for easy, medium, and hard tasks in the soft and hard curricula are listed below.
+Table 2 Sampling weights across training stages for soft and hard curricula.
+Stage (RL steps)
+Easy
+Medium
+Hard
+Soft curriculum
+0–7,500
+0.80
+0.15
+0.05
+7,500–17,500
+0.15
+0.80
+0.05
+17,500–30,000
+0.15
+0.40
+0.45
+30,000–40,000
+0.05
+0.15
+0.80
+Hard curriculum
+0–7,500
+0.90
+0.05
+0.05
+7,500–17,500
+0.05
+0.90
+0.05
+17,500–40,000
+0.05
+0.05
+0.90
+B.2
+Extended Results
+We provide extended results for the curriculum experiments in Qwen3-8B Base with the full vs. disjoint chains,
+showing detailed performance across in-domain (LCB) and out-of-domain (Math500, AIME2024) benchmarks
+for hard (Fig. 20), soft (Fig. 21), and uniform sampling (Fig. 22) strategies.
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.660
+0.680
+0.700
+0.720
+Math500 Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.260
+0.270
+0.280
+0.290
+0.300
+0.310
+0.320
+LCB Pass@10
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.830
+0.840
+0.850
+0.860
+0.870
+Math500 Pass@5
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.675
+0.700
+0.725
+0.750
+0.775
+0.800
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.260
+0.270
+0.280
+0.290
+0.300
+0.310
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.025
+0.030
+0.035
+0.040
+0.045
+0.050
+lcb_codegen_hard/pass@1
+SYNTH* Chains curriculum -- hard
+SYNTH* Disjoint curriculum -- hard
+Qwen 3 8B Base (baseline)
+Figure 20 Chains with hard curriculum in Qwen3-8B Base. Extended results for RL training on easy–medium–hard
+question chains using the hard curriculum schedule. Shown are in-domain results (LCB, including easy, medium, and
+hard splits) and out-of-domain results (Math500, AIME2024) with pass@1, pass@5/pass@10 metrics plotted over RL
+training steps.
+24
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.660
+0.680
+0.700
+0.720
+0.740
+Math500 Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.080
+0.100
+0.120
+0.140
+0.160
+0.180
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.260
+0.270
+0.280
+0.290
+0.300
+0.310
+0.320
+LCB Pass@10
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.820
+0.830
+0.840
+0.850
+0.860
+Math500 Pass@5
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+AIME2024 Pass@5
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.675
+0.700
+0.725
+0.750
+0.775
+0.800
+lcb_codegen_easy/pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.260
+0.280
+0.300
+0.320
+lcb_codegen_medium/pass@1
+0
+10K
+20K
+30K
+40K
+Training Steps
+0.030
+0.035
+0.040
+0.045
+0.050
+lcb_codegen_hard/pass@1
+SYNTH* Chains curriculum -- soft
+SYNTH* Disjoint curriculum -- soft
+Qwen 3 8B Base (baseline)
+Figure 21 Chains with soft curriculum in Qwen3-8B Base. Extended results for RL training on easy–medium–hard
+question chains using the soft curriculum schedule. Performance is reported for LCB (easy, medium, hard splits) and
+out-of-domain benchmarks (Math500, AIME2024) with pass@1, pass@5/pass@10 metrics over training steps.
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.640
+0.660
+0.680
+0.700
+0.720
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.100
+0.110
+0.120
+0.130
+0.140
+0.150
+AIME2024 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.260
+0.280
+0.300
+0.320
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.810
+0.820
+0.830
+0.840
+0.850
+0.860
+Math500 Pass@5
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+0.280
+AIME2024 Pass@5
+SYNTH* Chains - uniform
+SYNTH* Disjoint - uniform
+Qwen 3 8B Base (baseline)
+Figure 22 Chains without curriculum in Qwen3-8B Base. Extended results for RL training on easy–medium–hard
+question chains under uniform sampling across difficulty levels. Plots show in-domain (LCB) and out-of-domain
+(Math500, AIME2024) performance, including easy, medium, and hard splits, with pass@1, pass@5/pass@10 metrics
+over RL training steps.
+C
+Curriculum Experiments with Broader Difficulty Bins
+We extend our curriculum analysis by adopting broader difficulty bins to retain more data per split and
+reduce boundary effects between difficulty levels. The corresponding pass-rate thresholds and dataset sizes
+25
+Table 3 Difficulty bins and data split sizes used in curriculum experiments.
+Difficulty
+Pass Rate Range
+Number of Problems
+easy
+0.85–0.97
+10000
+easy–medium
+0.61–0.85
+7479
+medium
+0.26–0.61
+5268
+hard
+0.10–0.26
+2220
+are summarized in Table 3. This configuration allows us to test different curriculum strategies when difficulty
+granularity is relaxed, providing a more data-efficient setup for large-scale RL experiments.
+Sampling weights for the different curriculum strategies are shown in Table 4.
+Table 4 Sampling weights across training stages for classic and reverse curricula. The reverse (medium→easy) setup
+uses the easy–medium split instead of the standard easy bin.
+Stage (RL steps)
+Easy
+Medium
+Hard
+Easy Split Used
+Classic curriculum (Easy→Medium→Hard)
+0–10,000
+1.00
+0.00
+0.00
+easy
+10,000–15,000
+0.75
+0.25
+0.00
+easy
+15,000–25,000
+0.00
+1.00
+0.00
+easy
+25,000–30,000
+0.00
+0.75
+0.25
+easy
+30,000–40,000
+0.00
+0.00
+1.00
+easy
+Reverse curriculum (Hard→Medium→Easy)
+0–10,000
+0.00
+0.00
+1.00
+easy
+10,000–15,000
+0.00
+0.25
+0.75
+easy
+15,000–25,000
+0.00
+1.00
+0.00
+easy
+25,000–30,000
+0.25
+0.75
+0.00
+easy
+30,000–40,000
+1.00
+0.00
+0.00
+easy
+Reverse curriculum (Medium→Easy)
+0–17,500
+0.00
+1.00
+0.00
+easy–medium
+17,500–20,000
+0.25
+0.75
+0.00
+easy–medium
+20,000–40,000
+1.00
+0.00
+0.00
+easy–medium
+D
+Scaling Number of RL Environments
+0
+10K
+20K
+30K
+Training Steps
+0.200
+0.220
+0.240
+0.260
+LCB Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.260
+0.280
+0.300
+0.320
+0.340
+LCB Pass@10
+0
+10K
+20K
+30K
+Training Steps
+0.660
+0.680
+0.700
+0.720
+0.740
+0.760
+Math500 Pass@1
+0
+10K
+20K
+30K
+Training Steps
+0.100
+0.120
+0.140
+0.160
+0.180
+AIME2024 Pass@1
+REAL 25K
+SYNTH* Induction 20K
+SYNTH* Envs[x4] 20K
+Qwen 3 8B Base (baseline)
+Figure 23 Scaling RL environments with real-data baseline in Qwen3-8B Base. Comparison of RL training on
+20K problems from a single environment (induction), 20K problems distributed across four environments (induction,
+abduction, deduction, fuzzing), and the 25K real code-contest baseline. Shown are in-domain results (LCB, pass@1
+and pass@10) and out-of-domain results (Math500, AIME2024, pass@1). Distributing the data budget across multiple
+environments improves out-of-domain generalization and results in competitive or higher (in terms of pass@10)
+in-domain performance compared to the real-data baseline.
+26
+E
+RL Training Details
+We use the same asynchronous RL infrastructure as Copet et al. (2025). We use G = 8 samples per prompt
+for GRPO with no KL regularization (β = 0) and a sampling temperature of 1.0 during training (0.2 at
+evaluation). After an initial linear warmup over 800 steps (400 for Qwen2.5-32B Base), we use a constant
+learning rate of 6 × 10−8 for Llama3.1-8B Instruct and Qwen2.5-32B Base, and 1.4 × 10−7 for Qwen3-8B Base.
+We adopt a higher upper clipping value (εlow = 0.2, εhigh = 0.25) to mitigate entropy collapse (Yu et al.,
+2025). For evaluation, we generate 20 samples per problem on LCB, 10 on Math500, and 64 on AIME2024. All
+experiments are run on 4 nodes of 8× NVIDIA H100 GPUs.
+F
+Qualitative Example of In-Context Learning
+The teacher is shown the question generated in the previous round (turn 1), where the student manages to
+solve the question in all attempts.
+For turn 2, the teacher is asked to produce a problem of intermediate difficulty. The newly generated problem
+in turn 2 now has a student pass rate of 0.625.
+We show the prompt for the teacher in turn 2, as well as the teacher’s response including key excerpts from
+its reasoning.
+Turn 2 — Teacher Prompt
+Task Description
+## Task: Mutate Python Code Snippet Based on Student Responses to Previous Challenge and Create a New
+Challenge
+You've already created a coding challenge, and students have
+attempted to solve it.
+Now, design a new transformed problem that builds upon your
+previous challenge while addressing the strengths and weaknesses
+demonstrated in student responses.
+First, carefully analyze student responses to your previous
+challenge, then devise a clear plan for your new function with an
+adjusted level of difficulty. Identify how your proposed inputs
+have high coverage and why the inputs will be challenging and
+creative. Then, write the code, inputs, and message. Remember to
+wrap your inputs in ```input``` tags, and your message in
+```message``` tags.
+Previous Code, Input-Output Pairs and Message (Turn 1)
+```python
+def f(resources: dict, timeout: int) -> bool:
+"""
+Determine whether there exists **any** sequential execution
+order of the pending resources that
+* respects every mandatory dependency,
+* may benefit from *optional* dependencies (each optional
+dependency that has been completed before the task starts
+reduces its run time by a given amount, but the run time
+never goes below 0),
+* finishes each resource no later than its individual
+*deadline*,
+* and has a total elapsed time <= ``timeout``.
+27
+``resources`` maps a resource name to a 5-tuple:
+(status, mandatory_deps, optional_deps, run_time,
+deadline)
+* ``status`` - ``"Running"`` (already completed at time 0)
+or ``"Pending"``.
+* ``mandatory_deps`` - list of resource names that must be
+finished before this one can start.
+* ``optional_deps`` - list of ``(dep_name, reduction)``
+tuples; if ``dep_name`` is finished before the task starts,
+the task's run time is reduced by ``reduction`` (but not
+below 0).
+* ``run_time`` - base execution time once mandatory (and
+optional) deps are satisfied.
+* ``deadline`` - latest absolute time (from start) by which
+this resource must finish.
+If any dependency name (mandatory or optional) is unknown the
+whole problem is unsolvable and the function returns ``False``.
+"""
+# ------------------------------------------------------------
+# Normalise data - assign each resource a numeric index.
+# ------------------------------------------------------------
+names = list(resources.keys())
+n = len(names)
+idx = {name: i for i, name in enumerate(names)}
+status = [None] * n
+mand = [set() for _ in range(n)]
+opt = [[] for _ in range(n)]
+# list of (dep_idx, reduction)
+base_rt = [0] * n
+deadline = [0] * n
+# Validate and fill structures
+for name, (st, md, od, rt, dl) in resources.items():
+i = idx[name]
+status[i] = st
+for d in md:
+if d not in idx:
+# unknown mandatory dependency
+return False
+mand[i].add(idx[d])
+for d, red in od:
+if d not in idx:
+# unknown optional dependency
+return False
+opt[i].append((idx[d], red))
+base_rt[i] = rt
+deadline[i] = dl
+# --------------------------------------------------------
+# Bit-mask DP over subsets of already-finished resources.
+# dp[mask] = earliest possible finish time after completing
+#
+exactly the resources indicated by ``mask``.
+# --------------------------------------------------------
+INF = 10 ** 18
+size = 1 << n
+dp = [INF] * size
+# Resources marked "Running" are already done at time 0.
+start_mask = 0
+for i, st in enumerate(status):
+if st == "Running":
+if deadline[i] < 0:
+# a running task already missed its deadline
+return False
+start_mask |= 1 << i
+dp[start_mask] = 0
+28
+# Helper to compute reduction contributed by optional deps already in mask
+def optional_reduction(task_idx: int, mask: int) -> int:
+red = 0
+for dep_idx, amount in opt[task_idx]:
+if mask & (1 << dep_idx):
+red += amount
+return red
+# Iterate over all masks
+for mask in range(size):
+cur_time = dp[mask]
+if cur_time == INF:
+continue
+# Try to start any still-pending resource whose mandatory deps are satisfied
+for i in range(n):
+bit = 1 << i
+if mask & bit:
+continue
+# already finished
+# mandatory deps must be in mask
+if not mand[i].issubset(
+{j for j in range(n) if mask & (1 << j)}):
+continue
+# Compute effective run time after optional reductions
+reduction = optional_reduction(i, mask)
+eff_rt = max(0, base_rt[i] - reduction)
+finish_time = cur_time + eff_rt
+# Respect deadline and overall timeout (timeout check deferred to final mask)
+if finish_time > deadline[i]:
+continue
+new_mask = mask | bit
+if finish_time < dp[new_mask]:
+dp[new_mask] = finish_time
+full_mask = (1 << n) - 1
+return dp[full_mask] <= timeout
+```
+```input
+{
+"A": ("Running", [], [], 0, 0),
+"B": ("Pending", ["A"], [("A", 2)], 5, 10),
+"C": ("Pending", ["B"], [], 4, 15)
+}, 15
+```
+```output
+True
+```
+```input
+{
+"X": ("Pending", [], [], 7, 8),
+"Y": ("Pending", [], [("X", 3)], 6, 12)
+}, 13
+```
+```output
+True
+```
+```input
+{
+29
+"P": ("Pending", [], [("Q", 1)], 4, 10),
+"Q": ("Pending", [], [], 3, 6)
+}, 9
+```
+```output
+True
+```
+```input
+{
+"U": ("Pending", [], [("V", 2)], 5, 9),
+"V": ("Pending", [], [("U", 2)], 5, 9)
+}, 10
+```
+```output
+True
+```
+```input
+{
+"M": ("Running", [], [], 0, 0),
+"N": ("Pending", ["M"], [("M", 1)], 4, 5),
+"O": ("Pending", ["N"], [("N", 2)], 3, 8),
+"P": ("Pending", ["O"], [], 2, 10)
+}, 9
+```
+```output
+True
+```
+No message found! Make sure to correctly format the message.
+Student Answers Summary
+Pass rate for the student over 8 attempts was: 1.000
+Example solved 1:
+def f(task_dict, limit):
+"""
+Returns True if the sum of the fourth element (assumed
+duration) of each task tuple in `task_dict` does not
+exceed `limit`.
+"""
+total_duration = sum(
+info[3] for info in task_dict.values())
+return total_duration <= limit
+Example solved 2:
+def f(tasks, target):
+"""
+Determine whether the given target integer lies within the inclusive range
+defined by the sum of the lower and upper bounds of all tasks.
+Parameters
+----------
+tasks : dict
+Mapping from a task name to a tuple:
+(status: str, list1: list, list2: list, low: int, high: int)
+target : int
+The integer to test against the aggregated range.
+Returns
+-------
+bool
+30
+True if low_sum <= target <= high_sum, otherwise False.
+"""
+low_sum = sum(info[3] for info in tasks.values())
+high_sum = sum(info[4] for info in tasks.values())
+return low_sum <= target <= high_sum
+Response Instructions
+Remember that your goal is to create a function that feels
+like a natural progression from your previous challenge while
+addressing the specific learning needs revealed by student
+responses.
+Your response should include:
+1. Your new code snippet must again have the function named
+`f` wrapped in ```python``` tags
+- Build upon your previous challenge by adjusting the
+complexity or introducing new concepts
+- Do not include print statements or input/output examples
+inside the code block!
+2. 5 diverse inputs that demonstrate your function's behavior
+- Each input should be individually wrapped in ```input```
+tags.
+- For each input, format multiple arguments with commas
+between them
+- Remember to add quotes around string arguments. Example:
+```input
+'John', {'age': 20, 'city': 'New York'}
+```
+```input
+'Sammy', {'age': 37, 'city': 'Los Angeles'}
+```
+3. A message that hints at the function's purpose wrapped
+message in ```message``` tags
+- You cannot provide the code snippet in the message
+Progression Strategy
+The student always solved the previous task. Either the
+input-output relationship was too trivial (maybe not diverse
+enough or incomplete such that a much easier function also
+passes the tests), or the function was too easy to implement.
+Try to mutate this problem into a medium problem: student
+should have a pass rate of 0.35-0.65.
+You need to add more complexity to the problem and make sure
+the inputs you propose lead to diverse outputs to ensure a
+good learning experience for the student!
+Last reminder:
+Remember the question is a standalone question! The message
+should only reflect the current problem and not assume
+knowledge of the previous questions.
+Make sure the problem is interesting and challenging. This
+problem will be given to a student to solve, and they should
+learn valuable skills from it, such that they can overall
+code better and also do better in coding contests type
+questions.
+31
+Turn 2 — Teacher Answer (Student Pass Rate: 0.625)
+Teacher Reasoning
+[truncated with [. . . ]]
+<think>
+We need to design a new coding challenge based on previous one, but more complex; avoid trivial solutions like
+sum durations. [. . . ]
+We need to consider student responses: they submitted trivial functions computing sum of element 3 or low/high
+sum. That indicates they simplified problem to just checking total duration or range, ignoring dependencies.
+So new problem should require handling mandatory dependencies, optional reductions, deadlines, timeout, similarly
+but maybe add additional constraints such that naive sum fails.
+[. . . ]
+We have to ensure the new function is more complex: maybe also include “resource weight” values and allow parallel
+execution up to a concurrency limit? But that may be too complex.
+Simpler: keep same original problem but require that optional reductions can be applied only if the optional
+dependency finishes strictly before the task starts, and also mandatory dependencies can be “or” (any of list) –
+more complex.
+[. . . ]
+Alternatively, we could add a constraint: resources can have “exclusive groups” meaning only one resource from a
+group can run (cannot both be selected). Might be heavy.
+Goal: make harder for students who previously used trivial solution of sum.
+Thus we can retain mandatory/optional dependencies and deadlines, but also add “resource cost” and a global
+“budget” that must not be exceeded, and optional reductions affect cost.
+Students may still try to sum something but must consider dependencies.
+So we design function f(resources: dict, timeout: int, budget: int) -> bool. It must decide if there exists
+execution order respecting dependencies, deadlines, total time ≤timeout, and total cost ≤budget where cost =
+base_cost −optional reductions, not below 0.
+[. . . ]
+We need to implement solution: bitmask DP similar to earlier but with two dimensions: time and cost? [. . . ]
+Simpler: store for each mask the minimal time and minimal cost pair (Pareto frontier). We’ll compute reachable
+states list of (time, cost). For each mask, we keep list of non-dominated pairs.
+Implementation: use dict mapping mask →list of (time, cost). Start with start_mask (running tasks) having time
+0, cost 0.
+[. . . ] New_time = time + run_time_i. If new_time > deadline_i: skip. New_cost = cost + max(0, base_cost_i
+−sum_reductions_i) where sum_reductions_i = sum of reduction amounts for optional deps already completed
+(i.e., in mask). Add to frontier if within limits.
+After processing all masks, check any pair for full_mask with time ≤timeout and cost ≤budget.
+[. . . ]
+Now we need to provide 5 diverse inputs:
+• Input 1: simple chain with optional cost discounts.
+• Input 2: two parallel tasks with optional mutual discounts.
+• Input 3: unknown dependency →should return False.
+• Input 4: deadline tight prevents schedule.
+• Input 5: budget constraint fails.
+[. . . ]
+</think>
+Teacher Output
+<answer>
+```python
+from typing import Dict, List, Tuple
+def f(resources: Dict[str, Tuple[str, List[str], List[Tuple[str, int]], int, int, int]],
+timeout: int, budget: int) -> bool:
+"""
+resources maps a name to a 6-tuple:
+32
+(status, mandatory_deps, optional_deps, run_time, base_cost, deadline)
+* status - "Running" (already finished at time 0) or "Pending".
+* mandatory_deps - names that must be completed before this task starts.
+* optional_deps - list of (dep_name, discount) tuples; if dep_name is already
+finished when the task starts, the task's **cost** is reduced by *discount*
+(cost never goes below 0).
+Discounts do **not** affect run time.
+* run_time - execution time of the task.
+* base_cost - cost of executing the task before discounts.
+* deadline - absolute latest time by which the task must finish.
+The function returns True iff there exists an order of executing all pending
+tasks such that:
+* every mandatory dependency is satisfied before a task starts,
+* each task finishes no later than its deadline,
+* the total elapsed time after the last task is <= ``timeout``,
+* the sum of (discounted) costs of all pending tasks is <= ``budget``.
+If any dependency name is unknown the problem is unsolvable and False is
+returned.
+"""
+# ------------------------------------------------------------
+# Normalise names to integer indices.
+# ------------------------------------------------------------
+names = list(resources.keys())
+n = len(names)
+idx = {name: i for i, name in enumerate(names)}
+status = [None] * n
+mand = [set() for _ in range(n)]
+opt = [[] for _ in range(n)]
+# (dep_idx, discount)
+run = [0] * n
+base_cost = [0] * n
+deadline = [0] * n
+for name, (st, md, od, rt, bc, dl) in resources.items():
+i = idx[name]
+status[i] = st
+for d in md:
+if d not in idx:
+# unknown mandatory dependency
+return False
+mand[i].add(idx[d])
+for d, disc in od:
+if d not in idx:
+# unknown optional dependency
+return False
+opt[i].append((idx[d], disc))
+run[i] = rt
+base_cost[i] = bc
+deadline[i] = dl
+# ------------------------------------------------------------
+# Initial mask - resources already marked "Running".
+# ------------------------------------------------------------
+start_mask = 0
+for i, st in enumerate(status):
+if st == "Running":
+if deadline[i] < 0:
+# already missed its deadline
+return False
+start_mask |= 1 << i
+from collections import defaultdict
+# frontier[mask] = list of (elapsed_time, total_cost) pairs that are
+# not dominated (i.e., no other pair is both <= in time and <= in cost).
+frontier = defaultdict(list)
+frontier[start_mask].append((0, 0))
+full_mask = (1 << n) - 1
+# ------------------------------------------------------------
+33
+# Breadth-first DP over subsets.
+# ------------------------------------------------------------
+for mask in range(1 << n):
+if mask not in frontier:
+continue
+cur_states = frontier[mask]
+for i in range(n):
+bit = 1 << i
+if mask & bit:
+continue
+# already finished
+# mandatory dependencies must be satisfied
+if not mand[i].issubset({j for j in range(n) if mask & (1 << j)}):
+continue
+# total discount from optional dependencies already in mask
+discount = sum(disc for dep_idx, disc in opt[i] if mask & (1 << dep_idx))
+eff_cost = max(0, base_cost[i] - discount)
+for cur_time, cur_spent in cur_states:
+finish_time = cur_time + run[i]
+if finish_time > deadline[i]:
+continue
+new_spent = cur_spent + eff_cost
+if new_spent > budget:
+continue
+new_mask = mask | bit
+# Insert the new pair, keeping only non-dominated pairs.
+improved = True
+to_remove = []
+for t, c in frontier[new_mask]:
+if t <= finish_time and c <= new_spent:
+# existing pair dominates the new one
+improved = False
+break
+if t >= finish_time and c >= new_spent:
+# new pair dominates existing one
+to_remove.append((t, c))
+if improved:
+for itm in to_remove:
+frontier[new_mask].remove(itm)
+frontier[new_mask].append((finish_time, new_spent))
+# ------------------------------------------------------------
+# Any feasible final state?
+# ------------------------------------------------------------
+for t, c in frontier[full_mask]:
+if t <= timeout and c <= budget:
+return True
+return False
+```
+```input
+{
+"A": ("Running", [], [], 0, 0, 0),
+"B": ("Pending", ["A"], [("A", 2)], 5, 6, 12),
+"C": ("Pending", ["B"], [], 4, 5, 20)
+}, 15, 10
+```
+```input
+{
+"X": ("Pending", [], [("Y", 2)], 3, 5, 10),
+"Y": ("Pending", [], [("X", 3)], 4, 6, 10)
+}, 8, 9
+```
+34
+```input
+{
+"P": ("Pending", ["Q"], [], 4, 5, 10)
+}, 10, 10
+```
+```input
+{
+"A": ("Pending", [], [], 6, 5, 5),
+"B": ("Pending", [], [], 1, 2, 10)
+}, 10, 10
+```
+```input
+{
+"A": ("Pending", [], [], 3, 7, 10),
+"B": ("Pending", [], [], 4, 6, 10)
+}, 10, 10
+```
+```message
+Determine whether all pending resources can be completed within a given overall time limit **and** a total
+cost budget, while respecting mandatory dependencies, optional cost discounts, and individual deadlines.
+```
+</answer>
+35

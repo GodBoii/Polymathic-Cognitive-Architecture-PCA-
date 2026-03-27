@@ -1,0 +1,1031 @@
+Can an Actor-Critic Optimization Framework
+Improve Analog Design Optimization?
+Sounak Dutta∗, Fin Amin∗, Sushil Panda, Jonathan Rabe, Yuejiang Wen, Paul Franzon
+Department of Electrical and Computer Engineering
+North Carolina State University
+{sdutta6, samin2, spanda4, jcrabe, wyuejia, paulf}@ncsu.edu
+Abstract—Analog design often slows down because even small
+changes to device sizes or biases require expensive simulation
+cycles, and high-quality solutions typically occupy only a narrow
+part of a very large search space. While existing optimizers reduce
+some of this burden, they largely operate without the kind of
+judgment designers use when deciding where to search next. This
+paper presents an actor-critic optimization framework (ACOF)
+for analog sizing that brings that form of guidance into the loop.
+Rather than treating optimization as a purely black-box search
+problem, ACOF separates the roles of proposal and evaluation:
+an actor suggests promising regions of the design space, while a
+critic reviews those choices, enforces design legality, and redirects
+the search when progress is hampered. This structure preserves
+compatibility with standard simulator-based flows while making
+the search process more deliberate, stable, and interpretable.
+Across our test circuits, ACOF improves the top-10 figure of
+merit by an average of 38.9% over the strongest competing
+baseline and reduces regret by an average of 24.7%, with peak
+gains of 70.5% in FoM and 42.2% lower regret on individual
+circuits. By combining iterative reasoning with simulation-driven
+search, the framework offers a more transparent path toward
+automated analog sizing across challenging design spaces.
+Index Terms—analog circuit optimization, Bayesian optimiza-
+tion, Large language models, SPICE simulation
+I. INTRODUCTION AND MOTIVATION
+The demands on modern analog design continue to increase
+with new technology nodes, tighter specifications, and faster
+development cycles. Each node changes transistor behavior,
+invalidates earlier biasing strategies, and requires renewed ex-
+ploration of the design space. From an optimization standpoint,
+this is no longer merely schematic tuning, but the search for
+a feasible region where gain, bandwidth, phase margin, and
+power can be satisfied together. Because performance varies
+nonlinearly with sizing, designers need SPICE simulations, and
+more knobs mean more costly trials. Even after the topology
+is fixed, analog sizing is rarely straightforward. It typically
+requires repeated evaluation and careful adjustment to satisfy
+several coupled specifications while managing trade-offs among
+performance, power, and area. In practice, analog design is
+still a slow and labor-intensive process, requiring extensive
+simulation and considerable designer expertise [1]–[3].
+∗Equal contribution.
+Preprint. Under review.
+Actor-Critic Interaction
+Proposal  →  Audit  →  Search  →  Reflection
+PROPOSAL
+AUDIT
+SEARCH
+REFLECTION
+NEXT ROUND
+PROPOSAL
+AUDIT
+Actor
+- Starts broad search.
+- Ranges: R6_Ohm = 20k-35k,
+- L56_um = 0.32-0.90, W21_um = 45-90,
+- C1_pF = 4.0-9.0.
+Critic
+- Audit passed. The proposal stays inside the PDK bounds
+  and preserves the actor’s intent, so no repair is needed.
+- The round proceeds with the actor’s ranges as written.
+- Changed 0 / 21 knobs.
+BO + Simulation
+- Search only inside the critic-approved region.
+- Evaluate candidate designs with the simulator.
+- Return round data for reflection.
+Critic
+- valid_rate(prev)=1.000, valid_rate(curr)=0.940 (dropped).
+- Improvement stalled, so let's tighten the ranges:
+- R6_Ohm: tighten to 21.5k-27k (center ~23-25k)
+  to align with higher-performing cases and recover UGBW/FOM.
+- L56_um: 0.45-0.60,
+  pair Lout_um to 0.34-0.43 to rebalance bandwidth without PM loss.
+- Balance: Ib_uA to 8.5-9.2 and W21_um to 52-60,
+  with C1_pF at 7.8-8.8 to seek UGBW gains while
+  maintaining high PM and validity.
+Actor
+- Next proposal follows the memo.
+- It narrows the search.
+- The key changes are now explicit:
+  R6_Ohm = 21.5k-27k, L56/Lout tightened,
+  Ib_uA = 8.5-9.2,
+  W21_um = 52-60, C1_pF = 7.8-8.8.
+Critic
+- Modifies actor's proposal.
+- It narrows/expand the search for better
+  exploitation/exploration.
+- The key changes are now explicit:
+  R6_Ohm = 21.5k-23k, L56 = 0.51-0.57 ,
+  Ib_uA = 8.8-9.0,
+  W21_um = 54.8-57.6, C1_pF = 8.4-8.8.
+..........
+- Changed 21 / 21 knobs.
+Fig. 1. Example of interactions between our actor and critic components over
+rounds during analog sizing optimization. Our framework defines a closed-
+loop optimization process that alternates between proposal, audit, search, and
+reflection.
+For that reason, analog sizing has long been viewed as a
+constrained optimization problem. From that perspective, the
+central challenge is not simply to evaluate better candidate
+points, but to direct the search toward regions of the design
+space that are more likely to produce feasible and high-
+performing solutions under competing design constraints [2]–
+arXiv:2603.24714v1  [cs.LG]  25 Mar 2026
+Actor
+Critic
+Optimizer
+Simulator
+Proposes
+search region
+̃Ωn = π(en −1, Ω)
+Validates the
+proposed search
+region
+Ω+
+n = ( ̃Ωn, en −1)
+Region-constrained
+sampling
+n = BO(Ω+
+n )
+Evaluates circuit
+performance and
+computes the FoM
+n = {(x, f(x))}x ∈n
+Round
+summary
+en = g(n)
+Proposed search
+region  ̃Ωn
+Approved
+ranges  Ω+
+n
+Candidate set
+n ⊆Ω+
+n
+Evaluated round
+data n
+Feedback
+summary  en
+Fig. 2. An overview of our actor–critic optimization framework (ACOF). At each time step, n, the actor proposes a candidate search region ˜Ωn, the critic
+adjusts it to a PDK-legal region Ω+
+n , BO selects candidates x ∈Ω+
+n for simulation, and simulator outcomes are summarized into en for the next round. ACOF
+is agnostic to the specific choice of BO.
+[5]. Human designers address this problem differently. They
+do not treat the search space as uniformly promising; they use
+judgment to focus attention, interpret trade-offs, and revise
+direction when progress stalls.
+This paper is motivated by the idea that such guidance
+should become part of the optimization loop itself. Recent
+LLM-based studies in electronic design suggest that language
+models can contribute to design automation as reasoning agents
+rather than as mere text generators [6]–[11]. Building on that
+perspective, our contribution is investigating casting analog
+sizing as an actor–critic process in which one agent proposes
+promising regions of the design space, another evaluates
+whether the search direction should be preserved or revised,
+and a conventional optimizer explores within the resulting
+region. In this way, automated analog sizing can become not
+only more sample-efficient, but also more interpretable and
+more aligned with the way experienced designers reason about
+difficult trade-offs.
+II. PRIOR ART
+A. Bayesian Optimization for Analog Circuit Sizing
+Bayesian optimization (BO) has advanced analog circuit
+sizing in several important ways [12]. WEIBO [4] formulates
+sizing as constrained BO with Gaussian-process (GP) surrogates
+and weighted expected improvement, and extends the approach
+to multi-objective design. Local BO [5] scales this idea to
+larger spaces through trust-region-based local models and batch
+candidate evaluation. tSS-BO [13] targets the high-dimensional
+setting by restricting search to an effective truncated subspace
+while retaining local GP guidance and Bayesian selection.
+B. Language Driven Optimization
+Recent LLM-based work in analog design has begun to
+open several distinct directions rather than one unified path.
+LayoutCopilot [6] reimagines analog layout interaction by
+turning natural-language design requests into executable layout
+actions through a multi-agent framework, while LLANA
+[7] brings language models into the BO loop to generate
+design-dependent layout constraints, particularly net-weighting
+parameters for layout synthesis. AmpAgent [8] approaches
+amplifier design as a coordinated reasoning process across
+literature understanding, formula derivation, and device sizing.
+In contrast, AnalogCoder [9] treats analog design as a code-
+generation problem, using a training-free workflow to produce
+and iteratively correct Python-based circuit implementations.
+ADO-LLM [10] more directly couples an LLM with Bayesian
+optimization for circuit sizing, using the model to propose
+promising design candidates alongside a GP-based search
+process. LEDRO [14], in turn, shifts the emphasis from asking
+the LLM for a single sizing answer to asking it to progressively
+narrow the search region so that optimization can proceed
+within a more meaningful part of the design space. More
+recent frameworks extend this picture in complementary ways:
+EEsizer [15] formulates transistor sizing as a closed-loop LLM-
+guided process built around simulation, analysis, and iterative
+parameter updates, while LLM-USO [16] focuses on structured
+knowledge reuse across related circuits.
+C. Takeways from Prior Art
+These prior works point to the same recurring pressures:
+GP-based BO becomes harder to scale as the sample set
+and parameter dimension grow. Constrained search remains
+difficult, and exploration becomes increasingly fragile in high-
+dimensional spaces. Furthermore, these methods mainly act
+as black boxes [5], [7], [13]. Recent LLM-based methods
+have begun to address these limitations in different ways:
+some strengthen the reasoning and decomposition side of
+analog design [8], some couple LLMs with BO to improve
+candidate generation within the optimization loop [10] and
+some demonstrate the broader value of self-reflection [17] for
+iterative improvement in workflows using optimizer [14]. But
+in these systems, guidance is still driven mainly by simulator
+feedback or by the model’s own reflective process, leaving
+a natural opening for an independent critic that can examine
+a proposal from outside the actor’s reasoning stream. That
+distinction matters because prompt-heavy LLM systems already
+report performance dilution under long, multitask context [6].
+In relation to this, long-context retrieval studies show that
+current LLMs can struggle even on simple fact-retrieval tasks
+as context grows [18]. Our method is designed around exactly
+this gap. Considering these takeaways, we introduce ACOF in
+the following section.
+TABLE I
+RESULTS ACROSS THE FOUR TEST CIRCUITS, AGGREGATED OVER 3 RUNS PER CIRCUIT. EACH CIRCUIT FORMS ONE MULTIROW BLOCK AT LEFT. VALUES
+ARE MEAN WITH SUBSCRIPTED SEM (STANDARD ERROR OF THE MEAN). BOLD INDICATES THE BEST BASELINE METHOD WITHIN EACH CIRCUIT AND
+METRIC. QWEN WAS USED AS THE LLM.
+Top-10 Design Quality
+Reliability (%)
+Exploration/Exploitation
+Method
+Gain (dB) ↑UGBW (MHz) ↑
+PM (deg) ↑
+Power (mW) ↓
+FoM ↑
+Sim. Valid ↑Phys. Feasible ↑Regions ↑
+Regret ↓
+130nm
+12 Params
+Target Spec.
+85.00
+900.00
+100.00
+0.554
+0.00
+-
+-
+-
+-
+ACOF
+83.650.64
+785.3039.71
+101.351.13
+0.6580.045
+-0.190.01
+97.00.1
+86.21.4
+2.00.0
+0.250.01
+Single-LLM
+83.150.55
+717.6345.51
+111.890.74
+0.6570.029
+-0.240.02
+95.40.9
+78.91.8
+2.70.3
+0.300.01
+Pure-BO
+76.241.45
+673.9222.65
+128.233.27
+0.5870.014
+-0.390.02
+81.00.3
+26.90.1
+3.00.8
+0.370.02
+Human Expert
+72.77
+851.48
+173.59
+0.821
+-0.45
+-
+-
+-
+-
+180nm
+12 Params
+Target Spec.
+95.00
+500.00
+100.00
+0.194
+0.00
+-
+-
+-
+-
+ACOF
+90.990.55
+195.5910.25
+119.772.23
+0.2000.001
+-0.520.02
+100.00.0
+90.21.9
+5.01.2
+0.590.02
+Single-LLM
+90.880.20
+240.6978.42
+117.721.86
+0.3240.104
+-0.640.01
+100.00.0
+84.91.0
+2.00.0
+0.640.01
+Pure-BO
+86.790.29
+253.717.97
+127.971.23
+0.3590.024
+-0.740.02
+96.10.5
+36.12.6
+2.00.0
+0.690.04
+Human Expert
+81.62
+365.69
+127.42
+0.361
+-0.68
+-
+-
+-
+-
+130nm
+17 Params
+Target Spec.
+85.00
+20.00
+100.00
+0.277
+0.00
+-
+-
+-
+-
+ACOF
+88.562.77
+29.457.68
+104.5922.57
+0.2900.008
+-0.130.05
+97.70.8
+81.710.3
+3.70.7
+0.260.02
+Single-LLM
+87.061.53
+20.621.04
+71.732.23
+0.4750.141
+-0.440.17
+93.91.6
+82.36.5
+2.70.5
+0.450.12
+Pure-BO
+85.690.40
+50.4915.61
+74.935.47
+0.6560.100
+-0.730.01
+84.60.6
+68.40.6
+1.30.5
+0.650.03
+Human Expert
+78.33
+9.93
+80.06
+0.560
+-0.91
+-
+-
+-
+-
+180nm
+21 Params
+Target Spec.
+85.00
+1200.00
+120.00
+1.320
+0.00
+-
+-
+-
+-
+ACOF
+94.572.38
+1095.3618.60
+84.203.69
+1.3290.014
+-0.240.02
+99.30.3
+85.62.4
+2.70.3
+0.320.01
+Single-LLM
+102.434.70
+759.88178.60
+90.9110.95
+1.2320.090
+-0.440.07
+99.70.2
+74.63.3
+1.00.8
+0.470.05
+Pure-BO
+98.062.13
+469.3359.13
+123.247.15
+1.2430.068
+-0.610.01
+91.40.1
+19.31.0
+1.70.7
+0.580.01
+Human Expert
+72.69
+1138.87
+124.78
+2.210
+-0.51
+-
+-
+-
+-
+III. OUR APPROACH
+We formulate analog circuit design optimization as x⋆=
+arg maxx∈Ωf(x), where x denotes the vector of tunable circuit
+parameters, Ωdenotes the global feasible design domain
+induced by technology bounds and hard circuit constraints,
+which is primarily defined by the PDK and f(x) denotes the
+scalar figure of merit (FoM) obtained from circuit simulation.
+Our approach, the actor–critic optimization framework
+(ACOF), is organized as a role-separated reasoning loop with
+two logical agents: an actor, which proposes where the search
+should move next, and a critic, which reviews that proposal
+before optimization proceeds. This structure turns the familiar
+design-review pattern of analog practice into an iterative
+computational procedure.
+In our pipeline the actor does not output a single design
+point; instead, it proposes a search region within which the
+downstream optimizer should explore. At initialization, the
+actor is seeded by a small set of valid calibration examples,
+denoted by C0 [14], and produces the first candidate region
+˜Ω1 = π(C0, Ω). After the first round, the actor is updated by a
+round summary en−1 that condenses what the previous round
+revealed, including the best design found so far, representative
+high-quality samples, and the critic’s reflection on that round,
+so that for later rounds it proposes ˜Ωn = π(en−1, Ω). In the
+implemented loop, the actor is therefore driven not by the
+previous corrected region itself, but by the evidence generated
+from searching within it. Instead of allowing optimization
+to unfold as a blind sequence of samples, ACOF inserts an
+explicit stage of judgment between proposal and evaluation. As
+the search progresses, the critic also produces short reflection
+memos [17] that capture recurring patterns, useful corrections,
+and promising directions, thereby giving the loop continuity
+across rounds. An overview is given in Fig. 2.
+Before any BO step is performed, the critic audits the actor’s
+proposal and converts it into the region actually used for
+search, written as Ω+
+n = V(˜Ωn, en−1), where V(·) denotes
+the critic’s validation and correction step. Here Ω+
+n is the
+post-audit region for round n: it is the actor’s proposal after
+being checked, corrected when necessary, and accepted for
+optimization. Conceptually, this stage both preserves the actor’s
+intent when that intent is coherent and stabilizes the search
+when the proposal is malformed, overly narrow, overly loose,
+or otherwise inconsistent with the feasible domain. In this
+sense, the critic functions less as a second optimizer than as a
+gatekeeper that keeps exploration disciplined.
+Once Ω+
+n has been established, BO and simulation are carried
+out within that region under a fixed evaluation budget. Xn ∼
+BO(Ω+
+n ) denotes the candidate designs selected for evaluation
+in round n, then simulation produces the round data set Dn =
+{(x, f(x))}x∈Xn, where f(x) is the desired figure of merit.
+BO is therefore not used to search the full design space at
+every step, but to search efficiently within the region approved
+−5
+0
+5
+ACOF
+Avg FoM = -2.13, Max FoM = -0.34
+Avg FoM = -1.51, Max FoM = -0.28
+Avg FoM = -1.90, Max FoM = -0.35
+Avg FoM = -2.01, Max FoM = -0.31
+Avg FoM = -1.36, Max FoM = -0.32
+−5
+0
+5
+Single-LLM
+Avg FoM = -3.34, Max FoM = -0.55
+Avg FoM = -3.13, Max FoM = -0.51
+Avg FoM = -2.54, Max FoM = -0.64
+Avg FoM = -2.66, Max FoM = -0.65
+Avg FoM = -2.58, Max FoM = -0.55
+4
+8
+12
+R1–R2
+−5
+0
+5
+Pure-BO
+Avg FoM = -3.56, Max FoM = -0.68
+4
+8
+12
+R3–R4
+Avg FoM = -3.49, Max FoM = -0.59
+4
+8
+12
+R5–R6
+Avg FoM = -3.34, Max FoM = -0.62
+4
+8
+12
+R7–R8
+Avg FoM = -3.57, Max FoM = -0.44
+4
+8
+12
+R9–R10
+Avg FoM = -3.62, Max FoM = -0.71
+−4.0
+−3.5
+−3.0
+−2.5
+−2.0
+−1.5
+−1.0
+−0.5
+FoM
+UMAP Component 1
+UMAP Component 2
+Exploration by Round Across Methods -- 180nm 21 Params (GPT 4o Mini)
+Fig. 3. UMAP projections of the sizing parameters illustrate how the design space was explored over optimization rounds. To aid visualization, we outlined
+regions being explored in the current rounds in red and rendered the cumulative explored designs from past rounds in gray. ACOF judiciously explores the
+design space by targeting regions corresponding to high performance–as indicated by the higher round-wise Avg and Max FoM. Our technique successfully
+explored the regions above UMAP Component 2 > 1. On the other hand, the Single-LLM and Pure-BO baselines were apprehensive to exploration and
+achieved worse FoMs.
+for that round.
+After simulation, the framework compresses the round’s
+outcomes into a summary en = g(Dn), where g(·) denotes
+the round-level reflection process. This summary captures the
+practical meaning of the round: which parts of the region were
+productive, whether progress was made, and what kind of
+adjustment should guide the next proposal. The critic’s memo
+is part of this summary, so the feedback is not purely numerical
+but also interpretive. The next round then follows the same
+pattern, with ˜Ωn+1 = π(en, Ω) and Ω+
+n+1 = V(˜Ωn+1, en).
+Taken together, these steps define a closed-loop optimization
+process that alternates between proposal, audit, search, and
+reflection (see Fig. 1). The actor proposes where to search, the
+critic determines whether that proposal is suitable for actual
+optimization, BO explores within the approved region, and the
+resulting evidence is distilled into guidance for the next round.
+This separation between proposing a region and approving a
+region is the core operational idea of ACOF: it allows the search
+space to be refined progressively while remaining anchored to
+the feasible structure of the circuit.
+A. Why Use an Actor-Critic Structure?
+The distinction between policy-based and value-based meth-
+ods provides a useful lens for understanding why an actor–
+critic structure is a natural design choice in optimization. In
+reinforcement learning (RL), policy methods learn a direct
+mapping from states to actions, whereas value-based methods
+learn an estimate of expected return to guide action selection, as
+in REINFORCE/TRPO versus Q-learning/DQN [19]–[22]. The
+historical trend was not a simple shift from policy learning to
+value learning, since value-based deep RL was already central
+in the mid-2010s through DQN. A more meaningful shift was
+toward methods in which action proposals are shaped by an
+explicit evaluator. Actor-critic methods made this especially
+clear by pairing a policy with a learned critic that scores
+actions or states and stabilizes learning through lower-variance
+updates [20], [23]. More broadly, this points to a lesson larger
+than any one RL algorithm: many successful learning systems
+benefit when generation and judgment need not share the
+same mechanism. Methods such as Soft Actor-Critic, TD3,
+and MuZero push this logic further by placing learned value
+estimates, critics, and planning modules at the center of decision
+making [23]–[25]. In parallel, reward-learning and preference-
+based frameworks, including RLHF, further reinforce the idea
+that learning what should evaluate behavior can be as important
+as learning the behavior itself [26], [27].
+Our approach is motivated by the same principle, but applied
+to analog sizing rather than sequential control. Our framework
+is not an RL algorithm in the standard sense; instead, it adopts
+the structural lesson behind actor-critic methods by separating
+the proposal of a search region from its evaluation. In analog
+optimization, this separation is useful because a proposed region
+may be promising in spirit yet still be ill-posed, physically
+implausible, or wasteful under a fixed simulation budget. An
+independent critic therefore serves as an explicit evaluative
+mechanism that helps stabilize and redirect the search before
+expensive simulation is spent.
+IV. EXPERIMENTS
+We evaluate three optimization frameworks for their effec-
+tiveness in identifying high-quality circuit designs. In all cases,
+the objective is to maximize a scalar FoM that captures the
+target performance requirements. For each circuit, run, and
+method, we form a run-level summary, and then we report the
+average and standard error of the run-level summaries across
+the three runs. Our analysis considers three groups of metrics:
+design quality, reliability, and exploration/exploitation.
+(a) Two-stage amplifier
+(b) Folded cascode single-ended amplifier
+Fig. 4.
+The circuit schematics of our benchmarks. For an OpAmp, gain,
+bandwidth, phase margin, and power are coupled design specifications. Higher
+DC gain can introduce additional poles; this affects phase margin. Also,
+improving UGBW usually requires a higher bias current and increases power.
+Since low power is desirable, the circuit must balance gain, UGBW, and
+power, while phase margin sets the stability constraint and often trades off
+with frequency response and bandwidth.
+A. Benchmarks
+We benchmark four circuits of varying complexity across
+two technology nodes. In SKY130 (130 nm), we consider a two-
+stage amplifier and a cascode wide-swing amplifier with design
+vectors x ∈R12 and x ∈R17, respectively. In GF180MCU
+(180 nm), we consider a two-stage amplifier and a folded-
+cascode single-ended amplifier with design vectors x ∈R12 and
+x ∈R21, respectively (see Fig. 4). Each design vector includes
+the tunable devices, bias, and compensation parameters.
+B. Implementations and Baselines
+The first setup employs the proposed ACOF. For comparison,
+we use a second setup that replaces the actor–critic loop with a
+single LLM coupled to the same BO backend, and a third setup
+that uses BO alone with no LLM guidance. All three methods
+follow the same round schedule and the same per-round
+simulation budget under identical circuit-simulation conditions.
+In ACOF, the actor and critic are prompted separately. The
+actor is given topology-specific context, and the calibration
+set from the first round or a packed summary of the strongest
+valid designs from the previous round, including gain, UGBW,
+phase margin, power, and operating-region information. It then
+proposes numeric subranges for all tunable parameters. The
+critic receives those proposed ranges and returns a structured
+audit that either accepts the actor ranges or repairs them
+minimally within the legal bounds before BO is launched.
+After BO evaluates the candidate designs in the critic-approved
+region, the round summary is written back into the next actor
+prompt so that the search region can be revised progressively
+rather than reinitialized from scratch. See Fig. 1 for an example.
+For clarity and reproducibility, we will release the full
+prompting templates upon acceptance.
+Inspired by LEDRO [14], we implement a Single-LLM
+baseline to interface with BO. At each step it performs
+the actor’s candidate search region step but forgoes the
+correction/refinement by the critic. Lastly, as an LLM-free
+comparison, we report the performance of Pure-BO, by
+optimizing the design using BO, [28]. Before the rounds begin,
+an initial set of designs is generated using BO to provide
+C0 = 200 starting points, which are used to condition the
+LLM baselines. In each round, we perform the optimization
+procedures and use Ngspice to compute the FoMs [29].
+In our experiments, we configure our LLM-based methods
+using the open-source Qwen2.5-14B-Instruct [30]. To see how
+performance changes with respect to stronger LLM capabilities,
+we rerun our experiments on the 21-parameter folded-cascode
+benchmark using GPT-4o-mini [31] and GPT-5 [32].
+C. Performance Metrics
+Design Quality. We measure and maximize FoM computed
+from gain G(x), unity-gain bandwidth BW(x), phase margin
+ϕ(x), and power W(x). We define circuit-specific targets
+(G∗, BW ∗, ϕ∗, W ∗), reported as Target Spec. in Fig. I,
+and use them to construct normalized component scores sG(x),
+sBW (x), sϕ(x), and sW (x). Each score is zero when its
+corresponding target is met and penalizes deviations otherwise;
+we then combine them as f(x) = 3·sG(x)+sBW (x)+sϕ(x)+
+sW (x). These quantities are not reported from a single best
+design. Instead, for each run and method, we sort all simulated
+designs by FoM and average each metric over the top-10
+designs in our experiments. This gives a more stable summary
+of the quality of the best part of the search than reporting only
+a single extreme point.
+Reliability. We report two run-level rates. Sim. Valid is the
+fraction of all attempted designs in a run whose simulator
+output was marked valid by the pipeline. Phys. Feasible is the
+fraction of attempted designs that satisfy our physical sanity
+checks. In our implementation, a design is counted as physically
+meaningful only if it yields positive bandwidth, positive phase
+margin, positive power, and nonnegative gain. Both reliability
+metrics are computed over the full set of attempts.
+Exploration/Exploitation. To summarize how broadly each
+method visits distinct parts of the design space, we report
+Regions. For each circuit, we first normalize the active design
+parameters to [0, 1] using that circuit’s own parameter ranges.
+We then pool all sampled designs from a given run and method,
+0
+200
+400
+600
+800
+1000
+1200
+Optimization Steps
+−8
+−7
+−6
+−5
+−4
+−3
+−2
+−1
+0
+1
+FoM
+(
+)
+ACOF
+Single-LLM
+Pure-BO
+(a) GPT 4o Mini. Average and SEM of Top-10 FoM: ACOF −0.359 ±
+0.018, Single-LLM −0.643 ± 0.015, Pure-BO −0.652 ± 0.026.
+0
+200
+400
+600
+800
+1000
+1200
+Optimization Steps
+−8
+−7
+−6
+−5
+−4
+−3
+−2
+−1
+0
+1
+FoM
+(
+)
+ACOF
+Single-LLM
+Pure-BO
+(b) GPT 5. Average and SEM of Top-10 FoM: ACOF −0.271 ± 0.024,
+Single-LLM −0.319 ± 0.035, Pure-BO −0.639 ± 0.019.
+Fig. 5. Exponentially-smoothed FoM trajectories for the 180nm 21-parameter folded-cascode benchmark using variants of GPT as the LLM. Subcaptions
+report the across-run mean of the per-run top-10 mean FOM. Optimization steps for the LLM-based methods begin at 200 because both are initialized with
+C0 = 200 seed designs generated by Pure-BO. After initialization, the LLM-based methods update the optimization ranges every 100 steps.
+TABLE II
+RESULTS ON THE 180NM 21-PARAMETER FOLDED-CASCODE BENCHMARK
+USING VARIANTS OF GPT AS THE LLM.
+Model
+Method
+Top-10 FoM ↑
+Phys. Feasible (%) ↑
+Regret ↓
+GPT-4o Mini
+ACOF
+-0.3590.018
+67.13.5
+0.3950.019
+Single-LLM
+-0.6430.015
+37.82.3
+0.5790.021
+GPT-5
+ACOF
+-0.2710.024
+99.40.0
+0.3130.019
+Single-LLM
+-0.3190.035
+80.98.9
+0.3810.024
+and apply HDBSCAN [33], an unsupervised clustering method,
+in the normalized design space. The reported value is the
+number of discovered regions. A larger value indicates that the
+method visited more distinct regions of the parameter space
+during the run. This metric is computed from the full run-level
+point cloud. We also report Regret, defined relative to the ideal
+FoM value of 0. For each run and method, at each step we
+compute the gap between 0 and the best FoM found up to
+that point, and report the average of that quantity over the run.
+Lower regret means that the method reached strong designs
+earlier and stayed closer to the ideal score throughout the run.
+V. DISCUSSION AND CONCLUSION
+Across all four benchmarks in Table I, ACOF is the only
+method that remains on top in both FoM and regret. That pattern
+is more revealing than any one raw specification because the
+table reports averages over the top-10 designs, so the indication
+comes from the quality of a region rather than from a single
+fortunate sample. The baselines do lead on isolated metrics
+from time to time–Pure-BO on phase margin in some cases and
+on bandwidth in two circuits, and Single-LLM on gain for the
+180 nm 21-parameters benchmark–but those wins do not carry
+through to the joint objective. ACOF repeatedly converges to
+design sets in which gain, bandwidth, stability, and power sit
+in a better overall balance.
+Fig. 5 shows a similar overall trend. After the shared
+initialization budget, ACOF rises to stronger FoM levels and
+remains there through most of the search. In Fig. 5a, ACOF is
+44.2% closer to the ideal FoM of 0 than Single-LLM and 44.9%
+closer to 0 than Pure-BO. In Fig. 5b, the LM-guided portion
+shifts upward further: ACOF improves again, Single-LLM also
+benefits from the stronger model, and Pure-BO remains nearly
+unchanged. This result shows that the framework is not tied to
+one particular LM and that a better underlying model can be
+converted into better optimization behavior without changing
+the search procedure.
+The reliability columns in Table I tell a similar story. ACOF
+stays at or near perfect simulator validity throughout the study,
+but the more informative quantity is physical feasibility. On
+the 180 nm 21-parameters circuit, nearly every ACOF proposal
+simulates, and a much larger fraction remains physically
+meaningful than for Single-LLM or Pure-BO. The same trend is
+visible on the 130 nm 12-parameters and 180 nm 12-parameters
+benchmarks as well. Viewed alongside the actor-critic exchange
+in Fig. 1, this suggests that the critic is affecting what gets tried
+next, not merely repairing malformed outputs. In practice, that
+means fewer simulations are spent on points that are admissible
+yet unhelpful from an analog-design standpoint.
+The same search trend is visible in both the Table I and
+Fig. 3. On the 180 nm 21-parameters circuit, the red contours
+for ACOF migrate across several separated pockets of the
+embedding over successive round pairs, including pockets
+at UMAP Component 2 > 1 in Fig. 3–a region that the
+baselines touch lightly. What matters is that these relocations
+remain productive. In every round pair, the ACOF panels report
+a better average FoM than the corresponding Single-LLM and
+Pure-BO panels, and the best FoM found within each pair
+is stronger as well. Table I quantifies this behavior using
+Qwen as the LLM. On this benchmark ACOF covers the
+largest number of regions and still records the best FoM and
+regret. A similar relation between region coverage and solution
+quality appears on the 180 nm 12-parameters and 130 nm 17-
+parameters circuits, where ACOF also visits more regions than
+either baseline. The 130 nm 12-parameters case is instructive
+in the opposite direction: Pure-BO touches the most regions
+there, yet its physical-feasibility rate falls to 26.9%. The useful
+distinction is therefore not movement alone, but movement that
+lands in workable territory. ACOF shifts when a new region is
+needed and stays with a region when it is still yielding good
+designs.
+Taken together, Table I, Fig. 3, and Fig. 5 support the same
+conclusion. ACOF spends more of the evaluation budget in
+parts of the design space that are both promising and physically
+meaningful. This effect is clearest on the 180 nm 21-parameters
+benchmark, where the larger search space and tighter metric
+coupling make selective exploration especially valuable. This
+has clear implications for robust and sample-efficient analog
+design automation.
+REFERENCES
+[1] M. F. Barros, J. M. Guilherme, and N. C. Horta, Analog circuits and
+systems optimization based on evolutionary computation techniques.
+Springer, 2010, vol. 9.
+[2] M. Ahmadzadeh and G. G. Gielen, “Using probabilistic model rollouts
+to boost the sample efficiency of reinforcement learning for automated
+analog circuit sizing,” in Proceedings of the 61st ACM/IEEE Design
+Automation Conference, 2024, pp. 1–6.
+[3] M. Ahmadzadeh, J. Lappas, N. Wehn, and G. Gielen, “Anacraft: Duel-play
+probabilistic-model-based reinforcement learning for sample-efficient
+pvt-robust analog circuit sizing optimization,” IEEE Transactions on
+Computer-Aided Design of Integrated Circuits and Systems, 2025.
+[4] W. Lyu, P. Xue, F. Yang, C. Yan, Z. Hong, X. Zeng, and D. Zhou, “An
+efficient bayesian optimization approach for automated optimization of
+analog circuits,” IEEE Transactions on Circuits and Systems I: Regular
+Papers, vol. 65, no. 6, pp. 1954–1967, 2017.
+[5] K. Touloupas, N. Chouridis, and P. P. Sotiriadis, “Local bayesian
+optimization for analog circuit sizing,” in 2021 58th ACM/IEEE design
+automation conference (DAC).
+IEEE, 2021, pp. 1237–1242.
+[6] B. Liu, H. Zhang, X. Gao, Z. Kong, X. Tang, Y. Lin, R. Wang, and
+R. Huang, “Layoutcopilot: An llm-powered multi-agent collaborative
+framework for interactive analog layout design,” IEEE Transactions on
+Computer-Aided Design of Integrated Circuits and Systems, 2025.
+[7] G. Chen, K. Zhu, S. Kim, H. Zhu, Y. Lai, B. Yu, and D. Z. Pan, “Llm-
+enhanced bayesian optimization for efficient analog layout constraint
+generation,” arXiv preprint arXiv:2406.05250, 2024.
+[8] C. Liu, W. Chen, A. Peng, Y. Du, L. Du, and J. Yang, “Ampagent: An
+llm-based multi-agent system for multi-stage amplifier schematic design
+from literature for process and performance porting,” arXiv preprint
+arXiv:2409.14739, 2024.
+[9] Y. Lai, S. Lee, G. Chen, S. Poddar, M. Hu, D. Z. Pan, and P. Luo,
+“Analogcoder: Analog circuit design via training-free code generation,”
+in Proceedings of the AAAI Conference on Artificial Intelligence, vol. 39,
+no. 1, 2025, pp. 379–387.
+[10] Y. Yin, Y. Wang, B. Xu, and P. Li, “Ado-llm: Analog design bayesian
+optimization with in-context learning of large language models,” in Pro-
+ceedings of the 43rd IEEE/ACM International Conference on Computer-
+Aided Design, 2024, pp. 1–9.
+[11] N. Rouf, F. Amin, and P. D. Franzon, “Can low-rank knowledge
+distillation in llms be useful for microelectronic reasoning?” in 2024
+IEEE LLM Aided Design Workshop (LAD), 2024, pp. 1–6.
+[12] Y. Wen, J. Dean, B. A. Floyd, and P. D. Franzon, “High dimensional
+optimization for electronic design,” in Proceedings of the 2022 ACM/IEEE
+Workshop on Machine Learning for CAD, 2022, pp. 153–157.
+[13] T. Gu, J. Wang, Z. Bi, C. Yan, F. Yang, Y. Qin, T. Cui, and X. Zeng, “tss-
+bo: Scalable bayesian optimization for analog circuit sizing via truncated
+subspace sampling,” in 2024 Design, Automation & Test in Europe
+Conference & Exhibition (DATE).
+IEEE, 2024, pp. 1–6.
+[14] D. V. Kochar, H. Wang, A. P. Chandrakasan, and X. Zhang, “Ledro: Llm-
+enhanced design space reduction and optimization for analog circuits,”
+in 2025 IEEE International Conference on LLM-Aided Design (ICLAD).
+IEEE, 2025, pp. 141–148.
+[15] C. Liu and D. Chitnis, “Eesizer: Llm-based ai agent for sizing of analog
+and mixed signal circuit,” IEEE Transactions on Circuits and Systems I:
+Regular Papers, 2025.
+[16] N. K. Somayaji and P. Li, “Llm-uso: Large language model-based
+universal sizing optimizer,” IEEE Transactions on Computer-Aided
+Design of Integrated Circuits and Systems, 2025.
+[17] N. Shinn, F. Cassano, A. Gopinath, K. Narasimhan, and S. Yao, “Reflex-
+ion: Language agents with verbal reinforcement learning,” Advances in
+Neural Information Processing Systems, vol. 36, pp. 8634–8652, 2023.
+[18] E. Nelson, G. Kollias, P. Das, S. Chaudhury, and S. Dan, “Needle in
+the haystack for memory based large language models,” arXiv preprint
+arXiv:2407.01437, 2024.
+[19] R. S. Sutton and A. G. Barto, Reinforcement Learning: An Introduction,
+2nd ed.
+Cambridge, MA: MIT Press, 2018. [Online]. Available:
+https://incompleteideas.net/book/the-book-2nd.html
+[20] R. S. Sutton, D. A. McAllester, S. P. Singh, and Y. Mansour, “Policy
+gradient methods for reinforcement learning with function approximation,”
+in Advances in Neural Information Processing Systems 12 (NeurIPS
+1999), S. A. Solla, T. K. Leen, and K.-R. Müller, Eds.
+MIT Press, 2000,
+pp. 1057–1063.
+[21] V. Mnih, K. Kavukcuoglu, D. Silver, A. A. Rusu, J. Veness, M. G.
+Bellemare, A. Graves, M. Riedmiller, A. K. Fidjeland, G. Ostrovski,
+S. Petersen, C. Beattie, A. Sadik, I. Antonoglou, H. King, D. Kumaran,
+D. Wierstra, S. Legg, and D. Hassabis, “Human-level control through
+deep reinforcement learning,” Nature, vol. 518, no. 7540, pp. 529–533,
+2015. [Online]. Available: https://www.nature.com/articles/nature14236
+[22] J. Schulman, S. Levine, P. Abbeel, M. Jordan, and P. Moritz, “Trust
+region policy optimization,” in Proceedings of the 32nd International
+Conference on Machine Learning, ser. Proceedings of Machine Learning
+Research, vol. 37.
+PMLR, 2015, pp. 1889–1897. [Online]. Available:
+https://proceedings.mlr.press/v37/schulman15.html
+[23] T. Haarnoja, A. Zhou, P. Abbeel, and S. Levine, “Soft actor-
+critic: Off-policy maximum entropy deep reinforcement learning
+with a stochastic actor,” in Proceedings of the 35th International
+Conference on Machine Learning, ser. Proceedings of Machine Learning
+Research, vol. 80.
+PMLR, 2018, pp. 1861–1870. [Online]. Available:
+https://proceedings.mlr.press/v80/haarnoja18b.html
+[24] S. Fujimoto, H. van Hoof, and D. Meger, “Addressing function ap-
+proximation error in actor-critic methods,” in Proceedings of the 35th
+International Conference on Machine Learning (ICML), 2018, pp. 1587–
+1596.
+[25] J. Schrittwieser, I. Antonoglou, T. Hubert, K. Simonyan, L. Sifre,
+S. Schmitt, A. Guez, E. Lockhart, D. Hassabis, T. Graepel, T. Lillicrap,
+and D. Silver, “Mastering atari, go, chess and shogi by planning with a
+learned model,” Nature, vol. 588, no. 7839, pp. 604–609, 2020. [Online].
+Available: https://www.nature.com/articles/s41586-020-03051-4
+[26] P. F. Christiano, J. Leike, T. B. Brown, M. Martic, S. Legg, and
+D. Amodei, “Deep reinforcement learning from human preferences,”
+in Advances in Neural Information Processing Systems 30 (NeurIPS
+2017), I. Guyon, U. V. Luxburg, S. Bengio, H. Wallach, R. Fergus,
+S. Vishwanathan, and R. Garnett, Eds.
+Curran Associates, Inc., 2017,
+pp. 4299–4307. [Online]. Available: https://papers.neurips.cc/paper/
+7017-deep-reinforcement-learning-from-human-preferences.pdf
+[27] L. Ouyang, J. Wu, X. Jiang, D. Almeida, C. L. Wainwright,
+P. Mishkin, C. Zhang, S. Agarwal, K. Slama, A. Ray, J. Schulman,
+J. Hilton, F. Kelton, L. Miller, M. Simens, A. Askell, P. Welinder,
+P.
+F.
+Christiano,
+J.
+Leike,
+and
+R.
+Lowe,
+“Training
+language
+models to follow instructions with human feedback,” in Advances
+in Neural Information Processing Systems 35 (NeurIPS 2022),
+S. Koyejo, S. Mohamed, A. Agarwal, D. Belgrave, K. Cho, and
+A. Oh, Eds.
+Curran Associates, Inc., 2022, pp. 27 730–27 744.
+[Online].
+Available:
+https://proceedings.neurips.cc/paper_files/paper/
+2022/file/b1efde53be364a73914f58805a001731-Paper-Conference.pdf
+[28] H.
+Wang,
+“Bayesian-optimization,”
+https://github.com/wangronin/
+Bayesian-Optimization, 2023, gitHub repository.
+[29] H. Vogt, G. Atkinson, and P. Nenzi, Ngspice User’s Manual, Sep.
+2025, version 45 (ngspice release version). [Online]. Available:
+https://ngspice.sourceforge.io/docs/ngspice-45-manual.pdf
+[30] Qwen Team, “Qwen2.5-14b-instruct,” https://huggingface.co/Qwen/
+Qwen2.5-14B-Instruct, 2024, model card, accessed: 2026-03-15.
+[31] A. Hurst, A. Lerer, A. P. Goucher, A. Perelman, A. Ramesh, A. Clark,
+A. Ostrow, A. Welihinda, A. Hayes, A. Radford et al., “Gpt-4o system
+card,” arXiv preprint arXiv:2410.21276, 2024.
+[32] A. Singh, A. Fry, A. Perelman, A. Tart, A. Ganesh, A. El-Kishky,
+A. McLaughlin, A. Low, A. Ostrow, A. Ananthram et al., “Openai gpt-5
+system card,” arXiv preprint arXiv:2601.03267, 2025.
+[33] L. McInnes, J. Healy, S. Astels et al., “hdbscan: Hierarchical density
+based clustering.” J. Open Source Softw., vol. 2, no. 11, p. 205, 2017.

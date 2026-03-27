@@ -1,0 +1,1258 @@
+DAGverse: Building Document-Grounded
+Semantic DAGs from Scientific Papers
+Shu Wan1, Saketh Vishnubhatla1, Iskander Kushbay1, Tom Heffernan2, Aaron
+Belikoff2, Raha Moraffah2, and Huan Liu1
+1 Arizona State University, Tempe AZ 85281, USA
+{swan16,svishnu6,ikushbay,huanliu}@asu.edu
+2 Worcester Polytechnic Institute, Worcester MA 01609, USA
+{ntheffernan,azbelikoff,rmoraffah}@wpi.edu
+Abstract. Directed Acyclic Graphs (DAGs) are widely used to repre-
+sent structured knowledge in scientific and technical domains. However,
+datasets for real-world DAGs remain scarce because constructing them
+typically requires expert interpretation of domain documents. We study
+Doc2SemDAG construction: recovering a preferred semantic DAG from
+a document together with the cited evidence and context that explain
+it. This problem is challenging because a document may admit multiple
+plausible abstractions, the intended structure is often implicit, and the
+supporting evidence is scattered across prose, equations, captions, and fig-
+ures. To address these challenges, we leverage scientific papers containing
+explicit DAG figures as a natural source of supervision. In this setting,
+the DAG figure provides the DAG structure, while the accompanying text
+provides context and explanation. We introduce DAGverse, a framework
+for constructing document-grounded semantic DAGs from online scientific
+papers. Its core component, DAGverse-Pipeline, is a semi-automatic sys-
+tem designed to produce high-precision semantic DAG examples through
+figure classification, graph reconstruction, semantic grounding, and val-
+idation. As a case study, we test the framework for causal DAGs and
+release DAGverse-1, a dataset of 108 expert-validated semantic DAGs
+with graph-level, node-level, and edge-level evidence. Experiments show
+that DAGverse-Pipeline outperforms existing Vision-Language Models
+on DAG classification and annotation. DAGverse provides a foundation
+for document-grounded DAG benchmarks and opens new directions for
+studying structured reasoning grounded in real-world evidence.
+Keywords: Directed Acyclic Graph · Doc2SemDAG · Document Un-
+derstanding
+1
+Introduction
+Across biostatistics, econometrics, statistics, computer science, and industry
+workflows, researchers and domain experts use directed acyclic graphs (DAGs) to
+summarize the entities, assumptions, and directional relations relevant to a specific
+problem [20, 13, 9]. In practice, these graphs are not created in isolation. They
+arXiv:2603.25293v1  [cs.AI]  26 Mar 2026
+2
+S. Wan et al.
+are constructed from scientific papers, technical reports, and other documents
+whose supporting evidence is often scattered across prose, equations, captions,
+and figures. This makes real-world DAG construction both labor-intensive and
+difficult to scale [1], and leads to a natural question:
+Given a document, can we construct the DAG that a domain expert
+would draw from it?
+The difficulty appears as soon as one tries to dig deeper into this question. A
+document may support multiple plausible DAGs. Addtionally, claims may be im-
+plicit, compressed, or scattered across sections. Consequently, the same document
+may lead to different resulting DAGs. One researcher may attribute a mechanism
+into a single node, while another may unfold it into several intermediate variables.
+Moreover, experts do not usually draw a graph for everything mentioned in a
+document. They construct a graph for a particular problem, mechanism, or figure,
+at a level of abstraction that is succinct for that purpose.
+Fig. 1: Constructing a semantic DAG (Appendix A) from a scientific paper [25].
+A bare DAG only records dependency structure. Like Wittgenstein’s famous
+quote [28], “the meaning of a word is its use in the language”, the meaning of a
+DAG is defined by its use in the document. This motivates us to extend regular
+DAGs by attaching evidence from the document. We call this augmented DAG a
+semantic DAG (SemDAG).
+This shift from bare DAGs to semantic DAGs also changes the data prob-
+lem. Constructing document-grounded DAGs typically requires deep domain
+knowledge, specific modeling choices, and careful documentation, which makes
+DAGverse
+3
+high-quality examples difficult to obtain at scale. As a result, most existing
+datasets rely on synthetic or manually curated data, limiting their grounding
+in natural language and authentic real-world contexts. Scientific papers with
+DAG figures (1) provide a favorable source of candidates for this problem. In
+such papers, the DAG figure provides the structure, the accompanying text often
+describes its structure, semantics, and application setting. With the growing
+availability of online scientific repositories, this creates an opportunity to build a
+continuously expanding dataset of document-grounded DAGs at scale.
+Motivated by this opportunity, we introduce DAGverse, a framework for
+constructing document-grounded semantic DAGs from online scientific papers.
+The core component of this framework is DAGverse-Pipeline, a 5-stage semi-
+automated process consisting of metadata filtering, figure classification, graph
+reconstruction, semantic grounding, and validation. We apply this framework
+to causal DAGs as a concrete case study and release DAGverse-1, a benchmark
+featuring 108 expert-validated semantic DAGs supported by rich textual evidence.
+In summary, our contributions are as follows:
+1. We formally define SemDAG and the Doc2SemDAG task, alongside a
+discussion of the underlying assumptions and desiderata (Section 2).
+2. We present DAGverse-Pipeline, a modular and extensible system that uses
+scientific papers with DAG figures for building grounded examples for the
+Doc2SemDAG task (Section 3).
+3. We validate the framework on causal DAGs and release DAGverse-1, a curated
+benchmark of 108 semantic DAGs with graph-level, node-level, and edge-level
+evidence (Section 6).
+4. We benchmark modern VLMs and our pipeline on Doc2SemDAG and show
+that DAGverse outperforms existing methods(Section 5).
+2
+Problem Setting
+Definition 1 (Semantic DAG). A semantic DAG is an augmented DAG
+{G, S}, where G = (V, E) is a DAG and S contains the cited evidence and
+context that support how G should be interpreted in the source document D. In
+our setting, S may include text excerpts for nodes and edges, nodes aliases, and
+graph-level context such as theme and domain.
+In DAGverse, we represent each semantic DAG in JSON format (Appendix A).
+With this target in place, we can formally define the task of contructing semantic
+DAGs from documents.
+Task 1 (Doc2SemDAG) Given a document D and an intended problem, re-
+cover the preferred semantic DAG {G, S}, where S is grounded in D.
+To make the Doc2SemDAG task well posed, we require three assumptions:
+Assumption 1 (Existence) For the intended problem, the document admits at
+least one semantic DAG that captures its principal dependency structure.
+4
+S. Wan et al.
+Assumption 2 (Sufficiency) The document provides sufficient support to con-
+struct that preferred semantic DAG, including the interpretation of its nodes,
+edges, aliases, and graph-level context.
+These assumptions should not be taken as given. Some documents do not
+inherently support a clean DAG abstraction. Others mention dependencies too
+ambiguously or omit necessary context.
+Under these assumptions, a recovered semantic DAG should satisfy two
+desiderata.
+Desideratum 1 (Faithfulness) A recovered semantic DAG should be faithful
+to the document. It should not introduce unsupported structure, and it should not
+omit dependencies that the document supports.
+Remark 1 (Faithful vs. Factual). Faithfulness is different from factuality. Faithful-
+ness asks whether the semantic DAG is supported by, and self-contained within,
+the source document. Factuality asks whether the graph is correct with respect
+to external evidence or the real world. Our target is faithfulness, not factuality.
+Desideratum 2 (Preferred Canonicalization) Although multiple semantic
+DAGs may be compatible with a document, one canonical representation is pre-
+ferred for the intended use.
+Remark 2 (Preferred Canonicalization). The preferred canonicalization depends
+on the intended problem. For example, in causal analysis, dependencies should
+be interpreted as actual causality [8]. It should avoid both over-fragmented and
+overly coarse representations.
+2.1
+Scientific Papers with DAG Figures
+The assumptions and desiderata explain why scientific papers with DAG figures
+are a favorable source of candidate documents. In a well-written paper, the
+author has already externalized a preferred structural abstraction, while the
+accompanying text often provides the context needed to interpret it. This does
+not guarantee that every paper with a DAG figure provides ground truth without
+validation, but it is a strong heuristic for identifying documents that are likely
+to support a well-defined semantic DAG. In the next section, we translate
+assumptions and desiderata into pipeline design principles.
+3
+DAGverse-Pipeline
+We introduce DAGverse-Pipeline, a semi-automatic and continuously extensible
+system for constructing semantic DAGs from scientific papers. The design of
+DAGverse-Pipeline is guided by the assumptions and desiderata in Section 2:
+DAGverse
+5
+1. Decompose the task into specialized stages. Doc2SemDAG combines
+figure understanding, graph reconstruction, and evidence grounding. Rather
+than ask one model to do everything, we split the problem into simpler stages
+that can be handled by models specialized for each step.
+2. Prioritize precision over recall. Errors made early in the pipeline propa-
+gate to later stages and make validation more costly. We therefore prefer to
+miss borderline cases rather than admit many false positives into the dataset.
+3. Human experts as the gold standard. Full manual construction does
+not scale, but fully automatic construction is still unreliable. We therefore
+reserve human expertise for final quality control and difficult cases, where it
+has the highest value.
+4. Modular pipeline. Each stage should be replaceable as better parsers,
+VLMs, or LLMs become available. This makes the pipeline suitable for
+continuous updates as the literature grows.
+At a high level, the pipeline (Figure 2) decomposes the Doc2SemDAG task
+into five stages: (i) paper collection, (ii) paper parsing, (iii) DAG classification,
+(iv) DAG annotation & enrichment, and (v) validation.
+DAGverse-Pipeline is designed to be modular and extensible. In this paper,
+we use GPT-5.1 [24] for DAG classification and Gemini 2.5 Pro [5] for DAG
+annotation.
+1. Paper Collection
+2. Paper Parsing
+3. DAG Classification
+4. DAG Annotation
+5. Validation
+Human
+LLM
+Output: Paired
+Text-DAG Dataset
+Fig. 2: Overview of DAGverse-Pipeline. Paper collection can be updated routinely.
+Paper Collection. Public repositories host large numbers of papers, so the
+first step is to narrow down the search space. We utilize the metadata from these
+repositories to filter out irrelevant papers. We begin with simple keyword filtering,
+using terms such as causality, interpretability, and graphical models. We then
+apply an LLM-based metadata filter over titles and abstracts (Appendix B) to
+retain papers that are more likely to contain applied causal case studies.
+6
+S. Wan et al.
+Paper Parsing. We parse each PDF into text blocks and extracted figures
+using Marker 3. Text blocks include paragraphs, captions, and section headers,
+which we group into coherent chunks for downstream grounding. Figures are
+stored together with their coordinates and associated captions.
+DAG Classification. DAG classification filters out figures that are out of
+scope. Given only the figure, the model decides whether it contains a single
+DAG. The main difficulty is to separate true DAGs from visually similar figures
+that also contain nodes and arrows, such as flowcharts, model diagrams, and
+other diagrammatic graphics. Following the prompt in Appendix B, the model
+approves only figures that depict a single connected DAG with clear directionality
+and rejects out-of-scope figures. This stage is tuned for high precision so that
+downstream annotation operates on a much cleaner candidate pool.
+Remark 3 (DAG Scope). For simplicity, this paper focuses only on figures that
+contain a single, static DAG with clear directional syntax. We exclude figures that
+contain multiple DAGs, temporal DAGs, cyclic graphs, or mixed and ambiguous
+edge semantics.
+DAG Annotation & Enrichment. After this pre-filtering step, a more
+capable multimodal model receives the figure together with the parsed paper text.
+Following the prompt in Appendix B, the model first re-checks whether the figure
+is a causal graph and assigns a coarse category. For accepted cases, it reconstructs
+the node set and directed edges, then produces a structured JSON annotation
+with graph-level context, node aliases, node and edge descriptions, and evidence
+snippets grounded in the parsed paper text. The model may also mark a graph
+as abstract when the figure lacks a concrete real-world interpretation. Candidates
+that fail basic structural checks, such as duplicate node IDs or invalid edges, are
+rejected before human review.
+DAGverse-Pipeline is designed to produce semantic DAGs that support text-
+DAG reasoning. The enrichment schema extends with additional graph-level
+attributes, including the topic and domain of the DAG, and whether the DAG is
+technical or abstract. These fields support downstream filtering and analysis.
+4
+Dataset Validation
+4.1
+Human Expert Validation
+The automatic stages of DAGverse-Pipeline produce an initial pool of candidate
+semantic DAGs. Because the annotations are stored as JSON, we render each
+candidate into a visual review interface (Figure 3) that shows the source figure, a
+reconstructed graph G, and the corresponding evidence snippets from the parsed
+paper text.
+Human experts then apply a two-stage decision rule. They first check whether
+the figure is a valid, in-scope single DAG; candidates that fail this gate are
+3 https://github.com/datalab-to/marker
+DAGverse
+7
+rejected immediately. For candidates that pass, experts assess the reconstructed
+structure and supporting evidence together, evaluating whether node identities,
+edge directions, and graph-level, node-level, and edge-level evidence are accurate.
+We allow at most five manual edits for a candidate to be considered usable.
+(a) Reconstructed DAG view for
+structure checking.
+(b) Evidence panel for node and
+edge grounding checks.
+Fig. 3: Validation interface artifacts used by experts. Left: reconstructed DAG
+view for structure checking. Right: evidence panel for node and edge grounding
+checks.
+4.2
+LLM-as-a-Judge for Scalable Validation
+Human validation is currently indispensable for data quality, but it does not scale
+well enough for a continuously updated dataset. To explore scalable alternatives,
+we implement a LLM-as-a-judge framework [2] that follows the human expert
+rubric. For each candidate semantic DAG, we use three independent annotator
+models and one judge model. The judge, drawn from a different model family,
+then reviews their decisions and issues a final verdict.
+The judge behaves conservatively and tends to reject a subset of DAGs
+that humans would keep. This increases precision at the cost of recall, which
+is consistent with the overall design of DAGverse-Pipeline, but it also makes
+the system too restrictive for fully automatic validation. Inspection of the logs
+suggests that models are relatively strong at finding text that matches a proposed
+graph once the structure is given. Their main failure mode is earlier in the
+pipeline. They tend to be overly conservative on identifying in-scope DAG figures.
+This observation is consistent with the experiments in Section 5 and supports the
+need for a staged pipeline rather than a single end-to-end multimodal model.
+8
+S. Wan et al.
+5
+Experiments
+We evaluate the effectiveness and robustness of DAGverse-Pipeline on a curated
+benchmark of 100 paper-figure pairs drawn from causal learning papers. The
+benchmark contains 50 expert-validated semantic DAGs, 25 clearly non-DAG
+figures, and 25 DAG-like negatives that are visually similar to DAGs but fall
+outside our target class. The negative set includes examples such as flowcharts and
+model diagrams, which makes the front-end classification problem meaningfully
+harder than a simple graph-versus-non-graph decision.
+We compare DAGverse-Pipeline against zero-shot VLM baselines that are
+asked to produce a semantic DAG in a single pass from the candidate figure and
+the corresponding paper text blocks. In contrast, DAGverse-Pipeline decomposes
+the task into classification, reconstruction, grounding, and validation. We report
+three metrics:
+DAG Classification (DC). DC measures precision at the figure-filtering
+stage: among all figures predicted to contain a DAG, how many actually contain
+a valid single DAG. We emphasize precision because false positives propagate
+expensive errors into later stages of the pipeline.
+Structural Difference (SD). For figures correctly identified as DAGs, we
+compare the predicted graph ˆG against the reference graph G. Before computing
+the adjacency matrices, we align nodes between the two graphs by node identity.
+If a predicted node does not match any reference node, or a reference node is
+missing from the prediction, we treat that node as mismatched and remove all
+incoming and outgoing edges incident to it from the comparison. Let A and ˆA
+denote the resulting aligned adjacency matrices, where A, ˆA ∈{0, 1}m×m for
+a graph with m matched nodes. We then use one minus normalized Hamming
+distance so that higher is better.
+NHD(G, ˆG) =
+2
+m(m −1)
+X
+i̸=j
+1Aij̸= ˆ
+Aij,
+SD(G, ˆG) = 1 −NHD(G, ˆG)
+(1)
+Evidence Alignment (EA). EA measures whether the generated node-
+and edge-level evidence aligns with the reference text blocks. Because the dataset
+is expert-validated, we can directly compare the cited block IDs. If a model fails
+to identify a node or edge, the corresponding evidence is counted as incorrect.
+5.1
+RQ1: Pipeline Effectiveness
+To assess overall effectiveness, we compare DAGverse-Pipeline to several zero-shot
+VLM baselines under the metrics defined above. The table reports how many
+figures each method predicts as DAGs, how many of those are true single DAGs,
+and how many survive the full pipeline to become usable semantic DAGs.
+Table 1 reveals a clear pattern. Evidence alignment is already near-saturated
+for modern VLMs: even smaller models score between 93% and 98% EA, while
+GPT-5.1, Gemini 2.5 Pro, and DAGverse-Pipeline reach 98%–100%. On this
+DAGverse
+9
+Model
+Pred.
+True DAG
+DC
+SD
+EA
+Kept
+E2E
+Qwen3-VL-7B
+12
+6
+50%
+52%
+96%
+3
+25%
+InternVL3.5-8B
+29
+9
+31%
+43%
+93%
+7
+24%
+Qwen3-VL-30B
+21
+12
+57%
+25%
+97%
+9
+43%
+InternVL3.5-30B
+37
+16
+43%
+63%
+98%
+12
+32%
+GPT-5.1
+59
+46
+78%
+95%
+98%
+41
+69%
+Gemini2.5-Pro
+54
+39
+72%
+95%
+100%
+39
+72%
+DAGverse-Pipeline
+57
+50
+88%
+92%
+100%
+50
+88%
+Table 1: We compare DAGverse-Pipeline with popular open source and propretary
+VLMs. “Pred.” is the number of figures labeld as DAGs, “True DAG” are actual
+DAGs. “DC”, “SD”, “EA”, and “E2E” are calculated with respect to each model’s
+correct examples. Among all models, DAGverse-Pipeline has the highest retention
+rate, without highest number of examples kept.
+benchmark, once a model has identified the right figure and recovered a plausible
+graph, grounding nodes and edges back to the relevant text is comparatively easy.
+This suggests that evidence alignment is no longer the main bottleneck.
+The harder stages are DAG classification and structure construction. Struc-
+tural performance varies much more widely, from 25% to 95% SD, and classifica-
+tion precision remains far from solved. The main challenge is not distinguishing
+obvious non-DAG figures, which strong VLMs usually handle well, but rejecting
+figures that are visually similar to DAGs, such as flowcharts and model diagrams.
+Our logs show that these DAG-like negatives are the dominant source of errors.
+This is exactly where the pipeline gains its advantage: the classification stage is
+optimized for high-precision filtering, and the annotation stage is separated from
+the initial visual decision.
+The strongest monolithic models are still competitive once they commit to a
+true DAG. GPT-5.1 keeps 41 of the 46 true DAGs that it identifies, and Gemini
+2.5 Pro keeps all 39 of the true DAGs that it identifies. However, both sacrifice
+recall at the filtering stage by failing to retain the full set of 50 benchmark DAGs.
+DAGverse-Pipeline avoids this tradeoff most effectively. It achieves the best DAG
+classification precision (88%), recovers all 50 usable semantic DAGs, and attains
+the highest end-to-end score. Taken together, these results support the necessity
+of a staged pipeline design. A single end-to-end VLM can often ground evidence
+once the input is clean, but it still struggles to robustly filter and reconstruct
+DAGs in realistic document collections.
+5.2
+RQ2: Pipeline Robustness Across Sources
+To study robustness, we separately evaluate papers from arXiv and bioRxiv. This
+tests whether the pipeline is sensitive to differences in document layout, figure
+style, and writing conventions across sources. In this experiment, we focus on
+the bottom-line end-to-end retention rate, the fraction of usable semantic DAGs
+recovered from each source.
+10
+S. Wan et al.
+Model
+arXiv
+bioRxiv
+Qwen3-VL-7B
+5%
+7%
+InternVL3.5-8B
+8%
+14%
+Qwen3-VL-30B
+14%
+43%
+InternVL3.5-30B
+21%
+43%
+GPT-5.1
+67%
+71%
+Gemini2.5-Pro
+73%
+79%
+DAGverse-Pipeline
+88%
+93%
+Table 2: End-to-end performance of DAGverse-Pipeline and baselines across
+different paper sources.
+Table 2 shows that DAGverse-Pipeline remains strong on both sources and
+substantially outperforms the zero-shot baselines. The performance gap is es-
+pecially important because it appears before any domain-specific adaptation,
+suggesting that the staged design is robust to moderate changes in formatting
+and document style. This is necessary if DAGverse is to expand to additional
+venues and disciplines.
+6
+DAGverse-1: A Dataset of Document-Grounded Causal
+DAGs
+We introduce DAGverse-1, the first release of the DAGverse dataset, focusing on
+causal DAGs. The pipeline begins with over 2.7 million arXiv papers and 400
+thousand bioRxiv papers published between January 2019 and April 2025, and
+proceeds through a rigorous multi-stage filtering process (Table 4). In addition,
+we incorporate synthetic DAG datasets with textual descriptions (Cladder [10])
+to complement real-world sources. The final DAGverse-1 dataset contains 108
+high-quality semantic DAGs (Figure 4).
+Among all 108 DAGs, those sourced from arXiv are notably larger, averaging
+6.51 nodes and 7.79 edges, whereas Cladder DAGs average 3.43 nodes and 3.22
+edges. This distinction suggests that real-world DAGs have greater structural
+complexity and diversity than synthetic ones. In total, DAGverse-1 spans 190
+unique domains, with the most frequent tags including public health, epidemiology,
+healthcare, education, and biostatistics. This concentration is largely driven by
+the domain proximity of bioRxiv papers, and the current domain labeling is not
+sufficiently granular to distinguish finer differences.
+Overall, DAGverse-1 exhibits significant diversity in both domain coverage
+and graph structure. This distinguishes it from existing DAG datasets, which
+tend to be either synthetic or restricted to a narrow range of domains. The
+dataset is publicly available on HuggingFace 4.
+4 https://huggingface.co/datasets/textual-causal-reasoning/dagverse-example
+DAGverse
+11
+Nodes
+arXiv bioRxiv CLadder
+Mean
+6.45
+6.77
+3.43
+Variance
+14.53
+20.53
+0.25
+Minimum
+2
+3
+3
+Maximum
+25
+19
+4
+Edges
+arXiv bioRxiv CLadder
+Mean
+7.76
+7.92
+3.22
+Variance
+30.19
+29.08
+1.23
+Minimum
+1
+4
+2
+Maximum
+32
+19
+5
+Domain
+Count
+Public Health
+18
+Epidemiology
+17
+Healthcare
+12
+Education
+9
+Biostatistics
+8
+2
+3
+4
+5
+6
+7
+8
+9 10 11 12 13 14
+19
+25
+Nodes per DAG
+0
+5
+10
+15
+20
+25
+30
+Number of DAGs
+(a) Node Count Distribution by Source
+arXiv
+bioRxiv
+CLadder
+1 2 3 4 5 6 7 8 91011121314
+1819
+27
+32
+Edges per DAG
+0
+2
+4
+6
+8
+10
+12
+14
+16
+Number of DAGs
+(b) Edge Count Distribution by Source
+arXiv
+bioRxiv
+CLadder
+(c) Domain Tag Word Cloud
+Public Health
+Epidemiology
+Healthcare
+Education
+Biostatistics
+Public Policy
+Computer Vision
+Recommender Systems
+Reinforcement Learning
+Genetics
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+Count
+(d) Top 10 Domain Tags
+Fig. 4: DAGverse-1 data card. The left panel summarizes key statistics, including
+node and edge summaries and the most frequent domain tags. The right panel
+visualizes the node and edge distribution by source, a domain word cloud, and
+a top domain count plot. We omit two general tags “Causal Inference” and
+“Machine Learning” in domain visualizations.
+6.1
+Intended Use and Applications
+DAGverse-1 supports a range of tasks that require structured reasoning grounded
+in real-world evidence. Figure 5 shows how a semantic DAG can support different
+forms of text-graph reasoning.
+Text-to-DAG generation asks a model to recover a graph from scientific
+prose and associated figures. The difficulty is not only relation extraction, but
+also choosing the right level of abstraction so that the recovered nodes and edges
+summarize the document-level mental model.
+DAG-to-Text generation asks whether a model can verbalize a semantic
+DAG as a coherent explanation that remains globally consistent with the structure.
+Because each example contains graph-level, node-level, and edge-level evidence,
+the dataset supports evaluation beyond isolated local descriptions.
+Causal QA and reasoning. A semantic DAG supports DAG-based rea-
+soning because it combines graph structure with grounded meaning. For causal
+DAGs, the graph can act as a compact inference engine while the grounded
+text supplies semantic context. This enables reasoning tasks such as checking
+structural independence, tracing upstream causes, or testing whether a claim
+matches the documented graph.
+7
+Related Work
+7.1
+Graph–Text Paired Datasets
+Graph–text paired datasets have been widely studied in knowledge graph ver-
+balization and data-to-text generation. WebNLG [6] pairs small sets of DBpedia
+12
+S. Wan et al.
+Text-to-DAG
+DAG-to-Text
+Causal QA
+A patient visits a physician after
+noticing jaundice.
+The patient suddenly lost his
+wife to a car accident, became
+depressed, started drinking
+alcohol, and then developed
+cirrhosis. He also reports that
+his grandmother had
+depression.
+Q: Are spouse loss and family
+history of depression
+independent?
+A: Yes
+Explanation
+Depression severity is a collider,
+so the two causes become
+associated only if we condition on
+depression or its descendants.
+Spouse
+loss
+Family
+history
+Depression
+Alcohol
+use
+Cirrhosis
+diagnosis
+Spouse
+loss
+Family
+history
+Depression
+Alcohol
+use
+Cirrhosis
+diagnosis
+Spouse
+loss
+Family
+history
+Depression
+Alcohol
+use
+Cirrhosis
+diagnosis
+After losing a spouse, the
+patient becomes depressed,
+which increases alcohol use
+and culminates in cirrhosis.
+Family history contributes a
+weaker upstream influence
+through depression in this case
+narrative.
+Fig. 5: A single semantic DAG in DAGverse can be used in different ways. Using
+the cirrhosis example [25], we demonstrate 3 tasks: text-to-graph recovery from
+grounded evidence, graph-to-text generation of a coherent causal narrative, and
+causal question answering over graph structure and semantics.
+RDF triples with manually written descriptions, while WikiGraphs [26] aligns
+Wikipedia passages with subgraphs from Wikidata. These resources, however,
+center on factual triples rather than DAGs and provide short, often stylized text
+that enumerates relations rather than presenting explanatory narratives. Recent
+work has attempted to scale up graph–text construction automatically. Mousavi
+et al. [16] introduce LAGRANGE using a cyclic alignment framework, but find
+that fully automatic pairing frequently produces misaligned or incoherent text,
+and that even partially curated datasets, such as WebNLG, still outperform
+synthetic alternatives. Existing graph–text datasets highlight the difficulty of
+obtaining high-quality, semantically aligned graph–text pairs at scale.
+7.2
+Causal DAG Datasets
+Doc2SemDAG differs from standard causal discovery, which assumes that the
+variables and measurements are already fixed [19]. It also goes beyond pairwise
+causal relation extraction [15]. A wide range of causal DAG datasets support
+causal discovery and causal reasoning research, but most remain small, synthetic,
+or lack natural language grounding. Classic resources such as the bnlearn [22]
+offer only a few hand-crafted networks without textual descriptions. Automated
+extraction approaches, including Garg and Fetzer’s economics-focused pipeline
+[7], extract causal claims from econometric equations, producing large numbers of
+pairwise links. However, the resulting graphs are fragmented, domain-specific, and
+labeled with abstract identifiers rather than natural language concepts. Recent
+benchmarks shift toward evaluating LLMs’ causal reasoning under controlled DAG
+DAGverse
+13
+settings. CLadder probes Pearl’s hierarchy through a curated set of small graphs
+[10]; Corr2Cause tests correlation–causation discrimination [11]; CausalProbe
+examines causal signals in news text [4]; CausalGraph2LLM and CLEAR assess
+reasoning over synthetic graph scenarios [23, 3], and CausalBench aggregates
+multiple such evaluations [30]. These datasets provide useful probes but remain
+limited in scale, rely on manual construction, and rarely include rich natural
+language context. ReCAST [21] moves closer to real-world grounding by extracting
+and validating causal relations from economics text, yet it is restricted to a single
+domain and does not yield coherent, author-provided DAGs.
+DAG Statistics
+Data Curation
+Dataset
+# Domains
+Automatic
+Real-world
+Growing
+CLadder [10]
+Synthetic
+p
+p
+p
+Corr2Cause [11]
+Synthetic
+p
+p
+p
+CausalProbe [4]
+News
+p
+✓
+p
+CausalGraph2LLM [23]
+Mostly synthetic
+p
+p
+p
+ReCAST [21]
+Econ
+p
+✓
+p
+CLEAR [3]
+Synthetic
+p
+p
+p
+CausalBench [30]
+Varied
+p
+✓
+p
+DAGverse (ours)
+Multiple
+✓
+✓
+✓
+Table 3: Comparison between our dataset and existing causal DAGs datasets.
+7.3
+LLMs for Data Curation and Graph Construction
+Our methodology leverages LLMs and VLMs as flexible components for dataset
+curation and graph extraction. Prior work has explored similar directions. Pan
+et al. [18] outline how LLMs can interface with knowledge graphs by filling gaps
+or translating between text and structured representations, and Long et al. [14]
+test whether LLMs can generate causal graphs from textual descriptions, finding
+that models produce plausible links but often hallucinate or omit key variables.
+Multimodal systems extend this idea beyond text. VLMs have been applied
+to tasks such as chart reading [17] and diagram understanding [29], though
+converting full scientific figures into machine-readable graphs remains difficult.
+Most existing pipelines are still text-centric and require human supervision for
+training or verification, limiting their scalability despite the promise of LLMs
+and VLMs as general-purpose data-mining operators.
+8
+Conclusions
+In this work, we present DAGverse, a systematic framework for constructing
+semantic causal DAGs from scientific documents, and release DAGverse-1, a
+curated dataset that bridges natural language and causal DAGs. Together, they
+14
+S. Wan et al.
+establish a foundation for studying multimodal causal understanding and dataset
+construction from real-world scientific sources.
+DAGverse-Pipeline is designed to prioritize precision over recall. In practice
+this means that ambiguous figures, noisy parses, and uncertain annotations are
+discarded rather than forced into a graph. This conservative design yields a trust-
+worthy foundation for DAGverse, but it also limits coverage in the current release.
+Future versions of the pipeline should explore controlled ways to increase scale
+without losing reliability, for example by allowing multiple candidate graphs per
+figure, broadening the accepted DAG classes, or attaching calibrated confidence
+scores to intermediate decisions.
+The current version of DAGverse-Pipeline depends on specific OCR, VLM, and
+LLM components that are not state of the art in every respect. Improvements
+in document layout analysis, optical character recognition, and multimodal
+modeling are likely to yield better figure detection, cleaner node labels, and more
+reliable text alignment. In the longer term, specialized end-to-end models for
+DAG construction from documents, which jointly reason over layout, text, and
+graphical structure, may outperform our modular design while using DAGverse-1
+as supervision. Benchmarking multimodal LLMs and VLMs on such tasks, and
+defining shared splits and metrics on top of future, larger versions of DAGverse,
+is left for future work.
+DAGverse-1 focuses on DAGs and on papers with an explicit causal or graph-
+ical modeling component. It does not yet cover other graph types such as
+undirected networks, dynamic graphs, or hybrid diagrams that mix causal and
+noncausal edges. Extending DAGverse-Pipeline to additional graph classes and
+broader scientific domains is an important direction for future work.
+More broadly, DAGs provide a natural interface between natural text and
+symbolic reasoning. Recent work on multimodal document understanding and
+causal reasoning over scientific text [27, 12] highlights the need for datasets
+and benchmarks where structured models and natural language are connected.
+DAGverse offers such a setting. It provides a controlled test bed for studying how
+models can learn to construct structured knowledge from complex documents,
+how they can ground that knowledge in the original text, and how they can
+use it for downstream reasoning tasks. We hope that DAGverse will serve as
+a foundation for future research on document-grounded structured reasoning
+and for building better tools to help researchers navigate the growing scientific
+literature.
+Bibliography
+[1] Brouillard, P., Squires, C., Wahl, J., Kording, K.P., Sachs, K., Drouin,
+A., Sridhar, D.: The landscape of causal discovery data: Grounding causal
+discovery in real-world applications. arXiv preprint arXiv:2412.01953 (2024)
+[2] Chen, D., Chen, R., Zhang, S., Wang, Y., Liu, Y., Zhou, H., Zhang, Q., Wan,
+Y., Zhou, P., Sun, L.: Mllm-as-a-judge: Assessing multimodal llm-as-a-judge
+with vision-language benchmark. In: Forty-first International Conference on
+Machine Learning (2024)
+[3] Chen, S., Xu, M., Wang, K., Zeng, X., Zhao, R., Zhao, S., Lu, C.: Clear:
+Can language models really understand causal graphs? arXiv preprint
+arXiv:2406.16605 (2024)
+[4] Chi, H., Li, H., Yang, W., Liu, F., Lan, L., Ren, X., Liu, T., Han, B.:
+Unveiling causal reasoning in large language models: Reality or mirage?
+Advances in Neural Information Processing Systems 37, 96640–96670 (2024)
+[5] Comanici, G., Bieber, E., Schaekermann, M., Pasupat, I., Sachdeva, N.,
+Dhillon, I., Blistein, M., Ram, O., Zhang, D., Rosen, E., et al.: Gemini 2.5:
+Pushing the frontier with advanced reasoning, multimodality, long context,
+and next generation agentic capabilities. arXiv preprint arXiv:2507.06261
+(2025)
+[6] Gardent, C., Shimorina, A., Narayan, S., Perez-Beltrachini, L.: The webnlg
+challenge: Generating text from rdf data. In: 10th International Conference
+on Natural Language Generation. pp. 124–133. ACL Anthology (2017)
+[7] Garg, P., Fetzer, T.: Causal claims in economics. arXiv preprint
+arXiv:2501.06873 (2025)
+[8] Halpern, J.Y.: Actual causality. MiT Press (2016)
+[9] Harenslak, B.P., De Ruiter, J.: Data pipelines with apache airflow. Simon
+and Schuster (2021)
+[10] Jin, Z., Chen, Y., Leeb, F., Gresele, L., Kamal, O., Lyu, Z., Blin, K., Gonza-
+lez Adauto, F., Kleiman-Weiner, M., Sachan, M., et al.: Cladder: Assessing
+causal reasoning in language models. Advances in Neural Information Pro-
+cessing Systems 36, 31038–31065 (2023)
+[11] Jin, Z., Liu, J., Lyu, Z., Poff, S., Sachan, M., Mihalcea, R., Diab, M.,
+Schölkopf, B.: Can large language models infer causation from correlation?
+arXiv preprint arXiv:2306.05836 (2023)
+[12] Kiciman, E., Ness, R., Sharma, A., Tan, C.: Causal reasoning and large lan-
+guage models: Opening a new frontier for causality. Transactions on Machine
+Learning Research (2024), https://openreview.net/forum?id=mqoxLkX210,
+featured Certification
+[13] Koller, D., Friedman, N.: Probabilistic graphical models: principles and
+techniques. MIT press (2009)
+[14] Long, S., Schuster, T., Piché, A.: Can large language models build causal
+graphs? arXiv preprint arXiv:2303.05279 (2023)
+16
+S. Wan et al.
+[15] Mirza, P., Tonelli, S.: Catena: Causal and temporal relation extraction from
+natural language texts. In: The 26th international conference on computa-
+tional linguistics. pp. 64–75. ACL (2016)
+[16] Mousavi, A., Zhan, X., Bai, H., Shi, P., Rekatsinas, T., Han, B., Li, Y., Pound,
+J., Susskind, J.M., Schluter, N., et al.: Construction of paired knowledge
+graph-text datasets informed by cyclic evaluation. In: Proceedings of the
+2024 Joint International Conference on Computational Linguistics, Language
+Resources and Evaluation (LREC-COLING 2024). pp. 3782–3803 (2024)
+[17] Pan, H., Zhang, Q., Caragea, C., Dragut, E., Latecki, L.J.: Flowlearn:
+Evaluating large vision-language models on flowchart understanding. arXiv
+preprint arXiv:2407.05183 (2024)
+[18] Pan, J.Z., Razniewski, S., Kalo, J.C., Singhania, S., Chen, J., Dietze, S.,
+Jabeen, H., Omeliyanenko, J., Zhang, W., Lissandrini, M., et al.: Large
+language models and knowledge graphs: Opportunities and challenges. arXiv
+preprint arXiv:2308.06374 (2023)
+[19] Pearl, J.: Causal diagrams for empirical research. Biometrika 82(4), 669–688
+(1995), http://www.jstor.org/stable/2337329
+[20] Pearl, J.: Causality: Models, Reasoning, and Inference. Cambridge University
+Press, 2 edn. (2009), https://doi.org/10.1017/CBO9780511803161
+[21] Saklad, R., Chadha, A., Pavlov, O., Moraffah, R.: Can large language
+models infer causal relationships from real-world text? arXiv preprint
+arXiv:2505.18931 (2025)
+[22] Scutari, M.: Learning bayesian networks with the bnlearn r package. Journal
+of statistical software 35, 1–22 (2010)
+[23] Sheth, I., Fatemi, B., Fritz, M.: Causalgraph2llm: Evaluating llms for causal
+queries. arXiv preprint arXiv:2410.15939 (2024)
+[24] Singh, A., Fry, A., Perelman, A., Tart, A., Ganesh, A., El-Kishky, A.,
+McLaughlin, A., Low, A., Ostrow, A., Ananthram, A., et al.: Openai gpt-5
+system card. arXiv preprint arXiv:2601.03267 (2025)
+[25] Strobl, E.V.: Counterfactual formulation of patient-specific root causes of
+disease. Journal of Biomedical Informatics 150, 104585 (2024). https://doi.
+org/https://doi.org/10.1016/j.jbi.2024.104585, https://www.sciencedirect.
+com/science/article/pii/S1532046424000030
+[26] Wang, L., Li, Y., Aslan, O., Vinyals, O.: Wikigraphs: A wikipedia text-
+knowledge graph paired dataset. arXiv preprint arXiv:2107.09556 (2021)
+[27] Wang, Z., Xia, M., He, L., Chen, H., Liu, Y., Zhu, R., Liang, K., Wu, X., Liu,
+H., Malladi, S., et al.: Charxiv: Charting gaps in realistic chart understanding
+in multimodal llms. Advances in Neural Information Processing Systems 37,
+113569–113697 (2024)
+[28] Wittgenstein, L.: Philosophical investigations. John Wiley & Sons (2009)
+[29] Zhao, Y., Wang, C., Li, C., Cohan, A.: Can multimodal foundation models
+understand schematic diagrams? an empirical study on information-seeking
+qa over scientific papers. In: Findings of the Association for Computational
+Linguistics: ACL 2025. pp. 18598–18631 (2025)
+[30] Zhou, Y., Wu, X., Huang, B., Wu, J., Feng, L., Tan, K.C.: Causalbench: A
+comprehensive benchmark for causal learning capability of large language
+models. CoRR (2024)
+DAGverse
+17
+A
+Semantic DAG
+Semantic DAG Example
+{
+"dag_id": "arxiv_2204_09274_0",
+"source": "arxiv",
+"abstract": false,
+"technical": false,
+"domain": ["healthcare", "causal inference"],
+"nodes": [
+{
+"id": "Age",
+"aliases": ["patient age", "baseline age"],
+"evidence": ["Figure 2 shows an example causal graph to study
+the efficiency of a medication on a disease, where the nodes
+represent variables and the edges represent cause-effect
+relations intuitively..."]
+}
+],
+"edges": [
+{
+"source": "Age",
+"target": "Heart Rate",
+"evidence": ["Figure 2 shows an example causal graph to study
+the efficiency of a medication on a disease ..."]
+}
+]
+}
+B
+Prompts
+LLM Filter Prompt
+**Role:** You are an AI research assistant tasked with classifying
+academic papers based on their relevance to a specific research
+goal: identifying applied causal case studies rather than purely
+methodological papers.
+**Instructions:**
+Carefully follow the guideline provided below to analyze the input
+paper information (Category, Title, Abstract). Based *only* on
+the guideline and the provided paper information, determine if
+the paper should be classified as YES (keep) or NO (exclude).
+18
+S. Wan et al.
+**Guideline:**
+Only include papers that demonstrate the use of causal inference
+techniques in a specific applied domain (e.g., economics,
+education, healthcare). Exclude papers that focus purely on
+developing new methods without an application case study.
+**Input Paper Information:**
+* **CATEGORY:** {category}
+* **TITLE:** {paper_title}
+* **ABSTRACT:** {paper_abstract}
+**Output Format:**
+You must respond with exactly one word: "YES" or "NO".
+Answer:
+DAG Classification Prompt
+You are an expert in causal learning. Your goal is to determine
+whether the image represents a single **Directed Acyclic Graph (
+DAG)**.
+## Visual Description Guidelines
+Answer ‘True‘ if the image contains a **DAG**:
+- **One connected structure**: The image should display a single,
+unified network of nodes and arrows, not multiple disconnected
+groups.
+- **Nodes**: Clearly separated points, circles, or labeled shapes
+representing entities or variables.
+- **Edges**: Lines with arrows connecting nodes, indicating direction.
+Answer ‘False‘ if in the image there is (are):
+- No DAG: the image does not contain a single DAG
+- Flowcharts: or process diagrams, decision charts, business
+processes, etc.
+- Model diagrams: neural networks, Bayesian networks, etc.
+- Undirected graphs: lines without arrows
+- Graphs with cycles: arrows forming loops
+- Multiple separate DAGs in one image
+- Statistical diagrams: Venn diagrams, bar charts, scatter plots
+- Entity-relationship diagrams: ERDs
+- Circuit diagrams: electrical or logical circuits
+- Ambiguous or unclear graphs: uncertain node/edge direction, unclear
+structure
+DAGverse
+19
+Use ‘<answer>‘ tags for an output.
+## Output Format:
+‘‘‘
+<answer>
+True/False
+</answer>
+‘‘‘
+DAG Annotation Prompt
+### Introduction
+You are provided with a figure and the full text of a paper.
+The figure is extracted from the paper and likely depicts a causal
+DAG (Directed Acyclic Graph).
+Your task is to extract the DAG structure from the figure and enrich
+it using relevant information from the paper.
+### Formatting
+‘‘‘json
+You are an expert in causal learning.
+Your task is to extract stories based on a provided paper and a
+figure extracted from the paper.
+Strictly follow the instructions, using your explanation, reading
+comprehension, and visual understanding abilities to annotate.
+## **INPUT**
+- **Paper:** A causal learning paper in JSON format, with each block
+containing an ‘id‘ and the corresponding ‘text‘.
+- **Figure:** An image of a causal graph extracted from the paper.
+**Paper:**
+‘‘‘
+<paper>
+{{paper}}
+</paper>
+‘‘‘
+## **OUTPUT FORMAT**
+The output has three components:
+20
+S. Wan et al.
+* **label:** whether the figure meets the criteria specified in the
+instructions and its category
+* **structure:** detailed DAG annotation
+* **dags:** Semantically grounded ‘structure‘ associated with stories
+Structure your output following the schema below (don’t forget about
+(<output>, </output>) tags):
+‘‘‘
+<output>
+{
+"label":
+{
+"is_dag": true/false,
+"category": "simple" | "multiple" | "temporal" | "undetermined",
+"explanation": "..."
+},
+"structure":
+{
+"id": "{{paper_id}}",
+"nodes": [
+{
+"id": "node_id"
+}
+/* more nodes */
+],
+"edges": [
+{
+"source": "node_id",
+"target": "node_id"
+}
+/* more edges */
+]
+},
+"dags":
+[
+{
+"id": "{{paper_id}}_0",
+"abstract": true | false,
+"technical": true | false,
+// Is understanding the DAG
+technical or layman-accessible?
+"domain": [], // array, default []
+"context": {
+"theme": ’’, // string, default ’’
+"characters": [], // arrary, default []
+"setting": ’’, // string, default ’’
+"tone": [], // array, default []
+"summary": ’’, // string, default ’’
+"evidence": ’’ // array, default []
+DAGverse
+21
+},
+"nodes": [
+{ "id": <node_id>, "aliases": [<expanded aliases, including
+specific or lay terms as needed>], "evidence": [paper_block_id_1
+,..., ’figure’] }
+/* mode nodes */
+],
+"edges": [
+{ "source": <source_id>, "target": <target_id>, "evidence": [
+paper_block_id_1, ..., ’figure’] }
+/* more edges */
+]
+},
+/* one object per dag */
+]
+}
+</output>
+‘‘‘
+### Instructions
+Step 1: DAG Classification.
+Assess the figure to determine if it contains a causal DAG and, if so,
+its category. The output for this step is the label object.
+1. Set ‘is_dag‘:
+- Set to ‘false‘ if the figure contains no causal DAG (e.g., a
+flowchart, Venn diagram, a model diagram, or unrelated).
+3. If ‘is_dag‘ is ‘true‘, determine ‘category‘:
+1. ‘multiple‘: figure shows multiple separate DAGs. Use sub figure
+captions as cues.
+2. ‘temporal‘: DAG describes a repeated temporal event. Cues
+include time indices, lags, feedback loops. Not to confuse with
+trivial time-dependent events.
+3. ‘undetermined‘: contains undirected edges, bidirectional arrows,
+no arrows, or dashed lines. Not to confuse with unblocked paths
+annotations.
+4. ‘simple‘: a single DAG, with clear nodes and edges.
+4. ‘explanation‘: provide your explanation in a few sentences.
+If ‘is_dag‘ is ‘false‘, or the ‘category‘ is in [‘multiple‘, ‘
+temporal‘], leave the ‘structure‘ and ‘dags‘ objects empty and
+skip to Step 4.
+If ‘is_dag‘ is ‘true‘ and ‘category‘ is in [‘undetermined‘, ‘simple‘],
+proceed to the next step.
+Step 2: Structure Extraction.
+Extract essential nodes and edges from the figure
+22
+S. Wan et al.
+1. ‘id‘: set to ‘{{paper_id}}‘
+2. ‘nodes‘: create unique ‘id‘ per node, prioritize its label in the
+figure. If no label is available, fallback to ‘node_0‘, etc.
+3. ‘edges‘: create directed edges with ‘source‘ and ‘target‘, using
+node ‘id‘.
+4. For undetermined edges (bidirectional, no arrow, dashed line),
+create two separate edges (a -> b and b -> a).
+5. Do not annotate minor annotations (e.g. exogenous error, logic
+symbol) as edges or nodes.
+Step 3: Enrich the DAG ‘structure‘.
+Enrich the ‘structure‘ with information from paper. It’s possible
+more than one story can be associated with a single DAG.
+- The output should be about the DAG and its narrative only; ignore
+unrelated parts of the paper.
+- Fill the ‘dags‘ array with one object for each distinct DAG
+identified.
+- ‘id‘: set to ‘{{paper_id}}_N‘, where N starts from 0.
+- ‘abstract‘:
+-
+Set to ‘true‘ if the DAG is a methodological, abstract, or
+theoretical diagram where nodes are trivial (e.g., confounder,
+treatment) and do not represent real-world entities. Otherwise,
+set to ‘false‘.
+- ‘technical‘:
+-
+‘true‘ if the DAG requires domain expertise to interpret,
+otherwise false.
+-
+‘false‘ if the DAG is layman-accessible, even though some nodes
+use technical terms, such as drug names.
+- ‘domain‘: List all relevant research or application domains for the
+DAG as an array (e.g., [’economics’, ’healthcare’]). Leave empty
+if indeterminate.
+- ‘context‘:
+- ‘theme‘: The phenomenon, mechanism, or story of the DAG.
+- ‘characters‘: list of agents or actors in the DAG story, empty
+array if with no clear actors or the DAG is technical.
+- ‘setting‘: Describe the relevant scenario, time, or place
+implied by the DAG.
+- ‘tone‘: A list of compatible and varied tones fit the DAG’s
+story (e.g. neutral, somber, happy, hopeful, etc.).
+- ‘summary‘: Write a brief, readable narrative of the DAG’s story,
+referencing node concepts but not all edges. Start with ’The
+story ...’, do not use the word ’DAG’.
+- ‘evidence‘: Array of paper_block_ids from paper and/or the
+string ’figure’
+- For each ‘node‘ within the ‘dags‘ object:
+- ‘id‘: Reference the id created in Step 2.
+DAGverse
+23
+- ‘aliases‘: Extend aliases as needed for self-containment, from
+generic to concrete. IF the DAG is technical, and node represents
+a specific domain concept, do not extend, unless the paper
+support it.
+- For each ‘edge‘ within the ‘dags‘ object:
+- ‘source‘ and ‘target‘: Reference the ids created in Step 2.
+- Evidence: For all evidence fields (nodes, edges, context), list
+only the supporting paper block IDs and/or the string ’figure’.
+Do not include textual content.
+Step 4: Validate
+Narrative Integrity
+- Each dag object should be understandable as a self-contained
+narrative.
+- Evidence arrays must contain valid paper_block_ids or the string ’
+figure’.
+DAG integrity
+- All node IDs must be unique.
+- The number of nodes in structure and dags must match the essential
+nodes in the figure.
+- All edge sources and targets must reference valid node IDs.
+### Task
+#### Paper Input
+Paper: A paper in JSON format, with each block containing an ‘id‘ and
+the corresponding ‘text‘.
+use ‘id‘ to reference in the evidence.
+Example:
+‘‘‘json
+{
+"id": 48,
+"text": "...",
+"rules": [
+"..."
+]
+}
+‘‘‘
+Paper:
+{{paper}}
+24
+S. Wan et al.
+Number of Instances
+arXiv
+bioRxiv
+Metadata
+2,720,631 (100%)
+401,231 (100%)
+Metadata (processed)
+13,441 (0.49%)
+1,187 (0.30%)
+Papers (Downloaded)
+8,410 (0.31%)
+693 (0.17%)
+Papers (Candidates)
+260 (0.0096%)
+688 (0.17%)
+Figures (Pre-DAG classification)
+2,233 (0.08%)
+9,261 (2.31%)
+Figures (Post-DAG classification)
+1,552 (0.06%)
+2,169 (0.54%)
+Semantic DAGs (Pre-validation)
+66 (0.0024%)
+14 (0.0035%)
+Semantic DAGs (Validated)
+58 (0.0021%)
+13 (0.0032%)
+Table 4: End-to-end pipeline funnel from raw metadata to validated outputs.
+For each source, the percentage in parentheses is the retention rate at that step
+relative to the total number of papers in that source’s metadata.
+C
+Pipeline Funnel
+D
+Ethical Considerations
+DAGverse reflects the papers it is built from. The DAGs and associated text
+are faithful to the source papers in the sense that they capture what authors
+wrote and drew, but they are not guaranteed to be factually correct about the
+real world. Some graphs describe hypothetical scenarios, stylized examples, or
+modeling assumptions that may not hold outside their original context. Users
+should therefore treat DAGverse as a resource for studying how models interact
+with scientific arguments and representations, not as an authority on domain
+facts.
+DAGverse-1 is constructed from open-access repositories such as arXiv, and
+bioRxiv, and we respect the terms of use of each source. We release only derived
+annotations, metadata, and limited figure crops, leaving original PDFs hosted by
+the publishers, and intend the dataset for research use only. Because the corpus
+is skewed toward computer science, preprints, and English-language papers, users
+should be cautious when generalizing findings to other domains and languages.
+E
+Disclosure of Gen-AI Usage
+Generative AI tools were used during the development of this paper to assist
+with coding implementation and writing. All research ideas, methodology design,
+and manuscript writing are original work by the authors.

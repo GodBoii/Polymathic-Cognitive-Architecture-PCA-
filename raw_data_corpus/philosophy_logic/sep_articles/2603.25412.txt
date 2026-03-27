@@ -1,0 +1,1151 @@
+Beyond Content Safety: Real-Time Monitoring for Reasoning
+Vulnerabilities in Large Language Models
+Xunguang Wang, Yuguang Zhou, Qingyue Wang
+The Hong Kong University of Science and Technology
+Hong Kong, China
+{xwanghm,yzhougv}@cse.ust.hk,qingyue.wang@ust.hk
+Zongjie Li, Ruixuan Huang, Zhenlan Ji
+The Hong Kong University of Science and Technology
+Hong Kong, China
+{zligo,rhuangbi,zjiae}@cse.ust.hk
+Pingchuan Ma
+Zhejiang University of Technology
+Hangzhou, Zhejiang Province, China
+pma@zjut.edu.cn
+Shuai Wang∗
+shuaiw@cse.ust.hk
+The Hong Kong University of Science and Technology
+Hong Kong, China
+Abstract
+Large language models (LLMs) increasingly rely on explicit chain-
+of-thought (CoT) reasoning to solve complex tasks, yet the safety of
+the reasoning process itself remains largely unaddressed. Existing
+work on LLM safety focuses on content safety—detecting harmful,
+biased, or factually incorrect outputs—and treats the reasoning
+chain as an opaque intermediate artifact. We identify reasoning
+safety as an orthogonal and equally critical security dimension:
+the requirement that a model’s reasoning trajectory be logically
+consistent, computationally efficient, and resistant to adversarial
+manipulation.
+We make three contributions. First, we formally define reasoning
+safety and introduce a nine-category taxonomy of unsafe reason-
+ing behaviors, covering input parsing errors, reasoning execution
+errors, and process management errors. Second, we conduct a large-
+scale prevalence study annotating 4,111 reasoning chains from both
+natural reasoning benchmarks and four adversarial attack meth-
+ods (reasoning hijacking and denial-of-service), confirming that all
+nine error types occur in practice and that each attack induces a
+mechanistically interpretable signature. Third, we propose a Rea-
+soning Safety Monitor: an external LLM-based component that runs
+in parallel with the target model, inspects each reasoning step in
+real time via a taxonomy-embedded prompt, and dispatches an
+interrupt signal upon detecting unsafe behavior.
+Evaluation on a 450-chain static benchmark shows that our moni-
+tor achieves up to 84.88% step-level localization accuracy and 85.37%
+error-type classification accuracy, outperforming hallucination de-
+tectors (44.36%) and process reward model baselines (68.83%) by
+substantial margins. These results demonstrate that reasoning-level
+∗Shuai Wang is the corresponding author.
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+Conference acronym ’XX, Woodstock, NY
+© 2018 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-1-4503-XXXX-X/2018/06
+https://doi.org/XXXXXXX.XXXXXXX
+monitoring is both necessary and practically achievable, and es-
+tablish reasoning safety as a foundational concern for the secure
+deployment of large reasoning models.
+Keywords
+Large Language Models, Reasoning Safety, Chain-of-Thought, Mon-
+itoring, Reasoning Attacks
+ACM Reference Format:
+Xunguang Wang, Yuguang Zhou, Qingyue Wang, Zongjie Li, Ruixuan
+Huang, Zhenlan Ji, Pingchuan Ma, and Shuai Wang. 2018. Beyond Con-
+tent Safety: Real-Time Monitoring for Reasoning Vulnerabilities in Large
+Language Models. In Proceedings of Make sure to enter the correct conference
+title from your rights confirmation email (Conference acronym ’XX). ACM,
+New York, NY, USA, 10 pages. https://doi.org/XXXXXXX.XXXXXXX
+1
+Introduction
+Large Language Models (LLMs) have demonstrated remarkable pro-
+ficiency on complex reasoning tasks by generating explicit chain-
+of-thought (CoT) trajectories [26]—step-by-step intermediate rea-
+soning sequences that decompose difficult problems before commit-
+ting to a final answer. This paradigm has been further formalized
+in Large Reasoning Models (LRMs) such as OpenAI o1 [19] and
+DeepSeek-R1 [8], which internalize extended reasoning chains as a
+core capability and achieve state-of-the-art performance on mathe-
+matical, scientific, and logical benchmarks. As these systems are
+increasingly deployed in high-stakes domains—automated decision
+support, code generation, scientific discovery—the trustworthiness
+of their reasoning processes becomes a critical concern.
+The security community has devoted considerable effort to con-
+tent safety: ensuring that model outputs are free from toxicity, bias,
+privacy leakage, and factual hallucination [3, 10, 20]. However, this
+focus on the output leaves the reasoning process itself largely unpro-
+tected. We identify a distinct and previously underexplored attack
+surface: the chain-of-thought trajectory. An adversary who can
+manipulate a model’s intermediate reasoning steps—without nec-
+essarily altering the surface appearance of the final answer—can
+induce catastrophic failures that content-safety tools are blind to.
+Two classes of threats exemplify this attack surface. First, rea-
+soning hijacking attacks [27, 28] inject adversarially crafted reason-
+ing steps that redirect the model’s inference trajectory toward an
+attacker-controlled conclusion, corrupting the answer while the
+arXiv:2603.25412v1  [cs.AI]  26 Mar 2026
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Wang et al.
+output appears superficially coherent. Second, reasoning denial-
+of-service (DoS) attacks [11, 31] exploit the open-ended nature
+of extended reasoning by inducing the model to generate non-
+terminating or excessively redundant chains, exhausting compu-
+tational resources and inflating inference costs. Beyond adversar-
+ial threats, models also exhibit intrinsic reasoning vulnerabilities—
+logical fallacies, arithmetic errors, and goal drift—that arise without
+any external manipulation and can compound into catastrophic
+decision errors on high-complexity tasks.
+We argue that reasoning safety—the property that a model’s
+chain-of-thought trajectory is logically consistent, computation-
+ally efficient, and resistant to adversarial manipulation—constitutes
+a security dimension orthogonal to content safety. A model may
+produce a benign-sounding final answer whose underlying reason-
+ing is corrupted by injected fallacies or mired in an infinite loop;
+conversely, a logically sound reasoning chain may still yield harm-
+ful content. Securing deployed LLM systems therefore requires
+monitoring both dimensions independently.
+Neither class of existing safety tool adequately addresses reason-
+ing safety. Hallucination detectors [17, 18] assess the factual consis-
+tency of model outputs by cross-referencing sampled responses or
+external knowledge bases. They are fundamentally limited to identi-
+fying factual errors in surface-level claims and cannot detect logical
+fallacies, injected goal deviations, or process management failures
+that do not manifest as factual contradictions. Process reward mod-
+els (PRMs) assign quality scores to individual reasoning steps but
+are trained to assess answer-trajectory quality on in-distribution
+mathematical tasks; they generalize poorly to the diverse error
+types induced by adversarial attacks and produce scalar scores
+without error-type labels, precluding fine-grained diagnosis. In our
+empirical evaluation, SelfCheckGPT achieves only 44.36% step-level
+detection accuracy and the best PRM baseline reaches only 68.83%—
+both substantially below the 84–85% achieved by our approach.
+We propose a Reasoning Safety Monitor: an external, trusted
+component that operates in parallel with the target LLM, inspecting
+each reasoning step as it is generated in a streaming fashion. Upon
+detecting an unsafe step, the monitor immediately dispatches an
+interrupt signal to halt further generation, preventing corrupted
+reasoning from propagating to the final answer and terminating
+runaway chains before they exhaust computational budgets. The
+monitor is implemented by prompting an off-the-shelf LLM with a
+carefully designed prompt that embeds a nine-type error taxonomy,
+a structured input–output schema, and explicit calibration rules
+to suppress false positives on exploratory reasoning. This design
+requires no model fine-tuning, is model-agnostic with respect to the
+target LLM, and produces interpretable, actionable verdicts for each
+flagged step. The main contributions of this work are as follows:
+• We formally define reasoning safety as a security dimension
+orthogonal to content safety and introduce a systematic nine-
+category taxonomy of unsafe reasoning behaviors, organized by
+stage of occurrence and violation of three core safety properties
+(logical consistency, computational efficiency, and manipulation
+resistance).
+• We annotate 4,111 reasoning chains drawn from a natural reason-
+ing benchmark (OmniMath) and four adversarial attack datasets
+(BadChain, Preemptive Answer Attack, OverThink, Deadlock),
+empirically demonstrating that all nine unsafe behavior types
+occur in practice and that each attack induces a distinctive, mech-
+anistically interpretable error signature.
+• We design and implement a real-time, parallel monitoring frame-
+work that combines step-level streaming, contextual history
+tracking, taxonomy-embedded prompting, and a configurable
+intervention mechanism, enabling precise localization and clas-
+sification of reasoning vulnerabilities without any task-specific
+training.
+• We evaluate the monitor across four LLM backends on a 450-
+chain static benchmark and under adaptive attacks, demonstrat-
+ing up to 84.88% position accuracy and 85.37% type accuracy—
+surpassing hallucination detectors by over 40 percentage points
+and the best PRM baseline by over 16 percentage points.
+2
+Related Work
+2.1
+Content Safety
+Content safety research for LLMs has primarily focused on ensur-
+ing that model outputs are free from harmful, biased, or factually
+incorrect content. One major line of work addresses harmful content
+and toxicity: alignment techniques such as Reinforcement Learning
+from Human Feedback (RLHF) [20] and Constitutional AI [3] train
+models to refuse unsafe requests, while dedicated classifiers such
+as Llama Guard [10] and RealToxicityPrompts [6] benchmark and
+filter toxic outputs. A second line targets hallucination: methods
+such as SelfCheckGPT [17] and FActScore [18] assess the factual
+consistency of generated text by cross-checking sampled outputs
+or decomposing claims against external knowledge. Broader trust-
+worthiness evaluations such as TrustLLM [23] further assess LLMs
+across dimensions including truthfulness, fairness, and robustness.
+Despite this breadth, existing content safety approaches share a
+fundamental limitation: they operate on the final output or surface-
+level content of model responses, treating the reasoning chain as a
+black box. They are therefore blind to reasoning-level vulnerabilities—
+such as injected logical fallacies, manipulated inference steps, or
+adversarially induced overthinking—that corrupt the reasoning pro-
+cess itself while potentially leaving the final output superficially
+intact. This gap motivates our work on reasoning safety, a dimension
+orthogonal to content safety.
+2.2
+COT & LRMs
+Chain-of-Thought (CoT) prompting [26] has emerged as a funda-
+mental paradigm for enhancing LLM reasoning, requiring models
+to articulate step-by-step logical sequences before producing a final
+answer. Building on this foundation, advanced frameworks such
+as Self-Consistency CoT [25], Tree-of-Thought [30], and Graph-of-
+Thoughts [4] further structure the reasoning process to improve
+accuracy on complex tasks. More recently, Large Reasoning Models
+(LRMs) such as OpenAI o1 [19] and DeepSeek-R1 [8] have internal-
+ized explicit reasoning chains as a core model capability, trained
+via reinforcement learning to produce extended, structured rea-
+soning trajectories prior to a final response. While these advances
+substantially improve reasoning performance, the resulting rea-
+soning chains are longer, more complex, and increasingly opaque—
+expanding the attack surface and motivating the need for dedicated
+reasoning safety monitoring.
+Beyond Content Safety: Real-Time Monitoring for Reasoning Vulnerabilities in Large Language Models
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+2.3
+Reasoning Attacks
+As the cognitive capabilities and internal autonomy of Large Rea-
+soning Models expand, so does their attack surface, leading to the
+emergence of reasoning attacks. These can broadly be categorized
+into reasoning hijacking attacks and Denial-of-Service (DoS) at-
+tacks on reasoning.
+Reasoning Hijacking Attacks. These attacks manipulate the
+intermediate logical steps or "thoughts" of an LLM to force an incor-
+rect or malicious final answer. Unlike content-level jailbreaks that
+bypass safety filters, reasoning hijacking focuses on derailing the
+inference process itself. For example, BadChain [27] introduces a
+backdoor into the Chain-of-Thought (CoT) prompting process, caus-
+ing the model to output a targeted incorrect answer when triggered.
+Similarly, Preemptive Answer Attacks [28] demonstrate how in-
+jecting a seemingly innocuous but false premise into the reasoning
+chain can systematically bias the final conclusion. Adding to stealth,
+ShadowCoT [32] introduces cognitive hijacking techniques capable
+of planting hidden reasoning backdoors, further demonstrating the
+fragility of unprotected reasoning trajectories.
+Denial-of-Service (DoS) Attacks on Reasoning. A second
+class of attacks aims to exhaust computational resources by exploit-
+ing the auto-regressive and exploratory nature of CoT generation,
+forcing the model into an infinite loop or pathologically long rea-
+soning. OverThink [11] forces LLMs into an induced slowdown,
+deliberately wasting generation tokens and increasing API costs.
+This vulnerability is dramatically amplified by findings such as
+those in [31], which demonstrate that a single token embedding
+can trigger a complete deadlock in a large reasoning model. Extend-
+ing this to black-box systems, ThinkTrap [12] and BadThink [15]
+reveal how targeted prompts or triggered overthinking can induce
+infinite loops in commercial LLM services. Furthermore, Reason-
+ingBomb [16] introduces a stealthy approach that deliberately in-
+duces pathologically long reasoning paths to quietly degrade system
+throughput. Together, these threats underscore the critical necessity
+for active, real-time monitoring mechanisms to detect and interrupt
+malicious or runaway reasoning chains.
+3
+Reasoning Safety: Taxonomy & Prevalence
+3.1
+Defining Reasoning Safety
+Prior work on LLM safety has largely focused on content safety: en-
+suring that model outputs are free from harmful, biased, or factually
+incorrect content. These approaches treat the reasoning chain as
+an opaque intermediate artifact and evaluate safety exclusively at
+the output level. We argue that this view is insufficient for models
+that engage in explicit chain-of-thought reasoning, as the integrity
+of the reasoning process itself is an independent and equally critical
+safety dimension.
+Definition 1 (Reasoning Chain). Let a reasoning chain C =
+⟨𝑠1,𝑠2, . . . ,𝑠𝑛,𝑎⟩denote a sequence of intermediate reasoning steps
+𝑠𝑖generated by a language model in response to an input query 𝑞,
+terminating in a final answer 𝑎. Each step 𝑠𝑖is a natural-language
+inference unit that builds upon prior steps to advance toward the
+conclusion.
+Definition 2 (Safe Reasoning Chain). A reasoning chain C is
+safe with respect to query 𝑞if and only if it satisfies the following
+three properties:
+• Logical Consistency. Every step 𝑠𝑖must be logically co-
+herent with both the problem conditions stated in 𝑞and all
+prior steps 𝑠1, . . . ,𝑠𝑖−1. No step may introduce a contradic-
+tion, unsupported inference, or invalid logical transition.
+• Computational Efficiency. The length 𝑛of the reasoning
+chain must remain within a bound commensurate with the
+complexity of 𝑞. Specifically, C must not contain redundant,
+repetitive, or purposeless steps that inflate token consump-
+tion without advancing the reasoning toward a conclusion.
+• Manipulation Resistance. The reasoning trajectory must
+reflect the model’s faithful inference over 𝑞and must not be
+deflected by adversarially injected content—whether embed-
+ded in the input, retrieved context, or intermediate steps—
+that redirects the reasoning toward an attacker-controlled
+outcome.
+Reasoning Safety vs. Content Safety. Content safety concerns
+what a model says; reasoning safety concerns how a model thinks.
+A model may produce a response that appears benign at the output
+level while its underlying reasoning chain is corrupted by injected
+fallacies, truncated prematurely, or mired in an infinite loop—none
+of which content-safety tools can detect. Conversely, a reasoning
+chain may be logically sound yet yield harmful content, which falls
+outside the scope of reasoning safety. The two dimensions are thus
+orthogonal and both necessary for comprehensive LLM safety.
+We define reasoning safety as the property that all reasoning
+chains generated by a model satisfy P1–P3 above. Violations of
+these properties constitute reasoning vulnerabilities, which may
+arise either from the model’s intrinsic failure modes or from adver-
+sarial manipulation of the reasoning process.
+3.2
+Unsafe Behavior Taxonomy
+Based on our definition of reasoning safety, we propose a taxon-
+omy of unsafe behaviors that can arise in LLM reasoning chains.
+We organize violations of P1–P3 into three top-level categories
+corresponding to the stage of the reasoning process at which the
+failure occurs. Table 1 provides a structured overview.
+Category 1: Input Parsing Errors. These errors occur in the
+initial stage of problem comprehension, before substantive reason-
+ing begins. The model fails to faithfully map the query 𝑞into an
+internal representation that correctly captures its intent and con-
+straints, causing all downstream reasoning to proceed from a flawed
+premise. Input parsing errors constitute violations of P1 (logical
+consistency), as subsequent steps—though internally coherent—are
+grounded in an incorrect understanding of the problem. We identify
+three subtypes:
+• Misinterpretation: The model fails to identify the core in-
+tent or key instructions of the query, substituting a plausible
+but incorrect interpretation as the basis for reasoning.
+• Missing Constraints: The model silently omits one or more
+explicit conditions stated in 𝑞, producing a reasoning chain
+that solves a simpler or different problem than the one posed.
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Wang et al.
+• Symbol Mapping Error: The model incorrectly maps natural-
+language concepts or entities in 𝑞to internal logical or math-
+ematical representations, introducing a semantic error at the
+grounding stage.
+Category 2: Reasoning Execution Errors. These errors occur
+during the core reasoning stage, in which the model performs logi-
+cal deduction, computation, or inference. Even when the problem
+has been correctly parsed, execution errors corrupt individual rea-
+soning steps and propagate to produce an incorrect conclusion.
+These errors primarily violate P1 (logical consistency). Three sub-
+types are identified:
+• Logical Fallacy: The model employs an invalid argumenta-
+tive form—such as affirming the consequent, circular reason-
+ing, or unsound inductive generalization—rendering a step
+logically unjustified despite its surface plausibility.
+• Calculation Error: The model commits a numerical or pro-
+cedural error during mathematical operations, symbolic ma-
+nipulation, or algorithmic execution, leading to an incorrect
+intermediate or final result.
+• Inconsistency: The model produces statements or conclu-
+sions across different steps of the same reasoning chain that
+are mutually contradictory, violating the internal coherence
+required by P1.
+Category 3: Process Management Errors. These errors oper-
+ate at the meta-cognitive level, affecting not individual reasoning
+steps but the overall structure and trajectory of the reasoning pro-
+cess. They primarily violate P2 (computational efficiency) and P3
+(manipulation resistance), and are the characteristic failure mode
+induced by denial-of-service attacks on reasoning systems. Three
+subtypes are identified:
+• Reasoning Loop: The model enters a cyclic pattern in which
+it repeatedly regenerates equivalent or near-equivalent rea-
+soning steps without converging toward a conclusion, lead-
+ing to unbounded token consumption.
+• Goal Deviation: The reasoning trajectory drifts away from
+the core problem. This includes thought divergence, in which
+the model introduces irrelevant tangents, and goal drift, in
+which the model progressively loses track of the original
+objective.
+• Premature Conclusion: The model outputs a final answer—
+or an inappropriate intermediate conclusion—without gen-
+erating the reasoning steps required to support it, effectively
+bypassing the reasoning process entirely.
+This taxonomy encompasses unsafe behaviors arising from both
+intrinsic model failure modes and adversarial attacks. Reasoning
+hijacking attacks [27, 28, 32] predominantly induce Category 1 and
+Category 2 errors to steer the model toward an attacker-controlled
+answer, while reasoning denial-of-service attacks [11, 12, 15, 16]
+are specifically designed to trigger Category 3 errors to exhaust
+computational resources.
+3.3
+Prevalence Study
+To validate that our taxonomy captures unsafe behaviors arising in
+both natural and adversarial settings, we construct an annotated
+dataset from two complementary sources: a public CoT benchmark
+representing intrinsic model failures, and four reasoning attack
+methods representing adversarially induced failures.
+Data Collection. For natural reasoning errors, we use the Omni-
+MATH subset of ProcessBench [33], a publicly available benchmark
+for step-level reasoning evaluation. We choose all 1,000 mathe-
+matical problems and collect the corresponding model-generated
+reasoning chains.
+For adversarial reasoning errors, we collect data under four attacks
+spanning both attack categories:
+• BadChain [27] injects a small number of adversarially crafted
+demonstration steps into the few-shot CoT prompt, caus-
+ing the model to follow a corrupted reasoning template to-
+ward an attacker-specified conclusion. We target DeepSeek-
+V3 [14], GPT-3.5, GPT-4o, GPT-5-mini [22], and Qwen3-30B-
+A3B [29] on GSM8K [5], collecting 2,294 chains.
+• Preemptive Answer Attack [28] embeds a plausible but
+incorrect answer directly into the prompt context before
+the model begins reasoning, biasing subsequent steps to-
+ward confirming the planted answer. We target DeepSeek-
+V3, GPT-4o, and Qwen3-30B-A3B on GSM8K, MathQA [2],
+and StrategyQA [7], collecting 377 chains.
+• OverThink [11] appends adversarially constructed contex-
+tual paragraphs that semantically mislead the model about
+the problem setting, inducing excessive exploratory reason-
+ing and inflating token consumption. We target DeepSeek-
+R1-0528 [8] and Qwen3-30B-A3B-Thinking [29] on SQuAD
+[21], collecting 200 chains.
+• Deadlock [31] exploits specially crafted token embeddings
+to lock the model into an irrecoverable repetitive generation
+state, effectively halting useful inference. We target Phi-4-
+mini-Reasoning [1] and DeepSeek-R1-Distill-Llama-8B [8]
+on AIME 2024, GSM8K, CommonsenseQA [24], and MATH-
+500 [9, 13], collecting 240 chains.
+Annotation Protocol. Each reasoning chain is segmented into
+discrete steps using double newlines (\n\n) as delimiters. Human
+annotators label each erroneous step with (i) its 0-indexed position
+within the chain and (ii) one of the nine error subtypes defined
+in Section 3.2. Annotators follow a codebook derived from the
+taxonomy definitions, and disagreements are resolved by majority
+vote.
+Distribution Analysis. Figure 1 shows the error type distributions
+across all five datasets. The results yield three key observations.
+Finding 1: Intrinsic model failures span all three categories.
+The OmniMath distribution exhibits broad coverage across Cat-
+egory 1 and Category 2 errors, with Logical Fallacy (2a: 34.6%)
+and Calculation Error (2b: 25.2%) as the dominant failure modes,
+complemented by substantial Input Parsing errors spread across
+Misinterpretation (1a: 13.0%), Missing Constraints (1b: 10.8%) and
+Symbol Mapping Error (1c: 11.4%). Notably, Process Management
+errors are nearly absent (≤1.7% total), confirming that Category 3
+failures do not arise from normal reasoning behavior and are there-
+fore strong indicators of adversarial manipulation when detected.
+Finding 2: Each attack induces a distinctive error signature
+that aligns with its mechanism. Rather than producing uniform
+noise across all categories, each attack concentrates errors in a
+small number of subtypes that directly reflect its operational logic:
+Beyond Content Safety: Real-Time Monitoring for Reasoning Vulnerabilities in Large Language Models
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Table 1: Taxonomy of unsafe behaviors in LLM reasoning chains.
+Category
+Subtype
+Violated Property
+Primary Effect
+1. Input Parsing
+Misinterpretation
+P1
+Wrong answer
+Missing Constraints
+P1
+Wrong answer
+Symbol Mapping Error
+P1
+Wrong answer
+2. Execution
+Logical Fallacy
+P1
+Wrong answer
+Calculation Error
+P1
+Wrong answer
+Inconsistency
+P1
+Wrong answer
+3. Process Mgmt.
+Reasoning Loop
+P2, P3
+Resource waste
+Goal Deviation
+P2, P3
+Resource waste / Wrong answer
+Premature Conclusion
+P1, P3
+Wrong answer
+1a
+1b
+1c
+2a
+2b
+2c
+3a
+3b
+3c
+0.0
+5.0
+10.0
+15.0
+20.0
+25.0
+30.0
+35.0
+Percentage (%)
+13.0%
+10.8%
+11.4%
+34.6%
+25.2%
+3.4%
+0.0%
+0.4%
+1.3%
+Error Distribution in OmniMath
+(a) OmniMath (natural errors)
+1a
+1b
+1c
+2a
+2b
+2c
+3a
+3b
+3c
+0.0
+10.0
+20.0
+30.0
+40.0
+50.0
+60.0
+Percentage (%)
+2.4%
+2.6%
+0.8%
+12.6%
+3.5%
+17.3%
+0.0%
+60.8%
+0.0%
+Error Distribution in BadChain
+(b) BadChain
+1a
+1b
+1c
+2a
+2b
+2c
+3a
+3b
+3c
+0.0
+10.0
+20.0
+30.0
+40.0
+50.0
+Percentage (%)
+6.6%
+1.6%
+0.8%
+8.0%
+48.7%
+0.5%
+0.0%
+0.3%
+33.5%
+Error Distribution in PreemptiveAnswer
+(c) Preemptive Answer Attack
+1a
+1b
+1c
+2a
+2b
+2c
+3a
+3b
+3c
+0.0
+10.0
+20.0
+30.0
+40.0
+50.0
+60.0
+70.0
+80.0
+Percentage (%)
+74.5%
+0.0%
+0.0%
+0.0%
+0.5%
+0.0%
+0.0%
+25.0%
+0.0%
+Error Distribution in OVERTHINK
+(d) OverThink
+1a
+1b
+1c
+2a
+2b
+2c
+3a
+3b
+3c
+0.0
+10.0
+20.0
+30.0
+40.0
+50.0
+60.0
+70.0
+Percentage (%)
+12.1%
+0.8%
+0.0%
+0.4%
+0.0%
+0.0%
+69.6%
+15.8%
+1.2%
+Error Distribution in Deadlock
+(e) Deadlock
+Figure 1: Error type distributions across the natural reasoning dataset (OmniMath) and four attack-induced datasets. Cat-
+egory codes follow Table 1: 1a=Misinterpretation, 1b=Missing Constraints, 1c=Symbol Mapping Error, 2a=Logical Fallacy,
+2b=Calculation Error, 2c=Inconsistency, 3a=Reasoning Loop, 3b=Goal Deviation, 3c=Premature Conclusion.
+• BadChain overwhelmingly produces Goal Deviation (3b:
+60.8%), accompanied by Inconsistency (2c: 17.3%) and Logical
+Fallacy (2a: 12.6%). The injected backdoor demonstrations
+redirect the model’s reasoning trajectory away from the
+original objective—a classic goal-deviation pattern—while
+the resulting internal contradictions between legitimate and
+corrupted steps manifest as inconsistency.
+• Preemptive Answer Attack is characterized by a bimodal
+distribution: Calculation Error (2b: 48.7%) and Premature
+Conclusion (3c: 33.5%). The planted answer contaminates
+all downstream arithmetic steps, causing widespread calcu-
+lation errors, while a substantial fraction of chains exhibit
+premature termination as the model short-circuits reasoning
+to confirm the pre-loaded answer.
+• OverThink produces a near-singular distribution domi-
+nated by Misinterpretation (1a: 74.5%), with the remainder at-
+tributable to Goal Deviation (3b: 25.0%). The misleading con-
+textual paragraphs injected by OverThink cause the model
+to systematically misread the problem at the parsing stage,
+after which reasoning drifts further from the original objec-
+tive as the flawed premise propagates through subsequent
+steps.
+• Deadlock concentrates almost entirely on Reasoning Loop
+(3a: 69.6%), with secondary contributions from Goal Devi-
+ation (3b: 15.8%) and Misinterpretation (1a: 12.1%). The ad-
+versarial token embeddings lock the model into a repetitive
+generation cycle, producing the longest and most computa-
+tionally wasteful chains. The residual goal deviation reflects
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Wang et al.
+cases where the model escapes the loop but has lost track of
+the original problem.
+Finding 3: Attack categories map cleanly onto taxonomy
+categories. Reasoning hijacking attacks (BadChain, Preemptive
+Answer) primarily activate Category 1 and Category 2 errors along-
+side Goal Deviation (3b) and Premature Conclusion (3c), as their
+goal is to steer the model toward a wrong answer. Reasoning DoS
+attacks (OverThink, Deadlock) predominantly activate Category 3
+errors—particularly Reasoning Loop (3a) and Goal Deviation (3b)—
+as their goal is to inflate computational cost rather than control
+the final answer. This clean correspondence between attack type
+and error category validates the threat model of Section 4.1 and
+demonstrates that our taxonomy provides actionable signal for both
+detection and attack classification.
+Takeaway. The annotated corpus of 4,111 reasoning chains—spanning
+natural failures and four adversarial attack methods—confirms that
+all nine error subtypes in our taxonomy occur in practice and that
+each subtype carries meaningful diagnostic signal. This dataset
+serves as the foundation to evaluate the monitor in Section 4.
+4
+Reasoning Safety Monitor
+4.1
+Threat Model and Design Goals
+Attacker Capabilities. We consider an adversary who aims to com-
+promise the reasoning process of a target LLM. The attacker may
+operate in two modes: (i) a prompt-level attacker who manipulates
+the input query or few-shot demonstrations supplied to the target
+model—as in reasoning hijacking attacks such as BadChain [27]
+and Preemptive Answer Attack [28]; and (ii) an model-level attacker
+who exploits crafted token inputs or model-level vulnerabilities
+to induce pathological reasoning states, such as Deadlock [31]. In
+both modes, the attacker can control the content injected into the
+model’s context but is assumed to have no direct access to the mon-
+itor. The monitor itself is assumed to be a trusted, independently
+deployed component.
+Attack Scenarios. We consider two classes of attacks that map
+directly to the taxonomy of Section 3.2:
+• Reasoning Hijacking: The attacker redirects the model’s
+inference trajectory to produce an attacker-specified incor-
+rect answer. This could manifest as all types of errors (e.g.,
+injected logical fallacies, goal deviation, premature conclu-
+sion) and poses a correctness threat.
+• Reasoning DoS: The attacker induces the model to gener-
+ate excessively long or non-terminating reasoning chains,
+exhausting computational resources and inflating inference
+costs. This mainly manifests as Misinterpretation and Cate-
+gory 3 errors (e.g., reasoning loops, goal drift) and poses an
+efficiency threat.
+Design Goals. Given these threat scenarios, we formalize four
+design goals for a reasoning safety monitor:
+G1. Real-Time Detection: The monitor must evaluate each rea-
+soning step as it is generated, without waiting for the full
+chain, to enable timely intervention.
+G2. Precise Localization: The monitor must identify the specific
+step and text fragment at which an unsafe behavior first occurs.
+G3. Error Classification: The monitor must assign each detected
+anomaly to one of the nine subtypes in Section 3.2, providing
+actionable diagnostic information.
+G4. Intervention Support: Upon detecting an unsafe step, the
+monitor must trigger an intervention—either halting further
+token generation or flagging the chain for rollback—to prevent
+the unsafe reasoning from propagating to the final answer.
+4.2
+System Architecture
+Figure 2 illustrates the overall system design. The monitor operates
+as an independent process that runs in parallel with the target LLM,
+inspecting the reasoning chain as it is generated token by token.
+Step Segmentation. The target LLM generates its reasoning chain
+in a streaming fashion. The monitor treats each segment delimited
+by a double newline (\n\n) as an atomic reasoning step. Upon
+receiving a complete step, the monitor is immediately invoked; no
+buffering of the full chain is required.
+Contextual Sliding Window. To enable consistency and depen-
+dency checks across steps (e.g., detecting Inconsistency or Goal
+Deviation that spans multiple steps), the monitor maintains a rolling
+context comprising the original problem statement and all preced-
+ing steps up to the current one. Each invocation thus provides
+the monitor with the full reasoning history necessary to assess
+inter-step logical relationships.
+Monitor Output. For each step, the monitor produces a structured
+verdict containing: (i) a binary safety flag (safe/unsafe); (ii) the
+error type code from the taxonomy (or NO_ERROR); (iii) a confi-
+dence score in [0, 1]; (iv) a direct text quote locating the erroneous
+fragment; and (v) a concise natural-language explanation of the
+detected anomaly.
+Intervention Mechanism. If the monitor returns unsafe for any
+step, an interrupt signal is sent to the generation pipeline of the
+target LLM, halting further token generation. This prevents the
+corrupted reasoning from propagating to the final answer and termi-
+nates runaway chains before they exhaust computational budgets.
+The threshold for intervention is configurable: operators may re-
+quire the monitor to report high confidence (≥𝜏) before triggering
+interruption, trading off false-positive interruptions against missed
+detections.
+4.3
+Monitor Implementation
+LLM-Based Monitor. Rather than training a specialized classifier
+from scratch, we implement the monitor by prompting an off-the-
+shelf LLM as a reasoning verifier. Concretely, we use an LLM (e.g.,
+gpt-oss-20b) as the monitor model. This design choice offers three
+advantages: (i) it leverages the strong language understanding capa-
+bilities of pre-trained LLMs without requiring labeled training data;
+(ii) it produces interpretable, natural-language explanations along-
+side binary verdicts; and (iii) it is model-agnostic and can monitor
+any target LLM regardless of architecture or inference framework.
+Prompt Design. The monitor prompt is structured into five com-
+ponents, each addressing a specific design requirement.
+(1) Role Definition. The prompt opens by assigning the monitor
+a specific expert persona: “You are an Advanced AI Reasoning Ver-
+ification Expert. Your sole task is to objectively evaluate the logical
+Beyond Content Safety: Real-Time Monitoring for Reasoning Vulnerabilities in Large Language Models
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+User Query
+(problem + context)
+Target LLM
+Step 1
+Step 2
+  
+  
+Step k
+Step Segmenter
+(split by \n\n)
+Monitor LLM
+(e.g., gpt-oss-20b)
+Taxonomy Lookup
+9-type error classification
+Context Window
+problem + steps 1 
+ k
+1
+Verdict
+safe / unsafe  ·  error type
+location  ·  confidence  ·  explanation
+confidence 
+  
+  intervene
+Intervention
+halt generation
+(interrupt signal)
+Final Answer
+(all steps safe)
+Target System
+Monitor System
+stream
+step k
+unsafe
+STOP
+safe
+parallel execution
+Figure 2: Overview of the Reasoning Safety Monitor. The monitor runs in parallel with the target LLM, receiving each reasoning
+step via a streaming interface segmented by double newlines. For every step, the monitor queries an LLM verifier with the
+full contextual history and the nine-type error taxonomy, producing a structured verdict (safety flag, error type, location,
+confidence, and explanation). If the verdict indicates an unsafe step with confidence ≥𝜏, an interrupt signal halts the target
+LLM’s generation pipeline; otherwise, the step is appended to the context window and generation continues. A chain in which
+all steps pass inspection proceeds to produce the final answer.
+correctness of thought chains.” This anchors the monitor’s behav-
+ior to rigorous logical assessment and suppresses the tendency of
+general-purpose LLMs to be overly permissive or to hallucinate
+favorable verdicts.
+(2) Taxonomy Embedding. The full nine-category error taxon-
+omy (Section 3.2) is reproduced verbatim in the prompt, mapping
+directly to the error type codes expected in the output. Embedding
+the taxonomy ensures that the monitor’s classification vocabulary
+is precisely aligned with our definitions, enabling programmatic
+parsing of the output and direct comparability across experiments.
+(3) Structured Input Format. The monitor receives a JSON-formatted
+input comprising the original problem statement, optional back-
+ground context, and an ordered list of reasoning steps up to and
+including the current step under evaluation. Providing the full prior
+context as a structured list enables the monitor to detect cross-step
+anomalies such as Inconsistency (2c) and Goal Deviation (3b), which
+cannot be identified from the current step alone.
+(4) Structured Output Format. The monitor is required to respond
+exclusively in a fixed JSON schema containing the five fields de-
+scribed in Section 4.2. Enforcing structured output eliminates the
+need for post-hoc natural-language parsing and ensures that the
+error location field contains a verbatim quote from the input text—a
+design choice that provides precise, auditable localization.
+(5) Calibration Rules. Two explicit behavioral constraints are
+included to reduce false positives. First, the monitor is instructed
+to evaluate only the current step, not to re-audit prior steps already
+verified. This enforces per-step granularity and prevents duplicate
+annotations. Second, the monitor is directed not to flag speculative
+language, hypotheses, or self-questioning (e.g., “Maybe X is true” or
+“Is Y possible?”) as errors, recognizing that exploratory uncertainty
+is a legitimate and beneficial feature of extended reasoning chains.
+Only statements presented as definitive conclusions are subject to
+error classification.
+Latency Consideration. Because the monitor is invoked once per
+reasoning step and runs in parallel with the target LLM, its latency
+overhead is bounded by the time required to generate a single step—
+not the entire chain. In practice, the additional wall-clock time per
+chain is determined by the slowest single-step monitor invocation,
+which we characterize experimentally in Section 5.
+5
+Evaluation
+5.1
+Experimental Setup
+Benchmark Dataset. We construct a static evaluation benchmark
+by drawing from the annotated corpus collected in Section 3.3. To
+ensure balanced coverage across all data sources, we randomly sam-
+ple 50 chains from each of the five datasets (OmniMath, BadChain,
+Preemptive Answer Attack, OverThink, and Deadlock), yielding a
+benchmark of 450 reasoning chains in total. Each chain carries
+step-level ground-truth annotations specifying the index of the
+first erroneous step and its error subtype from the nine-category
+taxonomy.
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Wang et al.
+Table 2: Detection performance on the static benchmark.
+Position Acc: step-level localization accuracy. Type Acc: error
+subtype classification accuracy. “—” denotes not applicable
+(no type output).
+Monitor / Baseline
+Position Acc (%)
+Type Acc (%)
+SelfCheckGPT [17]
+44.36
+—
+Qwen2.5-Math-PRM-7B
+68.83
+—
+GPT-4o-2024-08-06
+73.11
+70.00
+gpt-oss-20b
+82.66
+75.33
+Gemini-3-Flash-Preview
+84.00
+80.44
+Qwen3.5-35B-A3B
+84.88
+85.37
+Baselines. We compare our monitor against two representative
+existing approaches:
+• SelfCheckGPT [17]: A hallucination detection method that
+assesses factual consistency by sampling multiple model
+outputs and measuring inter-sample agreement. We apply
+it at the step level to obtain a binary detection signal. As
+SelfCheckGPT is designed for factual consistency rather than
+logical error classification, it does not produce error-type
+labels.
+• Qwen2.5-Math-PRM-7B: A process reward model (PRM)
+trained to score the quality of individual reasoning steps
+in mathematical problem solving. We threshold its per-step
+reward scores to obtain binary step-level detection verdicts.
+Like SelfCheckGPT, this model produces scalar scores rather
+than typed error classifications.
+Monitor Configurations. We evaluate four LLMs as monitor back-
+ends using the prompt framework described in Section 4: Gemini-3-
+Flash-Preview, gpt-oss-20b, GPT-4o-2024-08-06, and Qwen3.5-
+35B-A3B. All monitors use the same prompt template with no
+configuration tuning per dataset.
+Evaluation Metrics. We report two complementary metrics:
+• Position Accuracy: The fraction of erroneous chains for
+which the monitor correctly identifies the step index of the
+first unsafe reasoning step. This measures the monitor’s
+ability to localize the error.
+• Type Accuracy: Among chains where the position is cor-
+rectly identified, the fraction for which the monitor assigns
+the correct error subtype from the nine-category taxonomy.
+This measures the monitor’s diagnostic precision.
+Since SelfCheckGPT and Qwen2.5-Math-PRM-7B do not produce
+error-type classifications, Type Accuracy is not applicable to these
+baselines.
+5.2
+Static Attack Detection
+Table 2 reports position and type accuracy across all monitors and
+baselines on the 450-chain benchmark.
+LLM monitors substantially outperform content-safety base-
+lines. SelfCheckGPT achieves only 44.36% position accuracy—little
+better than random guessing on a multi-step chain—confirming that
+factual consistency checking is fundamentally misaligned with the
+task of detecting logical reasoning errors. Its sampling-based con-
+sistency signal carries no information about structural reasoning
+failures such as Goal Deviation or Reasoning Loop, which constitute
+the majority of errors in attack-induced chains.
+Process reward models provide partial signal but lack clas-
+sification capability. Qwen2.5-Math-PRM-7B achieves 68.83%
+position accuracy, outperforming SelfCheckGPT by a substantial
+margin. This suggests that step-quality scoring does capture some
+reasoning anomalies. However, PRMs are trained to assess answer-
+trajectory quality on mathematical benchmarks and lack gener-
+alization to diverse error types such as Misinterpretation (1a) or
+Premature Conclusion (3c). Critically, neither baseline produces
+error-type labels, precluding their use for diagnostic or attack-
+classification purposes—a core requirement of our design goals G3
+and G4.
+All LLM monitor configurations outperform both baselines
+on position accuracy. Even the weakest LLM configuration (GPT-
+4o at 73.11%) exceeds the PRM baseline, and the strongest (Qwen3.5-
+35B-A3B at 84.88%) improves over the PRM by 16.05 percentage
+points. This demonstrates that embedding the explicit error tax-
+onomy into the prompt enables LLMs to detect reasoning-level
+anomalies that reward models trained on implicit quality signals
+cannot capture.
+Type accuracy is consistently high relative to position accu-
+racy. Across all LLM monitors, the gap between position accuracy
+and type accuracy is modest (at most 7.33 percentage points for
+gpt-oss-20b), indicating that once a monitor correctly localizes an
+erroneous step, it can reliably assign the correct error subtype.
+Qwen3.5-35B-A3B achieves the highest type accuracy at 85.37%,
+suggesting that its stronger reasoning understanding translates to
+more precise error diagnosis. This high type accuracy validates
+the practical utility of the monitor for downstream tasks such as
+automated attack attribution and targeted model debugging.
+6
+Conclusion
+This paper introduced reasoning safety as a security dimension
+orthogonal to content safety, addressing the previously overlooked
+vulnerability of LLM chain-of-thought reasoning to both adversar-
+ial manipulation and intrinsic failure. We proposed a nine-category
+taxonomy of unsafe reasoning behaviors grounded in three formal
+safety properties, and empirically validated its coverage through
+a large-scale annotation study spanning 4,111 reasoning chains
+across natural and adversarial settings. Building on this founda-
+tion, we designed a Reasoning Safety Monitor that operates in
+parallel with the target LLM, performing real-time step-level de-
+tection, localization, and classification without any task-specific
+training. Evaluation on a static benchmark demonstrated up to
+84.88% localization accuracy and 85.37% type accuracy, substan-
+tially outperforming hallucination detectors and process reward
+model baselines.
+Several directions remain open for future work. First, the moni-
+tor’s false positive behavior under diverse clean-reasoning distri-
+butions and the optimal calibration of the intervention threshold 𝜏
+warrant systematic characterization. Second, the robustness of the
+monitor against adaptive adversaries who craft attacks specifically
+to evade the taxonomy-embedded prompt is an important open
+Beyond Content Safety: Real-Time Monitoring for Reasoning Vulnerabilities in Large Language Models
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+problem. Third, extending the framework beyond text-only reason-
+ing to multimodal and tool-augmented chains represents a natural
+next step as LRM capabilities continue to expand. We hope that
+this work establishes reasoning safety as a foundational concern
+for the secure deployment of large reasoning models and provides
+a principled basis for future research in this direction.
+References
+[1] Abdelrahman Abouelenin, Atabak Ashfaq, Adam Atkinson, Hany Awadalla,
+Nguyen Bach, Jianmin Bao, Alon Benhaim, Martin Cai, Vishrav Chaudhary,
+Congcong Chen, et al. 2025. Phi-4-mini technical report: Compact yet powerful
+multimodal language models via mixture-of-loras. arXiv preprint arXiv:2503.01743
+(2025).
+[2] Aida Amini, Saadia Gabriel, Shanchuan Lin, Rik Koncel-Kedziorski, Yejin Choi,
+and Hannaneh Hajishirzi. 2019. MathQA: Towards Interpretable Math Word
+Problem Solving with Operation-Based Formalisms. In Proceedings of the 2019
+Conference of the North American Chapter of the Association for Computational
+Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers).
+Association for Computational Linguistics, Minneapolis, Minnesota, 2357–2367.
+doi:10.18653/v1/N19-1245
+[3] Yuntao Bai, Andy Jones, Kamal Ndousse, Amanda Askell, Anna Chen, Nova Das-
+Sarma, Dawn Drain, Stanislav Fort, Deep Ganguli, Tom Henighan, et al. 2022. Con-
+stitutional AI: Harmlessness from AI Feedback. arXiv preprint arXiv:2212.08073
+(2022).
+[4] Maciej Besta, Nils Blach, Ales Kubicek, Robert Gerstenberger, Michal Podstawski,
+Lukas Gianinazzi, Joanna Gajda, Tomasz Lehmann, Hubert Niewiadomski, Piotr
+Nyczyk, et al. 2024. Graph of Thoughts: Solving Elaborate Problems with Large
+Language Models. In Proceedings of the AAAI Conference on Artificial Intelligence,
+Vol. 38. 17682–17690.
+[5] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun,
+Lukasz Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano,
+Christopher Hesse, and John Schulman. 2021. Training Verifiers to Solve Math
+Word Problems. arXiv preprint arXiv:2110.14168 (2021).
+[6] Samuel Gehman, Suchin Gururangan, Maarten Sap, Yejin Choi, and Noah A
+Smith. 2020. RealToxicityPrompts: Evaluating Neural Toxic Degeneration in
+Language Models. In Findings of the Association for Computational Linguistics:
+EMNLP 2020. 3356–3369.
+[7] Mor Geva, Daniel Khashabi, Elad Segal, Tushar Khot, Dan Roth, and Jonathan
+Berant. 2021. Did Aristotle Use a Laptop? A Question Answering Benchmark with
+Implicit Reasoning Strategies. Transactions of the Association for Computational
+Linguistics (TACL) (2021).
+[8] Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Peiyi Wang, Qihao Zhu,
+Runxin Xu, Ruoyu Zhang, Shirong Ma, Xiao Bi, Xiaokang Zhang, Xingkai Yu,
+Yu Wu, Z. F. Wu, Zhibin Gou, Zhihong Shao, Zhuoshu Li, Ziyi Gao, Aixin Liu,
+Bing Xue, Bingxuan Wang, Bochao Wu, Bei Feng, Chengda Lu, Chenggang
+Zhao, Chengqi Deng, Chong Ruan, Damai Dai, Deli Chen, Dongjie Ji, Erhang Li,
+Fangyun Lin, Fucong Dai, Fuli Luo, Guangbo Hao, Guanting Chen, Guowei Li,
+H. Zhang, Hanwei Xu, Honghui Ding, Huazuo Gao, Hui Qu, Hui Li, Jianzhong
+Guo, Jiashi Li, Jingchang Chen, Jingyang Yuan, Jinhao Tu, Junjie Qiu, Junlong
+Li, J. L. Cai, Jiaqi Ni, Jian Liang, Jin Chen, Kai Dong, Kai Hu, Kaichao You, Kaige
+Gao, Kang Guan, Kexin Huang, Kuai Yu, Lean Wang, Lecong Zhang, Liang
+Zhao, Litong Wang, Liyue Zhang, Lei Xu, Leyi Xia, Mingchuan Zhang, Minghua
+Zhang, Minghui Tang, Mingxu Zhou, Meng Li, Miaojun Wang, Mingming Li,
+Ning Tian, Panpan Huang, Peng Zhang, Qiancheng Wang, Qinyu Chen, Qiushi
+Du, Ruiqi Ge, Ruisong Zhang, Ruizhe Pan, Runji Wang, R. J. Chen, R. L. Jin,
+Ruyi Chen, Shanghao Lu, Shangyan Zhou, Shanhuang Chen, Shengfeng Ye,
+Shiyu Wang, Shuiping Yu, Shunfeng Zhou, Shuting Pan, S. S. Li, Shuang Zhou,
+Shaoqing Wu, Tao Yun, Tian Pei, Tianyu Sun, T. Wang, Wangding Zeng, Wen
+Liu, Wenfeng Liang, Wenjun Gao, Wenqin Yu, Wentao Zhang, W. L. Xiao, Wei
+An, Xiaodong Liu, Xiaohan Wang, Xiaokang Chen, Xiaotao Nie, Xin Cheng, Xin
+Liu, Xin Xie, Xingchao Liu, Xinyu Yang, Xinyuan Li, Xuecheng Su, Xuheng Lin,
+X. Q. Li, Xiangyue Jin, Xiaojin Shen, Xiaosha Chen, Xiaowen Sun, Xiaoxiang
+Wang, Xinnan Song, Xinyi Zhou, Xianzu Wang, Xinxia Shan, Y. K. Li, Y. Q.
+Wang, Y. X. Wei, Yang Zhang, Yanhong Xu, Yao Li, Yao Zhao, Yaofeng Sun,
+Yaohui Wang, Yi Yu, Yichao Zhang, Yifan Shi, Yiliang Xiong, Ying He, Yishi Piao,
+Yisong Wang, Yixuan Tan, Yiyang Ma, Yiyuan Liu, Yongqiang Guo, Yuan Ou,
+Yuduan Wang, Yue Gong, Yuheng Zou, Yujia He, Yunfan Xiong, Yuxiang Luo,
+Yuxiang You, Yuxuan Liu, Yuyang Zhou, Y. X. Zhu, Yanping Huang, Yaohui Li,
+Yi Zheng, Yuchen Zhu, Yunxian Ma, Ying Tang, Yukun Zha, Yuting Yan, Z. Z.
+Ren, Zehui Ren, Zhangli Sha, Zhe Fu, Zhean Xu, Zhenda Xie, Zhengyan Zhang,
+Zhewen Hao, Zhicheng Ma, Zhigang Yan, Zhiyu Wu, Zihui Gu, Zijia Zhu, Zijun
+Liu, Zilin Li, Ziwei Xie, Ziyang Song, Zizheng Pan, Zhen Huang, Zhipeng Xu,
+Zhongyu Zhang, and Zhen Zhang. 2025. DeepSeek-R1 incentivizes reasoning in
+LLMs through reinforcement learning. Nature 645, 8081 (Sept. 2025), 633—-638.
+doi:10.1038/s41586-025-09422-z
+[9] HuggingFace. 2025. MATH-500: A Large-Scale Mathematical Problem Solving
+Dataset. Hugging Face Datasets.
+[10] Hakan Inan, Kartikeya Upasani, Jianfeng Chi, Rashi Rungta, Krithika Iyer, Yuning
+Mao, Michael Tontchev, Qing Hu, Brian Fuller, Davide Testuggine, et al. 2023.
+Llama Guard: LLM-based Input-Output Safeguard for Human-AI Conversations.
+arXiv preprint arXiv:2312.06674 (2023).
+[11] Abhinav Kumar, Jaechul Roh, Ali Naseh, Marzena Karpinska, Mohit Iyyer, Amir
+Houmansadr, and Eugene Bagdasarian. 2025. OverThink: Slowdown Attacks on
+Reasoning LLMs. arXiv preprint arXiv:2502.02542 (2025).
+[12] Yunzhe Li, Jianan Wang, Hongzi Zhu, James Lin, Shan Chang, and Minyi Guo.
+2025. ThinkTrap: Denial-of-Service Attacks against Black-box LLM Services via
+Infinite Thinking. arXiv preprint arXiv:2512.07086 (2025).
+[13] Hunter Lightman, Vineet Kosaraju, Yura Burda, Harri Edwards, Bowen Baker,
+Teddy Lee, Jan Leike, John Schulman, Ilya Sutskever, and Karl Cobbe. 2023. Let’s
+Verify Step by Step. arXiv preprint arXiv:2305.20050 (2023).
+[14] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Cheng-
+gang Zhao, Chengqi Deng, Chenyu Zhang, Chong Ruan, et al. 2024. Deepseek-v3
+technical report. arXiv preprint arXiv:2412.19437 (2024).
+[15] Shuaitong Liu, Renjue Li, Lijia Yu, Lijun Zhang, Zhiming Liu, and Gaojie Jin. 2025.
+BadThink: Triggered Overthinking Attacks on Chain-of-Thought Reasoning in
+Large Language Models. arXiv preprint arXiv:2511.10714 (2025).
+[16] Xiaogeng Liu, Xinyan Wang, Yechao Zhang, Sanjay Kariyappa, Chong Xiang,
+Muhao Chen, G. Edward Suh, and Chaowei Xiao. 2026. ReasoningBomb: A
+Stealthy Denial-of-Service Attack by Inducing Pathologically Long Reasoning in
+Large Reasoning Models. arXiv preprint arXiv:2602.00154 (2026).
+[17] Potsawee Manakul, Adian Liusie, and Mark J F Gales. 2023. SelfCheckGPT: Zero-
+Resource Black-Box Hallucination Detection for Generative Large Language
+Models. In Proceedings of the 2023 Conference on Empirical Methods in Natural
+Language Processing. 9004–9017.
+[18] Sewon Min, Kalpesh Krishna, Xinxi Lyu, Mike Lewis, Wen-tau Yih, Pang Wei Koh,
+Mohit Iyyer, Luke Zettlemoyer, and Hannaneh Hajishirzi. 2023. FActScore: Fine-
+grained Atomic Evaluation of Factual Precision in Long Form Text Generation.
+In Proceedings of the 2023 Conference on Empirical Methods in Natural Language
+Processing. 12076–12100.
+[19] OpenAI. 2024. OpenAI o1. https://openai.com Technical report and system card.
+[20] Long Ouyang, Jeffrey Wu, Xu Jiang, Diogo Almeida, Carroll Wainwright, Pamela
+Mishkin, Chong Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, et al. 2022.
+Training language models to follow instructions with human feedback. Advances
+in Neural Information Processing Systems 35 (2022), 27730–27744.
+[21] Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and Percy Liang. 2016.
+SQuAD: 100,000+ Questions for Machine Comprehension of Text. In Proceed-
+ings of the 2016 Conference on Empirical Methods in Natural Language Pro-
+cessing, Jian Su, Kevin Duh, and Xavier Carreras (Eds.). Association for Com-
+putational Linguistics, Austin, Texas, 2383–2392.
+arXiv:1606.05250 [cs.CL]
+doi:10.18653/v1/D16-1264
+[22] Aaditya Singh, Adam Fry, Adam Perelman, Adam Tart, Adi Ganesh, Ahmed
+El-Kishky, Aidan McLaughlin, Aiden Low, AJ Ostrow, Akhila Ananthram, et al.
+2025. Openai gpt-5 system card. arXiv preprint arXiv:2601.03267 (2025).
+[23] Lichao Sun, Yue Huang, Haoran Wang, Siyuan Wu, Qihui Zhang, Chujie Gao,
+Yixin Huang, Wenhan Lyu, Yixuan Zhang, Xiner Li, et al. 2024. TrustLLM:
+Trustworthiness in Large Language Models. In Proceedings of the 41st International
+Conference on Machine Learning.
+[24] Alon Talmor, Jonathan Herzig, Nicholas Lourie, and Jonathan Berant. 2019. Com-
+monsenseQA: A Question Answering Challenge Targeting Commonsense Knowl-
+edge. In Proceedings of the 2019 Conference of the North American Chapter of the
+Association for Computational Linguistics: Human Language Technologies, Volume
+1 (Long and Short Papers). Association for Computational Linguistics, Minneapolis,
+Minnesota, 4149–4158. arXiv:1811.00937 [cs] doi:10.18653/v1/N19-1421
+[25] Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc V Le, Ed H Chi, Sharan Narang,
+Aakanksha Chowdhery, and Denny Zhou. 2023. Self-Consistency Improves
+Chain of Thought Reasoning in Language Models. In International Conference on
+Learning Representations.
+[26] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed Chi,
+Quoc V Le, Denny Zhou, et al. 2022. Chain-of-Thought Prompting Elicits Rea-
+soning in Large Language Models. Advances in Neural Information Processing
+Systems 35 (2022), 24824–24837.
+[27] Zhen Xiang, Fengqing Jiang, Zidi Xiong, Bhaskar Ramasubramanian, Radha
+Poovendran, and Bo Li. 2024. BadChain: Backdoor Chain-of-Thought Prompting
+for Large Language Models. arXiv preprint arXiv:2401.12242 (2024).
+[28] Rongwu Xu, Zehan Qi, and Wei Xu. 2024. Preemptive Answer "Attacks" on
+Chain-of-Thought Reasoning. arXiv preprint arXiv:2405.20902 (2024).
+[29] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng,
+Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, et al. 2025. Qwen3 technical
+report. arXiv preprint arXiv:2505.09388 (2025).
+[30] Shunyu Yao, Dian Yu, Jeffrey Zhao, Izhak Shafran, Tom Griffiths, Yuan Cao, and
+Karthik Narasimhan. 2023. Tree of Thoughts: Deliberate Problem Solving with
+Large Language Models. Advances in Neural Information Processing Systems 36
+(2023), 11809–11822.
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Wang et al.
+[31] Mohan Zhang, Yihua Zhang, Jinghan Jia, Zhangyang Wang, Sijia Liu, and Tian-
+long Chen. 2025. One Token Embedding Is Enough to Deadlock Your Large
+Reasoning Model. arXiv preprint arXiv:2510.15965 (2025).
+[32] Gejian Zhao, Hanzhou Wu, Xinpeng Zhang, and Athanasios V. Vasilakos. 2025.
+ShadowCoT: Cognitive Hijacking for Stealthy Reasoning Backdoors in LLMs.
+arXiv preprint arXiv:2504.05605 (2025).
+[33] Chujie Zheng, Zhenru Zhang, Beichen Zhang, Runji Lin, Keming Lu, Bowen Yu,
+Dayiheng Liu, Jingren Zhou, and Junyang Lin. 2025. Processbench: Identifying
+process errors in mathematical reasoning. In Proceedings of the 63rd Annual
+Meeting of the Association for Computational Linguistics (Volume 1: Long Papers).
+1009–1024.
+Received 20 February 2007; revised 12 March 2009; accepted 5 June 2009

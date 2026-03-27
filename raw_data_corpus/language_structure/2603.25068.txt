@@ -1,0 +1,1099 @@
+Ultra-fast Traffic Nowcasting and Control via
+Differentiable Agent-based Simulation
+Fumiyasu Makinoshima∗1, Yuya Yamaguchi1, Eigo Segawa1, Koichiro
+Niinuma2, and Sean Qian3,4
+1Fujitsu Limited, Kawasaki, Japan
+2Fujitsu Research of America, Pittsburgh, PA, USA
+3Department of Civil and Environmental Engineering, Carnegie Mellon University, Pittsburgh,
+PA, USA
+4Heinz College of Information Systems and Public Policy, Carnegie Mellon University,
+Pittsburgh, PA, USA
+Abstract
+Traffic digital twins, which inform policymakers of effective interventions based
+on large-scale, high-fidelity computational models calibrated to real-world traffic,
+hold promise for addressing societal challenges in our rapidly urbanizing world.
+However, conventional fine-grained traffic simulations are non-differentiable and typ-
+ically rely on inefficient gradient-free optimization, making calibration for real-world
+applications computationally infeasible.
+Here we present a differentiable agent-
+based traffic simulator that enables ultra-fast model calibration, traffic nowcast-
+ing, and control on large-scale networks. We develop several differentiable com-
+puting techniques for simulating individual vehicle movements, including stochastic
+decision-making and inter-agent interactions, while ensuring that entire simulation
+trajectories remain end-to-end differentiable for efficient gradient-based optimiza-
+tion. On the large-scale Chicago road network, with over 10,000 calibration param-
+eters, our model simulates more than one million vehicles at 173 times real-time
+speed. This ultra-fast simulation, together with efficient gradient-based optimiza-
+tion, enables us to complete model calibration using the previous 30 minutes of
+traffic data in 455 s, provide a one-hour-ahead traffic nowcast in 21 s, and solve the
+resulting traffic control problem in 728 s. This yields a full calibration–nowcast–
+control loop in under 20 minutes, leaving about 40 minutes of lead time for imple-
+menting interventions. Our work thus provides a practical computational basis for
+realizing traffic digital twins.
+Introduction
+Rapid global urbanization represents a pivotal moment in human history, with urban
+dwellers now constituting the nearly half of the world’s 8.2 billion population [1]. The
+rapid urbanization has elevated the traffic congestion management to a critical global
+∗Corresponding author: f.makinoshima@fujitsu.com
+1
+arXiv:2603.25068v1  [cs.MA]  26 Mar 2026
+challenge, as it has significant effects on economic productivity [2, 3] and environmental
+and public health [4, 5], beyond mere inconvenience. Given the difficulty and potentially
+irreversible impacts of implementing traffic policies in real-world, traffic simulation has
+become an indispensable tool for identifying effective strategies within a virtual space
+in computers. This has led to the development of various simulation models [6, 7, 8]
+simulating vehicle movements at a fine scale with micro or mesoscopic models, which are
+now widely applied to inform practical policy-making.
+While simulation is a powerful tool for policy-making, its real-world effectiveness
+hinges on calibration, the process of aligning the model with empirical data. A well-
+calibrated simulator enables the exploration of reliable and effective strategies [9]. This
+calibration process, however, becomes a critical bottleneck for fine-grained traffic simu-
+lation models. Because of their inherent stochasticity and complex vehicle interactions,
+such models are non-differentiable and must typically be calibrated using gradient-free
+optimization algorithms [10, 11, 12, 13, 14], which are notoriously inefficient and require
+vast numbers of simulation runs.
+As the spatial scale of the simulation expands, the
+number of calibration parameters grows rapidly, further compounding the problem and
+making the optimization computationally intractable. As a result, the practical applica-
+tion of calibrated microscopic models remains confined to small-scale scenarios with only
+a few dozen parameters [15], falling short of the needs for addressing complex, large-scale
+urban systems. On the other hand, real-time traffic observation data for calibration is
+now becoming readily available from various observation channels [16]. This situation
+underscores the urgent need for advanced simulation technologies capable of translating
+this wealth of data into actionable insights for timely transportation policy making.
+The emerging paradigm of differentiable simulation presents a promising pathway to
+overcome this challenge.
+Effectively using automatic differentiation developed mainly
+for machine learning [17], the differentiable simulations calculate the dynamics of the
+equation-based white-box models while enabling the access to the gradient information
+of the simulated process and efficient gradient-based optimization [18].
+Differentiable
+simulation techniques first demonstrated their effectiveness for rapid parameter calibra-
+tion in the field of physical simulation [19, 20, 21]. More recently, their application has
+been extended to social simulations [22, 23, 24, 25, 26], where comparable benefits have
+been reported. In traffic engineering, while efforts to apply this paradigm to parameter
+calibration are emerging, they have been largely confined to macroscopic, continuous mod-
+els [27, 28, 29, 30, 31, 32]. The few pioneering works on microscopic models [22, 23, 33, 34]
+have come at the cost of simplification, often omitting complex behaviors such as agents’
+stochastic decision-making and their interactions with other agents. The core challenge
+lies in consistently differentiating stochastic choice of vehicles, vehicle transfers between
+road links, and vehicle-to-vehicle interactions. Consequently, developing a differentiable
+fine-grained traffic simulator with the fidelity to capture traffic dynamics in complex,
+real-world networks has yet to be achieved.
+Here we introduce an end-to-end differentiable, agent-based model that simulates the
+dynamics of over one million vehicles in real-time. Its design is grounded in traffic flow the-
+ory and employs novel computational techniques to maintain full differentiability through-
+out the simulation, even with complex stochastic behaviors of vehicles. The model is fully
+tensorized to leverage massive parallelization on hardware accelerators, achieving simu-
+lation speed significantly exceeding real-time. We demonstrate its capability on a large-
+scale, real-world road network with over 10,000 calibration parameters. This exceptional
+speed, combined with efficient gradient-based optimization, enables model calibration,
+2
+nowcasting, and intervention planning to be completed several times faster than real
+time, so that the full pipeline finishes with ample lead time for implementing interven-
+tions, thereby realizing a practical, operational traffic digital twin for a city. By bridging
+the gap between traditional simulators and the vast amount of available traffic data,
+our work paves the way for next-generation intelligent transportation systems to address
+pressing societal challenges.
+Results
+Differentiable agent-based traffic simulation
+We developed an end-to-end differentiable agent-based traffic simulator for real-time traffic
+nowcasting and control (see Methods and Supplementary Information A–D for details).
+The overall framework is illustrated in Fig. 1. Given the initial traffic state and two types
+of parameters, namely behavioral model parameters θb and environmental parameters
+θe, the simulator computes the traffic state over a time horizon of length T.
+While
+the environmental parameters, such as road pricing, can be specified objectively and, in
+some cases, decided by policy makers, the behavioral parameters governing how travelers
+perceive the environment and make decisions are not directly observable and must be
+inferred from data.
+A single forward step of our simulator, denoted by ϕ, can be viewed as the compo-
+sition of a position update function f and a vehicle transfer function g. The position
+update function f advances vehicle positions over one time step based on traffic flow
+theory, whereas the vehicle transfer function g governs probabilistic next-link choices and
+stochastic merging behavior. In this study, we construct differentiable versions of these
+processes while still simulating vehicle movements in a manner that is faithful to traffic
+flow theory, without ad-hoc simplifications of inter-agent interactions or stochasticity (see
+Methods for details). Because these processes are differentiable, the composite function
+ϕ and the simulated trajectories ϕT over T time steps are end-to-end differentiable. Con-
+sequently, the gradient of a loss function, which quantifies the discrepancy between the
+simulated traffic state ˆy and the observed state y, with respect to the behavioral pa-
+rameters θb, can be computed efficiently via automatic differentiation, enabling scalable
+gradient-based calibration of the simulation model.
+After calibration, we nowcast the traffic state at time T + ∆T by simulating the
+system with the calibrated behavioral parameters θ∗
+b and the environmental parameters
+θe. If the forecasted traffic state exhibits undesirable features, such as severe congestion
+on particular roads, we define the deviation between the forecasted and a desired traffic
+state (e.g., a less congested state) as a loss function. The gradient of this loss with respect
+to the environmental parameters θe can then be obtained via automatic differentiation,
+which effectively guides the system towards the desired state.
+The resulting optimal
+parameters θ∗
+e inform policy makers about effective interventions, such as road pricing
+strategies. If these steps, that is, calibration, nowcasting, and solution of the associated
+control problems, can be performed within a very short time period, they pave the way
+towards a digital twin of urban traffic that continuously updates the computational model
+using real-world traffic observations and guides interventions to improve real-world traffic
+conditions. In the subsequent sections, we demonstrate that, with the efficient gradient-
+based optimization enabled by automatic differentiation, these complex tasks, namely
+calibration, traffic nowcasting, and control, can be executed faster than real time, even
+3
+for city-scale networks.
+Figure 1: Framework of the differentiable agent-based traffic simulation for traffic now-
+casting and control. The framework consists of two main stages: calibration and now-
+casting/control. (1) Calibration: The simulation runs with initial conditions X(t = 0),
+optimizable behavioral parameters (θb), and fixed environmental parameters (θe).
+By
+minimizing the loss ℓbetween the simulated traffic state ˆy(t = T) and ground-truth
+observations y(t = T) via gradient-based optimization using the gradient ∂ℓ/∂θb, the be-
+havioral parameter is calibrated to θ∗
+b, accurately replicating observed traffic dynamics.
+(2) Nowcasting and Control: Using the calibrated parameter θ∗
+b, the current traffic state
+X(t = T), and the current environmental parameter θe, the model performs nowcasting
+to predict the near-future state ˆy(t = T +∆T). To control traffic, a desired state y∗is set.
+The gradient with respect to the environmental parameter, ∂ℓ/∂θe, is then calculated to
+determine the optimal interventions θ∗
+e (e.g., dynamic pricing, dynamic speed limit con-
+trol) that guide the system towards this desired state.
+Gradient-based model calibration
+As we verified that the calibration can be substantially accelerated with a larger platoon
+size ∆n without adverse effects on the loss (see Supplementary Information E), we applied
+the developed model to the large-scale Chicago network, involving 1,000,020 vehicles and
+10,284 calibration parameters, with ∆n = 30 (see Methods). Whereas the simulation with
+mean parameters failed to reproduce the spatially heterogeneous traffic patterns of the
+ground truth, the simulation with the gradient-based calibration successfully reproduced
+the complex traffic patterns (Fig. 2a). Quantitative comparisons against ground-truth
+traffic counts (every 5 min) showed that the calibrated simulation provides a good approx-
+imation of the true traffic state (mean absolute error (MAE) of 52.6; Pearson’s r = 0.83),
+whereas the mean-parameter simulation failed to capture the actual traffic trend (MAE
+of 87.4; Pearson’s r = 0.60), yielding a 40% improvement in accuracy (Fig. 2b). The
+4
+estimated behavioral model parameter β reproduced the ground-truth parameter distri-
+bution (Fig. 2c), indicating that the model successfully estimated the behavioral model
+from noisy, partial, and aggregate traffic counts and provided a good approximation of
+the actual traffic states. The forward simulation and its automatic differentiation are
+quite fast, and this large-scale gradient-based calibration required only 455.3 s, which
+corresponds to 4.0× real-time.
+Figure 2: Calibration results on the Chicago Sketch network. (a) Cumulative traffic counts
+from the mean-parameter simulation and the calibrated simulation, compared against
+ground-truth counts. (b) Five-minute traffic counts from the mean-parameter simulation
+and the calibrated simulation, compared against ground-truth counts. (c) Estimated β
+values compared against ground-truth β values. Because the choice probability of the
+next links is determined only by differences in utility, β is normalized for comparison. For
+clarity, we display only the β values of links at junctions connected to the top-10 links by
+traffic volume.
+Real-time traffic nowcasting
+After the calibration process, we ran forward simulations to nowcast future traffic states
+using the calibrated parameters (Fig. 3). By evolving the system from the current state
+with the calibrated parameters, we obtained future traffic states conditioned on the ob-
+5
+served traffic flows during the previous 30 minutes (Fig. 3a). Because only partial and
+noisy traffic counts are observed and agents’ route choices are stochastic, the calibrated
+model exhibits estimation errors that grow with the nowcast horizon. In this nowcasting
+test, we observed a systematic bias of approximately 6.9 veh/min per link on average,
+which led to a discrepancy between the estimated and ground-truth cumulative traffic
+counts after 60 minutes (Fig. 3b). Nonetheless, the nowcast captures the overall pattern
+of actual traffic flows (Pearson’s r = 0.69), which can still be informative for practical
+intervention planning. The nowcasts can be computed much faster than real time, and the
+computational cost increases approximately linearly with the nowcast horizon (Fig. 3c, d),
+because the length of the time-integration loop to be compiled and simulated increases in
+proportion to the nowcast horizon. For a one-hour-ahead nowcast, the just-in-time (JIT)
+compilation and forward simulation required 17.7 s and 3.0 s, respectively, corresponding
+to an overall speed of 173× real time for the nowcasting process.
+Figure 3: Traffic nowcasting results on the Chicago Sketch network. (a) Estimated cu-
+mulative traffic counts at nowcast horizons of 5, 10, 30, and 60 minutes from the current
+state. (b) Estimated cumulative traffic counts on links at the 60-minute nowcast horizon
+compared against ground-truth counts. (c) JIT compilation time for different nowcast
+horizons. (d) Forward simulation time for different nowcast horizons. In panels c and d,
+whiskers indicate the standard deviation across five trials. The dashed lines represent the
+regression results, indicating the linear scalability of the nowcasting computation.
+6
+Gradient-guided traffic control
+The one-hour-ahead traffic nowcast predicted that the target link highlighted in Fig. 4a
+would experience the maximum cumulative traffic count of 3,030 among all links. We
+therefore considered a traffic control problem in which we seek a road pricing policy that
+reduces the future cumulative traffic count on this target link by half. To this end, we
+defined a loss function as the squared error between the halved target count and the
+simulated count on the target link, and examined whether gradient-based optimization
+can solve this complex control problem, in which agents’ stochastic route choices and their
+interactions are indirectly controlled through cost changes.
+The resulting pricing pattern is not a simple uniform increase in costs around the tar-
+get link, but rather a complex spatial structure that would be difficult to obtain through
+manual design (Fig. 4b). While the optimization result shows intuitive trends, such as
+increasing the cost of the target link, it also assigns a non-trivial combination of cost
+increases and discounts to links around the target link.
+The differentiable simulation
+techniques developed in this study enable gradients to propagate across links and auto-
+matically and efficiently adjust the costs of relevant links that contribute to high traffic
+counts on the target link, solely based on the desired traffic condition. The optimized
+pricing policy achieved a reduction of 1,800 vehicles in the cumulative traffic count on the
+target link, corresponding to a 59% decrease (Fig. 4c). Because of the stochasticity of
+agents’ behavior, there remains a gap of 9% between the desired and achieved counts; nev-
+ertheless, the results indicate that the gradient signal effectively steers the traffic system
+toward the desired state. Solving this control problem required only 728 s, demonstrat-
+ing the efficacy of the differentiable model in addressing complex traffic control tasks via
+efficient gradient-based optimization.
+Figure 4: Traffic control results on the Chicago Sketch network. (a) Network view high-
+lighting the target link to be controlled via cost changes. (b) Optimized cost changes
+designed to halve the cumulative traffic count on the target link. (c) Cumulative traffic
+counts on the target link with and without control (cost changes). The dashed line rep-
+resents the target value (50% reduction).
+Discussion
+We developed a suite of differentiable simulation techniques and, taken together, they
+constitute a differentiable agent-based traffic simulator that scales to one million ve-
+hicles on a city-scale network.
+The combination of ultra-fast forward simulation and
+7
+efficient gradient-based optimization enabled by our differentiable model allowed us to
+complete the full calibration–nowcast–control loop for one-hour-ahead traffic flows in
+about 20 minutes, leaving roughly 40 minutes of lead time for implementing interven-
+tions. Conventional fine-grained simulation models are not differentiable and therefore
+must rely on inefficient gradient-free optimization methods for calibration and policy ex-
+ploration [10, 11, 12, 13, 14], which has hindered their use in real-time applications. The
+dependence on gradient-free optimization has also constrained the scale and fidelity of
+computational models, because derivative-free methods typically require rapidly increas-
+ing numbers of function evaluations as the dimensionality and complexity of continuous
+optimization problems grow, making it difficult to obtain high-quality solutions within a
+realistic evaluation budget [35]. A pioneering study proposed a computational model for
+a traffic digital twin of an expressway using real-time data [36]. However, the model is
+limited in scale and, critically, lacks a feedback loop from the computational model to the
+real traffic system. By definition, a digital twin requires an automatic closed loop between
+a real-world system and its computational model, so that both the physical system and the
+model are continuously updated; otherwise, the computational model is merely a digital
+model or shadow [37]. Establishing such a loop for a traffic digital twin requires solv-
+ing complex optimization problems for calibration and traffic control, and solving these
+problems on high-fidelity models in real time has been computationally infeasible with
+conventional simulation models that rely on gradient-free optimization algorithms. Our
+work provides a practical computational approach to address this long-standing challenge
+and to realize a traffic digital twin in which the closed loop between the real-world system
+and the computational model can be completed in real time.
+The computational techniques we developed for differentiable agent-based traffic sim-
+ulation are useful not only for traffic simulations but also for broader agent-based social
+simulations. Differentiable agent-based simulations have thus far been applied to various
+applications; however, they have been limited to simplified models of society [22, 23, 24,
+25, 26], and no existing study models large-scale spatial dynamics of agents while incor-
+porating their stochastic decision-making. Our differentiable computing techniques, such
+as the trajectory grafting technique developed for differentiable vehicle transfers between
+links, enable us to scale models to practical large-scale problems while maintaining end-
+to-end differentiability. These techniques can be applied to build differentiable versions of
+a wide range of agent-based models, because decision making and spatial movement are
+typical modeling elements in agent-based simulations [38]. This would allow such mod-
+els to exploit gradient information and powerful gradient-based optimization algorithms,
+ultimately facilitating the development of digital twins of societal systems.
+With a broad range of extensions, the new computational foundation presented in this
+paper can serve as a core for solving real societal challenges. A natural next step is to
+deploy the proposed framework continuously on real-world traffic networks and to assess
+its performance over repeated loops as it executes the cycle of calibration, nowcasting,
+and intervention. For real deployments, challenges such as noisy and missing sensor data,
+feedback effects from behavioral changes induced by interventions, and the need for ro-
+bust optimization that aligns with operational, safety, and equity constraints will arise. As
+demonstrated on synthetic data, our model already has sufficient speed and scale for real-
+world applications; the remaining obstacles lie in addressing these deployment challenges,
+which constitute a distinct class of research questions at the interface of data assimila-
+tion, control theory, and human-in-the-loop system design. To capture the full complexity
+of the real world, the model itself should be further enhanced. Here, the differentiable
+8
+nature of our framework opens up the possibility of joint optimization with other differ-
+entiable modules, such as demand forecasting [39] and signal control models [40], as the
+composition of differentiable models remains end-to-end differentiable and amenable to
+gradient-based optimization. For example, jointly optimizing demand generation, mode
+choice, network flow, and signal policies under a single objective could blur the traditional
+separation between strategic transport planning and operational traffic control. Beyond
+that, incorporating models of emissions, safety risk, or equity in a differentiable form
+would pave the way for multi-objective optimization directly targeting socially desirable
+outcomes. When continuous assimilation of real-world data, fast nowcasting, and joint
+optimization of diverse subsystems are brought together, advanced real-time control of
+urban traffic networks becomes a technically tangible prospect. The computational core of
+the traffic digital twin demonstrated in this work may thus serve as a foundation for future
+societal-scale digital twins, providing real-time decision-making infrastructure to address
+complex urban challenges, from congestion and emissions to resilience and accessibility.
+Methods
+Newell’s simplified car-following model
+Our model relies on Newell’s simplified car-following model [41] to determine vehicle
+movements within links. Specifically, we employed the following mesoscopic extension of
+the model [42, 43, 44]:
+x(t + ∆t, n) = min
+
+
+
+x(t, n) + u∆t
+x(t + ∆t −τ∆n, n −∆n) −1/κ∆n
+
+
+,
+(1)
+where x(t, n) denotes the position of n-th platoon (agent) at time t, u denotes the free-
+flow speed of the running link, τ denotes the reaction time, κ denotes the jam density,
+∆n denotes the platoon size, and ∆t denotes the simulation time step, which is given by
+τ∆n. In all experiments, we set τ = 1. This model determines a vehicle’s position as the
+minimum of two potential positions: one derived from its free-flow state (the first term)
+and another from its congested state (the second term). Conceptually, this formulation
+means that vehicles travel at their maximum free-flow velocity u, subject to the constraint
+of maintaining a safe distance from the vehicle ahead (defined by 1/κ∆n).
+Differentiable car-following model
+We have developed a fully tensorized algorithm for Newell’s car-following model that
+leverages vectorization and masked tensor operations to update all agent positions in
+parallel (see Supplementary Information A for implementation details).
+Our formula-
+tion entirely avoids conditional statements and loops, rendering the algorithm highly
+amenable to JIT compilation. This allows a JIT compiler to translate the operations into
+highly optimized kernels for modern hardware accelerators, unlocking significant perfor-
+mance gains.
+Furthermore, the differentiability of every operation permits the use of
+efficient, gradient-based schemes via automatic differentiation, resulting in ultrafast op-
+timization. By design, our algorithm maintains numerical equivalence with the original
+model, thereby preserving fundamental traffic characteristics, such as ensuring agents do
+9
+not move backward and remain strictly within link boundaries. The model is implemented
+using JAX [45, 46].
+Differentiable node model
+Our node model governs agent navigation at intersections through a two-step discrete
+choice process, comprising an agent’s link choice followed by a merge decision. Crucially,
+this formulation is not only expressed in a fully tensorized form for simultaneous processing
+of all intersections, but is also fully differentiable despite the probabilistic and discrete
+nature of the choices. Our choice model builds on standard discrete choice theory [47],
+and we develop a differentiable sampling scheme for this model using various differentiable
+computing techniques, such as the Gumbel–Softmax relaxation [48, 49] and the straight-
+through estimator [50] (see Supplementary Information B for implementation details).
+This enables efficient gradient-based optimization of behavioral model parameters, even in
+the presence of agents’ stochastic decision-making in the simulation. Our implementation
+is built using JAX [45, 46].
+Differentiable state updates
+We developed a computational technique, which we term Trajectory Grafting (TG), to
+handle discontinuous updates of agent positions within a differentiable simulation. In our
+simulation, an agent’s position is updated discontinuously, for instance, when it moves
+from the end of one road link to the start of another. If this transition is handled naively,
+the computational graph is broken at the point of the update. This break disrupts the
+gradient flow required for automatic differentiation and prevents backpropagation across
+links. The TG technique addresses this issue by maintaining a connected computational
+graph, which enables gradients to propagate through previous links and facilitates inter-
+link optimization (see Supplementary Information C).
+Optimization
+The same optimization algorithm is consistently used for both calibration and control
+problems.
+It consists of four iterative steps repeated until convergence: (1) forward
+simulation, (2) loss calculation, (3) gradient calculation, and (4) parameter update.
+In the forward simulation step, the differentiable traffic simulation is run to obtain
+traffic state estimates ˆy. Storing the entire computational graph for the subsequent au-
+tomatic differentiation, however, can lead to prohibitive memory usage, especially for
+long-duration or large-scale simulations. To address this, we employ checkpointing [51],
+a technique that reduces memory requirements for the backward pass by recomputing
+intermediate values instead of storing them. Specifically, we insert a checkpoint at every
+time integration step using the jax.checkpoint function. Furthermore, the time integra-
+tion loop is implemented with jax.lax.scan to prevent loop unrolling and reduce JIT
+compilation time. The loss function is the mean squared error between the estimated
+and observed traffic counts, where the squared errors are computed for each link with
+available observational data and then averaged over those links. Because traffic counting
+is not naively differentiable, we develop a differentiable traffic counting technique for the
+loss calculation (see Supplementary Information D). The loss function, which includes a
+forward simulation to evaluate the gap, is JIT-compiled with jax.jit to enable efficient
+optimization.
+10
+The gradient of the loss function with respect to the parameters to be optimized is then
+computed. As our simulator is end-to-end differentiable, this is achieved efficiently via
+automatic differentiation using the jax.grad function. The parameters are subsequently
+updated at the end of each iteration using the computed gradients. For this purpose,
+we employed the AdamW optimizer [52] implemented using the Optax library [53], using
+default hyperparameters except for a learning rate of 10−1 and a weight decay of 10−5. The
+optimization process is terminated when the loss has not improved in the most recent 20
+iterations, and the parameters yielding the lowest loss are adopted as the final estimates.
+Experimental setting
+We verified our model on the Sioux Falls network and the Chicago Sketch network, popular
+test problems in the transportation literature deposited in the Transportation Networks
+repository [54]. To generate heterogeneous trip patterns, we constructed the networks by
+removing either the virtual inflow or outflow link connected to each node. For terminal
+nodes that form the boundary of the simulation area (dead-end nodes), we did not remove
+the virtual links and retained both the inflow and outflow links to ensure that vehicles
+can exit the computational domain. The resulting numbers of nodes/links for the Sioux
+Falls and Chicago networks are 48/100 and 993/2571, respectively (see Supplementary
+Information F for a visual representation of the networks).
+As each link has four parameters, i.e., a free-flow velocity u (m/s), a jam density κ
+(veh/m), a behavioral model parameter β, and a merge priority α, the total numbers
+of parameters to be estimated for the Sioux Falls and Chicago networks are 400 and
+10,284, respectively. The cost parameter c of each link was fixed uniformly at 1 during
+the calibration process, but was optimized only during the control process as a measure
+of intervention.
+We evenly distributed 20,000 and 1,000,020 vehicles over the virtual inflow links of
+the Sioux Falls and Chicago networks, respectively, and simulated their dynamics for
+90 min with randomized parameters to synthesize observation data. These parameters
+used for synthesizing observations were randomly sampled from a uniform distribution
+over a realistic range, i.e., u ∈[13.9, 22.2], κ ∈[0.18, 0.22], β ∈[0, 5], and α ∈[0.01, 5].
+We simulated the traffic dynamics with ∆n = 1 and ∆n = 30 in the Sioux Falls and
+Chicago networks, respectively.
+As observations for calibration, we assumed that cumulative traffic counts, measured
+at the midpoint of each link, are available every 5 min over the past 30 min. To emulate
+realistic observation conditions, we added 10% random noise to the traffic counts and
+assumed that these noisy observations are only partially available, i.e., on 80% of the
+roads.
+In the calibration process, the estimation starts from the mean values of the
+uniform parameter ranges, and the parameters are estimated from the observations using
+a gradient-based optimization scheme. A forward simulation for the remaining 60 min is
+then conducted to evaluate performance in the traffic nowcasting and control problems.
+All experiments were conducted on a computational server equipped with two In-
+tel Xeon Platinum 8558 CPUs, utilizing a single NVIDIA H200 SXM 141GB GPU for
+acceleration.
+11
+Acknowledgements
+We thank the developers and contributors of the open-source simulator UX Sim [44],
+which provided useful insights and inspiration during the development of our model. We
+also acknowledge the Transportation Networks repository [54] for the network data used
+to construct the Sioux Falls and Chicago Sketch networks in this study.
+Supplementary Information
+A. Differentiable car-following model
+Throughout our algorithm, agent positions are represented as the following two-dimensional
+tensor X ∈R|N|×|L|:
+Xij =
+(
+xij
+if agent i is on link j,
+−M
+otherwise,
+(2)
+where N and L denote the sets of agents and links, respectively, xij represents the position
+of the agent i on the link j, and M is a large constant (e.g., 99999). Updating all vehicles
+simultaneously by processing the large tensor X is memory-demanding, particularly in
+large-scale applications. Therefore, we adopted a per-link computational approach by
+vectorizing the car-following model using the vmap function in JAX. This strategy en-
+ables parallel vehicle updates while substantially reducing memory usage. The following
+describes this per-link computation, which operates on x(j), a j-th column of the tensor
+X.
+We first calculate the position updates for the free-flow state, ∆x(j)
+free, as follows:
+∆x(j)
+free = Ix(j)≥0 ◦u(j) ◦∆t,
+(3)
+where u(j) ∈R|N|
+≥0 represents the free flow speed within the link j, Ix(j)≥0 ∈{0, 1}|N| is
+an indicator tensor which masks −M in x(j), ◦denotes the Hadamard product. In our
+model, each link j has a free-flow velocity uj. Agents traveling on a given link adopt
+its corresponding velocity. By applying these masked operations, we can simultaneously
+compute the free-flow position updates for all vehicles.
+Next, we calculate the position updates for vehicles under congested conditions. The
+next position of vehicle n is determined relative to the preceding vehicle, x(t, n −1). By
+leveraging the identity x(t, n −1) = x(t, n) + h(t, n), where h(t, n) is the space headway,
+we can express the next position in terms of vehicle n’s own state.
+This yields the
+expression x(t, n) + h(t, n) −1/κ∆n. Therefore, once the space headway of each vehicle
+is determined, we can compute the position updates for the congested state, ∆x(j)
+cong.
+Rather than relying on the computationally expensive, brute-force method of checking all
+pairwise vehicle distances, we constructed the space headway tensor h(j) ∈R|N| efficiently
+by sorting the vehicles according to their position. To obtain the sorted indices of valid
+vehicles on the link j, we first compute an auxiliary tensor ˜x as follows:
+˜x = Ix(j)≥0 ◦x(j) −Ix(j)<0 ◦M.
+(4)
+We then obtain the sorted indices σ by
+σ = argsort(−˜x).
+(5)
+12
+The indexing operation, using the output of the argsort function, does not disrupt
+the computational graph, preserving the path for gradient backpropagation. The sorted
+indices σ are then used to compute the components h′
+i of the preliminary space headway
+tensor h′ as follows:
+h′
+i =
+(
+x(j)
+σk−1 −x(j)
+σk
+if i = σk for some k ∈{2, . . . , |N|},
+M
+otherwise.
+(6)
+While this procedure yields correct headways for valid vehicles, it produces spurious values
+for invalid ones.
+This is because the placeholder value M assigned to their positions
+renders the subtraction-based calculation meaningless.
+Therefore, we obtain the final
+space headway tensor h(j) by correcting these spurious values in h′ as follows:
+h(j) = Ix(j)≥0 ◦h′ + Ix(j)<0 ◦M.
+(7)
+This artificially large headway is designed to manipulate the state-selection mechanism. It
+renders the congested-state update, ∆x(j)
+cong, extremely large for the leading vehicle. Since
+the final position update is determined by min(∆x(j)
+free, ∆x(j)
+cong), this forces the model to
+select the free-flow update, ∆x(j)
+free, for leading vehicles. In contrast, all other following
+vehicles operate with finite, realistic headways, allowing their states to be determined by
+the actual local traffic conditions. In the congested state, a small space headway h(j) can
+cause the position update ∆x(j)
+cong to become negative, implying an unphysical backward
+movement. To preclude this possibility and enforce non-negative updates, we compute
+∆x(j)
+cong as follows:
+∆x(j)
+cong = Ix(j)≥0 ◦max(h(j) −1/κ(j)∆n, 0).
+(8)
+Here, κ(j) ∈R|N| denotes the tensor of jam densities on link j, 0 ∈{0}|N| is the zero
+tensor. The indicator function Ix(j)≥0 serves as a mask to nullify the updates for invalid
+vehicles.
+The position update ∆x(j) is then calculated as the element-wise minimum of the
+free-flow update ∆x(j)
+free and the congested-flow update ∆x(j)
+cong:
+∆x(j) = min(∆x(j)
+free, ∆x(j)
+cong).
+(9)
+Subsequently, the preliminary position at the next time step, x(j)′(t + ∆t), is determined
+as:
+x(j)′(t + ∆t) = x(j)(t) + ∆x(j).
+(10)
+If the displacement ∆x(j) is large, this preliminary position may exceed the length of
+the current link. To ensure that the final position x(j)(t + ∆t) remains within the link’s
+boundaries, a correction is necessary. This correction utilizes a position-limiting tensor,
+x(j)
+limit, constructed as follows:
+x(j)
+limit = L(j) + x(j)′ −stop gradient(x(j)′),
+(11)
+where L(j) ∈R|N| is a constant tensor with all element equal to the length of link j.
+The stop gradient(·) operator blocks the gradient from flowing through its argument dur-
+ing backpropagation, effectively treating the argument as a constant. A naive clipping
+of the position, for instance, by simply replacing x(j)′ with L(j), would detach the op-
+eration from the computational graph. This is because L(j) is a constant and carries
+13
+no gradient information, which would prevent gradients from being propagated back to
+earlier computations. To address this, we introduce a technique inspired by the straight-
+through estimator [50], which we term Trajectory Grafting (TG). In Eq. 11, the term
+x(j)′−stop gradient(x(j)′) serves to isolate the computational trajectory of x(j)′, effectively
+acting as a gradient carrier. By adding this gradient carrier to the constant link length,
+we graft the computational history of x(j)′ onto the new limiting value. Therefore, the TG
+technique allows us to cap the agent positions at the link boundaries without breaking
+the computational graph essential for gradient-based optimization. Using this limiting
+tensor, the final position at the next time step is determined by taking the element-wise
+minimum with the preliminary position:
+x(j)(t + ∆t) = min(x(j)′, x(j)
+limit).
+(12)
+By mapping each newly computed tensor x(j)(t + ∆t) back to the j-th column of the
+original tensor X, we obtain the updated tensor X(t + ∆t). We provide the pseudocode
+of the differentiable car-following model in Alg. S1.
+Algorithm S1 Per-link differentiable car-following model.
+def
+compute_car_following_model (x, u, kappa , L, delta_t , delta_n , M):
+# mask for invalid
+vehicles
+I_xpos = x >= -1e-2
+# obtain dx in free -flow
+state
+dx_free = (u * delta_t) * I_xpos
+# obtain dx in congested
+state
+x_tilde = where(I_xpos , x, -1e12)
+sigma = argsort(-x_tilde)
+front = array ([M], dtype=x_tilde.dtype)
+prev = x_tilde [:-1]
+curr = x_tilde [1:]
+diffs = prev - curr
+diffs_full = concatenate ([front , diffs ])
+headway = full_like(x, M)
+headway = headway.at[sigma ].set(diffs_full)
+headway = where(I_xpos , headway , M)
+dx_cong = maximum(headway - 1.0 / kappa * delta_n , 0) * I_xpos
+# determine dx
+dx = minimum(dx_free , dx_cong)
+# update x
+x_new = x + dx
+# limit x within
+link
+x_limit = L + x_new - stop_gradient(x_new)
+x_new = minimum(x_new , x_limit)
+return
+x_new
+14
+B. Differentiable node model
+Link choice
+First, the node model determines the agents’ link choice. This process begins by identify-
+ing the set of potential next links for each agent. This set, L∗∈{0, 1}|N|×|L|, is expressed
+as:
+L∗= IX≥0 · A,
+(13)
+where A ∈{0, 1}|L|×|L| is the network’s adjacency tensor, where the element Aij = 1 if
+link j is reachable from link i, and 0 otherwise. A is static and determined by the road
+network geometry. Using L∗, we compute the link utility tensor V ∈R|N|×|L| as:
+V = (β ◦1/c) ∗L∗−M ◦( ¯L∗),
+(14)
+where ¯L∗represents the complement of L∗, β ∈R|L|
+≥0 is the learnable behavioral parameter
+that determines how the travel cost c ∈R|L|
+>0 affects link choice, and the operator ∗denotes
+an element-wise product with broadcasting.
+Consequently, the utility Vij for agent i
+choosing the link j becomes βj/cj if the transition is possible and a large negative number
+−M otherwise, effectively restricting the choice to valid links. While we present a simple
+utility function based on the cost factor with β, our formulation is general enough to
+incorporate additional factors, such as those related to an agent’s origin and destination.
+From the utility tensor V, the choice probability for each agent over all possible next links,
+z ∈[0, 1]|N|×|L|, is computed using a softmax function applied along the link dimension
+(the second axis):
+zij =
+exp(Vij)
+P|L|
+k=1 exp(Vik)
+.
+(15)
+To obtain a discrete link choice for each agent, one might sample from the probability
+distribution z, for instance by taking the argmax. However, such a sampling process is
+non-differentiable, which obstructs the end-to-end gradient flow essential for automatic
+differentiation. To address this challenge, we employ a two-stage approach. First, we use
+the Gumbel-Softmax trick [48, 49] to generate a differentiable proxy for discrete samples.
+This yields the following soft choice tensor π ∈[0, 1]|N|×|L|:
+πij =
+exp((log(zij) + gij)/τ)
+P|L|
+k=1 exp((log(zik) + gik)/τ)
+,
+(16)
+where gij are i.i.d samples drawn from a Gumbel(0, 1) distribution, and τ is a temperature
+parameter, which we set to 0.01.
+While π is differentiable, it consists of continuous
+values, whereas our simulation requires discrete, one-hot choices. To bridge this gap, we
+next apply the straight-through estimator [50], allowing us to use discrete samples in the
+forward pass while preserving a valid gradient in the backward pass. The preliminary link
+choice tensor l′ ∈{0, 1}|N|×|L| is then obtained as follows:
+l′ = onehot(π) + π −stop gradient(π),
+(17)
+where onehot operator converts the input into a one-hot tensor by applying argmax to the
+soft link-choice samples along the second axis. These techniques enable us to use exact
+discrete sampling in forward simulation while its gradient is seamlessly passed through
+the continuous proxy π in the backward pass.
+15
+A sampled link choice is considered valid only if the following three conditions are
+met: the current link is not a dead-end, the agent has reached the end of its current
+link, and the chosen destination link has sufficient capacity. To enforce this, we correct
+l′ to obtain the final, valid link choice tensor l by applying three indicator masks: a
+connectivity mask Iconnected ∈{0, 1}|L|, an arrival mask Iarrived ∈{0, 1}|N|, and a vacancy
+mask Ivacant ∈{0, 1}|L|. Using these masks, the final link choice tensor l ∈{0, 1}|N|×|L| is
+computed as:
+l = Iconnected ∗(Iarrived ∗(Ivacant ∗l′)).
+(18)
+The connectivity mask, Iconnected, is obtained by applying a max function to L∗along
+its second axis. The arrival mask, Iarrived, is computed by applying a sum function to
+IX=L along the second axis, where L ∈R|N|×|L| is the link length tensor.
+A link is
+deemed vacant if the rearmost agent on it is sufficiently far from the entry point. The
+position of this rearmost agent, Xmin ∈R|L|, is found by applying a min function to the
+masked tensor IX≥0◦X + IX<0◦M along the first axis. The vacancy mask is then given by
+Ivacant = Xmin > 1/κ∆n.
+Merge choice
+Next, we address the merge choice problem, which resolves merging conflicts when multiple
+agents, based on the link choice result l, compete to enter the same downstream link. To
+this end, we introduce a merge priority α ∈R|L|
+>0 that represents the intrinsic priority for
+merging from each link. The merging priority tensor p ∈R|L|×|N| is then formulated as:
+p = ((IX≥0 · α) ∗l)T.
+(19)
+In a similar manner to the construction of the link utility tensor V, we construct a merging
+utility tensor V′ ∈R|L|×|N| for this second problem as follows:
+V′ = p −Ip=0 ◦M.
+(20)
+An entry V ′
+ij becomes the merging priority of agent j for link i and −M otherwise.
+By applying the same sampling procedures (Eqs. 15-17) to V′, we obtain a preliminary
+sampling of transferring agents, a′ ∈{0, 1}|L|×|N|, where a′
+ij = 1 if agent j is chosen to
+transfer to link i, and 0 otherwise. However, invalid sampling occurs when no agent targets
+a particular link i, as the corresponding utilities V ′
+ij for all agents j become uniformly −M.
+To prevent this, we mask the preliminary sampling result a′ to yield the valid sampling
+of transferring agents a ∈{0, 1}|L|×|N|:
+a = (max(l))T ∗a′,
+(21)
+where the max function is applied along the first axis. By solving these successive two-
+step choice problems (link and merge choice), we can correctly simulate probabilistic yet
+consistent inter-link vehicle transfers, while fully preserving end-to-end differentiability
+for gradient-based optimization.
+Differentiable vehicle transfer
+To implement the vehicle transfers based on the choice result a, we update the agent
+state tensor X in a differentiable manner. This requires two auxiliary indicator tensors:
+Iremove ∈{0, 1}|N|×|L| for removing agents from their original links, and Iadd ∈{0, 1}|N|×|L|
+16
+for adding them to their new links. The tensor Iremove identifies agents that are leaving
+their current link and is obtained by:
+Iremove = IX≥0 ∗(sum(aT))T,
+(22)
+where the sum function is performed along the second axis. Similarly, Iadd is given by the
+transpose of the choice result, aT.
+To reflect these inter-link transfers, we update X. A naive update would break the
+computational graph; therefore, we again employ the TG technique. The inter-link trans-
+fers are implemented as follows:
+X ←X −(M + x) ∗Iremove + (M + x −stop gradient(x)) ∗Iadd,
+(23)
+where x ∈R|N| represents the tensor of valid vehicle positions, obtained by applying
+the max function along the first axis of XT. This operation updates an agent’s position
+on its original link to −M and initializes its position on the new link to 0. The TG
+technique, represented by the term x−stop gradient(x) in Eq. 23, grafts the computational
+trajectories on the previous link onto the new position. If this update were performed
+without TG, the computational history would be lost, preventing backpropagation across
+previous links. We provide the pseudocode of the differentiable node model in Alg. S2.
+17
+Algorithm S2 Differentiable node model.
+def
+compute_node_model (x, alpha , beta , cost , kappa , L, A, M):
+# mask for invalid
+vehicles
+I_xpos = x >= -1e-2
+# potential
+next link
+L_star = matmul(I_xpos , A)
+L_star_bar = L_star < 1
+# compute
+utility for link
+choice
+sampling
+V = (beta * cost) * L_star - M * L_star_bar
+# link
+choice
+sampling
+z = softmax(V, axis =1)
+l_prime = gumbel_softmax_sample (z)
+# generate
+masks to correct
+sampling
+is_arrived = x >= L - 1e-2
+is_vacant = min(M * (x < -1e-2) + (x >= -1e-2) * x, axis =0)
+I_arrived = asarray ([sum(is_arrived , axis =1)]).T
+I_vacant = is_vacant > 1 / kappa * delta_n
+I_connected = asarray ([sum(L_star , axis =1)]).T
+# correct
+link
+choice
+sampling
+l = I_connected * (I_arrived * (I_vacant * l_prime))
+# compute
+priority
+p = (matmul(I_xpos , alpha) * l).T
+# compute
+utility for merge
+choice
+sampling
+I_pzero = p == 0
+V_prime = p - M * I_pzero
+# merge
+choice
+sampling
+z_prime = softmax(V_prime , axis =1)
+a_prime = gumbel_softmax_sample (z_prime)
+# correct
+merge
+choice
+sampling
+a = asarray ([max(l, axis =0)]).T * a_prime
+# update x
+I_remove = I_xpos * asarray ([sum(a.T, axis =1)]).T
+I_add = a.T
+x_prime = asarray ([max(x, axis =1)]).T
+x_new = x - (M + x_prime) * I_remove + (M + x_prime - stop_gradient(
+x_prime)) * I_add
+return
+x_new
+18
+C. Trajectory grafting
+We developed a computational technique, termed Trajectory Grafting (TG), to enable
+discontinuous state updates of agents while maintaining differentiability. Such discontin-
+uous updates frequently occur in traffic simulations, for example when overwriting vehicle
+positions with the link length to keep them within a link, or when resetting the position
+to zero on the downstream link after an inter-link transfer. The key idea of TG is to
+graft the computational history accumulated in the old value vold onto a discontinuously
+updated new value vnew, so that gradients can still flow through the previous computa-
+tional history. This allows parameters involved in earlier computations to be effectively
+optimized via automatic differentiation, even in the presence of discontinuous updates.
+TG can be implemented as
+vnew ←vnew + vold −stop gradient(vold).
+(24)
+The term vold −stop gradient(vold) preserves the computaional history of the previous
+value and grafts it onto vnew, while not altering the numerical value of vnew. In JAX, the
+stop gradient(·) operator can be implemented using the jax.lax.stop gradient func-
+tion.
+In a simple toy problem, we verify the effect of the TG technique on optimization
+results. Fig. S1a illustrates the experimental setting. In this problem, a single agent
+travels from Link 1 to Link 2 over a total duration of 10 s. The agent moves with a
+free-flow speed of u1 on Link 1 and u2 on Link 2. The lengths of Link 1 and Link 2 are
+L1 = 15 m and L2 = 15 m, respectively. For the ground truth, we synthesized the agent’s
+trajectory with u1 = 1.5 m/s and u2 = 1.0 m/s. This setting yields a single observation
+of the agent at position x = 0 m on Link 2 at time t = 10 s. From this observation,
+we estimate both u1 and u2 so as to reproduce the observed state. The initial values for
+the estimation were set to u1 = 2.0 m/s and u2 = 1.0 m/s. As a loss function ℓ, we use
+the squared error between the observed and estimated positions. The optimization was
+performed using a simple gradient descent algorithm with a fixed learning rate of 10−2,
+based on the gradients ∂ℓ/∂u1 and ∂ℓ/∂u2.
+Fig. S1b reports the optimization results.
+Without TG, although the loss almost
+reaches zero, the optimization yields incorrect speed estimates of u1 ≈2.0 m/s and
+u2 ≈0 m/s; the estimated system reproduces the observation by freezing the agent on
+Link 2. This occurs because, in a naive state-update scheme, the computational history
+on Link 1 is discarded at the point of the link transfer, and the position of the agent on
+Link 2 depends only on u2, i.e., ∂ℓ/∂u1 = 0. In contrast, the model with TG successfully
+estimated the speeds as u1 ≈1.5 m/s and u2 ≈0.9 m/s, which are close to the true
+values. The TG technique grafts the computational history on Link 1 onto the state on
+Link 2, thereby correctly attributing a large contribution of u1 to the position on Link 2
+and guiding the optimization toward the true parameters.
+19
+Figure S1: Effect of the trajectory grafting on parameter estimation. (a) Experimental
+setup. A single agent travels from Link 1 to Link 2 over a total duration of t = 10 s.
+The link lengths are L1 = L2 = 15 m. The ground-truth trajectory is generated with
+free-flow speeds u1 = 1.5 m/s on Link 1 and u2 = 1.0 m/s on Link 2, resulting in a
+single observation of the agent at position x = 0 m on Link 2 at t = 10 s. From this
+observation, we estimate u1 and u2 by minimizing the squared error between the observed
+and simulated positions. (b) Optimization results without TG (left) and with TG (right).
+The solid and dashed lines represent estimated and true values, respectively. The results
+for u1 and u2 are shown in different colors.
+D. Differentiable traffic counting
+We develop a differentiable traffic counting technique because counting is not naively
+differentiable.
+Here, we describe the one-dimensional (per-link) case of the proposed
+approach for illustration.
+Given the positions of agents on link j, x(j) ∈R|N|, and the location of the traffic
+counter o(j) ∈R|N|, we first compute the non-differentiable traffic count indicator I(j)
+Q ∈
+{0, 1}|N|, which indicates whether each vehicle has passed the observation point, as I(j)
+Q =
+x(j) ≥o(j). We then compute the differentiable traffic count indicator I′
+Q ∈R|N| as
+I(j)′
+Q
+= sigmoid(s(x(j) −o(j))),
+(25)
+where sigmoid(·) is the sigmoid function, and s is a scale parameter. In this study, we
+systematically determine the scale parameter using the length of link j, L(j), as s = 5/L(j).
+Using the non-differentiable indicator I(j)
+Q
+and the differentiable indicator I(j)′
+Q , we
+construct a differentiable yet exact count indicator as I(j)
+Q + I(j)′
+Q
+−stop gradient(I(j)′
+Q ).
+Applying the sum function to this indicator yields the total count Q(j) on link j, i.e.,
+Q(j) = sum(I(j)
+Q + I(j)′
+Q
+−stop gradient(I(j)′
+Q )).
+E. Application to Sioux Falls network
+We applied the developed algorithm to traffic flows on the Sioux Falls network, synthesized
+with a platoon size of ∆n = 1. The same platoon size of ∆n = 1 was consistently used in
+the simulations for estimating the ground-truth traffic flows.
+The simulation with the gradient-based calibration successfully reproduced the spa-
+tially heterogeneous ground-truth traffic counts, whereas the mean-parameter simulation
+20
+failed to reproduce the ground-truth traffic counts (Fig. S2a). The calibrated simula-
+tion quantitatively reproduced the ground-truth traffic flows (MAE of 47.5; Pearson’s
+r = 0.90), whereas the mean-parameter simulation failed to capture the ground-truth
+traffic flows (MAE of 116.2; Pearson’s r = 0.66), corresponding to a 59% improvement in
+the traffic count estimation (Fig. S2b). This calibration using 30 min of traffic observa-
+tions required 144.3 s on average over 10 trials, which corresponds to 12.5× real-time.
+We further evaluated the performance of the gradient-based calibration with different
+platoon sizes ∆n and found that the calibration time can be dramatically reduced without
+degrading the loss (Fig. S2c, d). With larger ∆n = 2 and ∆n = 4, the calibration time was
+reduced to 47.0 s (3.1× speed-up) and 36.8 s (3.9× speed-up) on average over 10 trials,
+while the loss values were improved by 29% and 44%, respectively. For larger ∆n, we
+can take a larger time step ∆t, because ∆t is determined by τ∆n with τ = 1. This leads
+to a shorter time-integration loop for simulating the target traffic flows and substantially
+accelerates the optimization process.
+21
+Figure S2: Calibration results on the Sioux Falls network. (a) Cumulative traffic counts
+from the mean-parameter simulation and the calibrated simulation compared against the
+ground truth. (b) Traffic counts (every 5 minutes) from the mean-parameter simulation
+and the calibrated simulation compared against the ground truth. (c) Effect of the pla-
+toon size ∆n on the loss (estimation quality). (d) Effect of the platoon size ∆n on the
+calibration time. The dots and whiskers represent the measured values and their standard
+deviations over 10 trials, respectively.
+F. Road networks
+We used the Sioux Falls and Chicago Sketch networks to verify our model.
+Fig. S3
+visualizes these networks with inflow and outflow conditions imposed on the nodes. We
+constructed these models based on the network data deposited in the Transportation
+Networks repository [54].
+22
+Figure S3: Network structures used in this study. (a) Sioux Falls network. (b) Chicago
+Sketch network. Different node colors represent different inflow and outflow conditions.
+Bi-directional arrows indicate that there are inbound and outbound links (two links)
+between two nodes. The numbers of nodes/links for the Sioux Falls and Chicago networks
+are 48/100 and 993/2571, respectively.
+References
+[1] United Nations. World urbanization prospects 2025: Summary of results. Tech-
+nical Report UN DESA/POP/2025/TR/ NO. 12, United Nations, Department of
+Economic and Social Affairs, Population Division, New York, 2025.
+[2] Matthias Sweet. Traffic congestion’s economic impacts: Evidence from us metropoli-
+tan regions. Urban Studies, 51(10):2088–2110, 2014.
+[3] Md. Abdul Fattah, Syed Riad Morshed, and Abdulla-Al Kafy. Insights into the socio-
+economic impacts of traffic congestion in the port and industrial areas of chittagong
+city, bangladesh. Transportation Engineering, 9:100122, 2022.
+[4] J. Lelieveld, J. S. Evans, M. Fnais, D. Giannadaki, and A. Pozzer. The contribution
+of outdoor air pollution sources to premature mortality on a global scale. Nature,
+525(7569):367–371, sep 2015.
+[5] Christopher R. Knittel, Douglas L. Miller, and Nicholas J. Sanders. Caution, drivers!
+children present: Traffic, pollution, and infant health. The Review of Economics and
+Statistics, 98(2):350–366, 05 2016.
+[6] Martin Fellendorf and Peter Vortisch. Microscopic Traffic Flow Simulator VISSIM,
+pages 63–93. Springer New York, New York, NY, 2010.
+23
+[7] Andreas Horni, Kai Nagel, and Kay W Axhausen. The Multi-Agent Transport Sim-
+ulation MATSim. Ubiquity Press, London, GBR, 2016.
+[8] Pablo Alvarez Lopez, Michael Behrisch, Laura Bieker-Walz, Jakob Erdmann, Yun-
+Pang Fl¨otter¨od, Robert Hilbrich, Leonhard L¨ucken, Johannes Rummel, Peter Wag-
+ner, and Evamarie Wiessner. Microscopic traffic simulation using sumo. In 2018
+21st International Conference on Intelligent Transportation Systems (ITSC), pages
+2575–2582, 2018.
+[9] Jaume Barcel´o. Models, Traffic Models, Simulation, and Traffic Simulation, pages
+1–62. Springer New York, New York, NY, 2010.
+[10] Tao Ma and Baher Abdulhai. Genetic algorithm-based optimization approach and
+generic tool for calibrating traffic microscopic simulation parameters. Transportation
+Research Record, 1800(1):6–15, 2002.
+[11] Grant G. Schultz and L. R. Rilett. Analysis of distribution and calibration of car-
+following sensitivity parameters in microscopic traffic simulation models. Transporta-
+tion Research Record, 1876(1):41–51, 2004.
+[12] Byungkyu (Brian) Park and Hongtu (Maggie) Qi. Development and evaluation of a
+procedure for the calibration of simulation models. Transportation Research Record,
+1934(1):208–217, 2005.
+[13] Jingtao Ma, Hu Dong, and H. Michael Zhang. Calibration of microsimulation with
+heuristic optimization methods. Transportation Research Record, 1999(1):208–217,
+2007.
+[14] Jung-Beom Lee and Kaan Ozbay. New calibration methodology for microscopic traf-
+fic simulation using enhanced simultaneous perturbation stochastic approximation
+approach. Transportation Research Record, 2124(1):233–240, 2009.
+[15] Yaron Hollander and Ronghui Liu. The principles of calibrating traffic microsimula-
+tion models. Transportation (Amst.), 35(3):347–362, 2008.
+[16] Li Zhu, Fei Richard Yu, Yige Wang, Bin Ning, and Tao Tang. Big data analytics
+in intelligent transportation systems: A survey. IEEE Transactions on Intelligent
+Transportation Systems, 20(1):383–398, 2019.
+[17] Atılım G¨unes Baydin, Barak A. Pearlmutter, Alexey Andreyevich Radul, and Jef-
+frey Mark Siskind. Automatic differentiation in machine learning: a survey. J. Mach.
+Learn. Res., 18(1):5595–5637, January 2017.
+[18] Rhys Newbury, Jack Collins, Kerry He, Jiahe Pan, Ingmar Posner, David Howard,
+and Akansel Cosgun. A review of differentiable simulators. IEEE Access, 12:97581–
+97604, 2024.
+[19] Jonas Degrave, Michiel Hermans, Joni Dambre, and Francis wyffels. A differentiable
+physics engine for deep learning in robotics. Frontiers in Neurorobotics, Volume 13 -
+2019, 2019.
+24
+[20] Yuanming Hu, Luke Anderson, Tzu-Mao Li, Qi Sun, Nathan Carr, Jonathan Ragan-
+Kelley, and Fredo Durand. Difftaichi: Differentiable programming for physical sim-
+ulation. In International Conference on Learning Representations, 2020.
+[21] Deniz A. Bezgin, Aaron B. Buhendwa, and Nikolaus A. Adams. JAX-Fluids: A
+fully-differentiable high-order computational fluid dynamics solver for compressible
+two-phase flows. Computer Physics Communications, 282:108527, 2023.
+[22] Philipp Andelfinger.
+Differentiable agent-based simulation for gradient-guided
+simulation-based optimization. SIGSIM-PADS ’21, page 27–38, New York, NY, USA,
+2021. Association for Computing Machinery.
+[23] Philipp Andelfinger. Towards differentiable agent-based simulation. ACM Trans.
+Model. Comput. Simul., 32(4), January 2023.
+[24] Ayush Chopra, Alexander Rodr´ıguez, Jayakumar Subramanian, Arnau Quera-
+Bofarull, Balaji Krishnamurthy, B. Aditya Prakash, and Ramesh Raskar.
+Differ-
+entiable agent-based epidemiology. In Proceedings of the 2023 International Confer-
+ence on Autonomous Agents and Multiagent Systems, AAMAS ’23, page 1848–1857,
+Richland, SC, 2023. International Foundation for Autonomous Agents and Multia-
+gent Systems.
+[25] Joel Dyer, Arnau Quera-Bofarull, Ayush Chopra, J. Doyne Farmer, Anisoara Ca-
+linescu, and Michael Wooldridge. Gradient-assisted calibration for financial agent-
+based models. In Proceedings of the Fourth ACM International Conference on AI
+in Finance, ICAIF ’23, page 288–296, New York, NY, USA, 2023. Association for
+Computing Machinery.
+[26] Arnau Quera-Bofarull, Nicholas Bishop, Joel Dyer, Daniel Jarne Ornia, Anisoara
+Calinescu, Doyne Farmer, and Michael Wooldridge.
+Automatic differentiation of
+agent-based models, 2025.
+[27] Xin Wu, Jifu Guo, Kai Xian, and Xuesong Zhou. Hierarchical travel demand esti-
+mation using multiple data sources: A forward and backward propagation algorith-
+mic framework on a layered computational graph. Transportation Research Part C:
+Emerging Technologies, 96:321–346, 2018.
+[28] Wei Ma, Xidong Pi, and Sean Qian.
+Estimating multi-class dynamic origin-
+destination demand through a forward-backward algorithm on computational graphs.
+Transportation Research Part C: Emerging Technologies, 119:102747, 2020.
+[29] A.U.Z Patwary, Shuling Wang, and Hong K. Lo. Iterative backpropagation method
+for efficient gradient estimation in bilevel network equilibrium optimization problems.
+Transportation Science, 57(5):1134–1159, 2023.
+[30] Pablo Guarda, Matthew Battifarano, and Sean Qian. Estimating network flow and
+travel behavior using day-to-day system-level data: A computational graph approach.
+Transportation Research Part C: Emerging Technologies, 158:104409, 2024.
+[31] Taehooie Kim, Jiawei Lu, Ram M. Pendyala, and Xuesong Simon Zhou. Compu-
+tational graph-based mathematical programming reformulation for integrated de-
+mand and supply models. Transportation Research Part C: Emerging Technologies,
+164:104671, 2024.
+25
+[32] Xuesong (Simon) Zhou, Taehooie Kim, Mostafa Ameli, Henan (Bety) Zhu, Yudai
+Honma, and Ram M. Pendyala.
+Flow-through tensors: A unified computational
+graph architecture for multi-layer transportation network optimization.
+Artificial
+Intelligence for Transportation, 1:100006, 2025.
+[33] Sanghyun Son, Yi-Ling Qiao, Jason Sewall, and Ming C. Lin. Differentiable hybrid
+traffic simulation. ACM Trans. Graph., 41(6), November 2022.
+[34] Sanghyun Son, Laura Zheng, Brian Clipp, Connor Greenwell, Sujin Philip, and
+Ming C. Lin. Gradient-based trajectory optimization with parallelized differentiable
+traffic simulation. In 2025 IEEE International Conference on Robotics and Automa-
+tion (ICRA), pages 14497–14504, 2025.
+[35] Luis Miguel Rios and Nikolaos V Sahinidis. Derivative-free optimization: a review
+of algorithms and comparison of software implementations. Journal of Global Opti-
+mization, 56(3):1247–1293, 2013.
+[36] Kreˇsimir Kuˇsi´c, Ren´e Schumann, and Edouard Ivanjko.
+A digital twin in trans-
+portation: Real-time synergy of traffic data streams and simulation for virtualizing
+motorway dynamics. Advanced Engineering Informatics, 55:101858, 2023.
+[37] Aidan Fuller, Zhong Fan, Charles Day, and Chris Barlow. Digital twin: Enabling
+technologies, challenges and open research. IEEE Access, 8:108952–108971, 2020.
+[38] Eric Bonabeau. Agent-based modeling: Methods and techniques for simulating hu-
+man systems. Proceedings of the National Academy of Sciences, 99(suppl 3):7280–
+7287, 2002.
+[39] Ge Guo and Tianqi Zhang. A residual spatio-temporal architecture for travel demand
+forecasting. Transportation Research Part C: Emerging Technologies, 115:102639,
+2020.
+[40] Li Li, Yisheng Lv, and Fei-Yue Wang. Traffic signal timing via deep reinforcement
+learning. IEEE/CAA Journal of Automatica Sinica, 3(3):247–254, 2016.
+[41] G.F. Newell. A simplified car-following theory: a lower order model. Transportation
+Research Part B: Methodological, 36(3):195–205, 2002.
+[42] Jorge A. Laval and Ludovic Leclercq. The hamilton–jacobi partial differential equa-
+tion and the three representations of traffic flow. Transportation Research Part B:
+Methodological, 52:17–30, 2013.
+[43] Toru Seo. UXsim: An open source macroscopic and mesoscopic traffic simulator in
+Python – a technical overview, 2023. arXiv preprint arXiv:2309.17114.
+[44] Toru Seo.
+UXsim: lightweight mesoscopic traffic flow simulator in pure Python.
+Journal of Open Source Software, 10(106):7617, 2025.
+[45] Roy Frostig, Matthew Johnson, and Chris Leary. Compiling machine learning pro-
+grams via high-level tracing. In SysML Conference 2018, 2018.
+26
+[46] James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Chris
+Leary, Dougal Maclaurin, George Necula, Adam Paszke, Jake VanderPlas, Skye
+Wanderman-Milne,
+and Qiao Zhang.
+JAX: composable transformations of
+Python+NumPy programs, 2018. http://github.com/jax-ml/jax.
+[47] Kenneth E. Train. Discrete Choice Methods with Simulation. Cambridge University
+Press, 2003.
+[48] Eric Jang, Shixiang Gu, and Ben Poole. Categorical reparameterization with gumbel-
+softmax. In International Conference on Learning Representations, 2017.
+[49] Chris J. Maddison, Andriy Mnih, and Yee Whye Teh. The concrete distribution: A
+continuous relaxation of discrete random variables. In International Conference on
+Learning Representations, 2017.
+[50] Yoshua Bengio, Nicholas L´eonard, and Aaron Courville. Estimating or propagat-
+ing gradients through stochastic neurons for conditional computation, 2013. arXiv
+preprint arXiv:1308.3432.
+[51] Charles C. Margossian. A review of automatic differentiation and its efficient imple-
+mentation. WIREs Data Mining and Knowledge Discovery, 9(4):e1305, 2019.
+[52] Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In Inter-
+national Conference on Learning Representations, 2019.
+[53] DeepMind, Igor Babuschkin, Kate Baumli, Alison Bell, Surya Bhupatiraju, Jake
+Bruce, Peter Buchlovsky, David Budden, Trevor Cai, Aidan Clark, Ivo Danihelka,
+Antoine Dedieu, Claudio Fantacci, Jonathan Godwin, Chris Jones, Ross Hems-
+ley, Tom Hennigan, Matteo Hessel, Shaobo Hou, Steven Kapturowski, Thomas
+Keck, Iurii Kemaev, Michael King, Markus Kunesch, Lena Martens, Hamza Merzic,
+Vladimir Mikulik, Tamara Norman, George Papamakarios, John Quan, Roman Ring,
+Francisco Ruiz, Alvaro Sanchez, Laurent Sartran, Rosalia Schneider, Eren Sezener,
+Stephen Spencer, Srivatsan Srinivasan, Miloˇs Stanojevi´c, Wojciech Stokowiec, Luyu
+Wang, Guangyao Zhou, and Fabio Viola. The DeepMind JAX Ecosystem, 2020.
+http://github.com/google-deepmind.
+[54] Ben Stabler, Hillel Bar-Gera, and Elizabeth Sall. Transportation Networks, 2026.
+https://github.com/bstabler/TransportationNetworks.
+27

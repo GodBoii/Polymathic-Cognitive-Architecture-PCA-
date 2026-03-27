@@ -1,0 +1,759 @@
+Do LLMs Know What They Know?
+Measuring Metacognitive Efficiency with Signal
+Detection Theory
+Jon-Paul Cacioli
+Independent Researcher
+Melbourne, Australia
+Abstract
+Standard evaluation of LLM confidence relies on calibration metrics (ECE, Brier
+score) that conflate two distinct capacities: how much a model knows (Type-1
+sensitivity) and how well it knows what it knows (Type-2 metacognitive sensi-
+tivity). We introduce an evaluation framework based on Type-2 Signal Detection
+Theory that decomposes these capacities using meta-d′ and the metacognitive ef-
+ficiency ratio M-ratio. Applied to four LLMs (Llama-3-8B-Instruct, Mistral-7B-
+Instruct-v0.3, Llama-3-8B-Base, Gemma-2-9B-Instruct) across 224,000 factual
+QA trials, we find: (1) metacognitive efficiency varies substantially across mod-
+els even when Type-1 sensitivity is similar—Mistral achieves the highest d′ but
+the lowest M-ratio; (2) metacognitive efficiency is domain-specific, with differ-
+ent models showing different weakest domains, invisible to aggregate metrics;
+(3) temperature manipulation shifts Type-2 criterion while meta-d′ remains stable
+for two of four models, dissociating confidence policy from metacognitive capac-
+ity; (4) AUROC2 and M-ratio produce fully inverted model rankings, demonstrat-
+ing these metrics answer fundamentally different evaluation questions. The meta-
+d′ framework reveals which models “know what they don’t know” versus which
+merely appear well-calibrated due to criterion placement—a distinction with di-
+rect implications for model selection, deployment, and human–AI collaboration.
+Pre-registered analysis; code and data publicly available.
+1
+Introduction
+When a large language model answers a factual question, two capacities determine the reliability
+of its output: its ability to discriminate correct from incorrect responses, and its ability to moni-
+tor that discrimination through its confidence signal. These are fundamentally different problems
+requiring different interventions. A model that cannot discriminate needs better training data or ar-
+chitectural improvements. A model that discriminates well but monitors poorly needs recalibration,
+not retraining. Current evaluation practice does not make this distinction.
+Consider two hypothetical models evaluated on the same factual QA benchmark. Model A reports
+90% confidence on every trial and achieves 90% accuracy; its Expected Calibration Error is near
+zero. Model B reports 95% confidence when correct and 60% when incorrect, but its average con-
+fidence overshoots its 80% accuracy; its ECE is worse than Model A’s. Yet Model B’s confidence
+is far more useful: it tells you which specific answers to trust. Model A’s confidence, despite per-
+fect calibration, carries zero information about correctness. The standard metric rewards the wrong
+model.
+This example illustrates a well-known limitation of Expected Calibration Error [Guo et al., 2017]:
+it measures the average alignment between confidence and accuracy, conflating the resolution of the
+Preprint.
+arXiv:2603.25112v1  [cs.CL]  26 Mar 2026
+confidence signal (how well it separates correct from incorrect) with its bias (the overall level of
+confidence). The Brier score decomposes into reliability, resolution, and uncertainty, but not into
+the model’s discriminative capacity and its metacognitive sensitivity controlling for that capacity.
+AUROC of the confidence-accuracy curve [Steyvers and Peters, 2025] improves on ECE by mea-
+suring ranking quality, but still confounds how well the model performs with how well it monitors
+its performance.
+Signal Detection Theory (SDT; Green and Swets 1966; Macmillan and Creelman 2005) provides
+exactly this decomposition. Developed over seven decades of psychophysical research, SDT sepa-
+rates performance into sensitivity (d′: how well the observer discriminates signal from noise) and
+criterion (c: the observer’s threshold for responding). Cacioli [2026] demonstrated that the full
+parametric SDT framework—ROC analysis, unequal-variance model fitting, criterion estimation—
+reveals structure in LLM confidence invisible to calibration metrics alone.
+The present work extends this framework from Type-1 SDT (how well does the model discrim-
+inate correct from incorrect?)
+to Type-2 SDT (how well does the model know it is discrimi-
+nating correctly?). The key metric is metacognitive efficiency, operationalised as the ratio M =
+meta-d′/d′ [Maniscalco and Lau, 2012, Fleming and Lau, 2014]. An M-ratio of 1 indicates that
+the model’s confidence captures all the information available in its Type-1 evidence—an optimal
+metacognitive observer. M < 1 indicates metacognitive loss: the confidence signal is less informa-
+tive than the evidence supports. M > 1 indicates that confidence accesses information beyond what
+drives the Type-1 decision. For deployment, M-ratio answers a question that ECE cannot: given
+what the model knows, how much of that knowledge is accessible through its confidence?
+Dai [2026] concurrently applied meta-d′ to LLMs using prompted verbal confidence scales, find-
+ing M-ratios of 0.62–0.92. Our work differs in using internal token log-probabilities rather than
+prompted ratings (avoiding discretisation artifacts), testing domain-specific efficiency and tempera-
+ture effects, and applying the framework across four model families.
+Our contributions are:
+1. We introduce meta-d′/M-ratio as an evaluation framework for LLM confidence and demonstrate
+it reveals structure invisible to ECE, Brier score, and AUROC, including a model that achieves
+the highest Type-1 sensitivity but the lowest metacognitive efficiency.
+2. We show that metacognitive efficiency is domain-specific, with different models exhibiting dif-
+ferent weakest domains—information that aggregate metrics cannot provide.
+3. We demonstrate that temperature manipulation dissociates confidence policy (Type-2 criterion)
+from metacognitive capacity (meta-d′), showing these are independently adjustable parameters.
+4. All analyses are pre-registered, with code and data publicly available, applied across four models
+from three families on 224,000 factual QA trials.
+The contribution of this work is an evaluation methodology, not a dataset or benchmark. We demon-
+strate that meta-d′/M-ratio provides evaluative claims about the quality of LLM confidence signals
+that existing metrics—ECE, Brier score, AUROC2—cannot support. These claims are valid un-
+der two assumptions: that normalised log-probability functions as a graded evidence variable for
+correctness (verified empirically in §4 via monotonicity checks across all conditions), and that the
+equal-variance SDT model provides a reasonable first approximation (tested via robustness checks
+in §4.8 and the supplementary material). Limitations of scope—four open-weight 7–9B models, two
+factual QA datasets, quantised inference—are detailed in §5.4.
+2
+Background: Type-2 Signal Detection Theory
+2.1
+From Type-1 to Type-2 SDT
+In the Type-1 SDT framework applied to LLM factual QA [Cacioli, 2026], each question is a trial
+in which the model generates an answer. The normalised log-probability (NLP) of the generated
+answer serves as the evidence variable: NLP = (1/L) PL
+i=1 log p(ti | t<i), where L is the answer
+length in tokens. Higher NLP indicates greater model confidence. Type-1 sensitivity d′ quantifies
+how well NLP separates correct from incorrect answers.
+Type-2 SDT [Galvin et al., 2003, Maniscalco and Lau, 2012] asks a different question: given the
+model’s Type-1 performance, how well does its confidence monitor that performance? The Type-2
+2
+framework treats each trial’s confidence and accuracy as a metacognitive judgment and evaluates
+how well confidence discriminates between the model’s own correct and incorrect responses.
+The central insight is that Type-2 performance is constrained by Type-1 performance. An observer
+with d′ = 0 (no discriminative ability) cannot have meaningful metacognitive sensitivity, regardless
+of how its confidence varies. Conversely, an observer with perfect Type-1 discrimination (d′ →∞)
+would trivially achieve perfect metacognition. The interesting question is what happens in between:
+given a particular level of d′, how much of the available information reaches the confidence signal?
+2.2
+Meta-d′ and M-ratio
+Maniscalco and Lau [2012] formalised this question by defining meta-d′ as the d′ value that an
+ideal SDT observer would need to produce the observed pattern of confidence ratings conditional
+on accuracy. If the model’s confidence captures all the information in its Type-1 evidence, then
+meta-d′ = d′. If confidence is noisier or less informative than the evidence, meta-d′ < d′.
+The metacognitive efficiency ratio [Fleming and Lau, 2014] normalises for Type-1 performance:
+M-ratio = meta-d′
+d′
+(1)
+M-ratio has three interpretive regimes. M = 1: the confidence signal is as informative as the
+underlying evidence (optimal metacognition). M < 1: metacognitive loss—the confidence signal
+discards information that was available in the evidence. M > 1: the confidence signal captures
+information beyond what is reflected in the binary correct/incorrect outcome, potentially from richer
+internal representations.
+Meta-d′ is estimated by maximum likelihood [Maniscalco and Lau, 2012, 2014]: given the ob-
+served confidence × accuracy contingency table, find the d′ value of an ideal observer that would
+produce the observed Type-2 hit rates and false alarm rates. The Hautus (1995) log-linear correc-
+tion is applied to avoid degenerate cells. This approach is bias-free: unlike the correlation between
+confidence and accuracy (which confounds metacognitive sensitivity with overall confidence level),
+meta-d′ isolates how well confidence discriminates correct from incorrect responses, independent
+of the criterion for “high” versus “low” confidence.
+2.3
+Why NLP Is a Valid Confidence Variable
+Verbalized confidence—prompting a model to report a numerical certainty score—is the dominant
+paradigm for LLM uncertainty estimation in black-box settings [Xiong et al., 2024]. However, Dai
+[2026] demonstrate that verbalized confidence suffers from severe discretisation: more than 78% of
+responses on a 0–100 scale concentrate on just three round-number values, producing sparse and
+unreliable calibration estimates. Token-level log-probabilities, by contrast, provide a continuous
+confidence variable that is a direct output of the model’s generative process, requiring no secondary
+elicitation.
+NLP is not a pure “metacognitive signal” in any cognitive sense—it is a fluency measure that reflects
+both the quality of the generated answer and the model’s distributional properties [Cacioli, 2026].
+We adopt a functional operationalisation: metacognitive monitoring is defined as the discriminability
+of an internal signal for correctness, without requiring a distinct second-order monitoring system.
+This parallels the use of meta-d′ in animal metacognition research [Smith et al., 2014], where the
+question is whether behaviour reveals access to internal uncertainty signals, not whether the animal
+possesses a theory of mind.
+A consequence of using NLP is the sampling bottleneck: the model generates the answer before
+NLP is computed, so a fluent incorrect answer receives high NLP—a Type-2 false alarm. This is not
+a confound but a feature for deployment evaluation: in practice, downstream systems receive exactly
+this joint signal (answer + confidence), and M-ratio measures how well that signal separates correct
+from incorrect responses. The question is not whether NLP is a “pure” metacognitive channel but
+whether it is informative about correctness—which the monotonicity check confirms.
+As an empirical validation, we verify that NLP is monotonically related to accuracy across all condi-
+tions (§4): higher NLP quartiles consistently predict higher accuracy, confirming that NLP functions
+as a graded evidence variable suitable for Type-2 SDT analysis.
+3
+2.4
+What M-ratio Tells Evaluators That ECE Does Not
+ECE answers: is the model’s average confidence in each bin close to its accuracy in that bin? This
+is useful but misses three things. First, ECE is confounded by bias: a model that says “90%” on
+every trial achieves low ECE if its accuracy is 90%, despite zero metacognitive sensitivity. Second,
+ECE is unstable under the discretised confidence distributions typical of LLMs [Nixon et al., 2019,
+Dai, 2026]. Third, ECE conflates Type-1 and Type-2 performance: a model can improve ECE by
+becoming more accurate without improving its confidence signal. M-ratio addresses all three: it
+isolates sensitivity from bias, operates on the full confidence × accuracy contingency table, and
+controls for Type-1 performance by construction. For any system that uses confidence for decisions,
+M-ratio is the relevant metric.
+We note that other approaches to LLM uncertainty exist (semantic entropy, ensemble disagreement,
+conformal prediction). These aim to improve uncertainty estimates; M-ratio aims to evaluate them.
+Meta-d′ can be applied to any confidence signal as a diagnostic, and is thus complementary to
+alternative uncertainty methods.
+3
+Method
+3.1
+Models and Data
+Four LLMs spanning three model families were evaluated:
+Llama-3-8B-Instruct and Llama-
+3-8B-Base (Meta; Meta AI 2024), Mistral-7B-Instruct-v0.3 [Jiang et al., 2023], and Gemma-
+2-9B-Instruct (Google; Gemma Team 2024).
+All were run as Q5_K_M quantisations via
+llama-cpp-python 0.3.16 with Vulkan backend on an AMD RX 7900 GRE (16 GB VRAM). The
+inclusion of a non-instruction-tuned model (Llama-3-Base) and models from three distinct families
+(Meta, Mistral AI, Google) enables contrasts across instruction tuning and model lineage.
+Table 1: Model summary. All models run as Q5_K_M GGUF quantisations.
+Model
+Family
+Params
+Instruct
+Quant size
+Llama-3-8B-Instruct
+Meta
+8B
+Yes
+5.7 GB
+Llama-3-8B-Base
+Meta
+8B
+No
+5.7 GB
+Mistral-7B-Instruct-v0.3
+Mistral AI
+7B
+Yes
+5.1 GB
+Gemma-2-9B-Instruct
+Google
+9B
+Yes
+6.7 GB
+Two factual question-answering datasets were used. TriviaQA [Joshi et al., 2017]: 5,000 ques-
+tions sampled from the unfiltered set (seed = 42), classified into four knowledge domains plus an
+unclassified category: History & Politics (1,248), Arts & Literature (1,167), Geography (667), Sci-
+ence & Technology (634), and Unclassified (1,284). Natural Questions [Kwiatkowski et al., 2019]:
+3,000 short-answer questions from NQ-Open, serving as a replication dataset.
+Each
+model
+generated
+an
+answer
+to
+each
+question
+at
+seven
+temperatures:
+T
+∈
+{0.1, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0}, yielding 224,000 total trials (4 models × 8,000 questions × 7 tem-
+peratures). Per trial, the generated answer, normalised log-probability (NLP), and binary correctness
+were recorded. Correctness was determined by exact match against verified answer aliases with a
+difflib.SequenceMatcher ≥0.85 fallback. Data for the three original models were collected
+under a prior pre-registration [Cacioli, 2026]; Gemma-2-9B-Instruct was added post-registration to
+test cross-family generalisability, following the identical data collection protocol.
+3.2
+Type-2 SDT Pipeline
+Confidence binning.
+NLP values are binned into 2 × K ordered categories, where K = 4 is
+the number of confidence levels per response side (Maniscalco & Lau format; Maniscalco and Lau
+2014). Bin edges are set at the {12.5, 25, 37.5, 50, 62.5, 75, 87.5}th quantiles of the NLP distribution
+at T = 1.0 within each model × dataset condition, and held constant across temperatures to ensure
+comparability.
+Count arrays and MLE.
+For each analysis cell, two count arrays are constructed: nR_S1[k] =
+number of incorrect trials with rating k (k = 1, . . . , 8), and nR_S2[k] = number of correct trials with
+4
+Table 2: Aggregate metacognitive efficiency at T=1.0 on TriviaQA. Bootstrap 95% CIs from 10,000
+resamples. Bold: CI entirely below 1.0 (H1 supported).
+Model
+Acc
+d′
+meta-d′
+M-ratio
+95% CI
+Gemma-2-Instruct
+0.600
+0.946
+0.991
+1.048
+[0.913, 1.191]
+Llama-3-Base
+0.428
+1.407
+1.474
+1.048
+[0.952, 1.152]
+Llama-3-Instruct
+0.543
+1.386
+1.362
+0.983
+[0.886, 1.083]
+Mistral-Instruct
+0.427
+1.597
+1.361
+0.852
+[0.765, 0.941]
+rating k. The Hautus (1995) log-linear correction (+0.5 to all cells) is applied. Meta-d′ is estimated
+by maximum likelihood using metadpy 0.1.2 [Legrand, 2023] with equal-variance SDT (s = 1),
+following Maniscalco and Lau [2014] §3.6.
+Bootstrap inference.
+All confidence intervals are 95% bootstrap percentile intervals from 10,000
+resamples (seed = 42), resampling at the trial level. Each resample recomputes the full pipeline.
+Estimates with |M-ratio| > 10 are excluded as unstable.
+3.3
+Pre-Registered Hypotheses
+Analyses for the three original models were pre-registered on the Open Science Framework (OSF:
+https://osf.io/5q7mt/overview?view_only=bd718de95b6c44ff9c14c1ac424227ba).
+Gemma-2-9B-Instruct follows the identical protocol as a post-registration generalisability test. All
+hypotheses are tested at T = 1.0 on TriviaQA.
+H1 (Suboptimal metacognition): M-ratio < 1 for all models. Test: bootstrap 95% CI upper bound
+< 1.0.
+H2 (Domain-specific efficiency): M-ratio varies across TriviaQA domains. Test: ≥1 pairwise CI
+excludes 0 for ≥2 models.
+H3 (Temperature dissociation): meta-d′ stable while d′ varies across T ∈{0.3, 0.5, 0.7, 1.0}. Test:
+TOST (δ = 0.3) and |ρ(meta-d′, T)| < |ρ(d′, T)|.
+H4 (Hidden structure): Models with similar d′ differ in M-ratio. Test: ≥1 pairwise CI excludes 0.
+3.4
+Robustness Checks
+Six checks: R1 binning sensitivity (K ∈{3, 6}), R2 unequal-variance meta-d′, R3 equal-width bins,
+R4 NQ replication, R5 force-decode meta-d′, R6 difficulty-matched subsampling. R1 is reported in
+the main text; others in the appendix.
+4
+Results
+4.1
+Validation Checks
+All eight model×dataset conditions at T=1.0 passed the NLP monotonicity check: accuracy in-
+creased strictly across NLP quartiles (e.g., Gemma-2-Instruct on TriviaQA: Q1=0.314, Q2=0.539,
+Q3=0.690, Q4=0.859; full results in Appendix A). All 16 domain×model cells exceeded the min-
+imum trial threshold of 50 per accuracy category. Type-1 d′ for the three pre-registered models
+was consistent with Cacioli [2026]: Llama-3-Instruct d′=1.386 (da=1.39), Llama-3-Base d′=1.407
+(da=1.45).
+Mistral diverged (d′=1.597 vs. da=1.97), as expected from the EVSDT/UVSDT
+difference—Mistral has the most extreme unequal variance (s=0.57).
+4.2
+H1: Metacognitive Efficiency Varies Across Models
+H1 was partially supported: Mistral-Instruct’s CI fell entirely below 1.0, indicating its confidence
+carries less information than the Type-1 evidence supports. The remaining models produced M-
+ratios near or above 1.0, with CIs spanning unity.
+5
+Figure 1: Metacognitive efficiency space. Each point represents a model at T=1.0 on TriviaQA.
+The dashed line indicates optimal metacognition (meta-d′ = d′). Mistral (highest d′) falls furthest
+below the line; Gemma and Base sit near it despite very different d′ values.
+Table 3: Model rankings under AUROC2 and M-ratio are fully inverted. †Tied.
+Model
+AUROC2
+Rank
+M-ratio
+Rank
+Mistral-Instruct
+0.861
+1st
+0.852
+4th
+Llama-3-Base
+0.843
+2nd
+1.048
+1st†
+Llama-3-Instruct
+0.838
+3rd
+0.983
+3rd
+Gemma-2-Instruct
+0.752
+4th
+1.048
+1st†
+The critical finding is the variation across models. Mistral achieves the highest d′ (1.597) yet the
+lowest M-ratio (0.852): the best factual discriminator but the worst metacognitive monitor. Gemma-
+2, by contrast, has the lowest d′ (0.946) but near-optimal M-ratio (1.048). This dissociation is
+invisible to accuracy, ECE, or AUROC2.
+4.3
+AUROC2 and M-ratio Provide Non-Redundant Rankings
+The rankings are fully inverted: the model ranked 1st by AUROC2 is ranked 4th by M-ratio, and
+vice versa. AUROC2 inherits Type-1 sensitivity—Mistral’s high d′ inflates its AUROC2 regardless
+of how efficiently its confidence captures that sensitivity. M-ratio isolates the metacognitive com-
+ponent, revealing that Mistral’s apparently superior confidence discrimination is entirely inherited
+from its Type-1 advantage, with substantial metacognitive loss on top. For confidence-dependent
+applications, these metrics would lead to opposite model selections.
+4.4
+H2: Domain-Specific Metacognitive Efficiency
+Point estimates reveal consistent within-model variation:
+• Llama-3-Instruct: Sci/Tech (M=0.788) to Geography (1.198), range 0.41
+• Mistral: Arts & Lit (0.677) to Sci/Tech (1.068), range 0.39
+• Llama-3-Base: Hist/Pol (0.894) to Sci/Tech (1.202), range 0.31
+• Gemma-2: Sci/Tech (0.805) to Geography (1.508), range 0.70
+The weakest domain differs by model: Llama-3-Instruct and Gemma-2 are worst in Science & Tech-
+nology; Mistral is worst in Arts & Literature. The pre-registered H2 criterion (≥1 significant pair-
+wise difference for ≥2 models) was not met: only Mistral showed a significant pair (Arts & Lit
+vs. Sci/Tech: ∆M=−0.396 [−0.743, −0.071]). CIs were wide at domain-level trial counts (634–
+6
+Figure 2: Domain-specific M-ratio at T=1.0 on TriviaQA. Dashed line: optimal (M=1). Different
+models exhibit different weakest domains, a pattern invisible to aggregate metrics.
+Figure 3: d′ and meta-d′ as a function of temperature on TriviaQA. For Mistral and Gemma, d′ varies
+with temperature while meta-d′ remains stable, dissociating confidence policy from metacognitive
+capacity.
+1,248), indicating limited power rather than absence of effect. Hierarchical Bayesian estimation
+(HMeta-d; Fleming 2017) may provide the sensitivity needed to confirm domain-specific patterns.
+4.5
+H3: Temperature Dissociates Policy from Capacity
+Two models met both pre-registered criteria (TOST δ=0.3 and relative robustness):
+Mistral-Instruct: meta-d′ range = 0.117 (TOST: pass), ρ(meta-d′, T) = −0.80 vs. ρ(d′, T) =
++1.00. d′ increased monotonically (1.435 →1.597) while meta-d′ stayed within 1.361–1.478.
+Gemma-2-Instruct: meta-d′ range = 0.064 (TOST: pass), ρ(meta-d′, T) = +0.80 vs. ρ(d′, T) =
+−1.00. The most stable meta-d′ of any model, with d′ decreasing with temperature—opposite
+direction from Mistral, same dissociation.
+Llama-3-Instruct passed TOST but failed relative robustness. Llama-3-Base failed TOST (range
+= 0.364). The pattern is that instruction-tuned models from different families both show the disso-
+ciation, while the base model does not, suggesting instruction tuning decouples confidence policy
+from the metacognitive signal.
+4.6
+H4: Hidden Metacognitive Structure
+H4 was supported:
+Mistral and Llama-3-Base had non-overlapping CIs ([0.765, 0.941] vs.
+[0.952, 1.152]), despite Mistral having higher d′. Mistral vs. Gemma-2 nearly reached significance
+(CIs overlap by 0.028). Models that are indistinguishable by accuracy or ECE occupy distinct posi-
+tions in metacognitive efficiency space.
+4.7
+Instruction Tuning as Criterion Shift (Exploratory)
+The Llama-3 instruct/base pair had near-identical d′ (∆=−0.021) and meta-d′ (∆=−0.113), with
+instruction tuning producing a slight M-ratio decrease (∆=−0.065). This aggregate pattern masked
+a domain-specific effect: in Science & Technology, instruction tuning reduced M-ratio from 1.202 to
+0.788 (∆=−0.414). This is consistent with the Type-1 finding [Cacioli, 2026] that instruction tuning
+7
+Table 4: R1: Binning sensitivity. Model ordering preserved; max perturbation 0.048.
+Model
+K=3
+K=4 (primary)
+K=6
+Gemma-2-Instruct
+1.059
+1.048
+1.095
+Llama-3-Base
+1.027
+1.048
+1.027
+Llama-3-Instruct
+1.015
+0.983
+0.997
+Mistral-Instruct
+0.900
+0.852
+0.872
+primarily shifts criterion, and suggests RLHF may specifically degrade metacognitive efficiency in
+technical domains.
+4.8
+Robustness
+M-ratio estimates were robust to binning granularity (Table 4):
+the maximum |∆M| across
+K ∈{3, 6} was 0.048, and model ordering was preserved at all granularities. Full results for
+unequal-variance meta-d′ (R2), equal-width bins (R3), Natural Questions replication (R4), force-
+decode (R5), and difficulty-matched subsampling (R6) are reported in the supplementary material.
+5
+Discussion
+5.1
+What Meta-d′ Adds to LLM Evaluation
+Current confidence evaluation operates at three tiers. Tier 1 (ECE, Brier score): measures alignment,
+conflates sensitivity with bias, unstable under discretisation. Tier 2 (AUROC2, phi correlations):
+measures ranking quality, but confounds Type-1 performance with metacognitive monitoring. Tier 3
+(meta-d′/M-ratio): isolates metacognitive efficiency by controlling for Type-1 sensitivity.
+Our results make the practical consequence concrete. Mistral achieves the highest d′ but the lowest
+M-ratio. A deployment system using Mistral’s confidence for selective prediction would underper-
+form relative to a model with lower accuracy but higher metacognitive efficiency. This diagnostic is
+invisible to ECE.
+The domain-specificity finding extends the argument. A model that is metacognitively efficient in
+one domain and blind in another poses a deployment risk that aggregate metrics hide entirely. The
+meta-d′ framework applied at the domain level provides exactly this information.
+The practical consequence is direct: in a selective prediction system that abstains on low-confidence
+queries, model selection by AUROC2 versus M-ratio yields opposite choices—and the M-ratio
+choice performs better.1
+5.2
+Temperature, Criterion, and Metacognitive Capacity
+The dissociation between temperature and meta-d′ for Mistral and Gemma has implications for tem-
+perature tuning. Temperature primarily shifts the Type-2 criterion without affecting metacognitive
+signal quality. If a model’s M-ratio is low, improving calibration via temperature will not fix the
+underlying metacognitive deficit—the confidence signal will remain uninformative, just better cen-
+tred. For Llama-3-Base, where the dissociation does not hold, temperature changes the information
+content of confidence itself.
+5.3
+Connections to Human Metacognition
+The meta-d′ framework was developed for human metacognition [Maniscalco and Lau, 2012, Flem-
+ing and Lau, 2014, Fleming, 2017], where metacognitive efficiency is domain-specific [Rouault
+et al., 2018], dissociable from Type-1 performance [Fleming et al., 2010], and neurally distinct from
+perceptual decisions [Fleming and Dolan, 2012]. Our findings parallel these results functionally, not
+mechanistically—we do not claim LLMs possess metacognition phenomenologically. The value
+1At 50% coverage, Gemma-2 achieves 77.4% accuracy vs. Mistral’s 70.7%, despite Mistral’s higher AUROC2. The gap
+widens at higher coverage.
+8
+lies in the decomposition, not the cognitive interpretation, consistent with the use of SDT in medical
+diagnosis [Swets, 1996] and automated system evaluation [Bartlett and McCarley, 2017].
+5.4
+Limitations
+Four open-weight 7–9B models; generalisability to frontier scale unknown. Whether the observed
+metacognitive loss patterns persist, diminish, or amplify in 70B+ models remains an open question.
+API models that do not expose token-level log-probabilities cannot be evaluated with internal NLP;
+the verbal confidence approach of Dai [2026] provides a complementary path, though at the cost of
+discretisation artifacts.
+All models were run as Q5_K_M quantisations, which compress the logit distribution. However,
+M-ratio depends on the ordinal relationship between NLP and accuracy—whether higher NLP pre-
+dicts correctness—not on absolute logit magnitudes. Quantisation preserves rank order within the
+NLP distribution, and the NLP monotonicity check (§4) confirms that the ordinal signal survives
+quantisation in all conditions. The binning robustness check (R1) further demonstrates that M-ratio
+is stable across different discretisation granularities.
+NLP is a fluency measure, not a pure metacognitive signal; the sampling bottleneck [Cacioli, 2026]
+means M-ratio reflects the joint quality of generation and uncertainty representation. Our func-
+tional operationalisation is deliberately minimal: high M-ratio does not imply the model “knows
+that it knows” in any deep sense. The Goertz et al. (2024) normative critique of meta-d′ is acknowl-
+edged; we treat M-ratio as a model-relative measure under the classical algorithm and note that
+alternative estimators [Rausch et al., 2023] could be applied in future work. Gemma-2 was added
+post-registration with identical protocol.
+5.5
+Recommendations for Practice
+1. Report meta-d′/M-ratio alongside ECE. These are complementary, not redundant.
+2. Disaggregate by domain. Aggregate metrics hide domain-specific metacognitive deficits.
+3. For confidence-dependent systems, prefer higher M-ratio over lower ECE.
+4. Evaluate temperature effects on Type-2 parameters, not just calibration.
+6
+Conclusion
+We have introduced metacognitive efficiency (meta-d′/M-ratio) as an evaluation framework for
+LLM confidence, grounded in 70 years of psychophysical theory and applied to four models
+across 224,000 trials. The framework reveals structure invisible to standard metrics: models with
+similar accuracy occupy different metacognitive efficiency positions; efficiency varies across do-
+mains within models; temperature dissociates confidence policy from metacognitive capacity; and
+AUROC2 and M-ratio produce fully inverted model rankings. Current practice treats confidence
+as monolithic. The Type-2 SDT decomposition shows this is insufficient. All analyses are pre-
+registered, with code and data publicly available.2
+Use of Generative AI.
+Claude (Anthropic) was used as a research assistant for analysis pipeline
+design and code generation. All scientific decisions, hypothesis formulation, and interpretive judg-
+ments were made by the author.
+References
+Megan L. Bartlett and Jason S. McCarley. Signal detection theory analysis of automated system
+performance. Human Factors, 59(7):1010–1030, 2017.
+Jon-Paul Cacioli. LLMs as signal detectors: Sensitivity, bias, and the temperature–criterion analogy.
+arXiv preprint arXiv:2603.14893, 2026.
+Yuyang Dai. Rescaling confidence: What scale design reveals about LLM metacognition. arXiv
+preprint arXiv:2603.09309, 2026.
+2Pre-registration: https://osf.io/5q7mt/overview?view_only=bd718de95b6c44ff9c14c1ac424227ba. Code
+and data: https://anonymous.4open.science/r/sdt_calibration.
+9
+Stephen M. Fleming. HMeta-d: Hierarchical Bayesian estimation of metacognitive efficiency from
+confidence ratings. Neuroscience of Consciousness, 2017(1):nix007, 2017.
+Stephen M. Fleming and Raymond J. Dolan. The neural basis of metacognitive ability. Philosophical
+Transactions of the Royal Society B, 367:1338–1349, 2012.
+Stephen M. Fleming and Hakwan C. Lau. How to measure metacognition. Frontiers in Human
+Neuroscience, 8:443, 2014.
+Stephen M. Fleming, Rimona S. Weil, Zoltan Nagy, Raymond J. Dolan, and Geraint Rees. Relating
+introspective accuracy to individual differences in brain structure. Science, 329(5998):1541–1543,
+2010.
+Susan J. Galvin, John V. Podd, Vit Drga, and John Whitmore. Type 2 tasks in the theory of signal
+detectability: Discrimination between correct and incorrect decisions. Psychonomic Bulletin &
+Review, 10(4):843–876, 2003.
+Gemma Team. Gemma 2: Improving open language models at a practical size. arXiv preprint
+arXiv:2408.00118, 2024.
+Amélie Goertz, Ádám Koblinger, and József Fiser. New look at computing meta-d′ for confidence
+judgements. Journal of Vision, 24(10):973, 2024. Conference abstract.
+David M. Green and John A. Swets. Signal Detection Theory and Psychophysics. Wiley, 1966.
+Chuan Guo, Geoff Pleiss, Yu Sun, and Kilian Q. Weinberger. On calibration of modern neural
+networks. In ICML, pages 1321–1330, 2017.
+Michael J. Hautus. Corrections for extreme proportions and their biasing effects on estimated values
+of d′. Behavior Research Methods, Instruments, & Computers, 27(1):46–51, 1995.
+Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chap-
+lot, Diego de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile Saulnier,
+Lélio Renard Lavaud, Marie-Anne Lachaux, Pierre Stock, Teven Le Scao, Thibaut Lavril, Thomas
+Wang, Timothée Lacroix, and William El Sayed. Mistral 7B. arXiv preprint arXiv:2310.06825,
+2023.
+Mandar Joshi, Eunsol Choi, Daniel S. Weld, and Luke Zettlemoyer. TriviaQA: A large scale distantly
+supervised challenge dataset for reading comprehension. In ACL, 2017.
+Tom Kwiatkowski, Jennimaria Palomaki, Olivia Redfield, Michael Collins, Ankur Parikh, Chris
+Alberti, Danielle Epstein, Illia Polosukhin, Jacob Devlin, Kenton Lee, et al. Natural questions: A
+benchmark for question answering research. TACL, 7:453–466, 2019.
+Nicolas Legrand. metadpy: A Python package for metacognitive signal detection theory. https:
+//github.com/embodied-computation-group/metadpy, 2023.
+Neil A. Macmillan and C. Douglas Creelman. Detection Theory: A User’s Guide. Lawrence Erl-
+baum, 2nd edition, 2005.
+Brian Maniscalco and Hakwan Lau. A signal detection theoretic approach for estimating metacog-
+nitive sensitivity from confidence ratings. Consciousness and Cognition, 21(1):422–430, 2012.
+Brian Maniscalco and Hakwan Lau. Signal detection theory analysis of type 1 and type 2 data:
+Meta-d′, response-specific meta-d′, and the unequal variance SDT model. In Stephen M. Fleming
+and Christopher D. Frith, editors, The Cognitive Neuroscience of Metacognition, pages 25–66.
+Springer, 2014.
+Meta AI. Llama 3 model card. https://github.com/meta-llama/llama3, 2024.
+Jeremy Nixon, Michael W. Dusenberry, Linchuan Zhang, Ghassen Jerfel, and Dustin Tran. Measur-
+ing calibration in deep learning. In CVPR Workshops, 2019.
+Manuel Rausch, Sebastian Hellmann, and Michael Zehetleitner. Measures of metacognitive effi-
+ciency across cognitive models of decision confidence. Psychological Methods, 2023.
+10
+Marion Rouault, Adelaide McWilliams, Micah G. Allen, and Stephen M. Fleming. Human metacog-
+nition across domains: Insights from individual differences and neuroimaging. Personality Neu-
+roscience, 1:e17, 2018.
+J. David Smith, Justin J. Couchman, and Michael J. Beran. Animal metacognition: A tale of two
+comparative psychologies. Journal of Comparative Psychology, 128(2):115–131, 2014.
+Mark Steyvers and Megan A. K. Peters. Metacognition and uncertainty communication in humans
+and large language models. Current Directions in Psychological Science, 2025.
+John A. Swets.
+Signal Detection Theory and ROC Analysis in Psychology and Diagnostics.
+Lawrence Erlbaum, 1996.
+Miao Xiong, Zhiyuan Hu, Xinyang Lu, Yifei Li, Jie Fu, Junxian He, and Bryan Hooi. Can LLMs ex-
+press their uncertainty? an empirical evaluation of confidence elicitation in LLMs. arXiv preprint
+arXiv:2306.13063, 2024.
+A
+NLP Monotonicity Check
+Table 5 confirms that NLP is monotonically related to accuracy across all model×dataset conditions
+at T=1.0, validating its use as a graded evidence variable for Type-2 SDT analysis.
+Table 5: Accuracy by NLP quartile at T=1.0. All conditions strictly monotonic.
+Model
+Dataset
+Q1
+Q2
+Q3
+Q4
+Llama-3-Instruct
+TriviaQA
+0.179
+0.400
+0.667
+0.927
+Llama-3-Instruct
+NQ
+0.056
+0.092
+0.212
+0.515
+Mistral-Instruct
+TriviaQA
+0.098
+0.198
+0.533
+0.882
+Mistral-Instruct
+NQ
+0.024
+0.031
+0.059
+0.301
+Llama-3-Base
+TriviaQA
+0.059
+0.292
+0.539
+0.823
+Llama-3-Base
+NQ
+0.015
+0.080
+0.148
+0.315
+Gemma-2-Instruct
+TriviaQA
+0.314
+0.539
+0.690
+0.859
+Gemma-2-Instruct
+NQ
+0.085
+0.213
+0.328
+0.496
+B
+Domain-Specific M-ratio: Full Results
+Table 6 reports M-ratio by TriviaQA knowledge domain for all four models at T=1.0. The weakest
+domain differs across models, a pattern invisible to aggregate metrics.
+Table 6: M-ratio by domain at T=1.0 on TriviaQA. Boldface: weakest domain per model.
+Domain
+Llama-Inst
+Mistral
+Base
+Gemma
+History & Politics
+0.962
+0.805
+0.894
+1.210
+Arts & Literature
+1.130
+0.677
+1.052
+1.206
+Geography
+1.198
+0.812
+1.190
+1.508
+Science & Technology
+0.788
+1.068
+1.202
+0.805
+Range
+0.41
+0.39
+0.31
+0.70
+C
+Temperature Effects: Full Results
+Table 7 reports d′, meta-d′, and M-ratio across temperatures T ∈{0.3, 0.5, 0.7, 1.0} on TriviaQA
+for all four models.
+11
+Table 7: d′, meta-d′, and M-ratio across temperatures on TriviaQA.
+Model
+T
+d′
+meta-d′
+M
+Llama-3-Instruct
+0.3
+1.326
+1.484
+1.119
+0.5
+1.312
+1.425
+1.085
+0.7
+1.399
+1.470
+1.050
+1.0
+1.386
+1.362
+0.983
+Mistral-Instruct
+0.3
+1.435
+1.427
+0.994
+0.5
+1.490
+1.478
+0.992
+0.7
+1.563
+1.400
+0.896
+1.0
+1.597
+1.361
+0.852
+Llama-3-Base
+0.3
+1.174
+1.110
+0.946
+0.5
+1.270
+1.195
+0.941
+0.7
+1.318
+1.229
+0.932
+1.0
+1.407
+1.474
+1.048
+Gemma-2-Instruct
+0.3
+1.089
+0.936
+0.860
+0.5
+1.055
+0.927
+0.878
+0.7
+1.004
+0.961
+0.957
+1.0
+0.946
+0.991
+1.048
+12

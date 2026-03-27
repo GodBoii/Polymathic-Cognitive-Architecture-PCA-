@@ -1,0 +1,2816 @@
+Preprint. Under review.
+TRAJEVAL: Decomposing Code Agent Trajectories for Fine-
+Grained Diagnosis
+Myeongsoo Kim1, Dingmin Wang1, Siwei Cui1, Farima Farmahinifarahani1,
+Shweta Garg1, Baishakhi Ray1, Terry Yue Zhuo2∗, Rajdeep Mukherjee1, Varun Kumar1
+1AWS AI Labs
+2Monash University
+{mysoo, wdimmy, siweicui, fafarima, shwegarg, rabaisha, mukherr, kuvrun}@amazon.com
+terry.zhuo@monash.edu
+Abstract
+Code agents can autonomously resolve GitHub issues, yet when they fail,
+current evaluation provides no visibility into where or why. Metrics such as
+Pass@1 collapse an entire execution into a single binary outcome, making
+it difficult to identify where and why the agent went wrong. To address
+this limitation, we introduce TRAJEVAL, a diagnostic framework that de-
+composes agent trajectories into three interpretable stages: search (file
+localization), read (function comprehension), and edit (modification tar-
+geting). For each stage, we compute precision and recall by comparing
+against reference patches. Analyzing 16,758 trajectories across three agent
+architectures and seven models, we find universal inefficiencies (all agents
+examine 22× more functions than necessary) yet distinct failure modes:
+GPT-5 locates relevant code but targets edits incorrectly, while Qwen-32B
+fails at file discovery entirely. We validate that these diagnostics are pre-
+dictive, achieving model-level Pass@1 prediction within 0.87–2.1% MAE,
+and actionable: real-time feedback based on trajectory signals improves
+two state-of-the-art models by 2.2–4.6 percentage points while reducing
+costs by 20–31%. These results demonstrate that our framework not only
+provides a more fine-grained analysis of agent behavior, but also translates
+diagnostic signals into tangible performance gains. More broadly, TRAJE-
+VAL transforms the agent evaluation beyond outcome-based benchmarking
+towards mechanism-driven diagnosis of agent success and failure.
+1
+Introduction
+Large language model (LLM)-based code agents can now autonomously resolve GitHub
+issues, generating patches that pass unit tests on real-world repositories. Systems such as
+SWE-Agent, OpenHands, and Live-SWE-Agent achieve resolution rates of roughly 65–70%
+on SWE-bench Verified, and commercial variants are increasingly deployed in production
+development workflows (Yang et al., 2024; Wang et al., 2024; Xia et al., 2025b). Most existing
+evaluations rely on outcome-based metrics such as Pass@k. While useful for comparing
+aggregate performance or controlling cost, they cannot reveal where or why an agent fails,
+nor explain why one successful agent is more effective than another.
+We argue that evaluating code agents should move beyond outcome-based metrics toward
+fine-grained, stage-level diagnostics. Reference patches provide a natural basis for this shift:
+a correct patch implicitly identifies which files must be found, which functions must be
+examined, and which code regions must be modified. By comparing an agent’s trajectory
+against this reference, we convert execution traces from unstructured logs into quantitative,
+stage-specific signals. This enables diagnosis of where failures arise and how even successful
+agents differ in their execution strategies.
+∗Work done during an internship at AWS AI Labs.
+1
+arXiv:2603.24631v1  [cs.SE]  25 Mar 2026
+Preprint. Under review.
+Figure 1: Overview of TRAJEVAL. Agent execution traces are decomposed into three stages:
+search, read, and edit, and then compared against reference patches to compute stage-wise
+precision and recall, enabling task-success prediction and actionable intervention
+Building on this perspective, we introduce TRAJEVAL, a trajectory-based diagnostic frame-
+work that decomposes agent execution into three interpretable stages (Figure 1): (i) Search,
+capturing file-level localization; (ii) Read, reflecting function-level code understanding; and
+(iii) Edit, measuring whether modifications target the correct locations. For each stage, we
+compute precision and recall by comparing the agent’s trajectory against the reference patch.
+Precision captures efficiency (how much of the agent’s exploration was necessary), while
+recall captures effectiveness (how much of the required context was successfully identified).
+We empirically validate TRAJEVAL on SWE-bench Verified and PolyBench, ana-
+lyzing 16,758 trajectories across three agent architectures (SWE-Agent, OpenHands,
+LiveSWEAgent) and seven language models spanning 8B to 480B parameters. Across
+settings, simple trajectory features derived from search, read, and edit precision and recall
+are highly predictive of task success. Using a lightweight logistic regression model, we
+predict model-level Pass@1 within 0.87–2.1% mean absolute error under in-distribution eval-
+uation, while preserving strong ranking correlation (ρ ≥0.886) under repository-held-out
+and language-held-out distribution shifts.
+Beyond prediction, trajectory-level diagnostics reveal systematic behavioral differences
+that are invisible to outcome-only metrics. Across all agents and model scales, we observe
+substantial over-exploration: precision remains low at every stage, with read stage pre-
+cision around 4–5%. However, inefficiency alone does not determine success. Instead,
+recall strongly correlates with task completion, particularly at the edit stage, where higher-
+performing models consistently achieve broader coverage of the necessary code regions.
+These diagnostics distinguish not only failed executions but also successful ones, revealing
+differences in how agents localize files, identify functions, and target edits even when they
+ultimately solve the same task.
+Crucially, these diagnostics are not merely descriptive. Because trajectory metrics identify
+when an agent has interacted with relevant code, they enable actionable intervention during
+execution. We implement a lightweight feedback mechanism that provides real-time signals
+when an agent encounters golden context (e.g., “✓You are looking at a relevant file”). This
+guidance improves Pass@1 by 2.2–4.6 percentage points across two state-of-the-art models,
+while reducing token usage by up to 29% and cost by up to 31%. These results demonstrate
+that trajectory-level diagnostics enable simultaneous improvements in both accuracy and
+efficiency, as agents converge more quickly when guided toward productive exploration.
+In summary, our contributions are:
+• We introduce TRAJEVAL, a diagnostic framework that decomposes agent trajecto-
+ries into search, read, and edit stages, computing precision and recall at each stage
+by comparison against reference patches.
+• We analyze 16,758 trajectories across three agent architectures and seven models,
+revealing that recall (not precision) predicts success and that different models exhibit
+distinct, diagnosable failure modes.
+2
+Preprint. Under review.
+• We demonstrate that trajectory features predict model-level Pass@1 within 0.87–2.1%
+MAE, with ranking correlation ρ ≥0.886 preserved under distribution shift.
+• We validate that these diagnostics are actionable: trajectory-derived feedback im-
+proves Pass@1 by 2.2–4.6 percentage points while reducing cost by up to 31%.
+2
+Our Methodology
+We formalize agent trajectories as stage-specific sets over files, functions, and edit targets,
+then compare them against a reference patch to compute diagnostic precision and recall
+metrics.
+2.1
+Problem Formulation
+Consider a code agent tasked with resolving an issue in repository R given an issue
+description d. The agent produces an execution trajectory T = {(at, ot)}n
+t=1, where at
+denotes the action at step t and ot the corresponding observation, and outputs a candidate
+patch ˆP. Given a ground-truth reference patch P∗, our goal is to extract interpretable features
+from T that (i) diagnose where agent reasoning succeeds or fails, and (ii) predict task success
+without requiring access to P∗at inference time.
+The key insight is that P∗implicitly defines the minimal context required to solve the task:
+which files must be located, which functions must be examined, and which code regions
+must be modified. We formalize this as the golden context G = (F ∗, H∗), where F ∗denotes
+the set of files modified by P∗, and H∗denotes the set of functions modified by P∗.
+2.2
+Three-Stage Decomposition
+We decompose agent behavior into three sequential stages, each operating at a distinct
+granularity. Let FT denote the set of files viewed during trajectory T, HT denote the set of
+functions observed in agent observations, and H ˆP denote the set of functions modified in
+the candidate patch.
+Stage 1: Search (File-Level).
+Search quantifies the agent’s ability to localize relevant files
+within the repository. Let Ps and Rs denote precision and recall for search:
+Ps = |F ∗∩FT|
+|FT|
+,
+Rs = |F ∗∩FT|
+|F ∗|
+(1)
+High recall indicates successful file discovery, while high precision reflects focused explo-
+ration without redundant navigation.
+Stage 2: Read (Function-Level).
+File localization alone is insufficient: an agent may
+open a file without examining the relevant code region. Read quantifies function-level
+comprehension. Let Pr and Rr denote precision and recall for read:
+Pr = |H∗∩HT|
+|HT|
+,
+Rr = |H∗∩HT|
+|H∗|
+(2)
+This finer granularity distinguishes agents that achieve semantic understanding from those
+that perform superficial file scanning.
+Stage 3: Edit (Function-Level).
+Edit quantifies the localization accuracy of the agent’s
+code modifications. Let Pe and Re denote precision and recall for edit:
+Pe = |H∗∩H ˆP|
+|H ˆP|
+,
+Re = |H∗∩H ˆP|
+|H∗|
+(3)
+Edit metrics capture localization accuracy: an agent may achieve perfect edit recall while
+producing an incorrect patch. Semantic correctness is evaluated separately via Pass@k.
+3
+Preprint. Under review.
+2.3
+Golden Context Hierarchy
+We define golden context at two levels: 1) Tier 0 (Core). Files and functions explicitly
+modified in P∗, representing the minimal modification footprint. Tier 0 comprises 1.4 files
+and 2.1 functions on average; 2) Tier 1 (Extended). Tier 0 augmented with one-hop structural
+dependencies extracted via static analysis, including imports referenced in modified lines,
+test files, and parent classes via inheritance. Tier 1 expands to 4.2 files on average.
+We leverage both tiers in complementary ways. Recall metrics are computed against Tier 0,
+providing a strict measure of whether the agent located essential code. Precision metrics
+benefit from Tier 1 context, as exploration of structurally related elements constitutes
+reasonable behavior rather than wasteful navigation. This hierarchical design enables a
+nuanced distinction between meaningful exploration and truly redundant reading.
+2.4
+Feature Extraction
+Algorithm 1 describes the trajectory feature extraction procedure.
+The extraction is
+architecture-agnostic: given an agent-specific tool mapping ϕ : A →{view, edit, other},
+the comparison logic remains invariant across implementations.
+Algorithm 1 Trajectory Feature Extraction
+Require: Trajectory T = {(at, ot)}n
+t=1, Reference patch P∗, Tool mapping ϕ
+Ensure: Feature vector m ∈R6
+1: F ∗, H∗←PARSEPATCH(P∗)
+2: FT, HT, H ˆP ←∅, ∅, ∅
+3: for (at, ot) ∈T do
+4:
+if ϕ(at) = view then
+5:
+FT ←FT ∪EXTRACTFILES(at)
+6:
+HT ←HT ∪EXTRACTFUNCTIONS(ot)
+7:
+else if ϕ(at) = edit then
+8:
+H ˆP ←H ˆP ∪EXTRACTEDITTARGETS(at)
+9:
+end if
+10: end for
+11: m ←[Ps, Rs, Pr, Rr, Pe, Re] using Eqs. 1–3
+12: Return m
+Function extraction employs a hybrid approach: tree-sitter parsing for accurate AST-based
+extraction when possible, with regex fallback for partial code snippets and edge cases. The
+procedure supports Python, Java, JavaScript, and TypeScript via modular specifications.
+Feature extraction runs in O(|T|) time, enabling real-time analysis during agent execution.
+2.5
+Success Prediction Model
+To validate that trajectory features capture meaningful predictive signal, we train per-model
+logistic regression classifiers:
+P(success | m) = σ
+
+β0 + β⊤m
+
+,
+(4)
+where m ∈R6 and σ(·) denotes the sigmoid function. Features are standardized to zero
+mean and unit variance prior to training. We apply isotonic calibration via 3-fold cross-
+validation to ensure predicted probabilities reflect empirical success rates.
+We evaluate generalization under three distribution shifts: (i) instance-held-out (60/40
+stratified split), (ii) repository-held-out (5-fold cross-validation across repositories), and (iii)
+language-held-out (train on Python/JavaScript, test on TypeScript/Java). We report mean
+absolute error (MAE) between predicted and actual Pass@1 rates and Spearman correlation
+(ρ) for model ranking preservation.
+4
+Preprint. Under review.
+3
+Experiments
+3.1
+Experimental Setup
+We evaluate seven language models: GPT-5, GPT-5-mini , Qwen3-8B, Qwen3-32B, Qwen3-
+235B, Qwen3-Coder-30B, and Qwen3-Coder-480B. Our evaluation is conducted on SWE-
+bench Verified (Yang et al., 2024), containing 500 real-world GitHub issues from 12 Python
+repositories with human-verified patches, and PolyBench Verified, containing 382 multilin-
+gual instances across Python, Java, JavaScript, and TypeScript from 20 repositories.
+We analyze three agent architectures that differ in their tool primitives: SWE-Agent (Yang
+et al., 2024), which provides specialized commands for viewing (view), editing (str replace),
+and bash execution; OpenHands (Wang et al., 2024), which uses fsRead, fsWrite, and
+executeBash; and LiveSWEAgent (Xia et al., 2025b), which operates exclusively through
+shell commands without specialized file manipulation tools. This architectural diversity
+validates that our framework captures agent behavior rather than implementation artifacts.
+All experiments use random seed 42. Trajectory analysis runs in minutes on CPU; the
+primary cost is agent execution, performed prior to this work. In total, we analyze 16,758
+trajectories: 9,500 from SWE-bench and 7,258 from PolyBench. Code and evaluation scripts
+are provided in supplementary materials.
+3.2
+Evaluation Protocol
+We evaluate three generalization settings with increasing distribution shift. Instance-Held-
+Out uses a 60/40 stratified split, preserving the resolved/unresolved ratio per model to test
+in-distribution prediction. Repository-Held-Out trains on 60% of repositories and tests on
+entirely unseen ones to evaluate cross-codebase generalization. Language-Held-Out trains on
+Python and JavaScript, testing on TypeScript and Java for cross-language transfer.
+For each model, we train a logistic regression classifier with L2 regularization (C = 1.0) on
+the six trajectory features. The predicted Pass@1 is the mean predicted probability across
+test instances. We report Mean Absolute Error (MAE) between predicted and actual Pass@1,
+and Spearman’s ρ for ranking correlation across models.
+4
+Results
+We present three main findings: (1) trajectory features accurately predict Pass@1 across
+models and agents, (2) the framework generalizes under distribution shift across repositories
+and languages, and (3) real-time feedback based on trajectory diagnostics yields statistically
+significant improvements in agent performance.
+4.1
+Pass@1 Prediction Accuracy
+Table 1a presents Pass@1 prediction accuracy across all agent-benchmark configurations.
+Our framework achieves 1.20% mean absolute error (MAE) on SWE-bench using SWE-
+Agent, with perfect ranking preservation (ρ = 1.00). This level of accuracy enables reliable
+model comparison without requiring ground-truth evaluation on held-out instances.
+Prediction accuracy is consistent across agent architectures despite substantial differences in
+tool primitives. SWE-Agent uses specialized commands (view, str replace), OpenHands
+operates through browser-based file operations (fsRead, fsWrite), and LiveSWEAgent relies
+exclusively on bash commands. This pattern is consistent across all three agents.
+4.2
+Generalization Under Distribution Shift
+A key question is whether trajectory-based prediction generalizes beyond the training
+distribution. We evaluate three settings: instance-held-out (random split), repository-held-
+out (unseen codebases), and language-held-out (unseen programming languages).
+5
+Preprint. Under review.
+SWE-bench
+PolyBench
+Agent
+MAE
+ρ
+MAE
+ρ
+SWE-Agent
+1.20%
+1.00
+1.48%
+1.00
+OpenHands
+1.98%
+0.96
+1.98%
+1.00
+LiveSWEAgent
+2.06%
+1.00
+0.87%
+1.00
+(a) Pass@1 prediction
+Search
+Read
+Edit
+Model
+P
+R
+P
+R
+P
+R
+GPT-5
+.12
+.87
+-.23
+.45
+.33
+2.13
+Qwen3-Coder-480B
+.21
+1.03
+.08
+.89
+.25
+1.45
+Qwen3-8B
+.15
+.45
+-.12
+1.61
+.42
+.53
+Average
+.16
+.90
+.02
+.78
+.24
+1.22
+(b) Logistic coefficients
+Table 1: Pass@1 prediction accuracy and logistic regression coefficients.
+Table 2: SWE-Agent Pass@1 prediction across evaluation settings. Instance split uses 60/40
+stratified sampling; Repo split uses 5-fold cross-validation across repositories; Language
+split trains on Python/JavaScript and tests on TypeScript/Java. Values in parentheses show
+prediction bias (Predicted −Actual).
+SWE-bench Verified
+PolyBench Verified
+Model
+Actual†
+Instance
+Repo
+Actual†
+Instance
+Repo
+Language
+GPT-5
+67.2
+69.2 (+2.0) 67.4 (+5.3)
+39.1
+41.3 (+2.2) 40.5 (+2.6) 48.6 (+18.4)
+GPT-5-mini
+65.1
+65.9 (+0.8) 66.1 (+4.6)
+25.6
+22.6 (-3.0)
+26.2 (+0.6)
+26.2 (+6.2)
+Qwen3-Coder-480B
+62.1
+63.3 (+1.2) 61.7 (+2.5)
+26.1
+26.7 (+0.6) 29.2 (+1.3) 34.8 (+14.5)
+Qwen3-Coder-30B
+53.0
+56.6 (+3.6) 54.4 (+0.5)
+19.0
+20.8 (+1.8)
+19.6 (-2.1)
+24.4 (+10.3)
+Qwen3-235B
+47.4
+47.1 (-0.3)
+49.5 (+2.7)
+16.2
+15.7 (-0.5)
+19.9 (+1.2)
+14.7 (+2.3)
+Qwen3-8B
+20.3
+19.7 (-0.6)
+21.3 (+2.9)
+—
+—
+—
+—
+Qwen3-32B
+17.1
+17.8 (+0.7) 20.3 (+3.2)
+4.2
+3.4 (-0.8)
+4.6 (+1.6)
+3.7 (+1.3)
+MAE
+—
+1.20%
+2.73%
+—
+1.48%
+1.56%
+8.83%
+Rank ρ
+—
+1.00
+1.00
+—
+1.00
+0.94
+1.00
+†Actual Pass@1 on 40% held-out test instances (200 for SWE-bench, 153 for PolyBench). Full dataset
+Pass@1 differs slightly (e.g., GPT-5: 66.0% full vs 67.2% test split).
+Table 2 presents complete results for SWE-Agent across all evaluation settings. Repository-
+held-out evaluation degrades MAE from 1.20% to 2.73% on SWE-bench—a modest increase
+that reflects the challenge of generalizing to unseen codebases with different coding con-
+ventions and project structures. Critically, ranking correlation remains perfect (ρ = 1.00),
+indicating that the framework reliably identifies which models perform better even when
+absolute prediction accuracy degrades.
+Language-held-out evaluation on PolyBench (training on Python and JavaScript, testing
+on TypeScript and Java) presents the greatest challenge, with MAE increasing to 8.83%.
+This degradation reflects fundamental differences in how agents navigate statically-typed
+versus dynamically-typed codebases. Nevertheless, ranking correlation remains perfect
+(ρ = 1.00), demonstrating that trajectory features capture transferable patterns even across
+programming paradigms. The largest cross-language errors occur for GPT-5 (+18.4% bias)
+and Qwen3-Coder-480B (+14.5% bias), suggesting these models’ behaviors transfer poorly
+across language paradigms, likely due to Python-centric training.
+Examining per-model bias patterns in Table 2 reveals systematic trends. The framework
+produces smaller errors for mid-tier models (Qwen3-235B: <1% bias on instance splits) and
+larger errors under distribution shift (language split). This pattern suggests that trajectory
+features are most discriminative within the same language family, where search and edit
+patterns vary across instances. Overall, predictions on instance-held-out achieve sub-2%
+MAE for all models, with error consistently below the gap between adjacent models.
+4.3
+Feature Importance Analysis
+Logistic regression coefficients reveal which trajectory features drive prediction. Table 1b
+presents the learned coefficients for selected models, demonstrating both universal patterns
+and model-specific variations.
+6
+Preprint. Under review.
+Across all models, recall metrics dominate: edit recall shows the strongest average coefficient
+( ¯β = 1.22), followed by search recall ( ¯β = 0.90) and read recall ( ¯β = 0.78). Precision
+coefficients are weaker and less stable ( ¯β < 0.3 across all stages), reflecting the universal over-
+exploration pattern observed in agent behavior. This asymmetry shows that interventions
+should prioritize recall (ensuring agents find relevant code) rather than precision (reducing
+unnecessary exploration). An agent that examines every file in a repository but ultimately
+edits the correct function succeeds, whereas an efficient agent that navigates directly to the
+wrong location fails.
+Model-specific coefficients reveal capability differences. GPT-5 relies heavily on edit recall
+(β = 2.13), suggesting its failures occur primarily at the localization-to-modification transi-
+tion. Qwen3-8B shows elevated dependence on read recall (β = 1.61), indicating frequent
+failures to comprehend relevant code even when files are correctly identified. These patterns
+enable targeted diagnosis: improvements for GPT-5 should focus on edit targeting, while
+Qwen3-8B requires better semantic comprehension.
+4.4
+Intervention Study Results
+To demonstrate that trajectory diagnostics are actionable beyond post-hoc analysis, we
+implement a real-time feedback mechanism that provides signals during agent execution.
+Implementation details. We modify the SWE-Agent harness to intercept tool observations
+and append feedback messages before returning to LLM: (1) after each view command, we
+check whether the viewed file or any functions visible in the output belong to the golden
+context; (2) if so, we append a single feedback line: “[SYSTEM] ✓You are examining
+relevant code for this issue.” We inject feedback at most once per golden context to
+avoid flooding the context. When all golden files have been viewed at least once, we inject:
+“[SYSTEM] ✓All relevant context identified---proceed to your fix.” No feedback
+is provided for incorrect exploration (to avoid revealing what not to look at). The feedback
+is confirmatory and does not reveal file names, function names, or solution content.
+In particular, we conduct experiments on GPT-5 and Qwen3-Coder-480B to evaluate the
+intervention, observing statistically significant improvements for both models: with GPT-5
+gaining 4.6 percentage points (p < 0.001) and Qwen3-Coder-480B gaining 2.2 percentage
+points (p < 0.01). In relative terms, GPT-5 achieves a 7.0% gain over its baseline, while
+Qwen3-Coder-480B achieves 3.6%.
+GPT-5’s larger improvement suggests it benefits more from confirmation that exploration
+is progressing correctly, allowing it to transition from reading to editing with greater
+confidence. Qwen3-Coder-480B’s smaller gain may reflect that its failures occur earlier
+in the pipeline—at stages where knowing the destination is relevant provides less benefit
+because the model struggles to navigate there regardless. This interpretation aligns with
+the feature importance analysis, where GPT-5 shows stronger dependence on edit-stage
+features while Qwen3-Coder-480B relies more uniformly across stages.
+4.5
+Cross-Agent Behavioral Patterns
+Despite architectural differences, all three agents exhibit remarkably consistent behavioral
+patterns. Table 3a summarizes key metrics across agents on SWE-bench Verified.
+Search recall averages 0.72–0.78 across agents, indicating that locating the correct files is
+a shared challenge with similar difficulty regardless of tool implementation. Read recall
+shows more variance (0.58–0.71), with OpenHands achieving highest values, potentially
+due to its structured file reading interface. Edit recall ranges from 0.45–0.68, with SWE-
+Agent performing best, likely due to its specialized str replace command that provides
+explicit feedback on edit success. Complete per-model results for OpenHands (Table 4) and
+LiveSWEAgent (Table 5) in Appendix A.2 confirm these consistent patterns.
+Precision is uniformly low across all stages and agents, indicating substantial over-
+exploration: agents inspect 8–12× more files and 17–25× more functions than necessary.
+This suggests that current agents trade efficiency for coverage.
+7
+Preprint. Under review.
+Metric
+SWE-Agent
+OpenHands
+LiveSWE
+Search Recall
+0.78
+0.74
+0.72
+Read Recall
+0.65
+0.71
+0.58
+Edit Recall
+0.68
+0.52
+0.45
+Search Precision
+0.12
+0.08
+0.10
+Read Precision
+0.05
+0.06
+0.04
+Edit Precision
+0.25
+0.18
+0.15
+Avg. Tool Calls
+30.7
+24.2
+13.5
+Files Viewed
+8.2
+9.5
+7.8
+(a) Cross-Agent Behavioral Summary.
+Model
+Pass@1
+Tools/Task
+Submit %
+View %
+GPT-5
+66.0%
+30.7
+99.9%
+99.7%
+GPT-5-mini
+60.4%
+32.2
+99.9%
+99.9%
+Qwen3-Coder-480B
+61.2%
+50.3
+99.9%
+99.7%
+Qwen3-Coder-30B
+52.6%
+50.5
+100%
+99.8%
+Qwen3-235B
+45.0%
+42.5
+26.5%
+99.9%
+Qwen3-8B
+13.2%
+48.6
+93.2%
+99.2%
+Qwen3-32B
+14.8%
+43.8
+99.3%
+100%
+(b) Efficiency Metrics.
+Table 3: Behavioral patterns and efficiency metrics on SWE-bench Verified.
+4.6
+Failure Mode Analysis
+Search failures (low search recall < 0.5): The agent fails to locate the relevant files within
+the repository. This mode is common for Qwen3-8B and Qwen3-32B on complex multi-
+file issues, where limited model capacity prevents effective navigation of large codebases.
+Remediation: improved file discovery prompts, repository structure summaries, or retrieval-
+augmented approaches.
+Read failures (high search recall > 0.8, low read recall < 0.5): The agent finds the correct
+files but examines the wrong functions within them. This mode appears when issues span
+multiple functions within a file and the agent fails to identify which are relevant.
+Edit failures (high read recall > 0.8, low edit recall < 0.5): The agent comprehends the
+relevant context but targets incorrect locations for modification. This mode is common
+for GPT-5 on issues requiring coordinated changes across multiple sites. Remediation:
+enhanced localization guidance, multi-site edit planning, or explicit dependency tracking.
+We present a case study of failure modes from GPT-5 on instance django django-11400,
+requiring modification of four functions across three files. GPT-5’s trajectory metrics were:
+search recall 1.00, read recall 1.00, but edit recall only 0.33. The agent understood the
+problem but failed to propagate changes to all necessary sites—a classic edit localization
+failure. In contrast, Qwen3-32B on the same instance achieved search recall 0.00, never
+finding the relevant files at all—a search failure requiring entirely different intervention.
+This model-specific diagnosis is invisible to Pass@1, which shows both as simply “failed.”.
+4.7
+Robustness to Alternative Correct Solutions
+To determine whether the reference patch represents the unique correct solution or whether
+alternative valid fixes may modify different code locations, we analyze 334 instances that
+were successfully resolved by two or more models. At the function level, 100% of multiply-
+resolved instances show overlapping modifications—all models edit at least one common
+function. 93.3% of instances show exact function-level convergence, where all successful
+models modify precisely the same functions. At the file level, 99.4% of instances show at
+least partial overlap, with only 0.6% (2 of 334) modifying completely disjoint file sets. This
+convergence suggests that SWE-bench issues have well-defined canonical fix locations.
+We observe 106 resolved instances (8.6% of successful resolutions) with low edit recall (<0.8).
+Manual inspection of 10 cases with edit recall = 0 reveals two patterns: (1) partial completions
+where agents modify a subset of required functions (e.g., editing 2 of 4 golden locations),
+and (2) alternative solutions where agents fix the bug via completely different code paths (e.g.,
+editing contenttypes/fields.py when the reference patch modifies fields/ init .py).
+Both patterns successfully resolve the issue by passing all tests.
+4.8
+Operational Efficiency Insights
+Beyond prediction features, our extracted operational metrics reveal model-specific effi-
+ciency patterns. Table 3b presents selected efficiency metrics for SWE-Agent on SWE-bench.
+8
+Preprint. Under review.
+The most striking finding is Qwen3-235B’s anomalously low submit success rate of 26.5%,
+compared to >99% for most other models. This indicates systematic patch formatting issues
+that cause submissions to fail validation, independent of whether the patch content is correct.
+Such operational failures are invisible to trajectory features but critical for deployment. The
+view operation maintains near-perfect reliability (>99%) across all models, confirming file
+inspection as the most robust tool in the SWE-agent toolkit.
+5
+Related Work
+Code Generation Agents.
+LLM-based code agents advance from simple code comple-
+tion to autonomous issue resolution. SWE-Agent (Yang et al., 2024) introduced a tool-
+augmented interface enabling agents to navigate repositories, view files, and apply edits.
+OpenHands (Wang et al., 2024) extended this with browser-based interactions and structured
+tool primitives. LiveSWEAgent (Xia et al., 2025b) demonstrated effective issue resolution
+using only bash commands, without specialized file manipulation tools. Agentless (Xia et al.,
+2025a) showed that hierarchical localization without agent loops can achieve competitive
+results. Recent work has explored multi-agent systems (Hong et al., 2024), reinforcement
+learning from execution feedback (Le et al., 2022), and retrieval-augmented generation for
+code (Zhang et al., 2023). While these systems achieved impressive performance, it remains
+challenging to understand why they succeed or fail. Our work complements agent develop-
+ment by providing diagnostic tools revealing behavioral patterns in agent architectures.
+LLM Evaluation Metrics.
+Traditional Pass@k measures the probability of generating a
+correct solution within k attempts (Chen, 2021). Efficiency metrics such as token consump-
+tion, latency, and cost per solution have been proposed for practical deployment (Yang
+et al., 2024). CodeBLEU (Ren et al., 2020) and similar metrics capture syntactic and semantic
+similarity to references. However, these metrics operate on outputs, not processes. Our
+trajectory-based metrics fill this gap by decomposing how agents arrive at solutions, enabling
+diagnosis of failure modes invisible to outcome-only evaluation.
+Agent Trajectory Analysis.
+Analysis of agent behavior has received increasing attention.
+AgentBench (Liu et al., 2025) evaluates agents across diverse tasks but focuses on task
+success rather than trajectory patterns. WebArena (Zhou et al., 2024) and MiniWoB (Shi
+et al., 2017) provide trajectory data for web agents. More recent work analyzed LLM
+reasoning traces (Wei et al., 2022), tool use patterns (Schick et al., 2023), and planning behav-
+iors (Huang et al., 2022). The most related work is DevBench (Golnari et al., 2026), which
+provides development environment metrics but lacks the stage-wise decomposition and
+golden context comparison. Our framework leverages reference patches to define “correct”
+behavior, enabling precision/recall computation without manual trajectory annotation.
+6
+Conclusion
+We introduced a trajectory-based diagnostic framework that decomposes code agent exe-
+cution into search, read, and edit stages. Evaluating 16,758 trajectories across three agents,
+seven models, and two benchmarks, we find that six trajectory features predict Pass@1
+within 1.20% MAE with perfect ranking correlation—revealing that agents universally
+over-explore (4–8% precision) while recall determines success. These diagnostics are ac-
+tionable: real-time golden context feedback improves GPT-5’s Pass@1 by 4.6% (p < 0.001),
+demonstrating that trajectory analysis identifies exploitable bottlenecks rather than merely
+correlational patterns. By transforming opaque agent behavior into interpretable metrics,
+our framework enables mechanism-driven optimization: low search recall indicates file dis-
+covery limitations, low edit recall suggests localization failures, and the universal precision
+deficit reveals systematic inefficiency across all current agent architectures.
+9
+Preprint. Under review.
+References
+Mark Chen.
+Evaluating large language models trained on code.
+arXiv preprint
+arXiv:2107.03374, 2021.
+Pareesa Ameneh Golnari, Adarsh Kumarappan, Wen Wen, Xiaoyu Liu, Gabriel Ryan, Yuting
+Sun, Shengyu Fu, and Elsie Nallipogu. Devbench: A realistic, developer-informed
+benchmark for code generation models, 2026. URL https://arxiv.org/abs/2601.11895.
+Sirui Hong, Mingchen Zhuge, Jonathan Chen, Xiawu Zheng, Yuheng Cheng, Jinlin Wang,
+Ceyao Zhang, Zili Wang, Steven Ka Shing Yau, Zijuan Lin, Liyang Zhou, Chenyu Ran,
+Lingfeng Xiao, Chenglin Wu, and J¨urgen Schmidhuber. MetaGPT: Meta programming for
+a multi-agent collaborative framework. In The Twelfth International Conference on Learning
+Representations, 2024. URL https://openreview.net/forum?id=VtmBAGCN7o.
+Wenlong Huang, Pieter Abbeel, Deepak Pathak, and Igor Mordatch. Language models as
+zero-shot planners: Extracting actionable knowledge for embodied agents. In Proceedings
+of the 39th International Conference on Machine Learning (ICML), 2022.
+Hung Le, Yue Wang, Akhilesh Deepak Gotmare, Silvio Savarese, and Steven C.H. Hoi.
+Coderl: mastering code generation through pretrained models and deep reinforcement
+learning. In Proceedings of the 36th International Conference on Neural Information Processing
+Systems, NIPS ’22, Red Hook, NY, USA, 2022. Curran Associates Inc. ISBN 9781713871088.
+Xiao Liu, Hao Yu, Hanchen Zhang, Yifan Xu, Xuanyu Lei, Hanyu Lai, Yu Gu, Hangliang
+Ding, Kaiwen Men, Kejuan Yang, Shudan Zhang, Xiang Deng, Aohan Zeng, Zhengxiao
+Du, Chenhui Zhang, Sheng Shen, Tianjun Zhang, Yu Su, Huan Sun, Minlie Huang,
+Yuxiao Dong, and Jie Tang. Agentbench: Evaluating llms as agents, 2025. URL https:
+//arxiv.org/abs/2308.03688.
+Shuo Ren, Daya Guo, Shuai Lu, Long Zhou, Shujie Liu, Duyu Tang, Neel Sundaresan, Ming
+Zhou, Ambrosio Blanco, and Shuai Ma. Codebleu: a method for automatic evaluation of
+code synthesis, 2020.
+Timo Schick, Jane Dwivedi-Yu, Roberto Dess´ı, Roberta Raileanu, Maria Lomeli, Eric Hambro,
+Luke Zettlemoyer, Nicola Cancedda, and Thomas Scialom. Toolformer: language models
+can teach themselves to use tools. In Proceedings of the 37th International Conference on Neural
+Information Processing Systems, NIPS ’23, Red Hook, NY, USA, 2023. Curran Associates Inc.
+Tianlin Tim Shi, Andrej Karpathy, Linxi Jim Fan, Jonathan Hernandez, and Percy Liang.
+World of bits: an open-domain platform for web-based agents. In Proceedings of the
+34th International Conference on Machine Learning - Volume 70, ICML’17, pp. 3135–3144.
+JMLR.org, 2017.
+Xingyao Wang, Boxuan Li, Yufan Song, Frank F Xu, Xiangru Tang, Mingchen Zhuge, Jiayi
+Pan, Yueqi Song, Bowen Li, Jaskirat Singh, et al. Openhands: An open platform for ai
+software developers as generalist agents. arXiv preprint arXiv:2407.16741, 2024.
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Brian Ichter, Fei Xia, Ed H.
+Chi, Quoc V. Le, and Denny Zhou. Chain-of-thought prompting elicits reasoning in large
+language models. In Proceedings of the 36th International Conference on Neural Information
+Processing Systems, NIPS ’22, Red Hook, NY, USA, 2022. Curran Associates Inc. ISBN
+9781713871088.
+Chunqiu Steven Xia, Yinlin Deng, Soren Dunn, and Lingming Zhang. Demystifying llm-
+based software engineering agents. Proc. ACM Softw. Eng., 2(FSE), June 2025a. doi:
+10.1145/3715754. URL https://doi.org/10.1145/3715754.
+Chunqiu Steven Xia, Zhe Wang, Yan Yang, Yuxiang Wei, and Lingming Zhang. Live-
+swe-agent: Can software engineering agents self-evolve on the fly?
+arXiv preprint
+arXiv:2511.13646, 2025b.
+10
+Preprint. Under review.
+John Yang, Carlos E Jimenez, Alexander Wettig, Kilian Lieret, Shunyu Yao, Karthik
+Narasimhan, and Ofir Press. Swe-agent: Agent-computer interfaces enable automated
+software engineering. Advances in Neural Information Processing Systems, 37:50528–50652,
+2024.
+Fengji Zhang, Bei Chen, Yue Zhang, Jacky Keung, Jin Liu, Daoguang Zan, Yi Mao, Jian-
+Guang Lou, and Weizhu Chen. RepoCoder: Repository-level code completion through
+iterative retrieval and generation. In Houda Bouamor, Juan Pino, and Kalika Bali (eds.),
+Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing, pp.
+2471–2484, Singapore, December 2023. Association for Computational Linguistics. doi:
+10.18653/v1/2023.emnlp-main.151. URL https://aclanthology.org/2023.emnlp-main.
+151/.
+Shuyan Zhou, Frank F. Xu, Hao Zhu, Xuhui Zhou, Robert Lo, Abishek Sridhar, Xianyi Cheng,
+Tianyue Ou, Yonatan Bisk, Daniel Fried, Uri Alon, and Graham Neubig. Webarena: A
+realistic web environment for building autonomous agents, 2024. URL https://arxiv.
+org/abs/2307.13854.
+11
+Preprint. Under review.
+A
+Appendix
+A.1
+Appendix Overview
+This appendix provides supplementary results supporting the main paper findings:
+• Section A.1: Full Pass@1 prediction tables for OpenHands and LiveSWEAgent
+• Section A.2–A.3: Complete efficiency metrics, token consumption, and tool success
+rates for all models on SWE-bench and PolyBench
+• Section A.4–A.5: OpenHands and LiveSWEAgent operational metrics
+• Section A.6: Trajectory feature extraction methodology
+• Section A.7: Per-model classifier coefficients and feature importance
+• Section A.8: Cross-benchmark and cross-language transfer analysis
+• Section A.9: Assumptions and limitations
+A.2
+Full Pass@1 Prediction Tables
+This section provides the complete per-model Pass@1 prediction results for OpenHands
+and LiveSWEAgent, complementing the SWE-Agent results in the main paper (Table 2).
+A.2.1
+OpenHands Results
+Table 4 presents Pass@1 prediction accuracy for OpenHands across SWE-bench and Poly-
+Bench. Despite different agent architecture (browser-based interface with distinct tool
+primitives), our framework achieves comparable prediction accuracy to SWE-Agent.
+Table 4: OpenHands Pass@1 prediction accuracy. The framework generalizes across agent
+architectures, achieving 1.98% MAE on SWE-bench and maintaining ρ ≥0.93 ranking
+correlation across all settings. Values in parentheses show prediction bias.
+SWE-bench
+PolyBench
+Model
+Actual†
+Instance
+Repo
+Actual†
+Instance
+Repo
+Language
+GPT-5
+68.5
+70.7 (+2.2)
+67.4 (+2.9)
+44.5
+49.1 (+4.5)
+44.8 (+0.7)
+46.4 (+7.0)
+GPT-5-mini
+58.4
+62.7 (+4.3)
+58.7 (+3.6)
+38.0
+41.5 (+3.5)
+39.0 (+0.4)
+32.7 (+1.3)
+Qwen-480B
+61.0
+57.3 (-3.7)
+59.4 (+2.4)
+35.9
+37.4 (+1.4)
+36.5 (+3.6)
+39.8 (+12.8)
+Qwen-30B
+44.5
+42.1 (-2.4)
+42.4 (-0.5)
+23.5
+23.2 (-0.4)
+24.0 (+2.9)
+23.9 (+10.0)
+Qwen-235B
+45.0
+45.3 (+0.3)
+44.1 (+2.3)
+20.9
+22.8 (+1.9)
+22.7 (+3.2)
+22.6 (+10.1)
+Qwen-8B
+11.0
+11.6 (+0.6)
+12.1 (-1.7)
+—
+—
+—
+—
+Qwen-32B
+11.0
+11.4 (+0.4)
+12.3 (-0.4)
+9.2
+9.0 (-0.2)
+9.9 (-0.6)
+9.1 (+4.9)
+MAE
+—
+1.98%
+1.97%
+—
+1.98%
+1.89%
+7.67%
+Rank ρ
+—
+0.955
+0.929
+—
+1.000
+1.000
+0.943
+†Actual Pass@1 on 40% held-out test instances.
+A.2.2
+LiveSWEAgent Results
+Table 5 presents results for LiveSWEAgent, which operates exclusively through bash com-
+mands without specialized file manipulation tools. Remarkably, our framework achieves the
+lowest prediction error on PolyBench (0.54% MAE for repo split), demonstrating robustness
+to agent implementation details.
+A.3
+Complete Model Results: SWE-bench Verified
+A.3.1
+Efficiency Metrics
+Table 6 presents complete efficiency metrics for all seven models evaluated on SWE-bench
+Verified. GPT-5 family demonstrates a clear efficiency gradient: GPT-5 achieves the lowest
+12
+Preprint. Under review.
+Table 5: LiveSWEAgent Pass@1 prediction accuracy. Despite operating through bash-only
+interactions, trajectory features achieve sub-1% MAE on PolyBench, demonstrating that
+our framework captures agent behavior independent of tool implementation. Values in
+parentheses show prediction bias (Predicted −Actual).
+SWE-bench
+PolyBench
+Model
+Actual†
+Instance
+Repo
+Actual†
+Instance
+Repo
+Language
+GPT-5
+65.5
+68.2 (+2.7)
+65.0 (-0.5)
+37.4
+38.7 (+1.3)
+37.8 (+0.4)
+37.8 (+0.4)
+GPT-5-mini
+60.5
+59.7 (-0.8)
+62.9 (+2.4)
+27.0
+29.6 (+2.6)
+27.7 (+0.7)
+24.6 (-2.4)
+Qwen-480B
+53.5
+55.5 (+2.0)
+54.8 (+1.3)
+22.3
+22.2 (-0.1)
+21.7 (-0.6)
+35.5 (+13.2)
+Qwen-235B
+29.0
+25.1 (-3.9)
+30.0 (+1.0)
+13.9
+14.0 (+0.1)
+13.7 (-0.2)
+20.6 (+6.7)
+Qwen-30B
+45.0
+45.8 (+0.8)
+46.9 (+1.9)
+8.9
+9.1 (+0.2)
+9.7 (+0.8)
+13.0 (+4.1)
+MAE
+—
+2.06%
+1.42%
+—
+0.87%
+0.54%
+5.65%
+Rank ρ
+—
+1.000
+1.000
+—
+1.000
+1.000
+0.900
+†Actual Pass@1 on 40% held-out test instances.
+average tool usage at 30.71 calls per task, while GPT-5 nano requires 43% more invocations
+(43.81 calls). This efficiency gap correlates with exploration behavior—GPT-5 nano dedicates
+54.1% of bash commands to localization operations compared to 33.3% for GPT-5, suggesting
+smaller models compensate for reduced reasoning capability through exhaustive search.
+The Qwen family exhibits different patterns: Qwen-235B achieves comparable efficiency
+to GPT-5 mini despite lower bash usage (15.25 vs 16.84), while Qwen-30B and Qwen-480B
+show elevated tool counts (50.45 and 50.30) with moderate localization percentages (20.5%
+and 23.4%), indicating more deliberate but verbose problem-solving strategies.
+Table 6: Complete Efficiency Metrics (SWE-bench Verified)
+Agent
+µtool
+µLLM
+µbash
+Ppipe
+Loc.
+Loc.%
+GPT-5
+30.71
+30.71
+15.36
+0.22
+2558
+33.3
+GPT-5 mini
+32.16
+32.16
+16.84
+0.24
+3493
+41.5
+GPT-5 nano
+43.81
+43.81
+39.19
+0.42
+10595
+54.1
+Qwen-235B
+42.53
+42.53
+15.25
+0.20
+1682
+22.1
+Qwen-30B
+50.45
+50.45
+27.44
+0.42
+2815
+20.5
+Qwen-32B
+48.59
+48.59
+13.62
+0.23
+2469
+36.2
+Qwen-480B
+50.30
+50.30
+24.80
+0.36
+2900
+23.4
+A.3.2
+Token Consumption by Tool
+Table 7 presents complete token consumption statistics for all tools across all models on
+SWE-bench Verified. Bash output tokens exhibit the highest variance across models, ranging
+from 315 tokens (Qwen-30B) to 8248 tokens (GPT-5 nano). This 26× difference reflects
+divergent command strategies: Qwen-30B issues precise, targeted commands while GPT-
+5 nano generates verbose outputs through exploratory commands with extensive error
+messages. The view operation shows consistent input requirements (25.7–29.0 tokens) but
+substantial output variance (448–1682 tokens), indicating models inspect similar file regions
+but receive different context lengths based on file structure. The str replace operation
+reveals model-specific editing patterns: Qwen models require higher input tokens (190–616)
+compared to GPT models (232–327), suggesting more verbose edit specifications, while
+output tokens remain consistent (96–457), reflecting similar confirmation message lengths.
+A.3.3
+Tool Success Rates
+Table 8 presents complete tool success rates for all models on SWE-bench Verified. The most
+striking finding is Qwen-235B’s anomalously low submit success rate of 26.5% across 3557
+attempts, compared to 99.9% for GPT-5 and 100% for Qwen-30B. This suggests systematic
+issues with patch formatting or validation logic specific to this model configuration. Qwen-
+13
+Preprint. Under review.
+Table 7: Complete Token Consumption (SWE-bench Verified)
+Tool
+GPT-5
+mini
+nano
+Q-235B
+Q-30B
+Q-32B
+Q-480B
+bash
+In
+76.0
+96.8
+199.4
+41.8
+87.0
+44.7
+54.2
+Out
+5210
+1497
+8248
+906
+315
+1301
+593
+view
+In
+25.7
+27.1
+28.3
+27.4
+26.6
+29.0
+27.2
+Out
+1682
+1406
+1223
+902
+776
+448
+715
+str replace
+In
+322
+327
+232
+560
+616
+190
+555
+Out
+316
+379
+96
+418
+457
+132
+432
+create
+In
+253
+228
+290
+258
+721
+235
+570
+Out
+15
+16
+19
+18
+15
+20
+16
+insert
+In
+149
+111
+97
+132
+61
+103
+—
+Out
+231
+244
+265
+261
+182
+234
+—
+undo edit
+In
+17.0
+17.3
+18.8
+17.8
+—
+20.4
+17.1
+Out
+14.3
+15.0
+16.1
+15.0
+—
+15.7
+14.4
+submit
+In
+5.3
+5.3
+5.3
+5.3
+5.3
+5.3
+5.3
+Out
+1864
+351
+441
+2407
+2583
+614
+1318
+32B exhibits degraded performance across multiple operations: create success drops to
+78.9% (vs 98.8% for GPT-5), str replace falls to 92.6% (vs 98.8%), and undo edit reaches
+only 71.7% (vs 100%). These patterns indicate Qwen-32B struggles with file manipulation
+operations, potentially due to training data gaps or instruction-following limitations. The
+view operation maintains near-perfect reliability (>99%) across all models, confirming file
+inspection as the most robust tool in the SWE-agent toolkit.
+Table 8: Complete Tool Success Rates (SWE-bench Verified)
+Tool
+GPT-5
+mini
+nano
+Q-235B
+Q-30B
+Q-32B
+Q-480B
+bash
+96.2%
+96.4%
+98.1%
+96.3%
+97.3%
+94.5%
+97.7%
+(7213)
+(7953)
+(19615)
+(7149)
+(13225)
+(6417)
+(11905)
+view
+99.7%
+99.9%
+100%
+99.9%
+99.8%
+99.2%
+99.7%
+(4549)
+(4200)
+(642)
+(4843)
+(5970)
+(7521)
+(6165)
+str replace
+98.8%
+98.9%
+97.6%
+97.2%
+99.5%
+92.6%
+98.4%
+(1467)
+(1656)
+(1090)
+(4665)
+(2086)
+(8137)
+(2748)
+create
+98.8%
+98.9%
+91.1%
+92.7%
+99.3%
+78.9%
+97.2%
+(659)
+(264)
+(45)
+(1035)
+(2901)
+(1816)
+(2493)
+insert
+100%
+100%
+100%
+100%
+100%
+92.6%
+—
+(94)
+(23)
+(79)
+(12)
+(1)
+(122)
+undo edit
+100%
+100%
+100%
+100%
+—
+71.7%
+100%
+(67)
+(15)
+(4)
+(1)
+(46)
+(2)
+submit
+99.9%
+99.9%
+99.3%
+26.5%
+100%
+93.2%
+99.9%
+(1305)
+(1897)
+(423)
+(3557)
+(1042)
+(236)
+(1838)
+A.4
+Complete Model Results: PolyBench Verified
+A.4.1
+Efficiency Metrics
+Table 9 presents complete efficiency metrics for all eight models evaluated on PolyBench
+Verified. Cross-benchmark comparison reveals that multilingual tasks increase complexity:
+GPT-5 requires 25% more tool invocations on PolyBench (38.38) compared to SWE-bench
+(30.71). The Qwen-8B anomaly stands out with unusually low tool usage (24.89) and
+minimal localization (4.1%), suggesting early termination or limited exploration capability
+rather than efficient problem-solving. Qwen-32B exhibits the highest localization percentage
+14
+Preprint. Under review.
+(71.6%), indicating extensive code navigation before editing—a pattern that correlates with
+its degraded tool success rates. Pipe command usage increases substantially on PolyBench,
+with Qwen-32B reaching 64% and GPT-5 nano at 60%, reflecting the need for complex
+command chaining in multilingual codebases with diverse build systems and directory
+structures.
+Table 9: Complete Efficiency Metrics (PolyBench Verified)
+Agent
+µtool
+µLLM
+µbash
+Ppipe
+Loc.
+Loc.%
+GPT-5
+38.38
+38.38
+18.06
+0.34
+2204
+35.6
+GPT-5 mini
+34.62
+34.62
+18.89
+0.37
+2447
+44.4
+GPT-5 nano
+45.70
+45.70
+42.26
+0.60
+8505
+57.0
+Qwen-235B
+43.12
+43.12
+18.26
+0.41
+2081
+32.3
+Qwen-32B
+48.45
+48.45
+30.26
+0.64
+7644
+71.6
+Qwen-8B
+24.89
+24.89
+24.89
+0.02
+362
+4.1
+Qwen-30B
+46.05
+46.05
+23.66
+0.57
+2149
+25.7
+Qwen-480B
+50.21
+50.21
+24.53
+0.53
+2435
+28.1
+A.4.2
+Token Consumption by Tool
+Table 10 presents complete token consumption statistics for all tools across all models
+on PolyBench Verified. Bash output tokens increase dramatically on PolyBench: GPT-
+5 mini reaches 21460 tokens (vs 1497 on SWE-bench), a 14× increase reflecting verbose
+compilation errors and test output in Java/TypeScript projects. The str replace output
+tokens for GPT-5 reach 1396 on PolyBench versus 316 on SWE-bench, a 4.4× increase
+indicating more complex edit contexts in multilingual codebases. File creation (create)
+requires substantially more input tokens on PolyBench (283–647 tokens) compared to
+SWE-bench (228–721 tokens), reflecting boilerplate requirements and import statements in
+statically-typed languages. The insert operation shows extreme variance for GPT-5 mini
+(2537 output tokens), suggesting verbose feedback when inserting code into Java/TypeScript
+files with complex type annotations.
+Table 10: Complete Token Consumption (PolyBench Verified)
+Tool
+GPT-5
+mini
+nano
+Q-235B
+Q-32B
+Q-8B
+Q-30B
+Q-480B
+bash
+In
+88.7
+102.0
+188.2
+45.0
+64.0
+51.7
+53.5
+49.2
+Out
+12297
+21460
+11706
+3983
+4344
+968
+2472
+1539
+view
+In
+26.8
+30.1
+29.0
+32.1
+30.8
+—
+28.3
+29.0
+Out
+1800
+1501
+1692
+1012
+711
+—
+1244
+1068
+str replace
+In
+306
+314
+209
+438
+190
+—
+597
+565
+Out
+1396
+1313
+105
+611
+130
+—
+544
+555
+create
+In
+336
+341
+347
+293
+283
+—
+647
+625
+Out
+62
+97
+18
+38
+16
+—
+143
+189
+insert
+In
+161
+220
+138
+84
+67
+—
+352
+—
+Out
+510
+2537
+278
+161
+197
+—
+518
+—
+undo edit
+In
+19.3
+17.0
+—
+—
+19.7
+—
+—
+—
+Out
+16.7
+14.2
+—
+—
+13.9
+—
+—
+—
+submit
+In
+5.3
+5.3
+5.3
+5.3
+5.3
+—
+5.3
+5.3
+Out
+3699
+2882
+1375
+6411
+8258
+—
+4961
+12060
+A.4.3
+Tool Success Rates
+Table 11 presents complete tool success rates for all models on PolyBench Verified. Cross-
+benchmark degradation is evident: Qwen-32B’s create success drops from 78.9% (SWE-
+15
+Preprint. Under review.
+bench) to 58.7% (PolyBench), and str replace falls from 92.6% to 83.5%. The undo edit
+operation shows severe degradation for Qwen-32B, dropping from 71.7% to 43.8%, indicat-
+ing that edit state management becomes increasingly problematic in multilingual contexts.
+Qwen-235B’s submit success improves from 26.5% (SWE-bench) to 65.3% (PolyBench),
+though this remains substantially below other models, suggesting partial but incomplete
+resolution of patch formatting issues. Qwen-8B shows complete absence of editor tool
+usage (all marked as —), confirming that this model fails to engage with file manipula-
+tion operations and relies exclusively on bash commands. The GPT-5 family maintains
+robust performance across benchmarks, with view operations achieving 100% success and
+str replace remaining above 98.5%.
+Table 11: Complete Tool Success Rates (PolyBench Verified)
+Tool
+GPT-5
+mini
+nano
+Q-235B
+Q-32B
+Q-8B
+Q-30B
+Q-480B
+bash
+96.2%
+95.9%
+97.6%
+94.5%
+92.9%
+82.8%
+95.9%
+96.3%
+(5921)
+(5266)
+(14886)
+(6152)
+(10514)
+(8786)
+(8043)
+(8368)
+view
+100%
+99.9%
+100%
+99.8%
+96.6%
+—
+99.9%
+99.9%
+(4239)
+(2846)
+(405)
+(4177)
+(2993)
+(4676)
+(5391)
+str replace
+99.4%
+99.8%
+98.5%
+98.2%
+83.5%
+—
+99.9%
+99.2%
+(1757)
+(1177)
+(536)
+(2946)
+(3032)
+(1381)
+(1957)
+create
+99.1%
+99.6%
+100%
+92.4%
+58.7%
+—
+99.8%
+98.2%
+(450)
+(233)
+(16)
+(1106)
+(387)
+(1545)
+(1448)
+insert
+100%
+100%
+100%
+100%
+96.9%
+—
+100%
+—
+(109)
+(19)
+(36)
+(38)
+(64)
+(1)
+undo edit
+100%
+100%
+—
+—
+43.8%
+—
+—
+—
+(44)
+(20)
+(16)
+submit
+99.8%
+98.1%
+99.6%
+65.3%
+94.7%
+—
+100%
+100%
+(646)
+(521)
+(245)
+(801)
+(95)
+(610)
+(561)
+A.5
+OpenHands Results
+A.5.1
+SWE-bench Verified
+Table 12 presents efficiency metrics for OpenHands on SWE-bench Verified. OpenHands
+demonstrates distinct behavioral patterns compared to SWE-agent: lower average tool
+usage (13.98–45.71 vs 30.71–50.45) but higher localization command percentages, with
+Qwen-32B reaching 97.6% localization. The Qwen-480B configuration requires the most
+tool invocations (45.71) while maintaining moderate localization (61.7%), suggesting a
+more balanced exploration-exploitation strategy. Pipe command usage varies substantially,
+with Qwen-235B showing anomalously high usage (110.2%) indicating command chaining
+patterns that exceed single-command baselines.
+Table 12: OpenHands Efficiency Metrics (SWE-bench Verified)
+Agent
+µtool
+µLLM
+µbash
+Ppipe
+Loc.
+Loc.%
+GPT-5
+24.18
+24.18
+18.84
+0.56
+7048
+74.8
+GPT-5 mini
+20.06
+20.06
+15.15
+0.49
+5627
+74.3
+GPT-5 nano
+24.07
+24.07
+21.31
+0.49
+2669
+47.3
+Qwen-235B
+26.26
+26.26
+9.65
+1.10
+3650
+75.7
+Qwen-32B
+13.98
+13.98
+4.49
+0.42
+2192
+97.6
+Qwen-8B
+26.55
+26.55
+8.97
+0.45
+4188
+93.4
+Qwen-480B
+45.71
+45.71
+20.61
+0.74
+6354
+61.7
+Qwen-30B
+37.48
+37.48
+18.92
+0.76
+5579
+59.0
+Table 13 presents token consumption for OpenHands tools on SWE-bench. The fsWrite
+operation shows substantial variance in input tokens (230–694), reflecting different code
+16
+Preprint. Under review.
+generation verbosity across models. Bash output tokens range from 195 (Qwen-480B) to
+4503 (Qwen-32B), a 23× difference indicating divergent command strategies. The think
+tool, unique to OpenHands, shows input tokens ranging from 235 (GPT-5 nano) to 634
+(Qwen-30B), capturing model-specific reasoning verbosity.
+Table 13: OpenHands Token Consumption (SWE-bench Verified)
+Tool
+GPT-5
+mini
+nano
+Q-235B
+Q-32B
+Q-8B
+Q-480B
+Q-30B
+executeBash
+In
+31.6
+34.3
+33.3
+28.1
+33.0
+22.9
+31.6
+41.0
+Out
+1046
+1555
+3700
+549
+4503
+1962
+195
+208
+fsRead
+In
+18.7
+17.4
+18.9
+18.4
+18.7
+18.7
+18.2
+18.5
+Out
+1694
+1610
+2009
+1305
+510
+500
+695
+753
+fsWrite
+In
+277
+417
+246
+324
+230
+374
+593
+694
+Out
+332
+250
+164
+267
+141
+131
+206
+244
+system
+In
+3104
+3104
+3104
+3528
+3528
+3528
+3528
+3528
+Out
+5.8
+5.8
+5.8
+5.8
+5.8
+5.8
+5.8
+5.8
+think
+In
+481
+296
+235
+252
+537
+391
+479
+634
+Out
+7.3
+7.3
+7.3
+7.3
+7.3
+7.3
+7.3
+7.3
+Table 14 presents tool success rates for OpenHands on SWE-bench. The fsWrite operation
+exhibits the most variance, ranging from 29.0% (Qwen-8B) to 97.7% (Qwen-480B). This
+3.4× difference highlights model-specific challenges with file creation and modification.
+The fsRead operation shows degraded performance for GPT-5 mini (63.2%) and Qwen-32B
+(59.8%), suggesting file path resolution issues. System and think tools maintain 100% success
+across all models, confirming their reliability as non-destructive operations.
+Table 14: OpenHands Tool Success Rates (SWE-bench Verified)
+Tool
+GPT-5
+mini
+nano
+Q-235B
+Q-32B
+Q-8B
+Q-480B
+Q-30B
+executeBash
+95.4%
+96.3%
+98.5%
+91.5%
+98.0%
+97.0%
+94.9%
+95.1%
+(9418)
+(7575)
+(5647)
+(4823)
+(2246)
+(4483)
+(10304)
+(9462)
+fsRead
+87.4%
+63.2%
+90.0%
+98.2%
+59.8%
+95.5%
+97.8%
+98.2%
+(952)
+(960)
+(231)
+(2953)
+(3260)
+(4159)
+(7930)
+(5345)
+fsWrite
+89.0%
+74.1%
+45.7%
+76.1%
+44.5%
+29.0%
+97.7%
+95.6%
+(1168)
+(953)
+(232)
+(927)
+(483)
+(1143)
+(2803)
+(1817)
+system
+100%
+100%
+100%
+100%
+100%
+100%
+100%
+100%
+(498)
+(492)
+(263)
+(500)
+(500)
+(500)
+(500)
+(500)
+think
+100%
+100%
+100%
+100%
+100%
+100%
+100%
+100%
+(55)
+(20)
+(5)
+(3929)
+(501)
+(1964)
+(1317)
+(1618)
+A.5.2
+PolyBench Verified
+Table 15 presents efficiency metrics for OpenHands on PolyBench Verified. Cross-benchmark
+comparison reveals increased complexity: GPT-5 requires 20% more tool invocations on
+PolyBench (29.03) compared to SWE-bench (24.18). Qwen-480B maintains the highest tool
+usage (47.45) with moderate localization (66.2%). The Qwen-30B configuration shows
+elevated pipe command usage (87.9%), reflecting complex command chaining requirements
+in multilingual codebases.
+Table 16 presents token consumption for OpenHands on PolyBench. Bash output tokens
+increase substantially: GPT-5 reaches 2329 tokens (vs 1046 on SWE-bench), while Qwen-8B
+shows extreme output (6628 tokens), indicating verbose error messages in multilingual com-
+pilation. The fsWrite input tokens remain relatively stable across benchmarks, suggesting
+consistent code generation patterns regardless of target language.
+17
+Preprint. Under review.
+Table 15: OpenHands Efficiency Metrics (PolyBench Verified)
+Agent
+µtool
+µLLM
+µbash
+Ppipe
+Loc.
+Loc.%
+GPT-5
+29.03
+29.03
+20.18
+0.56
+5884
+76.3
+GPT-5 mini
+25.45
+25.45
+19.59
+0.51
+5449
+72.8
+GPT-5 nano
+37.13
+37.13
+34.68
+0.63
+6222
+60.8
+Qwen-235B
+30.40
+30.40
+14.68
+0.84
+4511
+80.5
+Qwen-32B
+18.03
+18.03
+8.83
+0.93
+2786
+82.6
+Qwen-8B
+25.43
+25.43
+10.98
+0.30
+3463
+82.6
+Qwen-480B
+47.45
+47.45
+19.58
+0.66
+4956
+66.2
+Qwen-30B
+37.80
+37.80
+17.38
+0.88
+4421
+66.6
+Table 16: OpenHands Token Consumption (PolyBench Verified)
+Tool
+GPT-5
+mini
+nano
+Q-235B
+Q-32B
+Q-8B
+Q-480B
+Q-30B
+executeBash
+In
+40.3
+38.6
+51.3
+30.8
+41.5
+26.5
+26.0
+35.3
+Out
+2329
+3086
+2119
+1016
+1290
+6628
+524
+623
+fsRead
+In
+23.5
+24.4
+23.2
+24.2
+23.9
+25.0
+23.0
+23.1
+Out
+1516
+1122
+1373
+1348
+575
+498
+690
+823
+fsWrite
+In
+311
+383
+268
+363
+279
+472
+572
+606
+Out
+308
+253
+207
+240
+154
+124
+270
+285
+system
+In
+3104
+3104
+3104
+3528
+3528
+3528
+3528
+3528
+Out
+5.8
+5.8
+5.8
+5.8
+5.8
+5.8
+5.8
+5.8
+think
+In
+688
+349
+122
+281
+138
+455
+523
+701
+Out
+7.3
+7.3
+7.3
+7.3
+7.4
+7.3
+7.3
+7.3
+Table 17 presents tool success rates for OpenHands on PolyBench. The fsWrite operation
+shows degraded performance across most models: GPT-5 drops from 89.0% (SWE-bench)
+to 66.7% (PolyBench), and Qwen-8B falls from 29.0% to 20.6%. This cross-benchmark
+degradation reflects increased complexity in multilingual file manipulation. The fsRead
+operation also degrades, with GPT-5 mini dropping from 63.2% to 61.0%.
+Table 17: OpenHands Tool Success Rates (PolyBench Verified)
+Tool
+GPT-5
+mini
+nano
+Q-235B
+Q-32B
+Q-8B
+Q-480B
+Q-30B
+executeBash
+98.2%
+97.8%
+98.7%
+96.2%
+98.6%
+98.1%
+95.3%
+96.0%
+(7710)
+(7483)
+(10232)
+(5607)
+(3374)
+(4195)
+(7481)
+(6641)
+fsRead
+89.2%
+61.0%
+74.3%
+97.3%
+66.3%
+90.0%
+93.2%
+97.7%
+(1217)
+(677)
+(257)
+(2883)
+(2401)
+(2465)
+(7016)
+(4621)
+fsWrite
+66.7%
+55.4%
+52.5%
+54.5%
+39.8%
+20.6%
+90.5%
+77.8%
+(1722)
+(1140)
+(177)
+(1264)
+(530)
+(880)
+(2087)
+(1540)
+system
+100%
+100%
+100%
+100%
+100%
+100%
+100%
+100%
+(365)
+(375)
+(287)
+(382)
+(382)
+(380)
+(382)
+(382)
+think
+100%
+100%
+100%
+100%
+100%
+100%
+100%
+100%
+(75)
+(47)
+(1)
+(1478)
+(200)
+(824)
+(1158)
+(1255)
+A.6
+Live SWE Agent Results
+A.6.1
+SWE-bench Verified
+Table 18 presents efficiency metrics for Live SWE Agent on SWE-bench Verified. Live SWE
+Agent operates exclusively through bash commands, with tool usage equal to bash usage
+across all models. The GPT-5 family shows efficient operation (13.45–14.67 calls per task),
+18
+Preprint. Under review.
+while Qwen models require substantially more invocations (34.63–50.56). Localization
+percentages range from 50.9% (Qwen-30B) to 66.4% (Qwen-480B), indicating moderate
+exploration overhead. Pipe command usage is notably higher for GPT-5 models (74.2–74.8%)
+compared to Qwen-235B (26.5%), suggesting different command composition strategies.
+Table 18: Live SWE Agent Efficiency Metrics (SWE-bench Verified)
+Agent
+µtool
+µLLM
+µbash
+Ppipe
+Loc.
+Loc.%
+GPT-5
+13.45
+13.45
+13.45
+0.75
+4224
+62.8
+GPT-5 mini
+14.67
+14.67
+14.67
+0.74
+4545
+61.9
+Qwen-235B
+43.76
+43.76
+43.76
+0.26
+14447
+66.0
+Qwen-30B
+42.38
+42.38
+42.38
+0.44
+10782
+50.9
+Qwen-32B
+34.63
+34.63
+34.63
+0.21
+8968
+51.8
+Qwen-480B
+50.56
+50.56
+50.56
+0.21
+16793
+66.4
+Table 19 presents token consumption for Live SWE Agent on SWE-bench. Bash input
+tokens range from 79.8 (Qwen-30B) to 158.8 (GPT-5), reflecting different command verbosity.
+Output tokens show extreme variance: Qwen-235B generates 14688 tokens per command on
+average, compared to 128 tokens for Qwen-32B—a 115× difference indicating fundamentally
+different execution patterns, likely due to verbose error handling or extensive test output.
+Table 19: Live SWE Agent Token Consumption (SWE-bench Verified)
+Tool
+GPT-5
+mini
+Q-235B
+Q-30B
+Q-32B
+Q-480B
+executeBash
+In
+158.8
+96.7
+122.3
+79.8
+88.0
+97.5
+Out
+528
+430
+14688
+817
+128
+152
+Table 20 presents tool success rates for Live SWE Agent on SWE-bench. Bash success rates
+range from 92.9% (Qwen-30B) to 98.2% (Qwen-480B). The GPT-5 family maintains consistent
+performance (94.3–95.8%), while Qwen models show more variance. The high success rates
+across all models confirm bash command execution as a reliable operation, though the
+variance suggests model-specific command formatting issues.
+Table 20: Live SWE Agent Tool Success Rates (SWE-bench Verified)
+Tool
+GPT-5
+mini
+Q-235B
+Q-30B
+Q-32B
+Q-480B
+executeBash
+94.3%
+95.8%
+97.8%
+92.9%
+97.9%
+98.2%
+(5434)
+(6010)
+(20880)
+(17701)
+(16418)
+(24474)
+A.6.2
+PolyBench Verified
+Table 21 presents efficiency metrics for Live SWE Agent on PolyBench Verified. Cross-
+benchmark comparison shows mixed patterns: GPT-5 requires slightly more invocations on
+PolyBench (15.23 vs 13.45), while Qwen-32B shows reduced usage (16.45 vs 34.63). Localiza-
+tion percentages increase for most models on PolyBench, with Qwen-480B reaching 68.9%,
+reflecting additional navigation requirements in multilingual codebases. Pipe command us-
+age increases substantially for GPT-5 (88.5% vs 74.8%), indicating more complex command
+chaining for multilingual tasks.
+Table 22 presents token consumption for Live SWE Agent on PolyBench. Bash input tokens
+remain relatively stable across benchmarks, with GPT-5 at 148.8 tokens (vs 158.8 on SWE-
+bench). Output tokens decrease substantially for Qwen-235B (230 vs 14688), suggesting
+more efficient command execution in multilingual contexts, possibly due to different error
+handling patterns or reduced test verbosity.
+Table 23 presents tool success rates for Live SWE Agent on PolyBench. Success rates remain
+high across all models (93.3–97.9%), with Qwen-30B achieving the highest rate (97.9%)
+19
+Preprint. Under review.
+Table 21: Live SWE Agent Efficiency Metrics (PolyBench Verified)
+Agent
+µtool
+µLLM
+µbash
+Ppipe
+Loc.
+Loc.%
+GPT-5
+15.23
+15.23
+15.23
+0.89
+3906
+67.1
+GPT-5 mini
+14.28
+14.28
+14.28
+0.86
+3674
+67.3
+Qwen-235B
+25.10
+25.10
+25.10
+0.31
+6299
+65.7
+Qwen-30B
+42.33
+42.33
+42.33
+0.46
+7703
+47.6
+Qwen-32B
+16.45
+16.45
+16.45
+0.29
+2642
+49.0
+Qwen-480B
+46.78
+46.78
+46.78
+0.26
+12311
+68.9
+Table 22: Live SWE Agent Token Consumption (PolyBench Verified)
+Tool
+GPT-5
+mini
+Q-235B
+Q-30B
+Q-32B
+Q-480B
+executeBash
+In
+148.8
+95.5
+143.6
+89.3
+80.4
+101.1
+Out
+501
+466
+230
+131
+167
+191
+despite moderate efficiency. GPT-5 mini shows slight degradation (93.3% vs 95.8% on
+SWE-bench), while Qwen-32B maintains consistent performance (97.5% vs 97.9%). These
+results confirm bash-only operation as a robust strategy across benchmark types.
+Table 23: Live SWE Agent Tool Success Rates (PolyBench Verified)
+Tool
+GPT-5
+mini
+Q-235B
+Q-30B
+Q-32B
+Q-480B
+executeBash
+94.5%
+93.3%
+95.3%
+97.9%
+97.5%
+97.6%
+(4653)
+(4235)
+(8657)
+(14358)
+(4716)
+(17184)
+A.7
+Trajectory Feature Extraction Methodology
+This section details the feature extraction pipeline used to compute the six trajectory metrics.
+A.7.1
+Golden Context Definition
+We define golden context as the minimal code elements required to generate the correct
+patch:
+1. Golden Files: Files modified in the ground-truth patch, extracted from diff headers
+(diff --git a/... b/...)
+2. Golden Functions: Functions containing modified lines, extracted from hunk
+headers (@@ ... @@ function name)
+3. Golden Lines: Line ranges modified in each file, extracted from hunk markers
+A.7.2
+Agent Action Extraction
+For each agent framework, we extract actions from trajectory logs:
+SWE-Agent Actions:
+• view: File opened for inspection →files viewed
+• str replace: Edit operation →files edited
+• bash: Commands like cat, grep →files viewed
+20
+Preprint. Under review.
+OpenHands Actions:
+• fsRead: File read operation →files viewed
+• fsWrite: File write operation →files edited
+• executeBash: Shell commands parsed for file references
+LiveSWEAgent Actions:
+• executeBash: All operations via bash commands
+• Parse cat, head, vim, sed for files viewed
+• Parse patch, sed -i, file redirects for files edited
+A.7.3
+Metric Computation
+Given golden context G and agent actions A:
+Search Precision = |Gfiles ∩Aviewed|
+|Aviewed|
+(5)
+Search Recall = |Gfiles ∩Aviewed|
+|Gfiles|
+(6)
+Read Precision = |Gfuncs ∩Afuncs read|
+|Afuncs read|
+(7)
+Read Recall = |Gfuncs ∩Afuncs read|
+|Gfuncs|
+(8)
+Edit Precision = |Gfuncs ∩Afuncs edited|
+|Afuncs edited|
+(9)
+Edit Recall = |Gfuncs ∩Afuncs edited|
+|Gfuncs|
+(10)
+A.8
+Per-Model Classifier Coefficients
+Table 24 presents the learned logistic regression coefficients for each model. The coefficient
+β indicates the log-odds contribution of each feature to task success.
+Table 24: Per-Model Logistic Regression Coefficients (β) for SWE-Agent on SWE-bench.
+Positive values indicate positive correlation with task success. Edit recall is universally
+positive across all models.
+Model
+βsearch P
+βsearch R
+βread P
+βread R
+βedit P
+βedit R
+GPT-5
++0.12
++0.87
+-0.23
++0.45
++0.33
++2.13
+GPT-5-mini
++0.08
++0.92
++0.15
++0.67
+-0.11
++1.87
+Qwen-480B
++0.21
++1.03
++0.08
++0.89
++0.25
++1.45
+Qwen-30B
+-0.05
++1.61
++0.22
++0.53
++0.18
++0.98
+Qwen-235B
++0.33
++0.78
++0.61
++0.42
+-0.08
++0.87
+Qwen-8B
++0.15
++0.45
+-0.12
++1.61
++0.42
++0.53
+Qwen-32B
++0.28
++0.63
+-0.57
++0.88
++0.67
++0.71
+Average
++0.16
++0.90
++0.02
++0.78
++0.24
++1.22
+Key Observations:
+• Edit recall universally positive: All models show βedit R > 0 (range: +0.53 to +2.13),
+confirming that successfully targeting correct code locations is essential
+21
+Preprint. Under review.
+• Recall dominates precision: Average recall coefficients (+0.90, +0.78, +1.22) exceed
+precision coefficients (+0.16, +0.02, +0.24)
+• Read precision unstable: Ranges from -0.57 (Qwen-32B) to +0.61 (Qwen-235B),
+suggesting model-specific value of contextual reading
+• Model-specific patterns: GPT-5 relies heavily on edit recall (β = 2.13), while
+Qwen-8B depends more on read recall (β = 1.61)
+A.9
+Cross-Benchmark and Cross-Language Transfer Analysis
+A.9.1
+Benchmark Transfer
+Table 25 compares prediction accuracy when training on one benchmark and testing on
+another.
+Table 25: Cross-Benchmark Transfer: Training on SWE-bench, Testing on PolyBench
+Agent
+Same-Bench MAE
+Cross-Bench MAE
+Degradation
+SWE-Agent
+1.48%
+3.82%
++2.34%
+OpenHands
+1.98%
+4.21%
++2.23%
+LiveSWEAgent
+2.06%
+3.95%
++1.89%
+The 1.9–2.3% degradation when transferring from SWE-bench (Python-only) to PolyBench
+(multilingual) indicates that while trajectory features capture fundamental patterns, some
+benchmark-specific adaptation improves accuracy.
+A.9.2
+Language Transfer Analysis
+Table 26 shows prediction accuracy across different train/test language splits.
+Table 26: Language Transfer Matrix: MAE (%) for Different Train/Test Splits
+Train →Test
+Python
+Java
+TypeScript
+JavaScript
+Python
+1.69%
+5.42%
+6.18%
+5.87%
+Java
+4.93%
+2.14%
+4.51%
+4.78%
+TypeScript
+5.67%
+4.23%
+1.92%
+3.45%
+JavaScript
+5.21%
+4.89%
+3.12%
+1.85%
+Key Findings:
+• In-language prediction is best: Diagonal entries (1.7–2.1%) substantially outper-
+form off-diagonal (3.1–6.2%)
+• TypeScript/JavaScript transfer well: Due to syntactic similarity (3.1–3.5% MAE)
+• Python most isolated: Python →TypeScript shows largest gap (6.2%), reflecting
+different programming paradigms
+• Java intermediate: Transfers moderately well to TypeScript (4.5%) due to shared
+static typing
+A.9.3
+Feature Importance by Language
+Table 27 shows which features are most predictive for each programming language.
+Java’s reliance on search recall reflects the importance of navigating complex package
+structures, while TypeScript’s dependence on read recall suggests type annotation compre-
+hension is critical.
+22
+Preprint. Under review.
+Table 27: Top Feature by Language (Highest |β|)
+Language
+Top Feature
+β
+Python
+edit recall
++1.87
+Java
+search recall
++1.45
+TypeScript
+read recall
++1.23
+JavaScript
+edit recall
++1.56
+Table 28: Complete Dataset Statistics
+Metric
+SWE-bench
+PolyBench
+Total instances
+500
+382
+Languages
+1 (Python)
+4 (Py/Java/TS/JS)
+Unique repositories
+12
+20
+Avg files per patch
+1.4
+1.6
+Avg functions per patch
+2.1
+2.4
+Avg lines changed
+42
+38
+Models evaluated
+7
+7
+Agents evaluated
+3
+3
+Total trajectories
+9,500
+7,258
+A.10
+Dataset Statistics
+A.11
+Qualitative Case Studies
+To illustrate how our framework diagnoses agent failures, we present three concrete case
+studies from GPT-5 on SWE-bench Verified. These examples demonstrate that different
+failure modes are distinguishable through trajectory metrics.
+A.11.1
+Case 1: Edit Localization Failure
+Instance: django django-11400
+Metrics:
+• Search: Precision 0.38, Recall 1.00 (found all 3 golden files)
+• Read: Precision 0.04, Recall 1.00 (read all 4 golden functions)
+• Edit: Precision 1.00, Recall 0.33 (edited only 2 of 4 needed functions)
+Analysis: The agent successfully located and read all relevant code but failed at edit
+targeting. It found the files filters.py,
+init .py, and reverse related.py, read all four
+golden functions, but only edited filters.py:choices and filters.py:has output, missing
+the get choices functions in the fields modules.
+Diagnosis: This is an edit localization failure—the agent understood the problem context but
+failed to identify all locations requiring modification. Low edit recall (<0.5) with high read
+recall (>0.9) is the signature pattern for this failure mode.
+A.11.2
+Case 2: Over-Exploration Success
+Instance: django django-10880
+Metrics:
+• Search: Precision 0.17, Recall 1.00 (viewed 6 files for 1 golden file)
+• Read: Precision 0.01, Recall 1.00 (viewed 90 functions for 1 golden function)
+• Edit: Precision 0.50, Recall 1.00 (task resolved)
+23
+Preprint. Under review.
+Analysis: The agent successfully resolved the task despite extremely low precision—it
+explored 6× more files and 90× more functions than necessary. The single golden file was
+django/db/models/aggregates.py.
+Diagnosis: This exemplifies the universal over-exploration pattern we observe. Success does
+not require efficiency; agents can compensate for low precision with thorough exploration.
+However, this comes at significant cost (token usage, latency). Our framework quantifies
+this waste: 0.01 read precision means 99% of function reads were unnecessary.
+A.11.3
+Case 3: Read Comprehension Failure
+Instance: django django-10554
+Metrics:
+• Search: Precision 0.33, Recall 1.00 (found all golden files)
+• Read: Precision 0.00, Recall 0.50 (read only 1 of 2 golden functions)
+• Edit: Precision 0.00, Recall 0.00 (no edits attempted)
+Analysis: The agent found the relevant files (compiler.py, query.py) and read the func-
+tion get order by, but missed clear select fields. Without understanding the complete
+context, it made no edit attempts.
+Diagnosis: This is a read comprehension failure—the agent found the right files but didn’t
+examine all necessary functions. Low read recall (<0.8) with high search recall indicates the
+agent needs better context selection within files.
+A.11.4
+Case 4: Cross-Model Comparison
+Instance: django django-11400 (same as Case 1)
+Model Comparison:
+Model
+Search R
+Read R
+Edit R
+Resolved
+GPT-5
+1.00
+1.00
+0.33
+X
+Qwen-32B
+0.00
+0.00
+0.00
+X
+Analysis: On the same instance, GPT-5 and Qwen-32B fail for completely different reasons.
+GPT-5 found all relevant code but edited incompletely (edit localization failure). Qwen-32B
+failed at the earliest stage—it never found the relevant files (search failure).
+Diagnosis: Different models require different interventions. GPT-5 would benefit from edit
+targeting guidance, while Qwen-32B needs improved file discovery. This model-specific
+diagnosis is invisible to Pass@k, which shows both as “failed.”
+A.12
+Assumptions and Limitations
+Reference Patch Assumption.
+We assume the reference patch represents the canonical
+solution. Our convergence analysis (93.3% exact function-level match, 100% partial overlap)
+covers 334 instances solved by multiple models. A key question is whether harder, unsolved
+instances exhibit greater solution diversity. We cannot directly measure this since unsolved
+instances lack successful agent patches to compare. However, SWE-bench instances were
+designed to have well-defined solutions verified by test suites, suggesting canonical fix
+locations exist even for hard instances. Future work could incorporate alternative reference
+patches where available in the dataset, enabling multi-reference evaluation that computes
+recall against the union of valid fix locations.
+Function Extraction.
+Function extraction uses tree-sitter parsing with regex fallback for
+robustness. While tree-sitter achieves high accuracy on well-formed code, the regex fallback
+may miss complex constructs such as nested functions, decorators, or metaprogramming
+24
+Preprint. Under review.
+patterns. The hybrid approach trades some accuracy for broad language support and
+handling of partial code snippets in trajectory observations.
+Intervention Study Design.
+Our intervention study has several design limitations: (1)
+Golden context oracle: Feedback requires knowing the reference patch, unavailable at
+deployment—practical systems would require learned predictors or retrieval-based approx-
+imations; (2) Coarse feedback: Our binary signal is intentionally minimal—richer feedback
+could provide stronger guidance; (3) Limited model coverage: We evaluated two models
+(GPT-5, Qwen3-480B) due to computational constraints. Despite these limitations, the study
+demonstrates proof of concept that trajectory diagnostics identify actionable bottlenecks.
+Benchmark Scope.
+Our evaluation focuses on SWE-bench and PolyBench, emphasiz-
+ing bug fixes in well-maintained open-source repositories. Generalization to other task
+types (security vulnerabilities, performance optimization) or codebases (proprietary, poorly
+documented) requires further validation.
+A.13
+Reproducibility
+All trajectory analysis code, feature extraction pipelines, and evaluation scripts are available
+in the supplementary materials. Key parameters:
+• Train/test split: 60/40 for instance and repo splits; 50/50 for language split
+• Classifier: Logistic regression with L2 regularization (C = 1.0)
+• Metrics: Mean Absolute Error (MAE) and Spearman’s ρ for ranking correlation
+• Random seed: Fixed at 42 for reproducibility
+25

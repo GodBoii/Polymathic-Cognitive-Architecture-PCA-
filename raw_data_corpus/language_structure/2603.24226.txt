@@ -1,0 +1,1103 @@
+UniScale: Synergistic Entire Space Data and Model Scaling for
+Search Ranking
+Liren Yu∗
+Taobao & Tmall Group of Alibaba
+Hangzhou, China
+yuliren.ylr@taobao.com
+Caiyuan Li∗
+Taobao & Tmall Group of Alibaba
+Hangzhou, China
+licaiyuan.lcy@taobao.com
+Feiyi Dong∗
+Taobao & Tmall Group of Alibaba
+Hangzhou, China
+dongfeiyi.dfy@taobao.com
+Tao Zhang†
+Taobao & Tmall Group of Alibaba
+Beijing, China
+quen.zt@alibaba-inc.com
+Zhixuan Zhang
+Taobao & Tmall Group of Alibaba
+Hangzhou, China
+zhibing.zzx@taobao.com
+Dan Ou
+Taobao & Tmall Group of Alibaba
+Hangzhou, China
+oudan.od@taobao.com
+Haihong Tang
+Taobao & Tmall Group of Alibaba
+Hangzhou, China
+piaoxue@taobao.com
+Bo Zheng
+Taobao & Tmall Group of Alibaba
+Beijing, China
+bozheng@alibaba-inc.com
+Abstract
+Recent advances in Large Language Models (LLMs) have inspired
+a surge of scaling law research in industrial search, advertising,
+and recommendation systems. However, existing approaches fo-
+cus mainly on architectural improvements, overlooking the critical
+synergy between data and architecture design. We observe that
+scaling model parameters alone exhibits diminishing returns, i.e.,
+the marginal gain in performance steadily declines as model size in-
+creases, and that the performance degradation caused by complex
+heterogeneous data distributions is often irrecoverable through
+model design alone. In this paper, we propose UniScale to address
+these limitation, a novel co-design framework that jointly optimizes
+data and architecture to unlock the full potential of model scaling,
+which includes two core parts: (1) ES3 (Entire-Space Sample Sys-
+tem), a high-quality data scaling system that expands the training
+signal beyond conventional sampling strategies from both intra-
+domain request contexts with global supervised signal constructed
+by hierarchical label attribution and cross-domain samples aligning
+with the essence of user decision under similar content exposure
+environment in search domain; and (2) HHSFT (Heterogeneous
+Hierarchical Sample Fusion Transformer), a novel architecture de-
+signed to effectively model the complex heterogeneous distribution
+of scaled data and to harness the entire space user behavior data
+with Heterogeneous Hierarchical Feature Interaction and Entire
+Space User Interest Fusion, thereby surpassing the performance
+∗These authors contributed equally to this work.
+†Corresponding author.
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+Conference acronym ’XX, Woodstock, NY
+© 2018 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-1-4503-XXXX-X/2018/06
+https://doi.org/XXXXXXX.XXXXXXX
+ceiling of structure-only model tuning. Extensive experiments on
+large-scale industrial datasets demonstrate that UniScale achieves
+significant improvements through the synergistic co-design of data
+and architecture and exhibits clear scaling trends. Most impor-
+tantly, online A/B tests on a real world E-commerce search platform
+confirm that UniScale consistently outperforms strong production
+baselines, delivering substantial gains in key business metrics.
+CCS Concepts
+• Information systems →Recommender systems.
+Keywords
+Industrial Search System, Entire Space Modeling, Scaling Laws,
+Feature Interaction
+ACM Reference Format:
+Liren Yu, Caiyuan Li, Feiyi Dong, Tao Zhang, Zhixuan Zhang, Dan Ou,
+Haihong Tang, and Bo Zheng. 2018. UniScale: Synergistic Entire Space
+Data and Model Scaling for Search Ranking. In Proceedings of Make sure to
+enter the correct conference title from your rights confirmation email (Con-
+ference acronym ’XX). ACM, New York, NY, USA, 9 pages. https://doi.org/
+XXXXXXX.XXXXXXX
+1
+Introduction
+Recommendation and search systems serve as indispensable chan-
+nels for users to access information in modern internet ecosystems
+such as e-commerce, streaming media, and social networks [2, 5, 13–
+15, 19, 20, 28, 31–33, 35]. Due to the inherent complexity of user be-
+haviors and the diversity of system inventory, precisely estimating
+user preferences remains a significant challenge in large-scale indus-
+trial information systems. The state-of-the-art approaches in both
+recommendation and search rely heavily on deep learning-based
+ranking models, which leverage sophisticated neural network ar-
+chitectures to flexibly capture patterns from historical feedback and
+make accurate predictions [4, 5, 9, 27, 35]. Recently, inspired by the
+remarkable success of Large Language Models (LLMs), whose capa-
+bilities scale dramatically with increasing model size [1, 10, 12, 26],
+arXiv:2603.24226v1  [cs.IR]  25 Mar 2026
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Liren Yu, Caiyuan Li, Feiyi Dong, Tao Zhang, Zhixuan Zhang, Dan Ou, Haihong Tang, and Bo Zheng
+the research community has begun exploring model scaling in rec-
+ommendation and search systems through architectural upgrades
+and increased parameter budgets [32, 33, 37]. Nevertheless, as model
+capacity grows, the returns from pure parameter scaling often ex-
+hibit diminishing marginal gains: simply stacking more parameters
+fails to yield further improvements. We hypothesize that this bot-
+tleneck is due to the limited information capacity of the training
+data. Under a fixed data volume, even highly expressive models
+cannot fully realize their potential.
+In this paper, we propose UniScale, a co-design framework that
+jointly optimizes data and architecture to unlock the full potential
+of model scaling. Specifically, UniScale includes two core parts: (1)
+ES3 (Entire-Space Sample System), a high-quality data scaling
+system that expands the training signal beyond conventional sam-
+pling strategies; and (2) HHSFT (Heterogeneous Hierarchical
+Sample Fusion Transformer), a novel architecture designed to
+effectively model the complex heterogeneous distribution of scaled
+data, thereby surpassing the performance ceiling of structure-only
+model tuning.
+Existing industrial practices typically expand training samples
+via heuristic augmentation [29] or negative sampling strategies [11,
+18, 30] to mitigate negative transfer. However, the performance
+degradation caused by complex heterogeneous data distributions is
+often irrecoverable through model design alone. In search systems,
+ranking models are traditionally trained on exposed samples, i.e.,
+items shown to users, and aim to predict the probability of positive
+user actions (e.g., clicks or purchases). Since exposed items must
+be relevant to the user’s query intent, the ranking process essen-
+tially becomes a fine-grained selection among similar candidates.
+This paradigm imposes stringent quality requirements on any addi-
+tional data introduced during scaling: only high-fidelity samples
+can meaningfully enhance model performance.
+To this end, ES3 scales the data by constructing a high-quality,
+entire-space training set through two key mechanisms: (1) Intra-
+domain Sample and Label Expansion: In closed-loop data collec-
+tion, traditional exposed sampling amplifies selection bias over time,
+leading to suboptimal models. ES3 incorporates unexposed items
+from the same request contexts as supplementary data, minimizing
+negative transfer while alleviating selection bias. Meanwhile, to
+address the exposure bias problem where only exposed items re-
+ceive user feedback, ES3 introduces a Hierarchical Label Attribution
+mechanism that propagates user feedback signals from the entire
+interaction space to assign supervision labels to both exposed and
+unexposed samples. Recognizing that user interest accumulates
+across sessions, we further treat delayed cross-domain conversions
+(e.g., a purchase in recommendations after a search session) as
+complementary labels. (2) Cross-domain Sample Searchifica-
+tion: Non-search interactions (e.g., recommendation clicks) encode
+valuable cross-domain interest signals but lack query fields and
+exhibit feature schema heterogeneity. ES3 transforms arbitrary user-
+item interactions into search-aligned training samples through two
+core components: Negative Sample Generation Module and Feature
+Alignment Module, preserving semantic coherence between the
+pseudo-search request and synthetic query. All transformed sam-
+ples undergo the search feature logging infrastructure, yielding
+instances with feature schemas fully aligned to original search
+samples.
+Through high-quality data scaling with mitigated negative trans-
+fer effects from the aforementioned ES3, the resulting dataset ex-
+hibits significantly richer and more complex distributions than
+conventional sample setting, demanding a more powerful archi-
+tecture for effective model learning. Consequently, we propose
+HHSFT, which comprises two modules: (1) Heterogeneous Hier-
+archical Feature Interaction: To handle semantic heterogeneity
+and distributional complexity, HHSFT first partitions features into
+semantic blocks and tokenizes them. Each block is projected via
+independent embedding matrices, then fused through multi-head
+self-attention mechanism to capture global interactions. Subsequent
+block-specific feed-forward networks enable nonlinear refinement.
+The aggregation result is then projected through composite pro-
+jection mechanism to model high-level interactions. (2) Entire
+Space User Interest Fusion: To further alleviate negative transfer
+caused by complex sample distributions, HHSFT employs a Domain-
+Routed Expert Fusion layer to decouple modeling cross-domain
+shared knowledge and domain-specific knowledge. Furthermore,
+a Domain-Aware Personalized Gated Attention selectively injects
+cross-domain user interests into the search ranking modeling.
+Finally, to deploy UniScale in large-scale production search sys-
+tems under strict latency and computational constraints, we imple-
+ment a series of optimizations (e.g., feature pre-hashing, attention
+kernel operation fusion, RDMA communication, fp16 quantization.),
+which enable real-time deployment while preserving model fidelity.
+In summary, this paper makes the following contributions:
+• We identify fundamental limitations of conventional sampling
+strategies in industrial search systems and propose UniScale, a
+co-design framework that jointly optimizes data and architecture
+to break through the performance bottleneck caused by limited
+information and biased model learning.
+• We propose ES3, an Entire-Space Sample System to enhance
+and expand data samples from both intra-domain and cross-
+domain user feedback with mitigated negative transfer effects,
+and HHSFT, a Heterogeneous Hierarchical Sample Fusion Trans-
+former architecture including heterogeneous feature tokeniza-
+tion, hierarchical feature interaction and entire space user interest
+fusion, to efficiently model datasets with complex distributions.
+• We conduct extensive offline and online experiments in billion-
+scaled industrial dataset and investigate significant improve-
+ments of our proposed UniScale, which verifies the importance of
+co-design of data and architecture in model scaling up. Currently,
+UniScale has been successfully deployed in Taobao Search Rank-
+ing System, achieving 1.70% and 2.04% increases in user purchase
+and Gross Merchandise Value (GMV).
+2
+Related Work
+2.1
+Scaling up Industrial Ranking models
+The evolution of recommendation systems is increasingly governed
+by scaling laws—model performance improves predictably with
+parameters, data volume, and compute. Recent industrial frame-
+works like OneRec [6] and OneSearch [3] demonstrate large-scale
+pre-training power in recommendation and search. To enhance
+efficiency, HSTU [32] improves sequence-length scalability via spa-
+tially efficient transformer. Wukong [33] explores the scaling laws
+for explicit high-order feature interaction in recommendations.
+UniScale: Synergistic Entire Space Data and Model Scaling for Search Ranking
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+RankMixer [37] enables scalable high-order feature interactions
+through token-mixing paradigms. OneTrans [34] provides unified
+Transformer backbones for sequential and non-sequential inputs.
+However, the returns from pure parameter scaling often exhibit
+diminishing marginal gains. We attribute this bottleneck to limited
+information capacity inherent in the training data. With data vol-
+ume held constant, the full potential of highly expressive models
+remains unrealized. In this paper, we propose a co-design frame-
+work that jointly optimizes data and architecture to unlock the full
+potential of model scaling.
+2.2
+Entire Space Sample Modeling
+Data sparsity and sample selection bias necessitate holistic mod-
+eling beyond observed exposures. ESMM [17] pioneers implicit
+entire-space modeling to mitigate bias, a paradigm subsequently ex-
+tended to multi-domain settings (STAR [23], PEPNet [2]) to leverage
+auxiliary data. However, direct fusion of heterogeneous domains
+often induces negative transfer due to distribution shifts. While
+Mixture-of-Experts (MoE) architectures (MMoE [16], PLE [25]) mit-
+igate task conflicts via soft gating, they remain vulnerable to the
+seesaw phenomenon as gradients from all domains propagate si-
+multaneously. Conversely, sparse MoEs with hard routing (Expert
+Choice [36], Switch Transformer [7]) demonstrate scalability in
+LLMs but lack adaptation for user-level interest fusion. Differing
+from existing methods, we first scale the data by constructing a
+high-quality, entire-space training set and then construct a hierar-
+chical multi-expert network to fully fuse entire space user interest.
+3
+Method
+3.1
+Problem Formulation
+Given a user 𝑢∈U, an item 𝑣∈I, contextual information
+𝑐∈C (e.g., query, time, device) and a domain identifier 𝑑∈D
+(e.g., search, recommendation, ad campaign), and the user feed-
+back label 𝑦∈{0, 1}, the user feedback prediction task aims to
+estimate the probability 𝑝(𝑦= 1|𝑢, 𝑣,𝑐,𝑑) that user 𝑢will interact
+with item 𝑣under context 𝑐in domain 𝑑. Formally, we define the
+input feature vector as x = [𝑢;𝑣;𝑐;𝑑] ∈R𝑑𝑋. Given the training
+set S = ∪𝑑∈DS𝑑= ∪𝑑∈D{(x,𝑦)}𝑑. The goal is to learn a model to
+predict the probability that ˆ𝑦≈𝑝(𝑦= 1|x).
+3.2
+Overall Architecture
+As illustrated in Figure 1, user behaviors in different domains ex-
+plicitly or implicitly express their interest. We propose UniScale
+to jointly optimize data and architecture and to unlock the full
+potential of model scaling from entire space user feedback. UniS-
+cale consists of two major parts: a) Entire Space Sample System
+(ES3) for high quality data scaling, which including intra-domain
+Sample Expansion for mitigating selection bias, cross-domain label
+attribution for addressing exposure bias, and cross-domain sample
+searchification to bridge modeling blind spots. b) Heterogeneous
+Hierarchical Sample Fusion Transformer (HHSFT), which combines
+heterogeneous hierarchical feature interaction module and entire
+space user interest fusion module, to fully incorporate user inter-
+ests expressed by cross-domain feedback into the search ranking
+modeling objective.
+Figure 1: Overall Architecture of Proposed UniScale, which
+combines Entire Space Sample System (ES3) for high quality
+data scaling and Heterogeneous Hierarchical Sample Fusion
+Transformer (HHSFT) for fully incorporating user interests
+expressed by entire space user behavior.
+3.3
+Entire-Space Sample System (ES3)
+Ranking models in search systems are conventionally trained on
+exposed samples with in-domain labels, which induces selection
+bias (unexposed candidates lack supervision), label sparsity (cross-
+domain feedback is discarded), and cross-domain blind spots (non-
+search interactions are entirely excluded). These bottlenecks be-
+come increasingly pronounced as model capacity scales up. To
+break this ceiling, we propose the Entire-Space Sample Sys-
+tem (ES3), a unified data construction framework that integrates
+intra-domain unexposed candidates and cross-domain user behav-
+iors into a search-aligned training space (Figure 2). ES3 comprises
+two modules: (i) Intra-domain Sample and Label Expansion (Sec-
+tion 3.3.1): expands the candidate space with unexposed samples
+and enriches supervision via hierarchical cross-domain label at-
+tribution; (ii) Cross-domain Sample Searchification (Section 3.3.2):
+transforms heterogeneous non-search interactions into schema-
+aligned pseudo-search samples.
+3.3.1
+Intra-Domain Sample and Label Expansion. Traditional rank-
+ing models trained exclusively on exposed samples suffer from
+two intertwined limitations. First, a critical training-inference mis-
+match: exposed-but-unclicked items serve as hard negative exam-
+ples within the training space, while the absence of easy negatives
+in training leads to prediction inaccuracy on the full candidate set.
+Second, label sparsity and exposure bias: click labels are bound to
+real-time exposure logs, while conversion labels adopt last-click at-
+tribution, which assigns conversion credit solely to the user’s final
+search click on the item. This paradigm fragments cross-scenario
+signals, yielding sparse and biased interest representations.
+Intra-Domain Unexposed Samples Expansion. To bridge the
+training-inference gap, we incorporate unexposed samples via uni-
+form random sampling from the full candidate list of each search
+request. This expansion aligns the training distribution with the
+inference space, significantly enhancing the model’s discriminative
+capability across the entire candidate set and mitigating selection
+bias.
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Liren Yu, Caiyuan Li, Feiyi Dong, Tao Zhang, Zhixuan Zhang, Dan Ou, Haihong Tang, and Bo Zheng
+Figure 2: Overview of the Entire-Space Sample System (ES3).
+ES3 constructs a unified, bias-mitigated training set by syner-
+gistically integrating samples across the entire user behavior
+space. The framework comprises two core modules: (i) Intra-
+domain Sample and Label Expansion; (ii) Cross-domain Sam-
+ple Searchification.
+However, directly integrating unexposed samples as pure neg-
+atives is problematic. These items inherently possess negative in-
+domain labels, which would exacerbate popularity bias. Meanwhile,
+even for originally exposed samples, the in-domain labels only cap-
+ture fragmented search-session feedback. A user may be exposed to
+an item in search without immediate interaction, yet later convert
+via off-search pathways (e.g., recommendation feed or item detail
+page). Such valuable positive signals remain unutilized under con-
+ventional attribution. To address both issues simultaneously, we
+introduce a hierarchical label attribution mechanism that enriches
+supervision for the entire intra-domain sample space.
+Hierarchical Label Attribution. We propose a hierarchical attri-
+bution paradigm to systematically recover cross-scenario behav-
+ioral signals with unified priority logic:
+• Cross-domain clicks: Attribute in descending priority to (1) search-
+exposed samples, (2) unexposed samples;
+• Cross-domain conversions: Attribute in descending priority to
+(1) search click samples, (2) exposed-but-unclicked samples, (3)
+unexposed samples.
+This paradigm bidirectionally enriches the intra-domain sample
+space: (a) unexposed samples gain positive supervision from cross-
+domain interactions, transforming them from uninformative pure
+negatives into supervised training instances; (b) originally exposed
+search samples receive complementary labels from delayed cross-
+domain conversions. By transforming sparse in-domain labels into
+dense multi-path supervision, ES3 jointly mitigates selection bias,
+label sparsity, and exposure bias within a unified intra-domain
+expansion framework.
+3.3.2
+Cross-domain Sample Searchification. The intra-domain ex-
+pansion in Section 3.3.1 incorporates cross-scenario positive signals
+explicitly associated with search behaviors into search samples.
+However, a substantial volume of user interactions within Taobao
+exhibit no explicit search association yet contain valuable cross-
+scenario interest signals. Direct adoption confronts two critical
+challenges: (1) Difference of sample distribution compared to search
+scenario; (2) Feature absence such as search query fields and signifi-
+cant heterogeneity in feature schemas. To address these challenges,
+we design and implement the Sample Searchification Engine, which
+transforms arbitrary user-item interactions into training samples
+that conform to the search sample feature schema. This engine
+comprises two core components, as detailed below.
+Negative Sample Generation Module. Non-search scenarios ex-
+hibit pronounced semantic heterogeneity among items within the
+same request. Directly converting exposed-but-unclicked samples
+into negatives would introduce query-irrelevant noise (e.g., a single
+feed request containing both apparel and electronics items). To
+preserve semantic coherence, we propose a similarity-aware nega-
+tive sampling approach: for each non-search click sample, select
+unclicked items semantically similar to the clicked item from the
+same-request exposure sequence as synthetic negative samples.
+This mechanism strictly maintains semantic consistency between
+samples within the pseudo-search request and the synthetic query,
+accurately emulating the negative sample distribution inherent to
+search scenarios.
+Feature Alignment Module. To resolve the missing query issue
+in non-search samples, we design a hierarchical strategy for gener-
+ating semantically aligned synthetic queries: (i) Historical query
+reuse: Prioritize the user’s historical search queries for the item
+(if available); (ii) Co-occurrence statistics: In the absence of his-
+torical queries, select high-frequency queries based on item-query
+co-occurrence statistics within the search domain; (iii) Semantic
+retrieval: When co-occurrence data is unavailable, retrieve the se-
+mantically closest query via approximate nearest neighbor (ANN)
+retrieval on embeddings of the item title and the full query corpus.
+Finally, non-search click samples and their synthetic negative coun-
+terparts are processed via the search feature logging infrastructure,
+yielding training instances with their feature schemas fully aligned
+with original search samples.
+Combined with the hierarchical attribution mechanism in Sec-
+tion 3.3.1, the resulting training set comprehensively covers cross-
+scenario user behaviors. This unified data foundation empowers
+downstream ranking models with robust cross-scenario interest
+representation capabilities.
+To handle enlarged sample space of ES3, we reformulate data in
+a list-wise format, where each data row contains one request and
+its candidate items, which reduces redundant user/query feature
+storage by sharing them at the request level (saving ∼50% storage
+space and IO operations) and computes user/query features once
+per request before interacting with all items, improving model
+training throughput.
+3.4
+Heterogeneous Hierarchical Sample Fusion
+Transformer (HHSFT)
+To fully exploit the potential of model scaling and data scaling in
+ranking systems, we propose HHSFT, which achieves high-order
+feature interactions through a hierarchical Transformer structure
+while balancing both model parameter scaling and global sample
+scaling. The overall framework consists of two stages: Heteroge-
+neous Hierarchical Feature Interaction and Entire Space User Interest
+Fusion (see an overview in Figure 3).
+3.4.1
+Heterogeneous Hierarchical Feature Interaction (HHFI). To
+adapt heterogeneous features to the Transformer architecture, we
+UniScale: Synergistic Entire Space Data and Model Scaling for Search Ranking
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Figure 3: Overview of Heterogeneous Hierarchical Sample Fusion Transformer (HHSFT) architecture. The HHSFT is designed to
+exploit model and data scaling in ranking systems through two primary stages. First, the Heterogeneous Hierarchical Feature
+Interaction (HHFI) stage employs heterogeneous feature attention layers with token-specific projection matrices and FFNs
+to preserve domain-unique distributions, followed by a global feature attention layer to capture high-order cross-domain
+interactions. Second, the Entire Space User Interest Fusion (ESUIF) stage comprises: Domain-Routed Expert Fusion (DREF)
+utilizes sample routing constraints to disentangle shared knowledge from domain-specific patterns; and Domain-Aware
+Personalized Gated Attention (DAPGA) adaptively modulates cross-domain information transfer via personalized gating.
+first convert input features into a unified token sequence. Specifi-
+cally, we partition input features into semantically coherent blocks
+based on their inherent meanings, such as user attributes, item at-
+tributes, queries, and user behavior. Each feature block is mapped to
+the same dimension through MLP, forming its corresponding token
+representation. This design ensures that heterogeneous features
+with diverse types and distributions can be processed uniformly by
+the Transformer. After tokenization, preserving the unique distri-
+butional characteristics of each feature domain while maintaining
+interaction efficiency is critical for model performance. In standard
+Transformer encoders, the projection matrices W𝑄, W𝐾, W𝑉are
+shared across all tokens. However, in e-commerce search domains,
+heterogeneous input features (e.g., categorical user IDs, continuous
+item prices, sequential behavioral features) originate from signifi-
+cantly different semantic spaces. Using shared projection matrices
+fails to preserve the uniqueness of heterogeneous features, often
+leading to semantic confusion and suboptimal interaction modeling.
+To address this issue, this paper proposes a heterogeneous hierar-
+chical feature interaction module, which consists of the following
+two parts:
+Heterogeneous Feature Attention (HFA): The heterogeneous
+feature attention layer is designed to capture the interactions be-
+tween heterogeneous tokens. It configures token-specific projection
+matrices, as well as a token-specific feedforward network. The spe-
+cific implementation is as follows: 1) Token-Specific QKV Projection:
+In layer 𝑙, for the 𝑖-th token, its representation ℎ(𝑙)
+𝑖
+∈R𝑑𝐻is pro-
+jected into token-specific query, key, and value vectors via dedicated
+projection matrices:
+𝑞(𝑙)
+𝑖
+= ℎ(𝑙)
+𝑖W𝑄
+𝑖,
+𝑘(𝑙)
+𝑖
+= ℎ(𝑙)
+𝑖W𝐾
+𝑖,
+𝑣(𝑙)
+𝑖
+= ℎ(𝑙)
+𝑖W𝑉
+𝑖
+(1)
+where W𝑄
+𝑖, W𝐾
+𝑖, W𝑉
+𝑖∈R𝑑𝐻×𝑑𝐻are token-specific weights. This
+design enables the attention mechanism to capture the unique
+semantic characteristics of each feature field. 2) Multi-Head Self-
+Attention: Standard MHSA is performed on the projected vectors
+to model cross-feature interactions. The representation of the 𝑖-
+th token is updated as 𝑎𝑙
+𝑖. 3) Token-Specific FFN: After attention
+calculation, each token is fed into a block-specific FFN to enhance
+non-linear transformations: ℎ(𝑙+1)
+𝑖
+= FFN𝑖
+ 𝑎𝑙
+𝑖
+. Let 𝐿𝐻denote the
+total number of layers, and let ℎ𝐿𝐻
+𝑖
+denote the final output of the
+𝑖-th token from the heterogeneous feature attention layer.
+Global Feature Attention (GFA): Building upon the heteroge-
+neous attention layer, we utilize a composite projection mechanism
+to model high-level interactions between all tokens. The global
+feature attention layer obtains 𝑚sets of ˜𝑞𝑗, ˜𝑘𝑗, ˜𝑣𝑗vectors with di-
+mension 𝑑𝐺through composite projections:
+˜𝑘𝑗= concat([ℎ𝐿𝐻
+1 , . . . ,ℎ𝐿𝐻
+𝑛]) ˜W𝐾
+𝑗,
+(2)
+where ˜𝑊𝐾
+𝑗
+∈R(𝑛·𝑑𝐻)×𝑑𝐺is the composite projection weight for the
+𝑗-th token in the global feature attention layer. The same projection
+strategy is applied to ˜𝑞𝑗and ˜𝑣𝑗, ensuring symmetry in modeling
+interactions. Through multi-head self-attention fusion with compos-
+ite projections, this layer learns comprehensive global interactions.
+Subsequently, all tokens are concatenated and passed through a
+Global FFN to produce an updated representation. By stacking the
+global feature attention modules up to 𝐿𝐺layers, we obtain the final
+representation Z ∈R𝑑𝑍, which is utilized for downstream tasks.
+3.4.2
+Entire Space User Interest Fusion (ESUIF). As introduced in
+Section 3.3.2, we incorporate user behavior samples from multiple
+domains to expand the training data scale. However, naively mixing
+heterogeneous domain data often leads to severe negative transfer
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Liren Yu, Caiyuan Li, Feiyi Dong, Tao Zhang, Zhixuan Zhang, Dan Ou, Haihong Tang, and Bo Zheng
+due to distribution inconsistencies. To leverage the gains from
+cross-domain data while suppressing noise injection, we propose
+the Entire Space User Interest Fusion Module. This module consists
+of two complementary components that jointly learn unified user
+interest representations across the entire domain space, which are
+described in detail below.
+Domain-Routed Expert Fusion (DREF): Under the multi-domain
+setting, user interests encompass both transferable cross-domain
+commonalities and domain-specific intents (along with feedback
+noise) that must be explicitly modeled and disentangled from shared
+knowledge. Mixture-of-Experts (MoE) has proven effective in multi-
+task learning [16, 25]. Unlike traditional MoE where all experts
+are updated by all samples, we introduce explicit sample routing
+constraints tailored for multi-domain learning: experts are parti-
+tioned into domain-shared expert 𝑓𝑠and domain-specific experts
+𝑓𝑑to explicitly disentangle cross-domain common knowledge from
+domain-specific patterns. Specifically, 𝑓𝑠forwards all samples 𝑋
+to learn stable cross-domain patterns, while each 𝑓𝑑exclusively
+forwards and receives updates only from samples in corresponding
+domain𝑋𝑑, thereby isolating cross-domain noise at the optimization
+level and mitigating negative transfer. Formally, for each sample
+representation generated from HHFI 𝑧∈Z, the shared expert out-
+put is computed as 𝑓𝑠(𝑧) and the domain-specific expert output is
+computed as 𝑓𝑑(𝑧). Finally, a gating network performs sample-level
+adaptive fusion between shared and specific representations, allow-
+ing the model to dynamically balance between shared transfer and
+domain specialization for each individual sample:
+[𝛼𝑠, 𝛼𝑑] = softmax(𝑔moe(𝑧)),
+(3)
+𝑒= 𝛼𝑠· 𝑓𝑠(𝑧) + 𝛼𝑑· 𝑓𝑑(𝑧),
+(4)
+where 𝑔𝑚𝑜𝑒denotes sample-level gating network to adaptively fuse
+shared and specific domain branches.
+Domain-Aware Personalized Gated Attention (DAPGA): Al-
+though the DREF Module structurally disentangles shared and
+domain-specific knowledge, our target application, i.e., Taobao
+Search, operates within a single domain. We aim to receive knowl-
+edge from auxiliary domains into the target-domain representation
+to complete cross-domain information transfer in a target-centric
+manner. To this end, we first propose Domain-Aware Attention, a
+cross-domain representation fusion mechanism with forward-visible
+across all domains and backward-isolated within each domain prop-
+erties (see an illustration in Figure 3). Unlike the domain-specific
+experts in Section 3.4.2 that only receive in-domain samples, in this
+module, each sample representation 𝑒forward-propagates through
+all domain experts to obtain multi-perspective feature representa-
+tions 𝑂. These are then fused using scaled dot-product attention
+(SDPA), where sample representation generated from the target
+domain expert 𝑜𝑐𝑢𝑟serves as the query vector to guide the selective
+transfer of cross-domain knowledge, and sample representations
+obtained from all domain experts are projected as keys and values
+vectors. This target-centric querying ensures that knowledge trans-
+fer is conditioned on the user’s current domain-specific mindset.
+To prevent noise gradients from cross-domain samples through at-
+tention weights during backpropagation, we apply loss masking
+on domain logits and gradient stopping on cross-domain Key/Value
+projections:
+𝑂= [𝑜𝑐𝑢𝑟, sg(𝑜1), ..., sg(𝑜𝑁)],
+(5)
+𝑞𝑐𝑢𝑟= 𝑜𝑐𝑢𝑟WQ,
+𝐾= 𝑂WK,
+𝑉= 𝑂WV,
+(6)
+where sg(·) denotes gradient stopping. The domain representation
+˜𝑜is obtained by this mechanism.
+Concurrently, A critical challenge in entire space scaling is that
+user behavior feedback exhibits significant conditional dependen-
+cies across domains. Specifically, user feedback are determined not
+only by long-term interests but also heavily modulated by current
+domain intent intensity, exposure mechanisms, and interaction
+costs. To enhance the model’s perception of users’ entire space
+mindset and model the user-domain conditions explicitly, inspired
+by gated attention mechanisms [21, 22], we introduce a Domain-
+Aware Personalized Gating Mechanism. A lightweight sigmoid
+gating network is applied after SDPA that takes user-side static fea-
+tures𝑢and domain features𝑑as inputs to generate an element-wise
+scaling vector 𝛾to enhance both personalization in cross-domain
+transfer and domain awareness:
+𝜸= 𝜙(𝑊[𝐸𝑚𝑏𝑢; 𝐸𝑚𝑏𝑑] + 𝑏)
+(7)
+where 𝜙denotes the sigmoid function, hence 𝛾∈(0, 1). Subse-
+quently, we perform element-wise multiplication between 𝛾and
+the domain representation 𝑢𝜄:
+˜o = 𝜸⊙˜o
+(8)
+3.4.3
+Loss Function. Each domain has individual output. The pre-
+dicted output of the sample x from domain 𝑑is denoted as ˆ𝑦(𝑑).
+The model is trained to minimize the binary cross-entropy loss in
+each domain:
+L(𝜃) = −
+∑︁
+𝑑∈D
+∑︁
+(x,𝑦)∈S𝑑
+
+𝑦log ˆ𝑦(𝑑)) + (1 −𝑦) log(1 −ˆ𝑦(𝑑))
+
+,
+Although the model is trained on multiple domains D, it is
+deployed solely for the search domain (𝑑= search) in production.
+This design leverages auxiliary domains for knowledge transfer
+during training while ensuring task-specific optimization for the
+target domain.
+3.5
+Training and Deployment Optimization
+Beyond the architectural novelty of HHSFT, the practical deploy-
+ment at an industrial scale necessitates a rigorous co-design of
+the underlying infrastructure to handle ultra-large-scale parameter
+volumes and stringent real-time response constraints. We perform
+full-stack optimizations, including low-level kernel fusion and ad-
+vanced communication protocols, to bridge the gap between the
+theoretical complexity of the model and the production efficiency.
+First, The hybrid nature of massive sparse features and inten-
+sive Transformer computations necessitates a training framework
+that pushes memory management and communication efficiency
+to their limits. To address these challenges, we implemented the
+following training optimizations: 1) High-Concurrency Data Reader:
+To address the I/O bottlenecks inherent in large-scale feature pro-
+cessing, we introduced an auxiliary asynchronous reader to handle
+data pre-fetching and parsing. 2) Feature Pre-hashing: To mitigate
+the excessive memory overhead caused by processing raw string-
+based features, we shifted the feature hashing process to the earliest
+UniScale: Synergistic Entire Space Data and Model Scaling for Search Ranking
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+stage of the data pipeline. 3) RDMA-enabled High-performance Clus-
+ter Communication: We leverage Remote Direct Memory Access
+(RDMA) technology to replace the traditional TCP protocol in dis-
+tributed training domains.
+Beyond training efficiency, we further optimize the inference
+efficiency to satisfy the stringent latency constraints of real-time
+recommendation systems. Our deployment-aware optimizations
+include: 1) FP16 Quantization: We utilize half-precision (FP16) in-
+ference to maximize hardware-specific throughput on GPUs. 2)
+Tile-Level Operator Push-Down: Lightweight operations (e.g., scal-
+ing, bias) are integrated directly into the embedding lookup stage.
+3) Fused Masked QKV Attention: We developed a custom fused ker-
+nel that consolidates the entire QKV attention pipeline, including
+projection, transposition, and masking, into a single operation.
+4
+Experiments
+4.1
+Experiment Settings
+4.1.1
+Datasets. To evaluate HHSFT, we conducted both offline and
+online experiments on Taobao’s e-commerce dataset, comprising
+billions of user-item interactions. We apply ES3 (Entire-Space Sam-
+ple System) to scale the training data from search-exposed samples
+only to a comprehensive entire-space dataset. As summarized in
+Table 1, all values are scaled relative to the baseline (search-exposed
+samples only). “Requests” denotes unique search requests; “Samples”
+refers to item-level samples; “Click Pos.” counts samples enriched
+with all-domain click signals. Arrows (↑) highlight the stage-specific
+contributions of ES3 components. To align our offline evaluation
+with the online deployment context, we constructed a held-out test
+set comprising only samples from the search domain. All reported
+metrics, such as AUC, are computed on this search-specific dataset,
+providing a direct measure of the model’s performance on the target
+task.
+Table 1: Impact of ES3 on Training Data Scale
+Stage
+Requests
+Samples
+Click Pos.
+Baseline (Search-exposed-only)
+1.0×
+1.0×
+1.0×
++ Unexposed Expansion
+1.0×
+3.0×↑
+1.0×
++ Hierarchical Label Attribution
+1.0×
+3.0×
+2.0×↑
++ Cross-domain Searchification
+2.0×↑
+5.0×↑
+4.0×↑
+4.1.2
+Baselines. We compare against the following widely rec-
+ognized SOTA baselines: DLRM-MLP: which is the vanilla MLP
+for feature crossing as the experiment baseline; DCNv2 [27] is
+the representative feature interaction model. AutoInt [24], Hi-
+former [8] investigate transform-like architecture for ranking
+model. Wukong [33] and Rankmixer [37] investigate the scaling
+law for recommendaton model.
+4.1.3
+Evaluation Metrics. To evaluate model performance, we use
+AUC (Area Under the Curve), GAUC (Group-AUC, user-query-
+wise) and Hitrate@5 (HR@5) which measures top-5 recommenda-
+tion accuracy as the primary performance metrics. Following indus-
+try practice, an increase of 0.05% can be regarded as a confidently
+improvement. We also report model size (Params, in millions)
+and computational complexity (TFLOPs) to evaluate efficiency-
+scalability tradeoffs. For online experiments, we use GMV as the
+business-centric metric to reflect practical impact.
+4.2
+Overall Performance
+The main results are summarized in Table 2. HHSFT outperforms all
+SOTA baselines in AUC and GAUC, aligning with our design goals.
+We observe three key findings: 1) Superiority of Transformer-
+based Architectures. Transformer-based models (AutoInt, Hi-
+Former, HHSFT) consistently outperform traditional DNN and FM-
+based approaches (DCNv2, Wukong). This confirms the efficacy
+of explicit attention mechanisms in capturing complex high-order
+feature interactions. 2) Efficacy of hierarchical feature inter-
+action. HHSFT achieves a substantial AUC improvement (+0.82%)
+and GAUC gain (+0.62%), significantly exceeding HiFormer (+0.54%,
++0.49%) and Wukong (+0.21%, +0.13%) under a comparable parame-
+ter budget (300M vs. 170M/32M). This validates that our heteroge-
+neous feature attention layer and global feature attention layer lead
+to more discriminative representations while maintaining compu-
+tational efficiency.3) Synergy Between Model Architecture and
+Sample Scaling. HHSFT+ES3 (+1.14%, +0.86%) yields an additional
++0.32% AUC gain over HHSFT, a benefit that is notably architecture-
+dependent. As shown in Section 4.3.2, the same sample expansion
+degrades standard backbones by -0.43% AUC. This contrast under-
+scores that HHSFT’s routing mechanism is essential for converting
+potential representation interference into information gain when
+leveraging heterogeneous samples.
+Table 2: Performance comparison of recommendation mod-
+els (best values in bold)
+Model
+AUC
+GAUC
+Params(M)
+TFLOPs
+DLRM-MLP (base)
+-
+-
+15
+0.42
+DCNv2
++0.08%
++0.01%
+24
+0.65
+AutoInt
++0.26%
++0.14%
+150
+1.19
+HiFormer
++0.54%
++0.49%
+170
+1.98
+Wukong
++0.21%
++0.13%
+32
+0.94
+Rankmixer
++0.38%
++0.32%
+140
+1.93
+HHSFT
++0.82%
++0.62%
+300
+1.22
+HHSFT+ ES3
++1.14%
++0.86%
+300
+1.22
+4.3
+Ablation Study
+4.3.1
+Heterogeneous Hierarchical Feature Interaction (HHFI) Mod-
+ule. To quantify the incremental contribution of each key compo-
+nent in HHFI described in 3.4.1, we conducted ablation experiments.
+Table 3 shows the AUC improvement for each individual modifi-
+cation, and the main conclusions are as follows: 1) Transformer
+backbone: Replacing DNN-MLP with a basic Transformer encoder
+already yields significant gains, confirming that self-attention out-
+performs MLP in modeling feature interactions. 2) Heterogeneous
+attention works:Token-specific QKV projections and FFNs further
+boost performance, validating that disentangling heterogeneous fea-
+ture semantics mitigates representation ambiguity. 3) Hierarchical
+feature interaction works: Adding a global feature interaction
+layer enhances high-order interactions, demonstrating the value
+of moving beyond pairwise dependencies. The combined effect of
+these components results in a total +0.82% AUC gain, confirming
+that each design choice in HHFI contributes meaningfully to its
+performance advantage.
+Table 3: Ablation on components of HHFI.
+Setting
+MLP
+Transformer
+Heterogeneous Attention
+HHFI
+AUC gain
+-
++0.17%
++0.41%
++0.80%
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+Liren Yu, Caiyuan Li, Feiyi Dong, Tao Zhang, Zhixuan Zhang, Dan Ou, Haihong Tang, and Bo Zheng
+4.3.2
+Entire Space User Interest Fusion (ESUIF) Module. To quan-
+tify the incremental contribution of each key component in ES-
+UIF Module under entire space sample setting, we conduct de-
+tailed ablation experiments. Table 4 presents the gains relative
+to the metrics introduced in section 4.1.3, with key insights as
+follows: 1) HHFI backbone with Entire-Space data: naively
+mixing cross-domain data under HHFI backbone yields significant
+metric decrease, confirming severe negative transfer phenomena.
+2) Domain-Routed Expert Fusion (DREF): Explicitly disentan-
+gling shared and domain-specific representations via hard routing
+effectively suppress cross-domain noise, yielding gains over intra-
+domain training and validating structural separation of shared and
+domain-specific patterns. 3) Domain-Aware Personalized Gated
+Attention (DAPGA): Adaptively modulates target-domain rep-
+resentations via personalized gating and attention mechanism. It
+aligns cross-domain signals to contextual intent delivering further
+metric improvements beyond DREF. The combined effect of ESUIF
+results in a total +0.32%/+0.26%/+0.44% gains in each metric over
+the HHFI training solely with intra-domain data , demonstrating
+that each design choice meaningfully contributes to the overall
+performance gain.
+Table 4: Ablation on components of ESUIF.
+Sample
+Setting
+AUC
+GAUC
+HR@5
+search
+HHFI
+-
+-
+-
+HHFI+DREF+DAPGA
++0.02%
++0.01%
++0.02%
+ES3
+HHFI
+-0.43%
+-0.24%
+-4.76%
+HHFI+DREF
++0.19%
++0.25%
++0.39%
+HHFI+DAPGA
++0.22%
++0.18%
++0.17%
+HHFI+DREF+DAPGA
++0.32%
++0.26%
++0.44%
+4.4
+Scaling Laws Validation
+A central thesis of HHSFT is that architectural scaling and data
+scaling must co-evolve to achieve optimal performance. We validate
+this through systematic experiments spanning both dimensions.
+We define a base configuration of HHSFT with the following dense
+architectural parameters (excluding embeddings, which are fixed):
+Heterogeneous feature attention: 1 layer, token dimension (𝑑𝐻=
+1648); Global feature attention: 1 layer, token dimension (𝑑𝐺= 256),
+number of tokens (𝑚= 8). Then, we scale model size and data
+volume independently, and measure AUC gain in Figure 4. Two
+critical conclusions emerge:
+Model Scaling: Under fixed search-domain data, scaling the global
+feature feature attention (𝑑𝐺) yields substantially higher returns
+than scaling the heterogeneous feature attention (𝑑𝐻) (e.g., +0.30%
+vs. +0.17% ΔAUC at 4×). This validates that HHSFT’s hierarchical
+design strategically allocates capacity to high-order fusion compo-
+nents, thereby maximizing scaling efficiency.
+Synergistic Scaling Effect: Critically, the performance gap be-
+tween HHSFT trained on search-only data (HHSFT+Search) and
+HHSFT leveraging full heterogeneous data (HHSFT+ES3) widens
+progressively with model scaling: from +0.12% ΔAUC at 1× to +0.32%
+at 4× (Figure 4, red vs. orange curves). This expanding margin
+demonstrates that HHSFT’s hierarchical fusion mechanism does
+not merely absorb heterogeneous data — it amplifies its marginal
+utility as model capacity grows. Larger architectures unlock pro-
+gressively higher returns from diverse data sources, transforming
+heterogeneous samples from incremental signals into compounding
+performance catalysts. This validates the synergistic scaling law:
+model and data co-evolution yields non-linear, accelerating gains,
+where architecture acts as a scalable conduit for heterogeneous
+information.
+Figure 4: AUC gain vs Dense Parameters Scale Ratio
+4.5
+Online Deployment and Performance
+To validate the industrial robustness of HHSFT+ ES3, we conducted
+a 10-day A/B test on Taobao’s search platform. We allocated 5%
+of the total production traffic to the experimental group powered
+by HHSFT, while the control group utilized the production DNN
+baseline. The online results demonstrate that HHSFT consistently
+outperforms the baseline, achieving a 1.70% increase in purchase
+and a 2.04% increase in Gross Merchandise Volume (GMV). Given
+the massive user base and transaction volume of the Taobao plat-
+form, these gains represent statistically significant and substantial
+incremental revenue, fully confirming HHSFT’s efficacy and scala-
+bility in a high-concurrency industrial environment. Furthermore,
+the engineering optimizations detailed in Section 3.5 reduced GPU
+inference costs by approximately 55% and training overhead by
+approximately 40%, confirming the model’s exceptional operational
+efficiency for large-scale deployment.
+5
+Conclusion and Future Work
+In this paper, we propose UniScale, a novel co-design framework
+that jointly optimizes data and architecture for industrial ranking
+model scaling, which has been successfully deployed on Taobao
+search system. UniScale includes ES3 (Entire-Space Sample System)
+that scale data volume and optimize data quality from entire space
+user feedback to mitigate selection bias, exposure bias and blind
+spot in self-reinforcing data loop. To effectively leverage and exploit
+entire space data generated by ES3, UniScale introduces HHSFT
+(Heterogeneous Hierarchical Sample Fusion Transformer) equipped
+with the heterogeneous hierarchical feature interaction module and
+the entire space user interest fusion module to fully incorporate
+user interests expressed by cross-domain feedback into the search
+ranking modeling objective. Extensive experiments on large-scale
+industrial datasets validate the superiority of synergistic co-design
+of data and architecture, which opens up a novel avenue for unified
+scaling in search ranking model. In the future, we will focus on
+the Trinity Scaling from sample, feature and architecture, further
+advancing the coordination and integration of multiple dimensions
+in industrial ranking models.
+UniScale: Synergistic Entire Space Data and Model Scaling for Search Ranking
+Conference acronym ’XX, June 03–05, 2018, Woodstock, NY
+References
+[1] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Floren-
+cia Leoni Aleman, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal
+Anadkat, et al. 2023. Gpt-4 technical report. arXiv preprint arXiv:2303.08774
+(2023).
+[2] Jianxin Chang, Chenbin Zhang, Yiqun Hui, Dewei Leng, Yanan Niu, Yang Song,
+and Kun Gai. 2023. Pepnet: Parameter and embedding personalized network for
+infusing with personalized prior information. In Proceedings of the 29th ACM
+SIGKDD Conference on Knowledge Discovery and Data Mining. 3795–3804.
+[3] Ben Chen, Xian Guo, Siyuan Wang, Zihan Liang, Yue Lv, Yufei Ma, Xinlong Xiao,
+Bowen Xue, Xuxin Zhang, Ying Yang, et al. 2025. Onesearch: A preliminary
+exploration of the unified end-to-end generative framework for e-commerce
+search. arXiv preprint arXiv:2509.03236 (2025).
+[4] Heng-Tze Cheng, Levent Koc, Jeremiah Harmsen, Tal Shaked, Tushar Chandra,
+Hrishi Aradhye, Glen Anderson, Greg Corrado, Wei Chai, Mustafa Ispir, et al.
+2016. Wide & deep learning for recommender systems. In Proceedings of the 1st
+workshop on deep learning for recommender systems. 7–10.
+[5] Paul Covington, Jay Adams, and Emre Sargin. 2016. Deep neural networks
+for youtube recommendations. In Proceedings of the 10th ACM conference on
+recommender systems. 191–198.
+[6] Jiaxin Deng, Shiyao Wang, Kuo Cai, Lejian Ren, Qigen Hu, Weifeng Ding, Qiang
+Luo, and Guorui Zhou. 2025. Onerec: Unifying retrieve and rank with generative
+recommender and iterative preference alignment. arXiv preprint arXiv:2502.18965
+(2025).
+[7] William Fedus, Barret Zoph, and Noam Shazeer. 2022. Switch transformers:
+Scaling to trillion parameter models with simple and efficient sparsity. Journal
+of Machine Learning Research 23, 120 (2022), 1–39.
+[8] Huan Gui, Ruoxi Wang, Ke Yin, Long Jin, Maciej Kula, Taibai Xu, Lichan Hong,
+and Ed H Chi. 2023. Hiformer: Heterogeneous feature interactions learning with
+transformers for recommender systems. arXiv preprint arXiv:2311.05884 (2023).
+[9] Huifeng Guo, Ruiming Tang, Yunming Ye, Zhenguo Li, and Xiuqiang He. 2017.
+DeepFM: a factorization-machine based neural network for CTR prediction. arXiv
+preprint arXiv:1703.04247 (2017).
+[10] Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya,
+Trevor Cai, Eliza Rutherford, Diego de Las Casas, Lisa Anne Hendricks, Johannes
+Welbl, Aidan Clark, et al. 2022. Training compute-optimal large language models
+(2022). arXiv preprint arXiv:2203.15556 (2022).
+[11] Jui-Ting Huang, Ashish Sharma, Shuying Sun, Li Xia, David Zhang, Philip Pronin,
+Janani Padmanabhan, Giuseppe Ottaviano, and Linjun Yang. 2020. Embedding-
+based retrieval in facebook search. In Proceedings of the 26th ACM SIGKDD
+International Conference on Knowledge Discovery & Data Mining. 2553–2561.
+[12] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B Brown, Benjamin Chess,
+Rewon Child, Scott Gray, Alec Radford, Jeffrey Wu, and Dario Amodei. 2020.
+Scaling laws for neural language models. arXiv preprint arXiv:2001.08361 (2020).
+[13] Xiangru Lian, Binhang Yuan, Xuefeng Zhu, Yulong Wang, Yongjun He, Honghuan
+Wu, Lei Sun, Haodong Lyu, Chengjun Liu, Xing Dong, et al. 2022. Persia: An
+open, hybrid system scaling deep learning-based recommenders up to 100 trillion
+parameters. In Proceedings of the 28th ACM SIGKDD Conference on Knowledge
+Discovery and Data Mining. 3288–3298.
+[14] Jianghao Lin, Xinyi Dai, Yunjia Xi, Weiwen Liu, Bo Chen, Hao Zhang, Yong Liu,
+Chuhan Wu, Xiangyang Li, Chenxu Zhu, et al. 2025. How can recommender
+systems benefit from large language models: A survey. ACM Transactions on
+Information Systems 43, 2 (2025), 1–47.
+[15] Zhuoran Liu, Leqi Zou, Xuan Zou, Caihua Wang, Biao Zhang, Da Tang, Bolin Zhu,
+Yijie Zhu, Peng Wu, Ke Wang, et al. 2022. Monolith: real time recommendation
+system with collisionless embedding table. arXiv preprint arXiv:2209.07663 (2022).
+[16] Jiaqi Ma, Zhe Zhao, Xinyang Yi, Jilin Chen, Lichan Hong, and Ed H Chi. 2018.
+Modeling task relationships in multi-task learning with multi-gate mixture-of-
+experts. In Proceedings of the 24th ACM SIGKDD international conference on
+knowledge discovery & data mining. 1930–1939.
+[17] Xiao Ma, Liqin Zhao, Guan Huang, Zhi Wang, Zelin Hu, Xiaoqiang Zhu, and Kun
+Gai. 2018. Entire space multi-task model: An effective approach for estimating
+post-click conversion rate. In The 41st International ACM SIGIR Conference on
+Research & Development in Information Retrieval. 1137–1140.
+[18] Shanlei Mu, Penghui Wei, Wayne Xin Zhao, Shaoguo Liu, Liang Wang, and Bo
+Zheng. 2023. Hybrid contrastive constraints for multi-scenario Ad ranking. In Pro-
+ceedings of the 32nd ACM international conference on information and knowledge
+management. 1857–1866.
+[19] Maxim Naumov, Dheevatsa Mudigere, Hao-Jun Michael Shi, Jianyu Huang,
+Narayanan Sundaraman, Jongsoo Park, Xiaodong Wang, Udit Gupta, Carole-
+Jean Wu, Alisson G Azzolini, et al. 2019. Deep learning recommendation model
+for personalization and recommendation systems. arXiv preprint arXiv:1906.00091
+(2019).
+[20] Nikil Pancha, Andrew Zhai, Jure Leskovec, and Charles Rosenberg. 2022. Pinner-
+former: Sequence modeling for user representation at pinterest. In Proceedings
+of the 28th ACM SIGKDD conference on knowledge discovery and data mining.
+3702–3712.
+[21] Zihan Qiu, Zekun Wang, Bo Zheng, Zeyu Huang, Kaiyue Wen, Songlin Yang,
+Rui Men, Le Yu, Fei Huang, Suozhi Huang, et al. 2025. Gated Attention for
+Large Language Models: Non-linearity, Sparsity, and Attention-Sink-Free. arXiv
+preprint arXiv:2505.06708 (2025).
+[22] Noam Shazeer. 2020.
+Glu variants improve transformer.
+arXiv preprint
+arXiv:2002.05202 (2020).
+[23] Xiang-Rong Sheng, Liqin Zhao, Guorui Zhou, Xinyao Ding, Binding Dai, Qiang
+Luo, Siran Yang, Jingshan Lv, Chi Zhang, Hongbo Deng, et al. 2021. One model to
+serve all: Star topology adaptive recommender for multi-domain ctr prediction. In
+Proceedings of the 30th ACM International Conference on Information & Knowledge
+Management. 4104–4113.
+[24] Weiping Song, Chence Shi, Zhiping Xiao, Zhijian Duan, Yewen Xu, Ming Zhang,
+and Jian Tang. 2019. Autoint: Automatic feature interaction learning via self-
+attentive neural networks. In Proceedings of the 28th ACM international conference
+on information and knowledge management. 1161–1170.
+[25] Hongyan Tang, Junning Liu, Ming Zhao, and Xudong Gong. 2020. Progressive
+layered extraction (ple): A novel multi-task learning (mtl) model for personalized
+recommendations. In Proceedings of the 14th ACM conference on recommender
+systems. 269–278.
+[26] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. Attention is all
+you need. Advances in neural information processing systems 30 (2017).
+[27] Ruoxi Wang, Rakesh Shivanna, Derek Cheng, Sagar Jain, Dong Lin, Lichan Hong,
+and Ed Chi. 2021. Dcn v2: Improved deep & cross network and practical lessons
+for web-scale learning to rank systems. In Proceedings of the web conference 2021.
+1785–1797.
+[28] Xue Xia, Pong Eksombatchai, Nikil Pancha, Dhruvil Deven Badani, Po-Wei Wang,
+Neng Gu, Saurabh Vishwas Joshi, Nazanin Farahpour, Zhiyuan Zhang, and An-
+drew Zhai. 2023. Transact: Transformer-based realtime user action model for
+recommendation at pinterest. In Proceedings of the 29th ACM SIGKDD Conference
+on Knowledge Discovery and Data Mining. 5249–5259.
+[29] Xu Xie, Fei Sun, Zhaoyang Liu, Shiwen Wu, Jinyang Gao, Jiandong Zhang, Bolin
+Ding, and Bin Cui. 2022. Contrastive learning for sequential recommendation. In
+2022 IEEE 38th international conference on data engineering (ICDE). IEEE, 1259–
+1273.
+[30] Ji Yang, Xinyang Yi, Derek Zhiyuan Cheng, Lichan Hong, Yang Li, Simon Xiaom-
+ing Wang, Taibai Xu, and Ed H Chi. 2020. Mixed negative sampling for learning
+two-tower neural networks in recommendations. In Companion proceedings of
+the web conference 2020. 441–447.
+[31] Liren Yu, Wenming Zhang, Silu Zhou, Tao Zhang, Zhixuan Zhang, and Dan Ou.
+2025. HHFT: Hierarchical Heterogeneous Feature Transformer for Recommenda-
+tion Systems. arXiv preprint arXiv:2511.20235 (2025).
+[32] Jiaqi Zhai, Lucy Liao, Xing Liu, Yueming Wang, Rui Li, Xuan Cao, Leon Gao, Zhao-
+jie Gong, Fangda Gu, Michael He, et al. 2024. Actions speak louder than words:
+Trillion-parameter sequential transducers for generative recommendations. arXiv
+preprint arXiv:2402.17152 (2024).
+[33] Buyun Zhang, Liang Luo, Yuxin Chen, Jade Nie, Xi Liu, Daifeng Guo, Yanli Zhao,
+Shen Li, Yuchen Hao, Yantao Yao, et al. 2024. Wukong: Towards a scaling law for
+large-scale recommendation. arXiv preprint arXiv:2403.02545 (2024).
+[34] Zhaoqi Zhang, Haolei Pei, Jun Guo, Tianyu Wang, Yufei Feng, Hui Sun, Shaowei
+Liu, and Aixin Sun. 2025. OneTrans: Unified Feature Interaction and Sequence
+Modeling with One Transformer in Industrial Recommender. arXiv preprint
+arXiv:2510.26104 (2025).
+[35] Guorui Zhou, Xiaoqiang Zhu, Chenru Song, Ying Fan, Han Zhu, Xiao Ma, Yanghui
+Yan, Junqi Jin, Han Li, and Kun Gai. 2018. Deep interest network for click-through
+rate prediction. In Proceedings of the 24th ACM SIGKDD international conference
+on knowledge discovery & data mining. 1059–1068.
+[36] Yanqi Zhou, Tao Lei, Hanxiao Liu, Nan Du, Yanping Huang, Vincent Zhao, An-
+drew M Dai, Quoc V Le, James Laudon, et al. 2022. Mixture-of-experts with
+expert choice routing. Advances in Neural Information Processing Systems 35
+(2022), 7103–7114.
+[37] Jie Zhu, Zhifang Fan, Xiaoxie Zhu, Yuchen Jiang, Hangyu Wang, Xintian Han,
+Haoran Ding, Xinmin Wang, Wenlin Zhao, Zhen Gong, et al. 2025. RankMixer:
+Scaling Up Ranking Models in Industrial Recommenders.
+arXiv preprint
+arXiv:2507.15551 (2025).

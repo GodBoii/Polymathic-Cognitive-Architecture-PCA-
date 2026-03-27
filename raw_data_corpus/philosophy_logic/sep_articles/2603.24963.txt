@@ -1,0 +1,755 @@
+Design Once, Deploy at Scale: Template-Driven ML
+Development for Large Model Ecosystems
+Jiang Liu, John Martabano Landy, Yao Xuan, Swamy Muddu, Nhat Le, Munaf Sahaf, Luc Kien Hang,
+Rupinder Khandpour, Kevin De Angeli, Chang Yang, Shouyuan Chen, Shiblee Sadik, Ani Agrawal, Djordje
+Gligorijevic, Jingzheng Qin, Peggy Yao, Alireza Vahdatpour
+Meta AI, Menlo Park, California, USA
+Modern computational advertising platforms typically rely on recommendation systems to predict
+user responses, such as click-through rates, conversion rates, and other optimization events. To
+support a wide variety of product surfaces and advertiser goals, these platforms frequently maintain
+an extensive ecosystem of machine learning (ML) models. However, operating at this scale creates
+significant development and efficiency challenges. Substantial engineering effort is required to regularly
+refresh ML models and propagate new techniques, which results in long latencies when deploying ML
+innovations across the ecosystem.
+We present a large-scale empirical study comparing model performance, efficiency, and ML technique
+propagation between a standardized model-building approach and independent per-model optimization
+in recommendation systems. To facilitate this standardization, we propose the Standard Model
+Template (SMT)—a framework that generates high-performance models adaptable to diverse data
+distributions and optimization events. By utilizing standardized, composable ML model components,
+SMT reduces technique propagation complexity from O(n · 2k) to O(n + k) where n is the number of
+models and k the number of techniques.
+Evaluating an extensive suite of models over four global development cycles within Meta’s production
+ads ranking ecosystem, our results demonstrate: (1) a 0.63% average improvement in cross-entropy
+at neutral serving capacity, (2) a 92% reduction in per-model iteration engineering time, and (3) a
+6.3× increase in technique-model pair adoption throughput. These findings challenge the conventional
+wisdom that diverse optimization goals inherently require diversified ML model design.
+Date: March 27, 2026
+Correspondence: jiangliu,johnlandy,yxuan,gligorijevic@meta.com
+Summary of Results
+• 0.63% average offline performance improvement over independently optimized baselines
+• 0.86% cumulative online lift
+• 92% reduction in per-model engineering effort
+• 6.3× technique propagation throughput
+1
+Introduction
+Deep learning recommendation systems are ubiquitous in computational advertising. They leverage user and
+advertiser data to predict response events (e.g. clicks, conversions, likes, follows) and relevance, ultimately
+optimizing auction outcomes He et al. (2014); Naumov et al. (2019); Covington et al. (2016); Zhang et al.
+(2022, 2024a); Gligorijevic et al. (2020). Furthermore, these systems must operate across diverse modalities,
+platforms (e.g. web, mobile), and constraints (e.g. latency restrictions from diverse serving hardware, data
+restrictions), requiring them to capture a wide variety of complex data distributions.
+This environment necessitates creation of a large fleet of production recommendation models, where each is
+1
+arXiv:2603.24963v1  [cs.AI]  26 Mar 2026
+Figure 1 The conventional model iteration process at Meta. For n models and k candidate techniques, this per-
+model development cycle yields an O(n · 2k) search complexity. For each model, engineers conduct trial-and-error
+hyperparameter optimization across all k techniques, isolate the subset that improves performance, and evaluate all
+possible combinations of these techniques (up to 2k) before selecting the final candidate for deployment.
+individually configured with custom architectures, feature engineering pipelines, and training and serving
+platform design and hyperparameter settings.
+This model diversity compounds over time as engineers
+continuously and independently optimize individual models through trial-and-error experimentation.
+The ensuing productionization process requires a customized application, tuning, and combination building
+process for every model Mi and Machine Learning (ML) technique Tj (Figure 1). Given n models and k
+candidate ML techniques, the design space for each model encompasses all 2k possible technique combinations.
+This creates a combinatorial explosion with an overall search space complexity of O(n · 2k). Furthermore,
+because any new technique Tj targeting a specific model type Mi must first be validated for compatibility
+with the model’s existing technique pool, shipping incremental techniques becomes progressively harder over
+time. Thus, we face a challenge reducing the latency and computational resources required to ship new ML
+techniques across such a wide array of model types.
+Additionally, evolving business needs, including new serving hardware and platform transitions, often require
+large-scale model migrations. These events magnify the inefficiencies of an independently optimized model-
+building approach. Therefore, we must address a critical challenge: developing an ML model design robust
+enough to handle the wide variety of data distributions and optimization events that currently fragment the
+ecosystem.
+To address these challenges, through architectural standardization, we propose the Standard Model Template
+(SMT). Instead of relying on model-specific configurations, we construct a small set of six reusable templates
+that instantiate across the entire model fleet. These templates are differentiated by model paradigm (e.g.
+two-tower vs. single-tower, early-stage efficiency vs. late-stage performance) and feature interaction type.
+Based on this framework, we define two distinct processes:
+• Template Iteration. ML innovations are evaluated at the template level on a representative subset of models,
+then encoded into a shared template.
+• Model Iteration. Individual models are instantiated directly from these templates using model-specific inputs,
+requiring no further architectural customization.
+By decoupling these two processes through a template-based approach, we successfully reduce the development
+complexity from O(n · 2k) to O(n + k). New techniques are first validated sequentially at the template level
+2
+(O(k)) and subsequently deployed to all models via the standard template (O(n)).
+This paper makes four main contributions:
+(1) Standardized ML Model. A modular template design that accommodates diverse data distributions and
+optimization events through standardized, composable components (Section 3.1).
+(2) Multi-Model Optimization (MMO). A technique generalization framework leveraging Bayesian optimization
+across representative models to find globally-optimal hyperparameter configurations (Section 3.2).
+(3) Deployment Methodology. An end-to-end workflow for template based model iteration that reduces
+per-model engineering effort by 92% (Section 3.3)
+(4) Empirical Validation. A study across four iteration cycles and a large number of models demonstrating
+0.63% average performance improvement, 0.86% cumulative online lift, and 6.3× throughput in technique
+adoption (Sections 4-5).
+2
+Related Work
+Although the problem of building and iterating on ML templates is novel, our approach draws on prior work
+in the AutoML field and shares design principles with libraries found in advanced ML systems across industry.
+AutoML and Neural Architecture Search. While AutoML systems reduce manual effort in model develop-
+ment Zhang et al. (2025); Yin et al. (2024); Wen et al. (2024b); Chen et al. (2022a,b); Hutter et al. (2019);
+Golovin et al. (2017); Feurer et al. (2015), Neural Architecture Search (NAS) automates the exploration
+of architectural designs Zhang et al. (2024b); Wen et al. (2024a); Zoph and Le (2016); Liu et al. (2018).
+Unlike these traditional approaches, which optimize models individually, SMT standardizes entire fleets of ML
+models. In our framework, AutoML is specifically leveraged for template parameter tuning, complementing
+human-designed architectures built upon accumulated domain expertise.
+Industrial ML Platforms. Large-scale systems such as Google’s TFX Baylor et al. (2017), Uber’s Michelan-
+gelo Hermann (2017), and Meta’s FBLearner Hazelwood et al. (2018) primarily address workflow orchestration,
+training infrastructure, and deployment. These platforms operate below the abstraction level of SMT, which
+defines the standardized ML model layer sitting directly atop this foundational infrastructure.
+Recommender Models Research. Prior research in recommendation systems has primarily focused on devel-
+oping novel architectures for individual models, such as DLRM Naumov et al. (2019), DCNv1 Wang et al.
+(2017)/v2 Wang et al. (2021), DHEN Zhang et al. (2022), and Wukong Zhang et al. (2024a), as well as those
+designed to capture advanced sequential features, like HSTU Zhai et al. (2024) and Interformer Zeng et al.
+(2025). Rather than proposing a single new ML model design, SMT provides a comprehensive framework to
+efficiently ML innovations including these diverse techniques across a massive fleet of models.
+3
+Methodology
+3.1
+Fragmented Model Iteration
+The model iteration process prior to or without SMT involves n models Mi ∈M, each of which can be
+iteratively improved by k candidate ML techniques Tj ∈T . When a new technique is developed, the objective
+is to deploy it across all applicable models to maximize aggregate performance improvement. This requires
+evaluating the proposed technique against each model’s baseline model and including it in the subsequent
+deployment only if detectable improvement is observed.
+In this non-standardized paradigm, every model is iterated and tested independently. This necessitates n
+separate processes, each conditionally evaluating all possible technique combinations, yielding an intractable
+O(n · 2k) search complexity (Figure 1). While engineers use heuristics to avoid exhaustive O(n · 2k) search,
+the operational complexity empirically remains significantly higher than O(n · k) per cycle. Consequently,
+propagating new ML innovations fleet-wide becomes practically impossible, frequently leaving many models
+without access to the latest advancements. The complexity of this non-standardized approach motivated the
+development of the Standardized Model Template (SMT). Specifically, we cover the template design, the
+template iteration, and the model iteration in detail below.
+3
+Figure 2 The template defines a modular, layered architecture, standardizing components from feature selection and
+representation across different feature types (numerical, categorical, embedding, sequence, etc.), through feature
+interaction, to prediction. Components at each layer have standardized interfaces allowing composition and substitution,
+enabling template evolution as state-of-the-art changes.
+3.2
+Standard Template Overview
+SMT introduces a layer of model design abstraction by packaging state-of-the-art ML techniques as modular
+components, validated through rigorous generalization studies (illustrated in Figure 2). Each template consists
+of fixed components (architecture, features, data, training, and serving) alongside variable inputs (data
+pipelines, optimization tasks, and serving constraints) that are tailored to each specific model. Models are
+then instantiated directly from these components and variables. This approach facilitates efficient tuning
+within a significantly reduced search space, bounded by strict, shippable performance criteria.
+3.2.1
+Template Components
+Architecture Template.
+The template encompasses a curated set of rigorously defined architectures, each
+tailored to fill a specific use case. We categorize these templates based on model paradigm (single-tower,
+two-tower) and feature interaction type, as each excels within different model size ranges (Table 1). The
+templates provide comprehensive coverage across the suite of ranking and retrieval models (Figure 3). Inputs
+to the chosen architectural template include a handful scaling- and optimization-focused parameters, such as
+the embedding dimension and the number of feature interaction layers determined at template creation stage.
+4
+Paradigm
+Scale Variants
+Use Case
+SparseNN
+Small, Medium, Large
+Final stage ranking
+Decoupled SparseNN
+Small, Medium, Large
+Early stage ranking
+Table 1 SMT supports both single-tower and two-tower architectures of varying sizes to support a wide array of use
+cases and model sizes across ranking and retrieval stages.
+Figure 3 The Small, Medium, and Large templates provide comprehensive coverage across a wide variety of ranking
+and retrieval models across a wide range of model FLOPs.
+Feature Template.
+The template incorporates advanced feature selection and optimization logic. For selection,
+we leverage the top K features across specified types (numeric, ID, embedding, transform, event, and others)
+based on previously calculated feature importance scores. Furthermore, the template automatically refines
+these features using techniques such as position-weighted pooling and specialized modules.
+Data Template.
+The template provides configurations to enable optimizations within the data pipeline,
+including label transformations, the use of features as labels, data enrichment, and sampling.
+Training and Serving Template.
+The template facilitates decoupled training and serving side configurations.
+This includes advanced model parameter distribution strategies such as Data Parallel (DP), Fully Sharded Data
+Parallel (FSDP) Zhao et al. (2023), Hybrid Sharded Data Parallel Zhang et al. (2022), and column-wise sharded
+embeddings Mudigere et al. (2021). Additionally, it manages dataset selection, optimizer configurations,
+hardware capacity allocations, and the specific cluster topologies required for both training and serving
+environments.
+3.2.2
+Template Inputs
+The template exposes a set of configurable hyperparameters for model adaptation and tuning, which fall into
+two broad categories:
+• Model-Specific Inputs. Parameters that define each individual model, such as its optimization events, data
+pipelines, available features, and serving constraints.
+• Model-Specific Hyperparameters. We observe that certain hyperparameters exhibit high variance when
+optimized independently across diverse models, indicating the value of leaving them exposed on a per-model
+basis. These hyperparameters define a constrained search space that is highly likely to improve model
+performance, enabling efficient template-to-model tuning.
+5
+Figure 4 Ranking and retrieval models are clustered according to model attributes (R6). The elbow method is used to
+select the optimal number of clusters, and each cluster’s center-most point is included in our representative set. The
+figure shows 20 clusters being projected into 2 dimensions showing the clear segmentation of the model space that can
+be served by templates.
+3.3
+Standard Template Iteration
+We define template iteration as the process of incrementally enhancing the SMT framework with novel ML
+innovations. This centralized updating mechanism is critical to SMT’s strong performance, enabling us to
+propagate a new ML technique across all instantiated models through a single implementation within the
+template.
+3.3.1
+Representative Model Set.
+We establish a representative model set MR to jointly evaluate each ML innovation. We define the model
+space M ∈R6 across six dimensions:
+1. Ranking stage. retrieval, pre-ranking, ranking
+2. Model size. FLOPs at inference
+3. Inference hardware. CPU, GPU, MTIA Meta AI (2026)
+4. Optimization event. CTR, CVR, quality, value, . . .
+5. Product surface. feed, posts, search, reels, . . .
+6. Data constraints. full data, restricted, regional
+Because M contains a large number of models, exhaustive evaluation is computationally prohibitive. Instead,
+we choose a smaller set of representative models to serve as the testbed for evaluating new ML techniques.
+We apply k-means clustering with the elbow method to identify the optimal number of clusters given the
+distribution of eligible models, then select each cluster’s centroid as a representative, ensuring a minimal yet
+diverse sample of models. With our current model space, this yields |MR| ≈20 models. Figure 4 visualizes
+the clusters projected into 2 dimensions.
+3.3.2
+Technique Generalization
+We define technique generalization as the process by which we derive fixed hyperparameters θh for a technique
+Tj which allow the technique to perform positively across a diverse set of ML models. Below, we cover the
+6
+technical process to achieve this generalization for eligible ML techniques.
+Let T = {T1, T2, . . . , Tk} denote the set of candidate ML techniques, and let MR ⊆M denote the representa-
+tive model set. Table 2 summarizes the key symbols.
+Symbol
+Description
+Tj ∈T
+The j-th candidate ML technique
+Mi ∈MR
+The i-th model in the representative set
+θh
+A hyperparameter configuration for technique Tj
+P base
+i
+∈R
+Baseline performance of model Mi (higher = better)
+Pi,j,h ∈R
+Performance of Mi with technique Tj and hyperparameter config θh
+∆i,j,h
+Performance Delta: Pi,j,h −P base
+i
+wi
+Importance weight for model Mi, with P
+i wi = 1
+α
+Significance threshold (default: 0.05%)
+ε
+Maximum allowable regression rate (default: 0.1)
+τ
+Minimum aggregate improvement for inclusion (default: 0.05%)
+Aj,h
+Aggregate Performance Delta across representative model set
+Table 2 Notation for technique generalization.
+Individual Performance Delta. Let P base
+i
+and Pi,j,h denote the performance of model Mi at baseline and after
+applying technique Tj with configuration θh, respectively, where higher values indicate better performance.
+The per-model Performance Delta achieved by applying the technique is:
+∆i,j,h = Pi,j,h −P base
+i
+.
+(1)
+A positive value of ∆i,j,h indicates that the technique improved the model, while a negative value indicates
+regression.
+Regression Rate. A model is considered to regress under a technique if applying the technique causes a
+significant performance degradation (i.e., the magnitude of the negative performance delta exceeds a threshold
+α). We define the regression rate Rj,h of a technique Tj (with θh hyperparameters) as the proportion of
+representative models that regress:
+Rj,h =
+1
+|MR|
+|MR|
+X
+i=1
+1{∆i,j,h<−α},
+(2)
+where 1{·} is the indicator function. The regression rate measures how well a technique generalizes across the
+model space; as such, it is primarily determined by the technique’s performance and the number of evaluated
+models, rather than traffic or revenue.
+Aggregate Performance Delta. To summarize the overall benefit of a technique on the representative model set,
+we first compute a weighted average of individual improvements:
+µj(θh) =
+|MR|
+X
+i=1
+wi∆i,j,h,
+X
+i
+wi = 1,
+(3)
+where wi reflects the operational priority of model Mi (e.g., traffic volume). A positive µj(θh) indicates the
+technique with the hyperparameter combination boosts the model fleet’s performance.
+We define the Aggregate Performance Delta with a penalty on regression rate above a threshold ε:
+Aj,h =
+(
+µj(θh)
+if Rj,h ≤ε
+−∞
+otherwise.
+(4)
+7
+Figure 5 Multi-Model Optimization (MMO): ML techniques are jointly optimized across multiple representative models
+using Bayesian Optimization for hyperparameter tuning and aggregation of metrics across models, producing an
+optimal set of hyperparameters θh.
+Technique-hyperparameter combinations causing excessive regression (Rj,h > ε) are penalized by assigning a
+value of −∞. Here we set ε = 0.1 (at most 10% of models may regress) and α = 0.05%.
+Hyperparameter Optimization. For each technique Tj ∈T , we employ Monte Carlo Bayesian Optimization Ba-
+landat et al. (2020) to efficiently find the hyperparameter configuration which maximizes the Aggregate
+Performance Delta:
+θ∗
+h = arg max
+θh Aj,h.
+(5)
+We denote the optimal performance of a technique as: P ∗
+j = Aj,h∗. Finally, we define T +
+G ⊆T as the set of
+generalized techniques whose performance measurably improved the representative models MR in aggregate,
+T +
+G =
+n
+Tj ∈T
+: P ∗
+j ≥α
+o
+.
+(6)
+We refer to the entire above process as Multi-Model Optimization (MMO), illustrated in Figure 5 and
+Algorithm 1.
+After optimization yields θ∗
+j for each technique Tj, two analyses are performed before template integration.
+Holdout Validation. We evaluate T +
+G and θ∗
+j on a held-out set MH ⊂M \ MR to guard against overfitting
+and verify that performance transfers to the broader model fleet.
+Sensitivity Analysis for Parameter Exposure. We determine which hyperparameters should be standardized (fixed
+in the template) versus exposed (left tunable per model). Let θh = (θh,1, . . . , θh,d) denote the d-dimensional
+configuration. Restricting to feasible trials (those with Rj,h ≤ε), we fit a first-order surrogate:
+µj(θh) ≈β0 +
+d
+X
+k=1
+βk θh,k
+(7)
+The coefficient βk quantifies global sensitivity. To measure cross-model disagreement, we fit the same model
+per model Mi, obtaining per-model coefficients βi,k, and compute σ2
+k = Vari[βi,k]. A hyperparameter is
+standardized when |βk| is small (low global sensitivity) and σ2
+k is small (models agree on its effect). It is
+exposed when either quantity is large, indicating model-specific tuning is warranted.
+Template Integration. Once we have generalized and evaluated each of the techniques across the representative
+model set, we can proceed to encode these techniques into our standard templates. We leverage the modularized
+design of the template to implement techniques Tj ∈T +
+G in an efficient manner. We follow this encoding with
+8
+Algorithm 1 Multi-Model Optimization (MMO)
+Require: Techniques T , representative models MR, weights {wi}, thresholds α, ε, τ, iterations N
+Ensure: Generalized set T +
+G with optimal configurations {θ∗
+h}
+1: T +
+G ←∅
+2: for each technique Tj ∈T do
+3:
+Initialize Bayesian optimizer over hyperparameter space
+4:
+for t = 1 to N do
+5:
+Sample θ(t)
+h
+via acquisition function
+6:
+for each model Mi ∈MR do
+7:
+Evaluate Pi,j,h(t)
+8:
+Compute ∆i,j,h(t) ←Pi,j,h(t) −P base
+i
+9:
+end for
+10:
+Compute Rj,h(t) via Eq. (2)
+11:
+Compute µj(θ(t)
+h ) via Eq. (3)
+12:
+Compute Aj,h(t) via Eq. (4)
+13:
+Update surrogate model with (θ(t)
+h , Aj,h(t))
+14:
+end for
+15:
+θ∗
+h ←arg maxθh∈{θ(1)
+h
+,...,θ(N)
+h
+} Aj,h
+16:
+P ∗
+j ←Aj,h∗
+17:
+if P ∗
+j ≥τ then
+18:
+T +
+G ←T +
+G ∪{Tj}
+19:
+end if
+20: end for
+21: return T +
+G , {θ∗
+h : Tj ∈T +
+G }
+a back-test to validate the performance and/or efficiency wins from all new techniques Tj ∈T +
+G in the new
+template version. Through four cycles of development, we have shipped 80 new ML techniques across each of
+the templates.
+Figure 6 During template iteration, eligible techniques undergo Multi-Model Optimization. Techniques that meet the
+specified selection criteria are codified into the Standard Model Template, and template versioning is utilized to ensure
+backward compatibility.
+3.4
+Standard Model Iteration
+We define model iteration as the end-to-end process of designing, building, testing, and deploying new models
+to serve production traffic. Here we outline the advantages that standardization provides during the model
+iteration.
+By enforcing a homogeneous model space, SMT enables the decoupling of Template Iteration (Figure 6)
+from Model Iteration (Figure 7). As detailed previously, Template Iteration leverages MMO to concurrently
+evaluate k techniques across the representative model set MR. By aggregating performance metrics, this
+9
+Figure7 The model iteration process in a standardized environment. By eliminating the need for per-model customization,
+each model simply instantiates the latest template version to seamlessly incorporate a suite of previously generalized
+ML techniques.
+process converges on a globally optimal hyperparameter configuration, effectively completing the design phase
+and advancing the template from version vx to vx+1.
+In the subsequent model iteration, we use template version vx+1 to directly apply these k techniques to all
+n models Mi ∈M. Decoupling these steps slashes the operational complexity to O(n + k), driving major
+efficiency wins (Figure 7). Additionally, this architectural standardization ensures that the performance gains
+of each technique Tj ∈T are highly consistent and transferable across the standardized model set.
+4
+Experimental Design
+To validate the SMT framework, we conducted a large-scale empirical study across Meta’s ranking and
+retrieval ecosystem. This section details the primary hypotheses guiding our evaluation and outlines the
+experimental setup used to measure both model performance and engineering throughput.
+4.1
+Hypotheses.
+We evaluate two primary hypotheses:
+• H1: Performance. A standardized template can match or exceed the offline and online performance of an
+independently optimized model across diverse data distributions and optimization goals.
+• H2: Efficiency. Template-based development significantly reduces per-model iteration engineering effort and
+increases technique propagation throughput.
+4.2
+Experimental Setup
+Our evaluation spans four development cycles, each comprising a variable number of iterations per model,
+to compare SMT against the existing, independently optimized model-building paradigm. Collectively, this
+dataset encompasses ≥50% of the models within the ranking and retrieval ecosystem. The baseline for
+comparison is each model’s bespoke configuration currently used in production. For every migrated model, we
+measure the following:
+• Offline performance. Normalized Entropy (NE) He et al. (2014), defined as the cross-entropy loss normalized
+by the entropy of the training data’s background event rate. An NE improvement of ≥0.05% is typically
+considered statistically significant. 1
+1Lower values of Normalized Entropy (NE) signify stronger performance. However, to improve readability in this paper, we
+denote performance improvements as a positive percentage NE delta.
+10
+• Online performance. Primary business metrics measured during live-traffic A/B tests.
+• Engineering effort. The number of engineering hours spent per model iteration, quantified via internal
+time-tracking.
+• Throughput. The total number of successful ⟨technique, model⟩pairs shipped to production.
+5
+Results
+In this section, we present the empirical findings from deploying the SMT framework across our production
+fleet.
+We evaluate these results against our primary hypotheses, beginning with an analysis of offline
+performance gains and online A/B test validations. Subsequently, we quantify the operational impact of
+the framework, detailing the significant reductions in engineering effort and the acceleration of technique
+propagation throughput.
+5.1
+Offline Performance Improvement
+Across four development cycles, SMT achieves an average NE improvement of 0.63% at neutral serving
+capacity (Table 3). The Model Share (%) metric indicates the percentage of studied models relative to the
+entire ranking and retrieval ecosystem, a growth driven by organic adoption. We observe that performance
+improvements accelerate over time as the templates mature; we hypothesize that later adopters inherit a richer
+baseline of performance because of the continuous accumulation of generalized ML techniques in the template.
+Period
+Model Share (%)
+Mean NE (%)
+Max NE (%)
+Cycle 1
+14.2
+0.36
+0.95
+Cycle 2
+20.1
+0.56
+1.12
+Cycle 3
+19.8
+0.68
+1.38
+Cycle 4
+29.4
+0.78
+1.94
+Total
+51.8
+0.63
+1.94
+Table 3 Offline performance improvement measured across four development cycles indicates cumulative average NE
+improvement of 0.63% with consistent improvement across 51.8% of models in the production ecosystem.
+5.2
+Online A/B Test Results
+Over the course of four half-year cycles and an extensive number of production launches, we observe that offline
+NE improvements consistently translated to online gains across primary business metrics, demonstrating the
+template’s substantial real-world value. Table 4 summarizes the A/B test results for SMT-powered technique
+launches across these development cycles. 2
+Period
+Model Share (%)
+Online Lift (%)
+Cycle 1
+14.2
+0.11
+Cycle 2
+20.1
+0.19
+Cycle 3
+19.8
+0.27
+Cycle 4
+29.4
+0.29
+Total
+51.8
+0.86
+Table 4 Online metric lift is consistent and increasing across cycles, totaling 0.86% across 4 such development cycles.
+5.3
+Efficiency Improvement
+SMT reduces the engineering effort required for offline model iteration by 92% compared to the traditional
+fragmented model iteration excluding effort on data preparation, but including any other optimization-related
+and model serving efforts. We attribute this large efficiency gain to two key mechanisms:
+2Online metrics represent the aggregate impact of technique propagation via SMT; online metrics for individual models vary.
+11
+• “Solve Once” Principle. In a standardized paradigm, architectural bugs or pipeline issues only need to be
+resolved once at the template level. This effectively amortizes the cost of issue resolution across the entire
+fleet of models under development.
+• Extensive Automation. Standardization inherently yields predictable model behavior. Consequently, au-
+tomating the model-building pipeline has higher reliability and reduced friction compared to managing
+bespoke, independently optimized models.
+5.4
+Throughput Improvement
+As a direct result of the 92% reduction in engineering hours per offline model iteration (e.g., data refresh,
+feature/architecture/training/serving optimization, and ML technique onboarding), SMT achieves a 6.3×
+increase in technique propagation throughput compared to traditional, independently optimized approaches
+(Table 5). This surge is primarily driven by a 5× increase in the number of models iterated, which we attribute
+to the dramatically lowered engineering barrier, allowing innovations to reach a much broader pool of models.
+Metric
+SMT
+Custom
+Techniques shipped per model (average)
+1.26X
+X
+Models reached per cycle (average)
+5Y
+Y
+Total (technique, model) pairs
+6.3XY
+XY
+Table 5 Technique propagation throughput. SMT demonstrates a 6.3× increase in total ⟨technique, model⟩pairs
+shipped compared to independently optimized baselines. This surge is largely attributable to a 5× increase in the
+number of models iterated.
+6
+Analysis
+Having established the empirical success of the Standard Model Template (SMT) framework, we now present
+the underlying mechanics driving these results. This section analyzes the architectural and operational factors
+that enable standardized templates to consistently outperform bespoke, independently optimized production
+models under the continuous active development, while simultaneously reducing engineering overhead.
+6.1
+Why Standardization Outperforms Independent Optimization
+Counterintuitively, we see that standardization outperforms independent optimization in model building. We
+will discuss our hypotheses for this improvement below:
+1. Innovation Compounding.
+Templates continuously accumulate improvements in the form of new ML
+techniques generalized during cyclic template iteration. Consequently, any model instantiated from the
+template immediately inherits a rich, collective history of previously generalized ML techniques.
+2. Escape from Local Optima. Years of isolated, per-model optimization often yield rigid configurations bound
+by outdated historical constraints. Engineers prioritize integrating new techniques over deprecating obsolete
+ones, yielding bloated model designs. Conversely, templates are continuously re-evaluated using validated
+best practices, preventing such bloat.
+3. Design Once, Deploy at Scale. A shared template serving 50 models receives 50× more production exposure
+than a single custom configuration. This massive scale ensures edge cases surface rapidly, allowing a single
+fix to immediately benefit the entire global model pool. In contrast, under an independent optimization
+paradigm, identical issues are either debugged repeatedly across different teams or left entirely unresolved
+in lower-priority models.
+6.2
+Lessons for Practitioners
+Based on four cycles of production deployment, we distill the following actionable insights for organizations
+managing large-scale model fleets:
+12
+1. Target ∼70% adoption, not 100%. Diminishing returns dictate that migrating the final ∼30% of models
+is rarely worth the required engineering effort. Accept that bespoke customization will always exist,
+as researchers require certain models to serve as experimental testbeds for new ideas before fleet-wide
+generalization can be considered.
+2. Focus on template quality. A single engineer-week spent improving a template can save ∼100 engineer-weeks
+across the fleet. Investing in robust infrastructure to support the seamless and reliable execution of
+templates is paramount.
+3. Apply the “Solve Once” principle rigorously. Every technical challenge must be resolved at the template level.
+Generalized solutions enable frictionless scalability across a diverse range of models. Solving identical
+problems on a per-model basis indicates a fundamental failure of abstraction.
+4. Use representative model clustering. In large model ecosystems, it is computationally impractical to test
+new ML techniques against every model. Prioritize identifying a minimal, diverse set of representative
+models that capture the critical aspects of fleet diversity, and leverage this cluster to efficiently assess the
+generalizability of new techniques.
+5. Track regression rate, not just average performance gain. When operating at scale, engineers lack the
+bandwidth to run per-technique ablation studies during model deployment. Therefore, when evaluating
+techniques during Template Iteration, minimizing the regression rate is often more critical than maximizing
+the absolute performance gain. A technique with a 5% median gain but a 20% regression rate introduces
+more systemic risk than one with a 2% gain and a 2% regression rate. Consistency is the foundation of
+fleet-wide deployment.
+6.3
+Limitations
+While the SMT framework delivers substantial improvements in both performance and engineering efficiency,
+our deployment revealed several practical bounds to fleet-wide standardization.
+6.3.1
+Models That Resisted Standardization
+Despite high success rates across the ecosystem, a small subset of models—approximately 5.6% (14 of
+252)—exhibited poor performance and struggled to converge when migrated to the template. While rigorous
+analysis has yet to isolate a definitive root cause, we hypothesize that extreme data distributions or highly
+niche optimization events may render these specific models incompatible with generalized architectures.
+6.3.2
+Trade-offs in Hyperparameter Optimization
+Although Multi-Model Optimization (MMO) saves significant engineering time by identifying globally optimal
+hyperparameter configurations, this generalized approach inherently trades away the granular performance
+gains achievable through per-model fine-tuning. However, the objective of large-scale model standardization
+is not the absolute elimination of customization; rather, it is to enable scalable iteration across a diverse fleet.
+To mitigate this trade-off, the template is designed to expose hyperparameters that exhibit high cross-model
+variance (e.g. optimizer settings), allowing for targeted per-model tuning when strictly necessary. Ultimately,
+managing a dynamic model ecosystem requires continuously re-evaluating the delicate balance between strict
+standardization and bespoke optimization.
+6.3.3
+Viability of Global Optima
+There is valid skepticism regarding whether novel ML techniques can actually converge on a global optimum
+that improves performance across a highly heterogeneous model suite. However, our empirical data indicates
+that the vast majority of techniques do find a globally optimal configuration, yielding statistically significant
+improvements across diverse data distributions and optimization targets. Specifically, over four development
+cycles, only 11% of candidate techniques failed to find such a generalized configuration. Techniques that fail
+to generalize fleet-wide but demonstrate strong gains during isolated, per-model optimization remain prime
+candidates for parameter exposure within the template, as discussed previously.
+13
+7
+Conclusion
+We present the Standard Model Template (SMT), a framework designed to manage large recommendation
+model fleets through rigorous ML model standardization. Across four development cycles and extensive
+production deployments, this framework has achieved:
+• 0.63% average offline performance improvement over independently optimized baselines.
+• 0.86% cumulative online lift.
+• 92% reduction in per-model engineering effort.
+• 6.3× technique propagation throughput.
+These results empirically demonstrate that architectural standardization can consistently outperform isolated,
+independent optimization for large-scale recommendation systems. Ultimately, a well-designed, continuously
+updated template serves as a robust universal foundation, allowing model-specific requirements to be resolved
+through data and task configurations rather than costly architectural modifications.
+References
+Maximilian Balandat, Brian Karrer, Daniel Jiang, Samuel Daulton, Ben Letham, Andrew G Wilson, and Eytan Bakshy.
+Botorch: A framework for efficient monte-carlo bayesian optimization. Advances in neural information processing
+systems, 33:21524–21538, 2020.
+Denis Baylor, Eric Breck, Heng-Tze Cheng, Noah Fiedel, Chuan Yu Foo, Zakaria Haque, Salem Haykal, Mustafa Ispir,
+Vihan Jain, Levent Koc, et al. Tfx: A tensorflow-based production-scale machine learning platform. In Proceedings
+of the 23rd ACM SIGKDD international conference on knowledge discovery and data mining, pages 1387–1395, 2017.
+Yutian Chen, Xingyou Song, Chansoo Lee, Zi Wang, Qiuyi Zhang, David Dohan, Kazuya Kawakami, Greg Kochanski,
+Arnaud Doucet, Marc’aurelio Ranzato, Sagi Perel, and Nando de Freitas. Towards learning universal hyperparameter
+optimizers with transformers. arXiv preprint arXiv:2205.13320, 2022a.
+Yutian Chen, Xingyou Song, Chansoo Lee, Zi Wang, Qiuyi Zhang, David Dohan, Kazuya Kawakami, Greg Kochanski,
+Arnaud Doucet, Marc’aurelio Ranzato, Sagi Perel, and Nando de Freitas. Towards learning universal hyperparameter
+optimizers with transformers. In Proceedings of the 36th International Conference on Neural Information Processing
+Systems, NIPS ’22, Red Hook, NY, USA, 2022b. Curran Associates Inc. ISBN 9781713871088.
+Paul Covington, Jay Adams, and Emre Sargin. Deep neural networks for youtube recommendations. In Proceedings of
+the 10th ACM conference on recommender systems, pages 191–198, 2016.
+Matthias Feurer, Aaron Klein, Katharina Eggensperger, Jost Springenberg, Manuel Blum, and Frank Hutter. Efficient
+and robust automated machine learning. Advances in neural information processing systems, 28, 2015.
+Djordje Gligorijevic, Jelena Gligorijevic, and Aaron Flores. Prospective modeling of users for online display advertising
+via deep time-aware model. In Proceedings of the 29th ACM International Conference on Information & Knowledge
+Management, pages 2461–2468, 2020.
+Daniel Golovin, Benjamin Solnik, Subhodeep Moitra, Greg Kochanski, John Karro, and D. Sculley. Google vizier: A
+service for black-box optimization. In Proceedings of the 23rd ACM SIGKDD International Conference on Knowledge
+Discovery and Data Mining, KDD ’17, page 1487–1495, New York, NY, USA, 2017. Association for Computing
+Machinery. ISBN 9781450348874. doi: 10.1145/3097983.3098043. https://doi.org/10.1145/3097983.3098043.
+Kim Hazelwood, Sarah Bird, David Brooks, Soumith Chintala, Utku Diril, Dmytro Dzhulgakov, Mohamed Fawzy,
+Bill Jia, Yangqing Jia, Aditya Kalro, et al. Applied machine learning at facebook: A datacenter infrastructure
+perspective. In 2018 IEEE international symposium on high performance computer architecture (HPCA), pages
+620–629. IEEE, 2018.
+Xinran He, Junfeng Pan, Ou Jin, Tianbing Xu, Bo Liu, Tao Xu, Yanxin Shi, Antoine Atallah, Ralf Herbrich, Stuart
+Bowers, et al. Practical lessons from predicting clicks on ads at facebook. In Proceedings of the eighth international
+workshop on data mining for online advertising, pages 1–9, 2014.
+J. Hermann.
+Meet michelangelo:
+Uber’s machine learning platform, 2017.
+https://www.uber.com/blog/
+michelangelo-machine-learning-platform/. Accessed: 2026-02-15.
+14
+Frank Hutter, Lars Kotthoff, and Joaquin Vanschoren. Automated machine learning: methods, systems, challenges.
+Springer, 2019.
+Hanxiao Liu, Karen Simonyan, and Yiming Yang.
+Darts:
+Differentiable architecture search.
+arXiv preprint
+arXiv:1806.09055, 2018.
+Meta AI. Four MTIA chips in two years: Scaling AI experiences for billions. Meta AI Blog, March 2026. https:
+//ai.meta.com/blog/meta-mtia-scale-ai-chips-for-billions/. Accessed: 2026-03-16.
+Dheevatsa Mudigere, Yuchen Hao, Jianyu Huang, Andrew Tulloch, Srinivas Sridharan, Xing Liu, Mustafa Ozdal,
+Jade Nie, Jongsoo Park, Liang Luo, et al. High-performance, distributed training of large-scale deep learning
+recommendation models. arXiv preprint arXiv:2104.05158, 2021.
+Maxim Naumov, Dheevatsa Mudigere, Hao-Jun Michael Shi, Jianyu Huang, Narayanan Sundaraman, Jongsoo Park,
+Xiaodong Wang, Udit Gupta, Carole-Jean Wu, Alisson G Azzolini, et al. Deep learning recommendation model for
+personalization and recommendation systems. arXiv preprint arXiv:1906.00091, 2019.
+Ruoxi Wang, Bin Fu, Gang Fu, and Mingliang Wang. Deep & cross network for ad click predictions. In Proceedings of
+the ADKDD’17, pages 1–7. 2017.
+Ruoxi Wang, Rakesh Shivanna, Derek Cheng, Sagar Jain, Dong Lin, Lichan Hong, and Ed Chi. Dcn v2: Improved deep
+& cross network and practical lessons for web-scale learning to rank systems. In Proceedings of the web conference
+2021, pages 1785–1797, 2021.
+Wei Wen, Kuang-Hung Liu, Igor Fedorov, Xin Zhang, Hang Yin, Weiwei Chu, Kaveh Hassani, Mengying Sun, Jiang
+Liu, Xu Wang, Lin Jiang, Yuxin Chen, Buyun Zhang, Xi Liu, Dehua Cheng, Zhengxing Chen, Guang Zhao,
+Fangqiu Han, Jiyan Yang, Yuchen Hao, Liang Xiong, and Wen-Yen Chen. Rankitect: Ranking architecture search
+battling world-class engineers at meta scale. In Companion Proceedings of the ACM Web Conference 2024, WWW
+’24, page 73–82, New York, NY, USA, 2024a. Association for Computing Machinery. ISBN 9798400701726. doi:
+10.1145/3589335.3648304. https://doi.org/10.1145/3589335.3648304.
+Wei Wen, Quanyu Zhu, Weiwei Chu, Wen-Yen Chen, and Jiyan Yang. Cubicml: Automated ml for distributed ml
+systems co-design with ml prediction of performance. arXiv preprint arXiv:2409.04585, 09 2024b.
+Hang Yin, Kuang-Hung Liu, Mengying Sun, Yuxin Chen, Buyun Zhang, Jiang Liu, Vivek Sehgal, Rudresh Rajnikant
+Panchal, Eugen Hotaj, Xi Liu, Daifeng Guo, Jamey Zhang, Zhou Wang, Shali Jiang, Huayu Li, Zhengxing Chen,
+Wen-Yen Chen, Jiyan Yang, and Wei Wen. Automl for large capacity modeling of meta’s ranking systems. In
+Companion Proceedings of the ACM Web Conference 2024, WWW ’24, page 374–382, New York, NY, USA, 2024.
+Association for Computing Machinery. ISBN 9798400701726. doi: 10.1145/3589335.3648336. https://doi.org/10.
+1145/3589335.3648336.
+Zhichen Zeng, Xiaolong Liu, Mengyue Hang, Xiaoyi Liu, Qinghai Zhou, Chaofei Yang, Yiqun Liu, Yichen Ruan,
+Laming Chen, Yuxin Chen, et al. Interformer: Effective heterogeneous interaction learning for click-through rate
+prediction. In Proceedings of the 34th ACM International Conference on Information and Knowledge Management,
+pages 6225–6233, 2025.
+Jiaqi Zhai, Lucy Liao, Xing Liu, Yueming Wang, Rui Li, Xuan Cao, Leon Gao, Zhaojie Gong, Fangda Gu, Michael He,
+et al. Actions speak louder than words: Trillion-parameter sequential transducers for generative recommendations.
+arXiv preprint arXiv:2402.17152, 2024.
+Buyun Zhang, Liang Luo, Xi Liu, Jay Li, Zeliang Chen, Weilin Zhang, Xiaohan Wei, Yuchen Hao, Michael Tsang,
+Wenjun Wang, et al. Dhen: A deep and hierarchical ensemble network for large-scale click-through rate prediction.
+arXiv preprint arXiv:2203.11014, 2022.
+Buyun Zhang, Liang Luo, Yuxin Chen, Jade Nie, Xi Liu, Daifeng Guo, Yanli Zhao, Shen Li, Yuchen Hao, Yantao Yao,
+et al. Wukong: Towards a scaling law for large-scale recommendation. arXiv preprint arXiv:2403.02545, 2024a.
+Tunhou Zhang, Wei Wen, Igor Fedorov, Xi Liu, Buyun Zhang, Fangqiu Han, Wen-Yen Chen, Yiping Han, Feng Yan,
+Hai Li, and Yiran Chen. Distdnas: Search efficient feature interactions within 2 hours. In 2024 IEEE International
+Conference on Big Data (BigData), pages 1492–1499, 2024b. doi: 10.1109/BigData62323.2024.10825061.
+Tunhou Zhang, Dehua Cheng, Yuchen He, Zhengxing Chen, Xiaoliang Dai, Liang Xiong, Yudong Liu, Feng Cheng,
+Yufan Cao, Feng Yan, Hai Li, Yiran Chen, and Wei Wen. Towards automated model design on recommender
+systems. ACM Trans. Recomm. Syst., 3(3), March 2025. doi: 10.1145/3706124. https://doi.org/10.1145/3706124.
+15
+Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang, Min Xu, Less Wright, Hamid Shojanazeri,
+Myle Ott, Sam Shleifer, et al. Pytorch fsdp: experiences on scaling fully sharded data parallel. arXiv preprint
+arXiv:2304.11277, 2023.
+Barret Zoph and Quoc V Le. Neural architecture search with reinforcement learning. arXiv preprint arXiv:1611.01578,
+2016.
+16

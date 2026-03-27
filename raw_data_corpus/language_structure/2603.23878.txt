@@ -1,0 +1,607 @@
+The Luna Bound Propagator for Formal Analysis
+of Neural Networks
+Henry LeCates and Haoze Wu
+Amherst College, USA
+{hlecates26,hwu}@amherst.edu
+Abstract. The parameterized CROWN analysis, a.k.a., α-CROWN,
+has emerged as a practically successful bound propagation method for
+neural network verification. However, existing implementations of α-
+CROWN are limited to Python, which complicates integration into exist-
+ing DNN verifiers and long-term production-level systems. We introduce
+Luna, a new bound propagator implemented in C++. Luna supports
+Interval Bound Propagation, the CROWN analysis, and the α-CROWN
+analysis over a general computational graph. We describe the architec-
+ture of Luna and show that it is competitive with the state-of-the-art
+α-CROWN implementation in terms of both bound tightness and com-
+putational efficiency on benchmarks from VNN-COMP 2025.
+Keywords: Neural Network Verification · Bound Propagation · Ab-
+stract Interpretation
+1
+Introduction
+Bound propagation is an important technique in the formal analysis of deep
+neural networks (DNNs). Modern DNN reasoners, such as α-β-CROWN [20,22,
+24], ERAN [14–16], Marabou [8, 21], NeuralSAT [4], NNV [10, 18], nnenum [2],
+VeriNet [6, 7], etc, all employ some version of bound propagation, either using
+it as stand-alone, incomplete DNN verification procedures, or as in-processing
+passes in a branch-and-bound/case-analysis-based search shell.
+Over the past few years, numerous bound propagation methods (e.g., [12,
+15, 19, 23, 25], inter alia) have been proposed. They differ in the choice of the
+abstraction domain and abstraction refinement strategies, and span over the
+spectrum of the efficiency and precision trade-off, from exact bounding based on
+MILP [17], to fast bounding based on interval arithmetic [5].
+In this paper, we focus on the parameterized CROWN (a.k.a. α-CROWN)
+analysis [25], which empirically strikes a good balance between precision and
+efficiency, and underlies the top two performers (α-β-CROWN and NeuralSAT)
+in the past two VNN-COMPs [3, 9]. To date, practical implementations of α-
+CROWN are only available in Python. The most widely used implementation is
+auto_LiRPA [22], which serves as the bound-propagation backend for both α-
+β-CROWN and NeuralSAT. While auto_LiRPA is in itself a high-performance
+arXiv:2603.23878v1  [cs.LG]  25 Mar 2026
+2
+Henry LeCates and Haoze Wu
+tool, invoking the Python-based α-CROWN from systems written in other pro-
+gramming languages, e.g., C++ or MATLAB, can incurs nontrivial integration
+and start-up overhead.
+To reduce this barrier and make α-CROWN accessible as a more easily
+integrable component for a wide range of verification tools (including future
+production-level verifiers), we develop Luna, the first C++ implementation of
+α-CROWN with a stable interface suitable for foreign-function integration. Luna
+is designed for the common setting in which a verifier must obtain sound output
+bounds for a given input region, while incurring minimal per-invocation over-
+head and still leveraging parallelization when available. Luna currently includes
+the following features:
+– support for interval bound propagation (IBP), CROWN, and α-CROWN
+analyses;
+– parallelization for the core tensor and bound computations leveraging the
+Torch Deep Learning Library;
+– multiple integration modes, including a command-line interface, a native
+C++ API, and Python bindings.
+On benchmarks from VNN-COMP 2025, Luna produces output bounds that
+are comparable with auto_LiRPA, the state-of-the-art α-CROWN implemen-
+tation, with overall lower runtime and start-up overhead. We expect that Luna
+will help to lower the engineering effort required to integrate strong bound-
+propagation techniques into existing tools and to promote research work that
+focus on other algorithmic bottlenecks in neural network verification.
+2
+Preliminaries on Bound Propagation
+Let f : Rn →Rm be a feedforward neural network. Given vectors ℓ, u ∈Rn,
+define the input box X := {x ∈Rn | ℓ≤x ≤u}. The goal of bound propagation
+is to compute an output box Y := {y ∈Rm | a ≤y ≤b}, such that f(x) ∈Y for
+all x ∈X.
+CROWN The CROWN analysis [25] (or equivalent the DeepPoly analysis [15])
+operates by constructing affine relaxations of each nonlinear layer. For a nonlin-
+ear layer z′ = σ(z) where z ∈[ℓ, u], it builds affine functions hL(z) and hU(z)
+such that hL(z) ≤σ(z) ≤hU(z) for all z ∈[ℓ, u]. By composing these affine
+bounds layer by layer, one obtains global affine lower and upper bounds on the
+network output. The concrete output bounds are then obtained by concretizing
+the global affine bounds using the input box X.
+Parameterized CROWN (α-CROWN) Many nonlinearities admit multiple
+valid affine relaxations. For example, ReLU(z) = max(z, 0) ≥α · z for all α ∈
+[0, 1]. Instead of fixing the relaxation, α-CROWN [22] considers a family of linear
+relaxations parameterized by a variable α. This induces parameterized global
+The Luna Bound Propagator for Formal Analysis of Neural Networks
+3
+ONNX Parser
+VNN-Lib Parser
+Bounds
+UNSAT, 
+UNKNOWN
+Bounded Model
+Computational 
+Graph
+Input Bounds
+C Matrix
+LiRPA Analysis
+Bounded Node
+Parameterized Bound 
+Propagation
+Optimize ɑ 
+over C
+Inference
+IBP
+Backward Relaxation 
+Computation
+𝛼-Parameter Management
+Fig. 1: High-level overview of Luna’s system architecture.
+bounds L(x, α) ≤f(x) ≤U(x, α) where L(x, α) and U(x, α) are affine in x for
+fixed α. The choice of α is then optimized (once for lower bound and once for
+upper bound) by solving
+max
+α∈A min
+x∈X L(x, α),
+min
+α∈A max
+x∈X U(x, α),
+where A represents the valid ranges of α (e.g., [0, 1] for ReLU lower bound). In
+practice, this nonconvex optimization problem is solved using projected gradient
+descent [11] over α.
+3
+The Luna Bound Propagator
+This section describes the architecture design of Luna. A high-level overview
+is presented in Figure 1. Luna takes as input a neural network in the ONNX
+format [1] and a specification in the VNN-LIB format, and computes sound
+bounds with respect to the input region defined in the specification.
+3.1
+Bounded Model
+Luna parses the inputs and convert them into (i) a bound-aware computational
+graph on top of the Torch Deep Learning Library [13], (ii) an input domain with
+element wise lower and upper bounds, and (iii) a set of linear output constraints
+in the form Cy ≤t. These three components constitute the Bounded Model,
+which is an internal representation of the verification problem shared by all
+analysis routines. App. A.1 provides implementation details on parsing.
+4
+Henry LeCates and Haoze Wu
+The computational graph is a directed acyclic graph whose nodes correspond
+to layer operations. For each node, three types of bounds are recorded: concrete
+bounds from interval arithmetic (IBP), linear relaxations from CROWN, and
+optimized bounds from α-CROWN. The specification matrix C represents a
+collection of linear constraints on the neural network output, which can be viewed
+as an additional layer following the output layer. During bound propagation,
+Luna treats this additional layer as the actual output layer and seeks to bound
+its output. For example, for an output constraint y1 ≤y2, Luna seeks to bound
+the value of an auxiliary variable a = y1 −y2.
+Bounded Node Modules Each node in the computational graph is associated
+with a Bounded Node module, which implements operator-specific bound com-
+putation. Two types of propagation are implemented: 1) Interval Bound Proro-
+gation (IBP), which is executed before the CROWN and α-CROWN analysis to
+obtain initial bounds on the neurons and detect stable neurons; 2) the CROWN
+backward propagation, which takes as input affine bounds of the output node
+in terms of the subsequent node, propagates them backward through the node,
+and outputs affine bounds of the output node in terms of the current node.
+Non-linear optimizable activation nodes inherit from an intermediate base
+class, which registers each node with the alpha optimization manager and pro-
+vides the interface for storing and retrieving per-neuron α parameters. During
+backward propagation, α is applied only for unstable neurons, while stable neu-
+rons use fixed slopes.
+Each node contains metadata on its dependencies, to ensure the tightest
+bounds are used for relaxations. Specifically, each node maintains a list of which
+inputs require precomputed bounds, and whether IBP is sufficient for computing
+its intermediate bounds or whether a CROWN backward pass is needed.
+Appendix A.2 provides more implementation details on the internal graph
+representation and node functionality.
+3.2
+Bound Propagation Engine
+The analysis engine forms the core of the verifier. It implements two complemen-
+tary bound propagation techniques: CROWN, which performs linear relaxations
+via backward propagation of symbolic coefficients, and α-CROWN with learn-
+able relaxation parameter optimized by projected gradient descent.
+CROWN The CROWN analysis module implements linear bound propaga-
+tion. CROWN processes nodes in a backward topological order, beginning from
+the output node. While propagating linear bounds backward, before a backward
+pass through a non-linear node, the engine recursively traverses the dependency
+graph, computing intermediate bounds for the pre-activation nodes, via sepa-
+rate CROWN backward pass. This lazy intermediate bound computation strat-
+egy, avoids unnecessary computation on stable neurons, while ensuring that the
+unstable neurons receive the tightest available input bounds, directly effecting
+The Luna Bound Propagator for Formal Analysis of Neural Networks
+5
+the quality of the backward relaxation. At the end of the backward propagation
+process, the symbolic bounds are concretized into concrete numerical bounds.
+The CROWN analysis engine also support CROWN-IBP which follows a two-
+phase approach. First IBP is performed, establishing the intermediate bounds.
+Second, a backward propagation from the output nodes occurs, using the pre-
+computed IBP bounds as intermediate bounds in the relaxation process. This
+avoids the cost of running separate CROWN backward passes to tighten each
+intermediate node’s bounds, requiring only a single IBP forward pass followed by
+one CROWN backward pass from the output node. This trades bound tightness
+for computational efficiency. By default Luna’s default is standard CROWN,
+which triggers additional CROWN backward passes for intermediate nodes.
+α-CROWN The α-CROWN module extends CROWN by introducing learn-
+able slope parameters that can tighten relaxations for selected nonlinearities. It
+wraps the standard CROWN analysis: the underlying CROWN engine performs
+all bound computation, while α-CROWN manages α parameter storage and the
+optimization loop, maintaining separate parameters for lower- and upper-bound
+optimization. At each optimization step, we collect all gradient-enabled α ten-
+sors and pass them to the optimizer. Each iteration re-runs the full CROWN
+backward pass, producing output bounds that depend on the current α values.
+We optimize a simple objective, minimizing the negative sum of lower bounds (or
+the positive sum of upper bounds), so improving the objective directly tightens
+the corresponding bounds.
+Appendix A.3 provides additional implementation details of the bound prop-
+agation engine.
+3.3
+Front End.
+Luna currently provides both a Command-Line Interface (CLI) and a Python
+API. The CLI expects an ONNX network and a VNN-LIB specification as inputs.
+The Python API allows users to load a network, specify input bounds, and
+compute output bounds using a selected analysis method. Figure 2 shows an
+example usage of the Python API. The interfaces allow users to set a time limit
+and configure the bound propagation passes, such as the analysis method to use
+(CROWN or α-CROWN), which bounds to optimize (upper, lower, or both),
+and the number of iterations in the α-CROWN analysis. Device placement is
+selected automatically (preferring CUDA if available), but can be overridden
+with –cpu or –cuda. Full configuration options and details about CLI usage
+appear in Appendix A.4.
+3.4
+Code, Installation, and Availability.
+Luna is implemented in 20k lines of C++17 code with Python bindings via py-
+bind11. The build system uses CMake and automatically downloads dependen-
+cies (libtorch, Boost, Protobuf, ONNX, pybind11) when not found locally. The
+6
+Henry LeCates and Haoze Wu
+from lirpapy import TorchModel
+import numpy as np
+onnx_path = "path/to/model.onnx"
+model = TorchModel(onnx_path)
+input_size = model.getInputSize()
+lower_bounds = np.full(input_size, -1.0)
+upper_bounds = np.full(input_size,
+1.0)
+model.setInputBounds(lower_bounds, upper_bounds)
+result = model.compute_bounds(method="alphaCROWN")
+Fig. 2: Example Python API usage: loading an ONNX model, setting input
+bounds, and computing α-CROWN bounds.
+project includes a comprehensive test suite of over 45 test files organized into unit
+tests (covering individual node types, parsers, and analysis routines), integration
+tests (end-to-end verification pipelines), and property-based tests (e.g., validat-
+ing that CROWN bounds are strictly tighter than IBP). The Luna source code
+is available on Github1 under the permissive modified BSD open-source license.
+4
+Evaluation
+4.1
+Experimental Setup
+We compare against auto_LiRPA [22], which underlies the top two performers,
+α-β-CROWN and NeuralSAT, in the past two VNN-COMPs [3, 9]. We evalu-
+ate Luna on supported benchmarks from VNN-COMP 2025. Currently, Luna
+supports a large fraction of the main track benchmarks. Handling richer speci-
+fications (e.g., ones with disjunctive pre-conditions) and additional operators is
+an on-going effort. Key hyper-parameters for the α-CROWN analysis include
+the number of optimization iterations and the learning rate. We fix those two
+parameters for both Luna and auto_LiRPA to 20 and 0.5 respectively. Aside
+from these shared hyperparameters, we used each tool’s default configuration
+for optimizing upper and lower bounds. We report three metrics: average bound
+width on instances where both tools terminated, average runtime in seconds,
+and the number of instances for which the tool successfully computed the out-
+put bounds within the timeout. All experiments were run on a cluster equipped
+with Dell PowerEdge R6525 CPU Servers. Each job is given 40 CPU cores, a
+192 GB memory limit, and a 300 s wall-clock time limit.
+4.2
+Results and Analysis
+Table 1 shows the results of Luna and auto_LiRPA on the evaluated bench-
+marks. Luna finished more benchmark instances within the timeout and is faster
+1 https://github.com/ai-ar-research/luna
+The Luna Bound Propagator for Formal Analysis of Neural Networks
+7
+Bench. (# inst.)
+Luna
+auto_LiRPA
+Width
+Time (s) Finished
+Width
+Time (s) Finished
+acasxu_2023 (184)
+867.42
+1.41
+184
+882.90
+6.19
+184
+cersyve (12)
+4.27
+1.23
+12
+4.38
+6.77
+12
+cifar100_2024 (200)
+4.63
+44.88
+170
+4.62
+136.59
+100
+collins_rul_cnn_2022 (62)
+35.80
+3.57
+62
+35.98
+5.78
+62
+cora_2024 (60)
+12073.43
+8.37
+60
+12067.97
+9.53
+60
+linearizenn_2024 (60)
+43.44
+2.96
+60
+48.53
+6.59
+60
+malbeware (150)
+5.42
+4.26
+150
+5.42
+5.30
+150
+metaroom_2023 (100)
+0.16
+1.68
+100
+0.16
+5.30
+95
+safenlp_2024 (189)
+22.77
+0.48
+189
+22.77
+5.20
+189
+sat_relu (98)
+58.99
+0.51
+98
+58.99
+5.13
+98
+tllverifybench_2023 (32)
+207.98
+18.63
+32
+213.18
+45.03
+20
+Table 1: Comparison of Luna and auto_LiRPA
+on every benchmark set. In terms of bound tightness, Luna produces tighter or
+equivalent bounds on 9 of the 11 benchmarks. For example, on the acasxu_2023
+benchmarks, Luna obtains tighter bounds in less time. And on the tllverify-
+bench_2023 benchmarks, Luna produces tighter bounds while being over 2.4
+times faster and finishing on all 32 instances compared to auto_LiRPA’s 20.
+Observing the 7 of the 11 benchmarks where Luna computed different av-
+erage bound widths, Luna’s bounds are tighter on 5 of them. Further on all 7
+of the benchmarks, Luna has a much faster runtime. On the 4 benchmarks the
+two tools produce compute equivalent bounds, Luna is more efficient. Notably,
+on the cifar100_2024 benchmarks, Luna is over 3 times faster (136.59/44.88),
+and finishes on 70 more instances than auto_LiRPA. The competitive per-
+formance stems from careful management of the computational graph, concrete
+design choices regarding the frequency of bound concretization, and operator-
+specific propagation strategies.
+Overall, at its current stage, Luna is competitive with the Python-based
+state-of-the-art bound propagator auto_LiRPA. Full per-instance results for
+all the reported benchmarks is publicly available.2
+5
+Conclusion and Next Steps
+We presented Luna, a C++-based bound propagation framework that imple-
+ments CROWN and α-CROWN. Our evaluation showed that Luna is compet-
+itive with state-of-the-art bound propagator auto_LiRPA in terms of bound
+tightness and overall more efficient on benchmarks from VNN-COMP’25. Future
+work includes expanding supported operator coverage, and integrating Luna
+into a complete verification workflow.
+2 https://drive.google.com/drive/folders/1iEfJ50rmWIgIK_
+Z2eQyPP1W5MFFSr382?usp=share_link
+8
+Henry LeCates and Haoze Wu
+References
+1. Bai, J., Lu, F., Zhang, K., et al.: Onnx: Open neural network exchange. https:
+//github.com/onnx/onnx (2019)
+2. Bak, S., Tran, H.D., Hobbs, K., Johnson, T.T.: Improved Geometric Path Enu-
+meration for Verifying ReLU Neural Networks. In: International Conference on
+Computer Aided Verification. pp. 66–96. Springer (2020)
+3. Brix, C., Bak, S., Johnson, T.T., Wu, H.: The fifth international verification of neu-
+ral networks competition (vnn-comp 2024): Summary and results. arXiv preprint
+arXiv:2412.19985 (2024)
+4. Duong, H., Nguyen, T., Dwyer, M.B.: Neuralsat: a high-performance verification
+tool for deep neural networks. In: International Conference on Computer Aided
+Verification. pp. 409–423. Springer (2025)
+5. Gowal, S., Dvijotham, K., Stanforth, R., Bunel, R., Qin, C., Uesato, J., Arand-
+jelovic, R., Mann, T., Kohli, P.: On the Effectiveness of Interval Bound Propagation
+for Training Verifiably Robust Models. arXiv preprint arXiv:1810.12715 (2018)
+6. Henriksen, P., Lomuscio, A.: DEEPSPLIT: An Efficient Splitting Method for Neu-
+ral Network Verification via Indirect Effect Analysis. In: International Joint Con-
+ference on Artificial Intelligence. pp. 2549–2555. ijcai.org (8 2021)
+7. Henriksen, P., Lomuscio, A.R.: Efficient Neural Network Verification via Adap-
+tive Refinement and Adversarial Search. In: Giacomo, G.D., Catalá, A., Dilkina,
+B., Milano, M., Barro, S., Bugarín, A., Lang, J. (eds.) European Conference on
+Artificial Intelligence. vol. 325, pp. 2513–2520. IOS Press (2020)
+8. Katz, G., Huang, D., Ibeling, D., Julian, K., Lazarus, C., Lim, R., Shah, P.,
+Thakoor, S., Wu, H., Zeljić, A., Dill, D., Kochenderfer, M., Barrett, C.: The
+Marabou Framework for Verification and Analysis of Deep Neural Networks. In:
+Proc. 31st Int. Conf. on Computer Aided Verification (CAV). pp. 443–452 (2019)
+9. Kaulen, K., Ladner, T., Bak, S., Brix, C., Duong, H., Flinkow, T., Johnson, T.T.,
+Koller, L., Manino, E., Nguyen, T.H., et al.: The 6th international verification
+of neural networks competition (vnn-comp 2025): Summary and results. arXiv
+preprint arXiv:2512.19007 (2025)
+10. Lopez, D.M., Choi, S.W., Tran, H., Johnson, T.T.: NNV 2.0: The Neural Network
+Verification Tool. In: Enea, C., Lal, A. (eds.) International Conference on Computer
+Aided Verification. vol. 13965, pp. 397–412. Springer (2023)
+11. Madry, A., Makelov, A., Schmidt, L., Tsipras, D., Vladu, A.: Towards deep learning
+models resistant to adversarial attacks. arXiv preprint arXiv:1706.06083 (2017)
+12. Müller, M.N., Makarchuk, G., Singh, G., Püschel, M., Vechev, M.: Prima: general
+and precise neural network certification via scalable convex hull approximations.
+Proceedings of the ACM on Programming Languages 6(POPL), 1–33 (2022)
+13. Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J., Chanan, G., Killeen,
+T., Lin, Z., Gimelshein, N., Antiga, L., et al.: Pytorch: An imperative style, high-
+performance deep learning library. Advances in neural information processing sys-
+tems 32 (2019)
+14. Singh, G., Ganvir, R., Püschel, M., Vechev, M.: Beyond the Single Neuron Convex
+Barrier for Neural Network Certification. Advances in Neural Information Process-
+ing Systems 32, 15098–15109 (2019)
+15. Singh, G., Gehr, T., Püschel, M., Vechev, M.: An Abstract Domain for Certifying
+Neural Networks. Proceedings of the ACM on Programming Languages 3(POPL),
+1–30 (2019)
+The Luna Bound Propagator for Formal Analysis of Neural Networks
+9
+16. Singh, G., Gehr, T., Püschel, M., Vechev, M.: Boosting Robustness Certification of
+Neural Networks. In: International Conference on Learning Representations (2019)
+17. Tjeng, V., Xiao, K.Y., Tedrake, R.: Evaluating robustness of neural networks with
+mixed integer programming. In: International Conference on Learning Represen-
+tations (2019)
+18. Tran, H.D., Yang, X., Manzanas Lopez, D., Musau, P., Nguyen, L.V., Xiang, W.,
+Bak, S., Johnson, T.T.: NNV: the Neural Network Verification Tool for Deep Neural
+Networks and Learning-enabled Cyber-Physical Systems. In: International Confer-
+ence on Computer Aided Verification. pp. 3–17. Springer (2020)
+19. Wang, S., Pei, K., Whitehouse, J., Yang, J., Jana, S.: Efficient Formal Safety
+Analysis of Neural Networks. Advances in Neural Information Processing Systems
+31, 6369–6379 (2018)
+20. Wang, S., Zhang, H., Xu, K., Lin, X., Jana, S., Hsieh, C.J., Kolter, J.Z.: Beta-
+crown: Efficient Bound Propagation with Per-neuron Split Constraints for Neural
+Network Robustness Verification. Advances in Neural Information Processing Sys-
+tems 34, 29909–29921 (2021)
+21. Wu, H., Isac, O., Zeljić, A., Tagomori, T., Daggitt, M., Kokke, W., Refaeli, I.,
+Amir, G., Julian, K., Bassan, S., et al.: Marabou 2.0: A Versatile Formal Analyzer
+of Neural Networks. arXiv preprint arXiv:2401.14461 (2024)
+22. Xu, K., Shi, Z., Zhang, H., Wang, Y., Chang, K.W., Huang, M., Kailkhura, B., Lin,
+X., Hsieh, C.J.: Automatic Perturbation Analysis for Scalable Certified Robustness
+and Beyond. Advances in Neural Information Processing Systems 33, 1129–1141
+(2020)
+23. Zelazny, T., Wu, H., Barrett, C., Katz, G.: On Reducing Over-Approximation Er-
+rors for Neural Network Verification. In: Proc. 22nd Int. Conf. on Formal Methods
+in Computer-Aided Design (FMCAD). pp. 17–26 (2022)
+24. Zhang, H., Wang, S., Xu, K., Li, L., Li, B., Jana, S., Hsieh, C.J., Kolter, J.Z.:
+General Cutting Planes for Bound-propagation-based Neural Network Verification.
+Advances in Neural Information Processing Systems 35, 1656–1670 (2022)
+25. Zhang, H., Weng, T.W., Chen, P.Y., Hsieh, C.J., Daniel, L.: Efficient Neural Net-
+work Robustness Certification with General Activation Functions. Advances in
+Neural Information Processing Systems 31, 4944–4953 (2018)
+10
+Henry LeCates and Haoze Wu
+A
+Architecture and Core Components
+This appendix records implementation-level details that complement Section 3,
+focusing on concrete classes, entry points, and internal data structures.
+A.1
+Input Parsing
+Onnx Parser The OnnxToTorchParser converts ONNX models through its
+main entry point, OnnxToTorchParser::parse(path), which returns a fully
+constructed TorchModel. Internally, processGraph() builds a topologically or-
+dered list of nodes: (i) graph inputs become source nodes with no dependencies,
+(ii) ONNX initializers (e.g., weights, biases, and other constants) become nodes
+that represent fixed tensors, and (iii) each remaining ONNX operator becomes
+a corresponding bound-aware operator node.
+Dependencies are resolved by mapping each operator’s input tensor names
+to previously created node indices, naturally supporting general DAG structure.
+For simple elementwise operators (e.g., Add and Sub), we distinguish between
+inputs that depend on earlier activations and inputs that are fixed constants;
+only the former are recorded as bound dependencies, since constant tensors do
+not require precomputed bounds during propagation.
+Shape inference runs before node construction in a separate multi-pass pro-
+cess. Its goal is to attach consistent tensor dimensions to each node so that
+shape-sensitive operators (e.g., Reshape) can be validated and constructed reli-
+ably. The parser validates operator input counts, rejects unsupported data types,
+and emits operator-specific error messages for malformed graphs.
+VNN-LIB Parsing The VnnLibInputParser provides three entry points:
+parseInputBounds(path, expectedInputSize) for input bounds (as a
+BoundedTensor), parseOutputConstraints(path, expectedOutputSize) for
+output constraints (as an OutputConstraintSet), and
+parseInputAndOutputConstraints(path, inputSize, outputSize) to parse
+both in a single pass.
+Parsing proceeds in two phases. readVnnLibFile() reads the file and removes
+comments; tokenize() then converts the remaining content into a stream of to-
+kens (parentheses, operators, identifiers, and numeric literals). For input bounds,
+the parser reads declarations of the form declare-const X_i Real and extracts
+interval constraints from assert statements, handling nested conjunctions (and)
+via recursion. If an input variable is declared but not constrained, it is treated
+as unbounded (i.e., [−∞, +∞]), which is conservative.
+For output constraints, parseLinearExpression() recursively evaluates ex-
+pressions over output variables Yi and produces a sparse set of coefficient terms.
+Constraints are normalized to the form Cy ≤t; ≥constraints are rewritten by
+negating both sides. Disjunctions (or) are represented as multiple branches col-
+lected by parseOutputBranch(); verification succeeds if any branch is satisfied.
+The Luna Bound Propagator for Formal Analysis of Neural Networks
+11
+A.2
+Bounded Model Representation
+Bounded Model After parsing, the network is stored as a computational graph
+with explicit dependency information in both directions: a forward map (map-
+pings nodes to their inputs) and a reverse map (mappings nodes to their suc-
+cessors). These maps are constructed by buildDependencyGraph() and allow
+efficient traversal for both forward interval propagation and backward linear
+relaxations.
+The main analysis entry point is compute_bounds(), which dispatches to
+runCROWN() or runAlphaCROWN() based on the selected method and returns a
+BoundedTensor containing the final lower and upper output bounds.
+Bounded Nodes Nonlinear activations nodes whose relaxations can be opti-
+mized (e.g., BoundedReLUNode) inherit from BoundedAlphaOptimizeNode. These
+nodes create learnable slope parameters lazily: during boundBackward(). This
+allocation is only needed for unstable neurons, meaning neurons whose input
+bounds contain 0; for stable neurons the ReLU behavior is fixed and no relax-
+ation parameter is required.
+To keep memory usage low, nodes store only long-lived information such as
+registered module parameters, shape metadata, and cached initialization values.
+Per-run quantities (for example, the symbolic coefficient tensors used in back-
+ward propagation) are recomputed on each backward pass, since they depend on
+the current input bounds and (for α-CROWN) the current parametrized slope
+values.
+A.3
+Bound Propagation Engine
+The analysis engine implements two complementary bound-propagation meth-
+ods. CROWN constructs linear upper and lower bounds by propagating symbolic
+coefficients backward through the graph, while α-CROWN tightens those bounds
+by optimizing learnable slope parameters for non linear activations.
+CROWN The CROWN analysis module implements linear bound propagation
+through a three-phase pipeline. First, fast Interval Bound Propagation (IBP) is
+performed via computeIBPBounds(), establishing initial interval bounds for all
+nodes in the network. The second phase, backwardFrom(startIndex), executes
+backward propagation from a specified output node, computing linear relaxation
+coefficients that express the output as a linear function of earlier layers. Finally,
+concretizeNode(startIndex) transforms these symbolic bounds into concrete
+numerical bounds using the concretization formula.
+In the standard CROWN, after the initial IBP pass, only the input node is
+marked as having concrete bounds. During the backward pass from the output,
+when a nonlinear node (e.g., ReLU) requires bounds on its inputs to compute
+relaxations, checkPriorBounds() triggers computeIntermediateBoundsLazy()
+for those inputs. This method first attempts to use IBP if the dependency chain
+12
+Henry LeCates and Haoze Wu
+consists only of element-wise operations (via checkIBPIntermediate()). If the
+chain contains linear layers, a separate CROWN backward pass is launched for
+that intermediate node to compute tighter bounds. This lazy computation strat-
+egy tightens intermediate bounds beyond IBP where beneficial, producing tighter
+final bounds at the cost of multiple backward passes.
+For CROWN-IBP, after the initial IBP pass, all nodes are marked as having
+concrete bounds. The single backward pass from the output uses these precom-
+puted IBP bounds as intermediate bounds during relaxations. No additional
+backward passes are triggered.
+The helper preprocessC() transforms a specification matrix of the output
+constraints into the internal representation. If no specification is provided, an
+identity specification is constructed to bound each output dimension indepen-
+dently.
+α-CROWN α-CROWN stores relaxation parameters in a nested map indexed
+by node and specification branch, with separate parameter sets used when opti-
+mizing lower bounds versus upper bounds.computeOptimizedBounds() runs it-
+erative gradient-based optimization, where each iteration re-runs CROWN with
+gradient tracking enabled, extracts the resulting bounds, and defines a loss that
+encourages tighter bounds (e.g., the negative sum of lower bounds when max-
+imizing lower bounds, or the positive sum of upper bounds when minimizing
+upper bounds).
+When an iteration improves the objective, the current learned slope values
+and the corresponding bounds are cached as the best-so-far solution. The op-
+timizer follows the standard zero_grad(), backward(), step() sequence, then
+clips the learned slopes to a valid range (for ReLU, [0,1]). Early stopping with a
+configurable patience detects convergence and restores the best cached learned
+slope values.
+A.4
+Front End
+Python API The Python API lunapy exposes TorchModel and BoundedTensor
+via pybind11 bindings. Users can load a network, specify input bounds, and
+compute output bounds using a selected analysis method. In addition to di-
+rect parsing from .onnx and .vnnlib files, lirpapy supports user-constructed
+specifications and custom analysis workflows.
+CLI The CLI executable accepts an ONNX model and a VNN-LIB specification,
+making it suitable for automated runs and direct integration with the VNN-
+COMP benchmark format. Below is an example of invoking Luna through its
+CLI:
+lirpa --input <path/to/model.onnx> --vnnlib <path/to/property.vnnlib> /
+--method alpha-crown --optimize-lower --optimize-upper --lr 0.5 /
+--iterations 20
+The Luna Bound Propagator for Formal Analysis of Neural Networks
+13
+All front ends share a unified configuration layer, LirpaConfiguration, so
+that the same analysis choices and runtime settings apply regardless of whether
+Luna is invoked through Python or the CLI. Users select the analysis method
+with –method (crown by default or alpha-crown) and control which bounds are
+computed (lower/upper) as well as logging via –verbose/–quiet or –verbosity.
+For α-CROWN, optimization is determined by standard hyperparameters in-
+cluding –iterations, –lr, and –lr-decay, with additional toggles for opti-
+mizing lower and/or upper bounds (–optimize-lower/–no-optimize-lower,
+–optimize-upper/–no-optimize-upper) and stability-focused options such as
+early stopping and retaining the best iteration. For CROWN-style analysis, the
+configuration exposes a choice between standard CROWN and CROWN-IBP
+(–standard-crown vs. –crown-ibp). Runtime and reproducibility are handled
+through –timeout and –seed. Device placement is selected automatically when
+CUDA is available, but can be overridden with –cpu or –cuda.

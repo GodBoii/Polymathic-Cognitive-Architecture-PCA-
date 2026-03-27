@@ -1,0 +1,1947 @@
+Model2Kernel: Model-Aware Symbolic Execution For Safe CUDA Kernels
+Mengting He
+The Pennsylvania State University
+mvh6224@psu.edu
+Shihao Xia
+The Pennsylvania State University
+szx5097@psu.edu
+Haomin Jia
+State Key Lab of Processors, Institute of Computing Technology, CAS
+jiahaomin25@mails.ucas.ac.cn
+Wenfei Wu
+Peking University
+wenfeiwu@pku.edu.cn
+Linhai Song
+State Key Lab of Processors, Institute of Computing Technology, CAS
+songlinhai@ict.ac.cn
+Abstract
+The widespread adoption of large language models (LLMs)
+has made GPU-accelerated inference a critical part of modern
+computing infrastructure. Production inference systems rely
+on CUDA kernels to implement core transformer operations,
+yet these kernels are highly susceptible to memory-safety
+bugs due to model-dependent tensor layouts, intricate memory
+indexing, and massive thread-level parallelism. Such bugs
+can corrupt model weights, crash inference services, or even
+enable adversarial attacks. Existing techniques either depend
+on unavailable hardware, incur high overhead, or fail to handle
+kernel inputs with variable lengths, and none can effectively
+detect CUDA memory bugs in LLM inference systems.
+This paper presents Model2Kernel, the first practical sys-
+tem for automatically verifying the memory safety of CUDA
+kernels used in LLM inference. Model2Kernel performs
+model-aware dynamic analysis to determine how each model
+invokes kernels and to classify kernel arguments as either
+fixed by the model architecture or controlled by model users.
+Using this information, Model2Kernel then applies CUDA-
+specialized symbolic execution, supported by new abstrac-
+tions for dynamic tensor memory and thread identifiers, to
+accurately pinpoint memory bugs in kernels. In the evaluation
+on CUDA kernels and models from vLLM, Hugging Face,
+and recent LLM research papers, Model2Kernel discovers 353
+previously unknown bugs while producing only nine false
+positives, demonstrating its effectiveness.
+1
+Introduction
+The rapid adoption of large language models (LLMs) has
+driven an explosion of inference workloads across chat bots [1,
+2,22], search [44,91], recommendation [5,80,86], copilots [15,
+40,90], scientific computing [7,45,77], and countless other
+areas [8, 10, 84]. These services now operate at large scale
+and serve real users, making LLM inference systems a critical
+part of modern computing infrastructure.
+LLM inference systems rely on a layered software archi-
+tecture. Model developers publish Python model files and
+weights—such as those released on Hugging Face [29]—
+which inference frameworks (e.g., vLLM [42], SGLang [87],
+Transformers [30]) load and execute. These frameworks
+manage inference requests and register GPU kernels to link
+Python-level logic with host-side wrapper code. The wrap-
+per code prepares CUDA kernel inputs and configures kernel
+launches. At the lowest layer, CUDA kernels perform the
+core linear algebra operations required by transformer archi-
+tectures on the GPU. This design supports rapid innovation
+but substantially increases system complexity.
+Memory-safety bugs remain a persistent challenge [72],
+and CUDA kernels are particularly vulnerable for three main
+reasons. First, fine-grained index calculations across large
+tensors and thousands of threads make kernels prone to out-
+of-bounds accesses and data races. Second, as model archi-
+tectures grow larger [84] and inference sequences become
+longer [23, 74], the risk of integer overflows in CUDA ker-
+nels increases. Third, the complexity of the entire inference
+stack can produce tensor layouts that violate kernel assump-
+tions [16, 52], further increasing the potential for memory-
+safety errors.
+Memory-safety bugs in CUDA kernels can lead to severe
+consequences. Out-of-bounds accesses and data races often
+trigger “illegal memory access” errors on the GPU, poten-
+tially crashing the entire inference service [63]. Recent work
+has also shown that such vulnerabilities can be exploited to
+modify arbitrary GPU memory or even achieve arbitrary code
+execution [25, 34, 57]. Because inference systems interact
+with external users and may receive attacker-controlled inputs,
+exploitable memory bugs in kernels pose a serious security
+risk, potentially allowing adversaries to alter deployed model
+weights or compromise the entire system.
+Existing techniques for detecting memory bugs in CUDA
+kernels fall into two main categories. Dynamic methods
+track metadata for GPU memory buffers and check whether
+pointer values fall within valid bounds before dereferenc-
+ing [28,43,43,49,59,60,73,82,88,89,92]. However, these
+methods either incur high runtime overhead or rely on ex-
+tra hardware not yet widely available. Static tools, on the
+1
+arXiv:2603.24595v1  [cs.PL]  6 Mar 2026
+Figure 1: An overview of Model2Kernel.
+other hand, cannot handle buffers with sizes determined
+at runtime or the variability of kernel launch configura-
+tions [6,35,46–48,50,54,65]. As a result, no existing tech-
+nique offers comprehensive and practical memory bug detec-
+tion for the CUDA kernels in modern LLM inference systems.
+We argue that symbolic execution provides a promising
+approach for detecting memory-safety issues in CUDA ker-
+nels. Many critical vulnerabilities (e.g., integer overflows,
+buffer overflows, data races) can be formulated as constraint-
+satisfaction problems over indices, tensor shapes, and thread
+identifiers, a domain where symbolic execution excels. In
+addition, CUDA kernels are generally simpler than typical
+C/C++ programs: they primarily operate over multidimen-
+sional tensors, use few custom data structures, and rarely
+involve complex pointer operations (e.g., pointers to pointers)
+or indirect function calls. These characteristics make CUDA
+kernels easy for symbolic analysis.
+However, applying symbolic execution to CUDA kernels
+presents several challenges. First, existing symbolic execution
+techniques have difficulty handling dynamic arrays, yet most
+CUDA kernels in LLM systems operate on tensors whose
+shapes are often determined only at runtime. Second, CUDA
+kernels execute across thousands of parallel threads, and scal-
+ing symbolic execution to these threads is non-trivial. Third,
+kernel behavior may vary across different model architec-
+tures, and automatically inferring these architectures and un-
+derstanding how they affect kernel execution remain complex
+due to the intricacies of the full inference stack.
+To address these challenges, we design Model2Kernel,
+a fully automated analysis framework that verifies whether
+CUDA kernels exhibit memory-safety issues when used to-
+gether with a given LLM model. Model2Kernel targets four
+types of bugs in CUDA kernels: buffer overflows, integer
+overflows, data races, and NULL pointer dereferences, and
+supports models sharing the same format as those released on
+Hugging Face. As shown by Figure 1, Model2Kernel consists
+of two major components: cuKLEE and HFProbe.
+cuKLEE is a symbolic execution engine specialized for
+CUDA kernels. To handle input tensors whose memory lay-
+outs are determined at runtime, we model each tensor as a
+distinct and widely separated memory region. This abstrac-
+tion simplifies pointer–tensor association and makes bounds
+checking more tractable. We then introduce symbolic vari-
+ables to represent each tensor’s base address, element count,
+dimensions, and other properties. With these variables, cuK-
+LEE can handle more than 100 tensor methods by adding the
+appropriate constraints to its execution states. We also model
+CUDA thread identifiers as symbolic variables, enabling uni-
+fied symbolic execution that captures both thread-shared and
+thread-specific computations in a single pass. This design
+allows cuKLEE to scale to thousands of CUDA threads.
+HFProbe “executes” each model without requiring GPU
+hardware. It profiles how the model invokes CUDA kernels
+and automatically identifies which kernel inputs are deter-
+mined by the model architecture (and therefore should re-
+main fixed during cuKLEE’s analysis) and which inputs are
+controlled by end users (and should be treated as variable).
+Incorporating this information allows cuKLEE to analyze
+kernels more efficiently and accurately. In addition, HFProbe
+statically identifies all CUDA kernels that may be invoked by
+a given model and automatically mutates the model’s configu-
+rations to trigger more kernels, ensuring more comprehensive
+analysis of both the model and its CUDA kernels.
+We evaluate Model2Kernel on CUDA kernels and models
+from three sources: all text-generation models in vLLM [42]
+and the related kernels, all Hugging Face models with custom
+kernels, and models and kernels from four recent research
+publications [39,55,64,81]. In total, Model2Kernel identifies
+353 memory bugs, including 328 integer overflows and 25
+out-of-bounds accesses, with only nine false positives, demon-
+strating its effectiveness in detecting memory safety issues
+for CUDA kernels. We further compare Model2Kernel with
+Honeycomb [54], GKLEE [47], and ESBMC-GPU [65] on
+20 known vLLM CUDA kernel bugs. Model2Kernel success-
+fully detects 15 of these bugs, far more than the baseline
+techniques, highlighting its good bug coverage and clear im-
+provement over existing techniques. An ablation study shows
+that both HFProbe and cuKLEE are critical for Model2Kernel
+to achieve this level of effectiveness.
+In sum, we make the following contributions:
+• We design cuKLEE, a CUDA-specific symbolic execu-
+tion engine that supports tensors with dynamic shapes
+and scales to thousands of CUDA threads.
+• We develop HFProbe, a dynamic model profiler that an-
+alyzes how models invoke CUDA kernels and infers
+model-dependent kernel arguments.
+• By integrating cuKLEE with HFProbe, we build
+Model2Kernel, a fully automated framework for detect-
+ing CUDA memory bugs in LLM inference systems, and
+we demonstrate its effectiveness through comprehensive
+experiments.
+2
+Background
+This section provides background for the project, including
+Hugging Face models, the CUDA programming language,
+memory-safety issues in CUDA kernels, and the limitations
+of existing symbolic execution techniques.
+2
+1
+class DeepseekV3ForCausalLM(nn.Module):
+2
+def __init__(self, config):
+3
+self.model = DeepseekV2Model(config)
+4
+def forward(self, input_ids, positions):
+5
+return self.model(input_ids, positions)
+6
+class DeepseekV2Model(nn.Module):
+7
+def __init__(self, config):
+8
+self.layers = ...
+9
+self.norm = RMSNorm(config.hidden_size)
+10
+def forward(self, input_ids, positions):
+11
+hidden_states, residual = ...
+12
+for layer in self.layers:
+13
+hidden_states,residual = layer(positions, hidden_states,
+residual)
+14
+hidden_states, _ = self.norm(hidden_states, residual)
+15
+return hidden_states
+16
+class RMSNorm(nn.Module):
+17
+def __init__(self, hidden_size: int, eps=1e-6):
+18
+self.w, self.e = torch.ones(hidden_size), eps
+19
+def forward(self, x, residual=None):
+20
+torch.ops._C.fused_add_rms_norm(x,residual,self.w,self.e)
+21
+return x, residual
+(a) The Python model code of DeepseekV3ForCausalLM.
+1
+TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+2
+ops.def("fused_add_rms_norm(Tensor! input, Tensor! residual,
+3
+Tensor weight, float epsilon) -> ()");
+4
+ops.impl("fused_add_rms_norm",torch::kCUDA,&fused_add_rms_norm);
+5
+}
+(b) The registration of the CUDA kernel to Python.
+1
+void fused_add_rms_norm(torch::Tensor& input, torch::Tensor&
+residual, torch::Tensor& weight, double epsilon) {
+2
+int hidden_size = input.size(-1);
+3
+int num_tokens = input.numel() / hidden_size;
+4
+dim3 grid(num_tokens);
+5
+dim3 block(std::min(hidden_size, 256));
+6
+const at::cuda::OptionalCUDAGuard
+device_guard(device_of(input));
+7
+const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+8
+vllm::fused_add_rms_norm_kernel<bfloat16, 8>
+9
+<<<grid, block, 0, stream>>> (input.data_ptr<bfloat16>(),
+residual.data_ptr<bfloat16>(), weight.data_ptr<bfloat16>(),
+epsilon, num_tokens, hidden_size);
+10
+}
+(c) Wrapper function.
+1
+template <typename scalar_t, int width>
+2
+__global__ std::enable_if_t<(width > 0) &&
+_typeConvert<scalar_t>::exists>
+3
+fused_add_rms_norm_kernel(
+4
+scalar_t* __restrict__ input,
+5
+scalar_t* __restrict__ residual,
+6
+const scalar_t* __restrict__ weight,
+7
+const float epsilon, const int num_tokens,
+8
+const int hidden_size) {
+9
+10
+const int vec_hidden_size = hidden_size / width;
+11
+__shared__ float s_variance;
+12
+13
+float variance = 0.0f;
+14
+auto* __restrict__ input_v =
+reinterpret_cast<_f16Vec<scalar_t, width>*>(input);
+15
+auto* __restrict__ residual_v =
+reinterpret_cast<_f16Vec<scalar_t, width>*>(residual);
+16
+auto* __restrict__ weight_v = reinterpret_cast<const
+_f16Vec<scalar_t, width>*>(weight);
+17
+18
+for (int idx = threadIdx.x; idx < vec_hidden_size;
+19
+idx += blockDim.x) {
+20
+int id = blockIdx.x * vec_hidden_size + idx;
+21
+_f16Vec<scalar_t, width> temp = input_v[id];
+22
+temp += residual_v[id];
+23
+variance += temp.sum_squares();
+24
+residual_v[id] = temp;
+25
+}
+26
+27
+using BlockReduce = cub::BlockReduce<float, 1024>;
+28
+__shared__ typename BlockReduce::TempStorage reduceStore;
+29
+variance = BlockReduce(reduceStore).Reduce(variance,
+cub::Sum{}, blockDim.x);
+30
+if (threadIdx.x == 0) {
+31
+s_variance = rsqrtf(variance/hidden_size+epsilon);
+32
+}
+33
+34
+__syncthreads();
+35
+36
+for (int idx = threadIdx.x; idx < vec_hidden_size;
+37
+idx += blockDim.x) {
+38
+int id = blockIdx.x * vec_hidden_size + idx;
+39
+_f16Vec<scalar_t, width> temp = residual_v[id];
+40
+temp *= s_variance;
+41
+temp *= weight_v[idx];
+42
+input_v[id] = temp;
+43
+}
+44
+}
+(d) CUDA kernel. (Thread-dependent computations are in yellow.)
+Figure 2: A CUDA kernel example, its wrapper function, its registration to vLLM, and a Hugging Face model using the kernel.
+2.1
+Hugging Face Models
+Hugging Face is the largest platform for sharing pre-trained
+models [29], offering both a model marketplace and libraries
+that facilitate model integration into LLM inference frame-
+works (e.g., vLLM [42], SGLang [87], Transformers [30]). To-
+day, it hosts millions of models, including major open-source
+foundation models (e.g., Qwen, LLaMA) and their variants,
+making it a central hub for the AI community.
+A model released on Hugging Face typically contains four
+types of files. The config.json file defines the model’s architec-
+ture, including layers, hidden size, activation functions, and
+other structural parameters. The model-weight files store the
+trained parameters. The Python code files define classes that
+extend nn.Module and implement the model’s architecture.
+One top-level class assembles all model components together,
+with its forward() method as the entrance of the model’s
+whole forward pass. For example, Figure 2a shows simplified
+model code for DeepseekV3ForCausalLM, and forward()
+in line 4 begins the model’s inference process. Finally, doc-
+umentation files (e.g., README.md) provide instructions,
+usage examples, and licensing information.
+2.2
+The CUDA Programming Language
+CUDA is the dominant general-purpose programming lan-
+guage for exploiting GPU computational power [21], and
+most GPU kernels in inference systems are written in CUDA.
+CUDA source files (.cu files) typically contain two types of
+code: host wrapper functions and GPU kernel functions. Host
+wrappers run on the CPU and are exposed to Python code in
+inference systems via registration or binding macros [36,67]
+(e.g., Figure 2b). They process input Tensors from Python
+code into kernel arguments, configure launch parameters (e.g.,
+3
+number of thread blocks, threads per block, shared-memory
+size), and call the kernels. CUDA kernels run on the GPU.
+They define the computation performed by each parallel
+thread. Under CUDA’s execution model, a kernel runs across
+many threads organized into blocks and grids. Each thread
+uses built-in identifiers (e.g., blockIdx.x, threadIdx.x) to
+determine its location in this hierarchy and the portion of
+input data it processes.
+Function fused_add_rms_norm() in Figure 2c is a wrap-
+per function. It computes the model’s hidden size and
+the number of input tokens in lines 2–3, sets the num-
+ber of blocks to the token count (line 4) and threads per
+block to 256 (line 5), and then launches kernel function
+fused_add_rms_norm_kernel() with pointers to the under-
+lying memory of the input tensors, the epsilon parameter,
+and the computed hidden size and token number in lines 8–9.
+Figure 2d shows the launched CUDA kernel. It fuses
+element-wise addition, RMS normalization, and scaling by
+weight. To improve performance, the kernel uses vectoriza-
+tion. It calculates how many vector units fit into the hidden
+size in line 10, allocates a shared-memory variable that all
+threads in the block can access in line 11, and casts the input
+pointers to vectorized types in lines 14–16. The loop in lines
+18–25 distributes work across threads. Each thread determines
+which part of data it should process based on the block’s start-
+ing offset (blockIdx.x * vec_hidden_size), its thread ID
+(threadIdx.x), and additional loop increments equal to the
+block size (blockDim.x). In each iteration, a thread loads
+a vector in line 21, adds residuals in line 22, and accumu-
+lates the squared sum into the thread-local variance in line
+23. Next, a block-wise reduction sums variances from all
+threads in lines 27–29. The kernel computes the RMS nor-
+malization coefficient and stores it to the shared memory in
+line 31. Finally, the second loop in lines 36–43 uses the same
+indexing pattern to apply the normalization, multiplies by
+weight, and writes the results back to input.
+2.3
+Memory Safety Issues in CUDA Kernels
+Unfortunately, CUDA kernels in LLM inference systems are
+prone to memory bugs (e.g., integer and buffer overflows).
+This arises partly because kernels must implement complex,
+highly optimized matrix operations to exploit hardware fea-
+tures such as caches and vectorized instructions (e.g., line
+21 in Figure 2d), increasing the likelihood of programming
+errors. Moreover, inference systems integrate kernels and
+models from different groups, so a kernel correct for one
+model may fail for another. For example, the model’s hidden
+size of 8192 in Figure 2a and line 8 of Figure 2c yield width
+= 8 and vec_hidden_size = 1024 in Figure 2d. The ker-
+nel launches one block per token, so blockIdx.x equals the
+number of tokens or the batch size multiplied by the sequence
+length. With batch size up to 64 and sequence length up to
+128,000, the product blockIdx.x * vec_hidden_size in
+line 20 can easily exceed the int32 limit, triggering an inte-
+ger overflow. The overflowed value is then used as an index
+into input_v, causing a buffer overflow.
+We conduct an empirical study to assess the prevalence
+and characteristics of CUDA memory bugs in LLM inference
+systems. By examining vLLM’s change logs, we identify 20
+resolved memory bugs in CUDA kernels, including ten integer
+overflows (also causing buffer overflows), eight additional
+buffer overflows and two null-pointer dereferences. 17 occur
+on input tensors residing on GPU global memory, while three
+happen on GPU shared memory. 13 were reported by users
+during production, six detected by unit tests, and one found
+via code review. These results highlight the prevalence of
+CUDA memory errors in LLM inference systems and their
+strong association with tensors.
+CUDA memory errors can easily lead to incorrect compu-
+tations in LLM inference systems. Moreover, GPUs trigger
+an “invalid memory access” when unallocated memory is
+accessed, which can crash the entire inference system, as
+observed in our study [13]. Compounding the risk, recent
+research shows that such memory errors can be exploited for
+attacks, including arbitrary memory writes and code execution
+on GPU [25,34,57], highlighting the urgent need to address
+CUDA memory bugs in LLM inference systems.
+2.4
+Symbolic Execution Techniques
+Symbolic execution [79] is a static analysis technique that “ex-
+ecutes” programs with symbolic, rather than concrete, inputs.
+By systematically exploring execution paths and invoking con-
+straint solvers to assess path feasibility, it can generate inputs
+that expose potential defects. Numerous symbolic execution
+techniques have been developed. They have successfully de-
+tected diverse issues (e.g., buffer overflows, integer overflows)
+in critical software systems [9,11,17,33,76,78].
+Existing symbolic execution techniques struggle with dy-
+namic arrays whose sizes are only known at runtime. Con-
+sider how KLEE [11] handles the allocation “buffer =
+(int *)malloc(n * sizeof(int))” where n is fully user-
+controlled and marked symbolic. KLEE forks three states
+upon encountering this statement. The first assumes n = 1,
+typically producing false positives for later accesses because
+real inputs are usually much larger. The second assumes
+n > 231, causing KLEE to report “null page access” once
+buffer is used. The third treats n as a symbolic uint32, is-
+sues a “concretized symbolic size” warning, and terminates
+the exploration for the state. KLEE and most symbolic ex-
+ecutors handle dynamic arrays in this simplified way because
+they use a contiguous memory model. If an array’s size is
+symbolic, the addresses of all subsequent buffers also become
+symbolic, dramatically complicating memory–access reason-
+ing for those buffers.
+This limitation is particularly problematic for CUDA ker-
+nels, especially those used in LLM inference, because they
+4
+operate directly on tensor memory whose shapes depend on
+model architectures or even on user-provided token counts
+(e.g., the dimensions of the input tensor in Figure 2c). Conse-
+quently, although prior efforts have explored symbolic execu-
+tion for CUDA kernels [6,35,46,48], none can be effectively
+applied to CUDA code in modern LLM inference systems.
+3
+Overview of Model2Kernel
+Model2Kernel is designed to detect memory bugs in CUDA
+kernels for LLM inference systems. As shown in Figure 1,
+it consists of two components: HFProbe, which collects
+model-architecture information, and cuKLEE, which iden-
+tifies CUDA memory bugs using this information.
+HFProbe supports two backends, vLLM [42] and Trans-
+formers [30], enabling it to analyze any model compati-
+ble with these frameworks, including all models from Hug-
+ging Face [29]. For each CUDA kernel, HFProbe determines
+which kernel inputs are model-dependent and which are user-
+controlled. For example, when analyzing the model in Fig-
+ure 2a, HFProbe infers that the last dimensions of tensors
+input, residual, and weight in Figure 2c are all 7168, the
+model’s hidden size, while the first dimensions of input and
+residual correspond to the number of input tokens.
+cuKLEE is a symbolic execution engine specialized for
+CUDA that detects out-of-bounds accesses, integer overflows,
+data races, and null-pointer dereferences. Using model in-
+formation provided by HFProbe, it identifies buggy lines
+in CUDA kernels and generates concrete values for user-
+controlled kernel inputs that can trigger the bugs. For exam-
+ple, for Figure 2c, it reports that when the first dimension of
+input is 2,432,000 (batch size 19, sequence length 128,000),
+line 20 experiences an integer overflow and line 21 performs
+an out-of-bounds access in Figure 2d.
+Model2Kernel enhances the safety and reliability of infer-
+ence systems in two ways. First, model developers can use it
+to verify existing CUDA kernels correctly support newly de-
+veloped model architectures and expected input token counts.
+Second, CUDA developers can use it to ensure that new ker-
+nel optimizations do not introduce memory bugs and remain
+compatible with models already deployed in production.
+4
+Design of Model2Kernel
+This section gives the detailed design of Model2Kernel.
+4.1
+cuKLEE: Symbolic Execution on CUDA
+cuKLEE begins its analysis at each wrapper function (e.g.,
+Figure 2c) to gather information about how the CUDA kernel
+(e.g., Figure 2d) is invoked. It then examines the kernel to de-
+tect potential memory bugs. cuKLEE allows users to specify
+constraints on the wrapper’s inputs, so that information about
+Table 1: Constraint variables defined for tensor t.
+Tensor Fields
+Description
+Variables
+t.storage_.data_ptr_
+base address
+Bt
+t.numel_
+# of elements
+Nt
+t.sizes_and_strides_.size_
+# of dimensions
+Dt
+t.sizes_and_strides_
+dimensions
+d0
+t , d1
+t , ... dD−1
+t
+t.data_type_.itemsize_
+element size
+St
+model architectures can be incorporated to improve both ac-
+curacy and performance. In summary, we address three key
+challenges in building cuKLEE.
+First, as discussed in Section 2.4, existing symbolic execu-
+tion techniques have difficulty handling dynamic arrays. In
+contrast, most CUDA kernels in LLM inference systems oper-
+ate on the raw memory of tensor objects (e.g., input in line 4
+of Figure 2d), whose shapes vary depending on model archi-
+tectures or user-provided tokens. How can cuKLEE analyze
+memory operations on tensors with dynamic shapes?
+Second, wrapper functions often call tensor methods to set
+up parameters for kernel launches. These methods involve
+complex memory management, and analyzing them in full
+would significantly increase execution time and reduce preci-
+sion. How can we summarize these tensor methods to make
+cuKLEE both efficient and accurate?
+Third, CUDA kernels run across many threads, and ana-
+lyzing each thread separately would result in redundant work.
+How can we share symbolic execution results across threads
+to avoid unnecessary computations?
+4.1.1
+Memory Model of cuKLEE
+Tensor Memory. GPUs have three types of memory: global,
+shared, and local. All input tensors and tensors created by
+wrapper functions reside in global memory and are accessible
+to all GPU threads. We model the memory regions of these
+tensors as discrete and well-separated, because all input ten-
+sors are allocated by the inference system, which prevents
+CUDA kernel programmers from making any assumptions
+about their layout. Consequently, in CUDA kernels, a pointer
+to an element of one tensor never refers to an element of
+another tensor through arithmetic computations.
+As shown in Table 1, we associate each tensor with a set of
+symbolic constraint variables. cuKLEE uses these variables
+to construct constraints when it analyzes specific instructions
+or tensor methods. Note that the number of dimensions (D)
+may remain unknown even at the end of analysis. Therefore,
+we maintain a map to record all known dimensions, where
+the keys are dimension indices and the values are the corre-
+sponding symbolic variables (e.g., d1, d2). For example, line
+2 of Figure 2c accesses the last dimension of tensor input
+by calling input.size(-1). cuKLEE processes this line by
+adding an entry to the map with key −1 and value dD−1, and
+it also adds a constraint representing hidden_size is equal
+to dD−1 into its execution state.
+This modeling strategy greatly simplifies the detection of
+5
+Table 2: Examples for tensor-method handling. (’-’: ignored
+by cuKLEE.)
+Category
+Tensor Methods
+Constraints
+I
+t.numel()
+Nt
+I
+t.data_ptr()
+Bt
+II
+t2=t1.sum(0)
+Nt2 = Nt1/d0
+t1,
+Dt2 = Dt1 −1, St2 = St1,
+d0
+t2 = d1
+t1, ..., dD−1
+t2
+= dD
+t1
+III
+check_dim_size
+(t, n, i, exp)
+Dt = n, di
+t = exp
+IV
+t.toString()
+-
+out-of-bounds accesses on tensor memory. For each tensor, all
+pointers to its elements carry value constraints that relate them
+to the tensor’s base address. Using this information, cuKLEE
+can quickly identify the corresponding tensor and retrieve its
+associated metadata. When a pointer is dereferenced, cuKLEE
+can construct constraints indicating the pointer is outside the
+tensor’s valid memory region and invoke a constraint solver
+to validate the feasibility. For example, when analyzing line
+21 in Figure 2d, cuKLEE immediately determines that the
+memory access must be checked against the bounds of input.
+This follows the constraint established in line 14, which binds
+input_v to the base address of input. In contrast, without
+such modeling, a symbolic execution engine (e.g., KLEE)
+must scan all allocated memory objects to infer which object a
+pointer may reference before performing any boundary check.
+Other Memory. For global and local memory allocated
+within wrapper and kernel functions, we adopt the contiguous
+memory model used by KLEE. CUDA shared memory can
+be allocated dynamically at kernel launch, where cuKLEE
+infers a concrete or symbolic size from the launch parameters,
+or statically with a fixed size in the kernel (e.g., line 11 of
+Figure 2d), in which case the size is known directly. cuKLEE
+also treats global, shared, and local memory as separate re-
+gions and resolves pointer targets only within the region to
+which they belong.
+4.1.2
+Handling Tensor Methods
+We group the 140 Tensor and TensorIterator methods
+into four categories and handle each category differently in
+cuKLEE. Table 2 provides representative examples.
+First, 36 methods return tensor properties. For example,
+input.numel() in line 3 of Figure 2c returns the number of
+elements in input. For these methods, cuKLEE models their
+return values using the constraint variables defined in Table 1.
+Second, 70 methods create a new tensor or produce a sub-
+tensor of an existing one. For such methods, cuKLEE creates
+a new set of constraint variables for the resulting tensor and
+adds constraints that relate them to the original tensor based
+on the method’s semantics. For example, Table 2 shows the
+constraints for B = A.sum(0). Since A.sum(0) reduces A
+along its first dimension, B has one fewer dimension than A,
+and its i-th dimension equals to the (i+1)-th dimension of A.
+Table 3: Constraint variables defined for CUDA threads.
+Variables
+Description
+Type
+blockIdx.x/y/z
+block identifier
+ID
+threadIdx.x/y/z
+thread identifier
+ID
+gridDim.x/y/z
+grid size
+launching
+blockDim.x/y/z
+block size
+launching
+Third, four methods inspect properties of a tensor. For these,
+cuKLEE adds constraints that encode the conditions required
+for the check to succeed.
+Fourth, 30 methods do not affect cuKLEE’s analysis. These
+methods are therefore ignored.
+4.1.3
+Handling CUDA Threads
+CUDA organizes threads into blocks and blocks into grids. Al-
+though all threads execute the same kernel code, their behavior
+differs based on their thread and block identifiers, which pro-
+grammers also use to partition input data. cuKLEE follows
+this execution model by treating thread and block identifiers
+as symbolic variables rather than enumerating all possible
+values, allowing a single symbolic execution to represent the
+behavior of all threads. Thread-independent bugs are handled
+as in sequential programs, while thread-dependent bugs (e.g.,
+line 20 in Figure 2d) are captured through constraints over
+these symbolic identifiers. cuKLEE then checks the feasibility
+of these conditions under the kernel’s launch configuration.
+To support this analysis, we introduce two classes of con-
+straint variables: six ID variables and six launching vari-
+ables, as shown in Table 3. ID variables are constrained
+by launching variables according to CUDA semantics (e.g.,
+blockIdx.x < gridDim.x). Constraints on launching vari-
+ables are obtained when analyzing the kernel launch (e.g.,
+blockDim.x=num_tokens in Figure 2c).
+For loops that distribute work across threads (e.g., the high-
+lighted loops in Figure 2d), cuKLEE analyzes the loop body
+only once rather than forking execution at each termination
+check. cuKLEE adds the loop’s exit condition (e.g., idx >=
+vec_hidden_size) for the remaining execution. The loops’
+termination conditions are usually simple to ensure correct-
+ness for thousands of threads, making single-pass analysis
+enough. cuKLEE also detects data races within such loops by
+creating a second set of ID variables that represent a different
+thread with the same launch constraints. cuKLEE adds con-
+straints indicating the two threads are different by negating
+the constraints that the two threads’ six ID variables are equal
+pairwise. For each global memory access, cuKLEE checks
+whether this second thread may perform a conflicting write
+to the same address. A similar check is performed for shared
+memory, excluding constraints on blockIdx.x/y/z, since
+only threads in the same block can access shared memory.
+4.1.4
+Additional Considerations
+Initial Constraints. Before analyzing each wrapper function,
+cuKLEE introduces three constraint variables: BS for batch
+6
+size, SL for sequence length, and TC for the total number of
+tokens, with the relation TC = BS×SL. In addition to the con-
+straints provided by HFProbe, we further restrict BS ≤1000
+and SL ≤1,000,000. Many recent models already support
+context lengths of one million tokens [18,19], and maximum
+context lengths have increased by roughly a factor of 30 per
+year since 2023 [32]. These bounds therefore reflect both
+current and near-future LLM capabilities.
+Buggy Constraints. cuKLEE detects four types of bugs.
+Data-race detection is described in Section 4.1.3; here, we fo-
+cus on the other three. To detect out-of-bounds accesses, cuK-
+LEE adds constraints for each memory access via a pointer
+indicating that the pointer is either smaller than the base ad-
+dress or larger than the upper bound of the buffer. For integer
+overflows, it adds a constraint for each addition or multipli-
+cation on 32-bit integers specifying the result exceeds the
+type’s maximum value. For null-pointer dereferences, cuK-
+LEE adds constraints for each pointer dereference indicating
+the pointer may have been computed from an unknown base
+pointer. We assume that all input tensors are valid and that
+their base addresses are properly initialized.
+Library and Instruction Support. We leverage API
+summarization [38, 53] to handle 91 CUDA APIs (e.g.,
+cudaMalloc()) and 39 C/C++ library functions (e.g., meth-
+ods of std::vector) that are commonly used by wrap-
+per functions. In essence, we use summarization to up-
+date the execution state without performing inter-procedural
+analysis to explore their internal logic. Similarly, we sup-
+port 44 LLVM intrinsics and 59 inline assembly calls
+used in CUDA kernels. For example, when processing
+llvm.nvvm.read.ptx.sreg.tid.x(), cuKLEE returns the
+symbolic variable representing threadIdx.x.
+4.2
+HFProbe: Dynamic Profiling of HF Models
+HFProbe provides analysis contexts for CUDA kernels by
+supplying concrete shapes for some (but not all) input tensors
+and placing constraints on their values. This reduces the num-
+ber of symbolic variables handled by cuKLEE, improving
+scalability and decreasing false positives arising from unre-
+alistic inputs. As illustrated in Figure 1, HFProbe operates
+in four stages. It first performs static analysis to identify all
+CUDA kernels each input model may call. It then executes the
+model with a real configuration using mocked CUDA kernels
+and records how the kernels are actually invoked. Next, it mu-
+tates the configuration to exercise additional kernels identified
+statically but not triggered dynamically. Finally, it aggregates
+the collected information in a post-mortem analysis to derive
+analysis contexts for cuKLEE.
+4.2.1
+Static Call Graph Computation
+Given a model’s Python implementation (e.g., Figure 2a), we
+build a static call graph using the model’s forward() method
+as the root. The analysis is path- and field-sensitive and lever-
+ages common coding patterns of Hugging Face models. For
+example, we assume that a model object has no aliases within
+its own implementation. Our analysis identifies all CUDA ker-
+nels used by the model. However, the resulting call graph may
+also include spurious kernels that are not actually used. Ex-
+isting Python call-graph analysis techniques cannot precisely
+analyze Hugging Face models [37,70,83]. For instance, PyCG
+does not handle __call__, preventing it from resolving calls
+to an nn.Module object—a common practice for invoking a
+layer’s forward() method (e.g., line 5 in Figure 2a).
+Our analysis operates on the Abstract Syntax Tree (AST) of
+the input Python program. It maintains an execution context
+where each program object is represented as an instance. The
+analysis creates the instance when analyzing the object’s class
+constructor. Each instance stores its fields and their values
+in a dictionary. The analysis processes each instruction with
+respect to this context and also updates it according to the
+instruction’s semantics.
+Our analysis begins with the model’s __init__() method
+to initialize the context. It then analyzes the forward()
+method to construct the call graph. For each object field as-
+signment (e.g., line 3 in Figure 2a), the analysis updates the
+left-hand instance’s dictionary using either the concrete value
+or the instance referenced on the right-hand side. For each
+function call, it performs interprocedural analysis: it maps the
+instances of actual arguments to the formal parameters of the
+callee. If the receiver’s type is known only at the base class
+level, all methods of possible derived classes are treated as
+potential callees. At each branch, the analysis inspects the
+context to decide which path is feasible. If both paths may
+occur, it clones the context and analyzes each path indepen-
+dently. When encountering Python bindings to CUDA kernels
+(e.g., line 20 in Figure 2a), it records that the model calls the
+corresponding CUDA kernels. All Python bindings and their
+links to CUDA kernels (e.g., Figure 2b) are identified in a
+separate analysis using regular expressions.
+4.2.2
+Profiling Backends
+We modify the vLLM and Transformers inference frame-
+works to serve as HFProbe’s backends and to record runtime
+information during model inference. To accelerate profiling,
+we disable all actual GPU computations, allowing the modi-
+fied frameworks to exercise models without GPU hardware.
+Overall, three categories of framework functions are changed.
+First, for every CUDA kernel registered in the frameworks,
+we replace calls to its Python binding with calls to a fake
+function. As shown in Figure 3, the fake function records
+the call stack and the type of all input parameters. For tensor
+inputs (e.g., input), it further records their shapes and data
+types. For primitive-type parameters, it records their concrete
+values. If the original binding returns a tensor, the fake func-
+tion returns a zero-filled tensor with matching shape and data
+7
+1
+class RMSNorm(CustomOp):
+2
+def forward_cuda(self, x, r=None):
+3
+if residual is not None:
+4
+- torch.ops._C.fused_add_rms_norm(x, r, self.w, self.e)
+5
++ fake_fused_add_rms_norm(x, r, self.w, self.e)
+6
+return x, r
+7
+8
++def fake_fused_add_rms_norm(input, residual, weight, epsilon):
+9
++ LOG('fused_add_rms_norm')
+10
++ LOG(retrieve_stack_info())
+11
++ LOG('input', type(input), input.shape, input.dtype)
+12
++ LOG('residual',type(residual), residual.shape,
+residual.dtype)
+13
++ LOG('weight', type(weight), weight.shape, weight.dtype)
+14
++ LOG('epsilon', type(epsilon), epsilon)
+15
++ return None
+Figure 3: The fake function for fused_add_rms_norm().
+type. When an input tensor of an integer data type contains
+nonzero values, the fake function records its maximum and
+minimum values. This helps capture potential index ranges
+used inside CUDA kernels, which are useful for generating
+constraints in execution contexts.
+Second, we modify the model-loading functions so they
+only create tensors with the correct shapes, without actually
+loading any model weights.
+Third, although no GPU computations are executed, we
+make sure the frameworks still follow the same control flow
+they would use if GPU computations were running. For ex-
+ample, without a real GPU, the module vllm._C cannot be
+imported, which causes a runtime error. We import a fake
+module to address this issue. As another example, for ev-
+ery tensor we create, we adjust its internal properties so the
+frameworks believe the tensor’s data is stored on the GPU.
+Fourth, we optimize vLLM’s KV-cache management to
+initialize tensors with minimal memory and expand them
+using the expand() method to the correct shapes, without
+more memory allocation. Extra memory is only allocated for
+a tensor when it receives writes beyond its initially allocated
+space. This lazy allocation strategy eliminates pre-allocated
+memory and reduces memory pressure for large models.
+4.2.3
+Model Configuration Mutation
+For each input model, we adjust its execution configuration
+to trigger more CUDA kernels. There are two types of config-
+urations we modify: those defined in the model’s config.json
+file, and those defined by inference frameworks.
+Several config.json parameters govern which CUDA
+kernels
+are
+used
+during
+a
+model’s
+forward
+pass.
+For example, for the model in Figure 2a, modifying
+quantization_config changes the quantization kernels,
+while reducing n_routed_experts from 256 to 128 alters
+the padding kernel used for token routing, switching from
+sgl_moe_align_block_size to moe_align_block_size.
+Because parameter names vary across models, we use an
+LLM to generate modified config.json files. Leveraging its
+understanding of natural language and code, the LLM can pro-
+duce compatible configurations that activate targeted kernels.
+For each CUDA kernel identified by static analysis but not
+triggered in prior runs, we provide the model’s Hugging Face
+repository URL and the kernel name, and ask the LLM to pro-
+duce a new config.json to trigger the kernel. We run the LLM
+in agent mode so it can inspect the repository, reference the
+example config.json, and read the model implementation code.
+However, not all generated config.json files are valid. For ex-
+ample, the model in Figure 2a requires the activation function
+silu, and changing the hidden_act field in config.json will
+cause an assertion error. We simply discard any modified
+config.json that results in a runtime failure.
+For framework-defined configurations, we consider both
+environment variables and framework startup parameters. We
+construct a mapping from each CUDA kernel to the configura-
+tion required to activate it. Building the mapping is a one-time
+effort, as it is framework-specific and applies across all mod-
+els. When a kernel needs to be triggered, we retrieve and
+apply its corresponding configuration. If a kernel requires co-
+ordinated changes to both framework settings and config.json,
+we inform the LLM that the necessary framework configura-
+tion has already been applied before requesting it to modify
+config.json.
+4.2.4
+Context Generation
+Given a configuration, we execute the model with varying
+batch sizes and sequence lengths, which together determine
+the number of input tokens. For each kernel, we analyze the
+recorded values of tensor dimensions, primitive parameter
+values, and the minimum and maximum values of integer-
+valued tensors. From this data, we infer four categories of
+constraints that together form the analysis context of cuKLEE:
+1) strict linear relationships with batch size, sequence length,
+or token count; 2) invariant values determined by the model
+architecture; 3) equality relationships between the values;
+and 4) residual parameters that do not fall into the above
+categories but may still exhibit indirect dependence on the
+model architecture; for these, we impose an upper-bound
+constraint using the maximum value observed.
+For example, after executing the model in Figure 2a with a
+configuration [31], we infer that the last dimensions of input,
+residual, and weight in Figure 2c are all 7168, fixed by
+the model architecture, that the first dimensions of input and
+residual are token count, and that epsilon equals 1e−6.
+5
+Evaluation
+Implementation. cuKLEE is built on KLEE v3.1 and oper-
+ates on LLVM IR generated from CUDA source code. We
+implement 31,002 lines of C++ to support tensor abstrac-
+tions, enable symbolic execution across CUDA threads, and
+handle CUDA-specific instructions. cuKLEE uses Z3 [24]
+as its constraint solver. HFProbe is implemented in Python
+8
+Table 4: Benchmark Information and Detection Results. ( IO:
+integer overflow, OOB: out-of-bounds, DR: data race, and
+NULL: null pointer dereference. xy: x true positives, y false
+positives. ’-’ indicates zero true and false positives.)
+Models
+Kernels
+IO
+OOB
+DR
+NULL
+Total
+vLLM
+62
+50
+142
+257
+-
+-
+399
+HF
+54
+117
+2900
+-
+-
+-
+2900
+Papers
+4
+6
+240
+-
+-
+-
+240
+Total
+120
+173
+3282
+257
+-
+-
+3539
+and performs call-graph analysis using the built-in AST mod-
+ule [68]. It provides two profiling backends (vLLM-0.9.0 [42]
+and Transformers v4.52.1 [30]) and employs GPT-5’s agent
+mode [61] to mutate model configuration files, which has web-
+search capability to retrieve relevant code. In total, HFProbe
+comprises 8,962 lines of code, including both standalone mod-
+ules and framework modifications.
+Research Questions. Our experiments aim to evaluate
+Model2Kernel’s effectiveness in detecting memory bugs
+in real-world CUDA kernels (Section 5.1), its coverage of
+CUDA memory bugs (Section 5.2), its advancements over
+existing techniques (Section 5.2), and the rationale behind
+combining dynamic model profiling with CUDA-specific sym-
+bolic execution (Section 5.3).
+Experimental Settings. The majority of experiments are
+conducted on a server equipped with an Intel(R) Xeon(R)
+Silver 4110 CPU, 256 GB RAM, and Red Hat Enterprise
+Linux 9. We use clang++ 13.0.0 to compile CUDA code
+with -cuda-gpu-arch=sm_80 to target CUDA 12.1 and
+-emit-llvm to generate LLVM IR for cuKLEE.
+5.1
+Bug Detection in the Wild
+5.1.1
+Methodology
+As shown in Table 4, we evaluate Model2Kernel on models
+and kernels from three real-world sources. First, we extract
+all text-generation models and their associated kernels from
+vLLM-0.9.0, the latest release at the start of this project, yield-
+ing 62 models and 50 kernels, with substantial kernel reuse
+across models. Because vLLM omits config.json files, we
+retrieve them from Hugging Face by querying model IDs
+specified in vLLM’s tests, and selecting the config.json from
+the top-ranked repository for each model. Second, we gather
+all Hugging Face models that contain custom CUDA kernels,
+resulting in 54 models and 117 unique kernels. Third, we
+survey recent top-tier AI conference papers from the past two
+years and identify four [39,55,64,81] whose artifacts provide
+both Hugging Face models and custom kernels, contributing
+four models and six kernels. In total, our evaluation includes
+120 models and 173 kernels, comprising 170,875 lines of
+Python model code and 139,951 lines of CUDA code.
+We evaluate benchmarks from the first source using the
+vLLM backend and the remaining benchmarks using the
+Transformers backend. For each model, we attempt configura-
+1
+//M: number of tokens
+2
+//Mistral-7B: OC=28672, split_k_iters=8
+3
+//Wrapper: N=128, threadIdx.x<32,
+4
+//blockIdx.x<(M + 16 - 1) / 16 * j_factors1 * split_k_iters
+5
+__global__ void gemm_forward(int M, int OC, half* C) {
+6
+float C_warp[32];
+7
+int j_factors1 = (OC + N - 1) / N; //224
+8
+int blockIdx_y = blockIdx.x%((M + 16 - 1) /16 *j_factors1);
+9
+for (int ax1_0_1 = 0; ax1_0_1 < (N / 32); ++ax1_0_1) {
+10
+for (int local_id = 0; local_id < 8; ++local_id) {
+11
+int row_offset = (blockIdx_y / j_factors1) * 16 +
+threadIdx.x / 4 + (local_id % 4) / 2 * 8;
+12
+if (row_offset < M) {
+13
+*(C + ax1_0_1 * 16 + row_offset * OC + (local_id / 4) *
+8 + local_id % 2) = __float2half(C_warp[(ax1_0_1 * 8)]);
+14
+}
+15
+}}}
+Figure 4: A detected integer overflow bug.
+tion mutation only once for any CUDA kernel that is statically
+reachable but not triggered by the collected config.json. For
+every configuration (both original and mutated), we test nine
+combinations of batch sizes {1,3,5} and sequence lengths
+{1,7,17}, chosen to keep profiling short while remaining re-
+alistic and uncommon. Each CUDA kernel is analyzed by
+cuKLEE for up to one hour, following common practice in
+prior symbolic-execution work [12,41,51].
+For each bug reported by cuKLEE, we examine the corre-
+sponding CUDA code to verify whether the reported tensor
+shapes and input values indeed trigger the issue. We further
+assess whether the shapes and values are semantically valid
+and whether any logic in the model or inference framework
+would prevent them from reaching the kernel. To ensure ob-
+jectivity, each bug is independently reviewed by at least two
+authors. Because vLLM kernels are shared across models,
+we merge vLLM bug reports with the same root cause and
+kernel line number, even if triggered by different models. For
+out-of-bounds accesses resulting from a preceding integer
+overflow, we count only the integer overflow.
+5.1.2
+Experimental Results
+As shown in Table 4, Model2Kernel detects 353 memory
+bugs in CUDA kernels, comprising 328 integer overflows
+and 25 out-of-bounds accesses. No data races or null-pointer
+dereferences are identified. The large number of findings
+demonstrates Model2Kernel’s effectiveness in validating the
+memory safety of CUDA kernels.
+In addition, Model2Kernel detects bugs across benchmarks
+from all three sources, underscoring its ability to analyze
+diverse models and kernels.
+Integer Overflows. All integer overflows detected in the
+vLLM and Hugging Face benchmarks occur on int32 val-
+ues. Of these, 198 result from multiplying the token count
+by the hidden size. In 106 cases, the overflowed value is
+subsequently used to index a tensor storing per-token dimen-
+sions, causing out-of-bounds accesses. Figure 2d illustrates
+one instance. Another 98 cases occur when computing in-
+dices for the QK⊤output, where the maximum index can
+9
+1
+//num_thread = std::max(num_experts, 32)
+2
+//the size of share_mem: num_experts + 1 + (num_thread + 1) *
+num_experts
+3
+__global__ void moe_align_block_size_kernel(int32_t
+num_experts) {
+4
+extern __shared__ int32_t shared_mem[];
+5
+- int32_t* tokens_cnts = shared_mem + blockDim.x + 1;
+6
++ int32_t* tokens_cnts = shared_mem + num_experts + 1;
+7
+for (int i = 0; i < num_experts; ++i) {
+8
+tokens_cnts[num_experts * (threadIdx.x + 1) + i] = 0;
+9
+}
+10
+}
+Figure 5: An out-of-bounds bug from vLLM.
+reach batch_size×num_heads×seq_len2 and exceed the
+int32 limit. Four additional overflows arise from multiplying
+the token count by 1,024 (thread count), and one more from
+multiplying the token count by the number of experts.
+The remaining three int32 overflows arise from multiply-
+ing the token count by the number of output features. One
+example is the sub-expression row_offset * OC in line 13
+of Figure 4. For Mistral-7B, OC is 28,672 (line 2). The long
+expression in line 11 determines row_offset, whose upper
+bound is M, the number of tokens. Several components of
+line 11 are statically known: with OC = 28,672 and N = 128,
+j_factors1 evaluates to 224 (line 7); local_id is at most 7
+(line 10); and threadIdx.x is at most 31 based on the wrap-
+per (line 3). However, blockIdx_y depends on another com-
+plex expression in line 8 that involves blockIdx.x, which
+itself depends on launch configuration and M. This complex
+dependency chain makes such overflows extremely difficult
+to identify manually. In contrast, Model2Kernel automatically
+detects that the overflow occurs when the number of input
+tokens M is larger than 74,896.
+The 24 integer overflows identified in the research-paper
+benchmarks all arise from the same code fragment, which
+appears 24 times. In this fragment, a 32-bit integer is shifted
+left by 10 bits and then cast to a 16-bit integer. When the
+shifted value exceeds 31, an overflow occurs. Neither the
+model code nor the CUDA kernel imposes any constraint to
+prevent this value from exceeding that limit.
+Buffer Overflows. Nine buffer overflows occur in scenarios
+where data are partitioned into blocks but the final block
+is only partially populated; nonetheless, the CUDA kernels
+access it as if it were fully valid. The remaining 16 are cases
+where an input tensor’s content is used to compute indices to
+access another tensor, and the kernel does not have adequate
+validation of the results, leading to out-of-bounds accesses.
+For them, we further confirm that the framework code permits
+the buggy tensor content to pass into the kernel.
+False Positives. Model2Kernel reports nine false positives,
+yielding a false discovery rate of 2.49%. These arise from
+three sources. First, four cases stem from HFProbe’s inability
+to track tensor values across kernels. Because it returns ten-
+sors with zero values for kernel binding functions, subsequent
+kernel bindings cannot track valid value ranges for those ten-
+sors, producing two integer-overflow and two out-of-bounds
+false positives. Second, two false positives involve kernels
+Table 5: Comparison with baseline techniques. (20 bugs are
+for each row. ‘/’: not applicable.)
+Honeycomb GKLEE ESBMC-GPU
+cuKLEE
+vLLM
+/
+/
+/
+15
+Simplified
+0
+5
+3
+19
+that index tensors using values loaded from model weights.
+As HFProbe does not load the actual weights, it cannot accu-
+rately capture the indices; manual inspection confirms that
+the true weight values cannot trigger errors. Third, three false
+positives arise because cuKLEE reports tensor shapes that
+are infeasible given constraints enforced by vLLM code. For
+example, it flags an out-of-bounds error for input 250, since a
+tensor’s size cannot evenly divide 250, whereas vLLM per-
+mits only 128 or 256.
+Time and Monetary Cost. Model2Kernel requires 985.95
+total hours to complete its analysis: 972.54 hours for the
+vLLM benchmarks, 11.23 hours for Hugging Face, and 12.18
+hours for research papers. Experiments run with multiple par-
+allel processes, and the reported time reflects their aggregate.
+Using GPT’s agent model costs $442.16. Considering that
+both the Python and CUDA codebases exceed 100,000 lines,
+Model2Kernel incurs moderate time and monetary costs.
+More specifically, cuKLEE consumes 902.19 hours, sub-
+stantially more than HFProbe (103.66 hours). HFProbe gen-
+erates 1,274 distinct model configurations. Because many
+vLLM kernels are shared across models, we merge identical
+analysis contexts, yielding 8,562 unique contexts for cuKLEE.
+Kernel analysis completes within one hour for 7,784 cases
+and reaches the limit for 778 cases. All kernels exceeding
+one-hour limit contain 600+ lines of CUDA code.
+Answer to effectiveness: Model2Kernel can accurately de-
+tect integer overflows and buffer overflows in CUDA kernels
+used within LLM inference systems.
+5.2
+Coverage and Advancement
+5.2.1
+Methodology
+We use the 20 known vLLM bugs analyzed in Section 2.3
+to evaluate coverage. Most of these bugs were reported by
+vLLM users, and the corresponding model information is not
+available. However, the bug reports or developer discussions
+typically include the kernel in which the bug occurs and the
+required inputs (e.g., tensor shapes). Therefore, in this experi-
+ment, we evaluate only cuKLEE. We retain the input fields
+mandated by the model architecture and treat all other inputs
+as symbolic when running cuKLEE.
+We compare cuKLEE with three static CUDA analy-
+sis tools: Honeycomb’s validator [54], GKLEE [47], and
+ESBMC-GPU [65]. These tools cannot run directly on vLLM
+kernels due to incompatibilities with modern C++, CUDA, as
+well as PyTorch and vLLM CUDA libraries (e.g., Tensor).
+Moreover, GKLEE and ESBMC-GPU require a main() as
+their entry point, which vLLM kernels lack. To enable com-
+10
+parison, we simplify the vLLM kernels by rewriting modern
+CUDA/C++ features with legacy constructs, removing Py-
+Torch and vLLM CUDA dependencies, and adding a main()
+function for each kernel that replaces the original wrapper and
+allocates GPU memory for tensors. These simplified kernels
+preserve the root causes of the bugs. Because Honeycomb
+targets HIP kernels [4], we additionally translate CUDA APIs
+to HIP equivalents using hipify-perl [3]. We do not compare
+with other related tools because they are not free [20,62] or
+their code is not available [14,35,46,48].
+5.2.2
+Experimental Results
+As shown in Table 5, cuKLEE identifies 15 of the 20 known
+bugs, including nine integer overflows, five out-of-bounds
+accesses, and one NULL-pointer dereference, demonstrating
+strong coverage of real memory errors in CUDA kernels.
+Figure 5 shows an out-of-bounds error. The wrapper func-
+tion (omitted for brevity) allocates shared memory to record
+how threads assign tokens to experts. As shown in line 2,
+the first num_experts + 1 entries store the total token count
+and the per-expert counts. The remaining entries form a two-
+dimensional array storing how many tokens each thread routes
+to each expert, plus one slot per expert for the expert’s total.
+Line 5 attempts to skip this first region so that lines 7–9
+operate the second region. However, it incorrectly uses the
+number of threads (blockDim.x), rather than the number of
+experts, to compute the offset. As marked in line 1, when the
+expert count is below 32, the thread count exceeds it, lead-
+ing to a buffer overflow in line 8. cuKLEE correctly reports
+the buffer overflow at the line, with threadIdx.x=31 and
+num_experts=8.
+The missed bugs arise for several reasons. First, one NULL-
+pointer dereference occurs because the kernel is launched on a
+different GPU than the data it accesses, which is undetectable
+via static analysis. Second, one out-of-bounds error is caused
+by a mismatch between a tensor’s declared shape and the
+underlying memory layout; cuKLEE assumes consistency be-
+tween these properties and therefore misses the issue. Third,
+two bugs exceed the one-hour analysis limit and remain un-
+detected. Fourth, cuKLEE lacks support for C++ std map,
+causing it to miss one bug that depends on this construct. For
+the simplified kernels, cuKLEE still fails to detect the first
+bug but successfully identifies the other four.
+Honeycomb detects no bugs because it only checks whether
+memory accesses stay within one of four coarse regions (pro-
+tected, read-only, read-write, and private). All tested out-of-
+bounds accesses fall inside the read-write region, so Honey-
+comb cannot catch them.
+GKLEE detects one integer overflow and four out-of-
+bounds accesses, but misses the remaining bugs for three
+reasons. First, seven bugs occur only when threadIdx.x or
+blockIdx.x exceed 30, while GKLEE assumes small con-
+stant values for both. Second, GKLEE fully unrolls loops,
+Figure 6: Contributions of Model2Kernel’s components. (39
+bugs detected in vLLM. W.O.: without, C: cuKLEE, H: HF-
+Probe, and M: configuration mutation.)
+causing the analysis of seven buggy kernels to hit the one-
+hour timeout. Third, GKLEE cannot pinpoint the bug due to
+the kernel and its data on different GPUs.
+ESBMC-GPU identifies one integer overflow and two out-
+of-bounds accesses. It misses nine, seven, and one bugs re-
+spectively for the exact same reasons as GKLEE.
+Answer to coverage and advancement:
+cuKLEE detects
+most of the tested known bugs, substantially more than the
+baselines, demonstrating its strong coverage of real CUDA
+memory bugs and its advantages over existing techniques.
+5.3
+Rationality of Components
+5.3.1
+Methodology
+We conduct an ablation study to assess the contribution of
+each component of Model2Kernel. We create several vari-
+ants of Model2Kernel by disabling individual components
+and compare their effectiveness against the full-featured ver-
+sion, using the vLLM models and kernels under the same
+experimental setup as Section 5.1.
+Specifically: 1⃝Without HFProbe. We run cuKLEE di-
+rectly on kernel wrapper functions without providing any
+guidance from HFProbe. 2⃝Without cuKLEE. We execute
+each model on real GPUs using both original and mutated
+configurations, and record runtime errors (e.g., “illegal mem-
+ory access”). To parallelize experiments, we use multiple
+GPU types (four RTX 5090s and four H100s); since we only
+check for error occurrence, hardware differences do not af-
+fect the results. 3⃝Without configuration mutation. We run
+Model2Kernel on the collected config.json files and vLLM’s
+default configurations, without applying any mutations.
+5.3.2
+Experimental Results
+The full-featured version of Model2Kernel detects the most
+bugs in Figure 6, demonstrating the value of each component.
+Removing HFProbe causes cuKLEE to report 5,527 false
+positives for two reasons. First, cuKLEE may infer tensor
+shapes that are theoretically possible but never occur in real-
+ity, leading to incorrect out-of-bounds reports. For example,
+in Figure 2c, cuKLEE incorrectly assigns tensor input the
+shape (256,256) and tensor residual the shape (8) to trig-
+ger out-of-bounds access in line 22 of Figure 2d, as the two
+11
+tensors are accessed with the same index inside the loop. How-
+ever, the two tensors always share the same shape in practice,
+making such a case infeasible. Second, cuKLEE may treat
+tensor shape values or other parameters as having extremely
+large, unrealistic values (e.g., a hidden size of 2,147,483,640).
+Moreover, without model-architecture information, all ten-
+sor shapes become symbolic, forcing cuKLEE to explore far
+more possibilities. As a result, it fails to complete the analysis
+of 23 kernels within one hour, 16 more than when architec-
+ture information is provided in Section 5.1, and increases the
+average analysis time per kernel by 2.5X.
+With cuKLEE disabled, no runtime errors are detected, so
+this variant reports nothing. Our experiments use a maximum
+batch size of 7 and a sequence length of 17 (only 119 tokens
+in total), far too few to expose hidden bugs. This shows that
+Model2Kernel uncovers issues that would otherwise appear
+only at large production scales.
+Without configuration mutation, only 21 of the 50 CUDA
+kernels are exercised, leading Model2Kernel to miss 32 bugs.
+Answer to rationality: Each component of Model2Kernel
+plays a distinct and essential role in its overall effectiveness.
+6
+Limitations and Discussion
+Model2Kernel currently focuses on Hugging Face models
+and CUDA kernels with tensor inputs, which cover a large
+portion of real-world usage. However, due to the ecosystem’s
+diversity and rapid evolution, Model2Kernel does not yet sup-
+port components such as Triton-based kernels or TensorFlow
+models. Its core ideas—mutating model configurations to ex-
+plore diverse execution paths, modeling dynamic arrays as
+discrete memory regions, and symbolizing thread IDs—can
+be generalized to other bug types and CUDA kernels. Extend-
+ing cuKLEE to NPU instruction sets and NPU kernels is a
+promising direction for future work.
+In Section 4.2, we mutate execution configurations to trig-
+ger additional CUDA kernels. While this increases coverage,
+collected contexts still represent only a small fraction of real
+LLM inference scenarios. Developing more systematic meth-
+ods to explore inference frameworks and validate kernels
+under broader, realistic contexts remains future work.
+In our experiments, cuKLEE analyzes each kernel for up
+to one hour. For certain kernels (e.g., gptq_marlin_gemm(),
+moe_wna16_marlin_gemm()), not all paths are explored, po-
+tentially missing memory bugs. cuKLEE builds on KLEE and
+inherits its path exploration strategies, originally designed for
+C/C++. Since CUDA kernels may follow different program-
+ming patterns, optimizing path exploration for CUDA is a key
+direction to improve cuKLEE’s effectiveness.
+7
+Related Work
+Exploiting CUDA Memory Bugs. Prior work shows that
+CUDA memory bugs are highly exploitable [34, 69]. They
+can enable control-flow hijacking [25,57], mind-control at-
+tacks [63], and side-channel attacks [58,66,85], leading to se-
+vere inference degradation or arbitrary code execution. These
+findings motivate our systematic analysis of CUDA kernels
+to detect memory bugs in them.
+Static techniques have been developed for CUDA kernels.
+ProofWright [14] uses Vercons to verify kernels against LLM-
+generated specifications. COVT [50] translates CUDA into
+C/C++ and then detects integer and buffer overflows. Honey-
+comb’s validator [54] ensures memory accesses remain within
+predefined coarse-grained regions. Tong et al. extend Dartag-
+nan with GPU consistency models [75]. Symbolic-execution-
+based methods have also been proposed [6, 35, 46–48, 65].
+Overall, these static techniques struggle with dynamically
+sized memory buffers, do not support the widely used Tensor
+library, and cannot handle varied kernel launch configurations.
+We evaluate three of them [47,54,65] in Section 5.2 and find
+they are limited in usability and less effective than cuKLEE.
+Commercial static tools also exist [20,62], but their technical
+details are unavailable for analysis.
+Dynamic Techniques. NVIDIA provides several mech-
+anisms to enforce GPU memory safety. By default, the
+GPU MMU reports “illegal memory access” errors when
+untracked virtual addresses are accessed [56]. CUDA-
+MEMCHECK [59] and its successor Compute Sanitizer [60]
+record metadata for GPU buffers, enabling detection of a
+broader range of memory errors at the cost of increased run-
+time overhead. Researchers have also devoted efforts in this
+area. GPUShield [43], GPUArmor [92], cuCatch [73], and
+LAK [82] build on similar principles as Compute Sanitizer,
+with the first three emphasizing lower runtime overhead and
+latter using lock-key metadata to provide stronger memory
+safety. GMOD [26, 27] pads memory buffers and detects
+overflows by monitoring changes to the padding. IMT [71]
+leverages ECC to ensure GPU memory safety. Race detec-
+tion tools, including BARRACUDA [28], GRace [88], GM-
+Race [89], and LDetector [49], track the last-accessing thread
+for each memory location and identify unsynchronized con-
+current accesses. Despite these advances, these techniques
+rely on specific inputs to trigger bugs, require instrumentation
+or hardware support, and many incur large runtime overhead.
+8
+Conclusion
+This paper presents Model2Kernel, an automated tool that
+combines dynamic model profiling with CUDA-specialized
+symbolic execution to detect CUDA memory bugs in LLM
+inference systems. Model2Kernel identifies more than 300
+CUDA memory bugs in popular LLM inference frameworks
+when they perform inference with real models, demonstrating
+its practical effectiveness. Future work can further improve
+the efficiency of symbolic execution for CUDA kernels and
+extend Model2Kernel to support NPU kernels.
+12
+References
+[1] Eleni Adamopoulou and Lefteris Moussiades. Chat-
+bots: History, technology, and applications. Machine
+Learning with applications, 2:100006, 2020.
+[2] Eleni Adamopoulou and Lefteris Moussiades.
+An
+overview of chatbot technology. In IFIP international
+conference on artificial intelligence applications and
+innovations, pages 373–383. Springer, 2020.
+[3] Advanced Micro Devices, Inc.
+hipify-perl, 2025.
+https://rocm.docs.amd.com/projects/HIPIFY/en/latest/
+hipify-perl.html.
+[4] Advanced Micro Devices, Inc.
+What is HIP?,
+2025.
+https://rocm.docs.amd.com/projects/HIP/en/
+latest/index.html.
+[5] Keqin Bao, Jizhi Zhang, Yang Zhang, Wang Wenjie,
+Fuli Feng, and Xiangnan He. Large language models
+for recommendation: Progresses and future directions.
+In Proceedings of the Annual International ACM SIGIR
+Conference on Research and Development in Informa-
+tion Retrieval in the Asia Pacific Region (SIGIR-AP ’23),
+Melbourne, Australia, 2023.
+[6] Adam Betts, Nathan Chong, Alastair Donaldson, Shaz
+Qadeer, and Paul Thomson. GPUVerify: a verifier for
+GPU kernels. In Proceedings of the ACM International
+Conference on Object-Oriented Programming, Systems,
+Languages, and Applications (OOPSLA’ 12), Tucson,
+AZ, USA, 2012.
+[7] Daniil A Boiko, Robert MacKnight, and Gabe Gomes.
+Emergent autonomous scientific research capabili-
+ties of large language models.
+arXiv preprint
+arXiv:2304.05332, 2023.
+[8] Rishi Bommasani. On the opportunities and risks of
+foundation models. arXiv preprint arXiv:2108.07258,
+2021.
+[9] Fraser Brown, Deian Stefan, and Dawson Engler. Sys:
+a static/symbolic tool for finding good bugs in good
+(browser) code. In Proceedings of the 29th USENIX
+Conference on Security Symposium (SEC ’20), Virtual
+Event, 2020.
+[10] Sébastien Bubeck, Varun Chandrasekaran, Ronen Eldan,
+Johannes Gehrke, Eric Horvitz, Ece Kamar, Peter Lee,
+Yin Tat Lee, Yuanzhi Li, Scott Lundberg, et al. Sparks
+of artificial general intelligence: Early experiments with
+gpt-4. arXiv preprint arXiv:2303.12712, 2023.
+[11] Cristian Cadar, Daniel Dunbar, and Dawson Engler.
+Klee: unassisted and automatic generation of high-
+coverage tests for complex systems programs. In Pro-
+ceedings of the 8th USENIX Conference on Operating
+Systems Design and Implementation (OSDI ’08), San
+Diego, California, 2008.
+[12] Cristian Cadar, Daniel Dunbar, Dawson R Engler, et al.
+KLEE: unassisted and automatic generation of high-
+coverage tests for complex systems programs. In Pro-
+ceedings of the 8th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI’ 08), San
+Diego, CA, USA, 2008.
+[13] casper hansen. AWQ broken when trying to add Mistral,
+2023. https://github.com/vllm-project/vllm/issues/1236.
+[14] Bodhisatwa Chatterjee, Drew Zagieboylo, Sana Damani,
+Siva Hari, and Christos Kozyrakis. ProofWright: To-
+wards agentic formal verification of cuda. arXiv preprint
+arXiv:2511.12294, 2025.
+[15] Mark Chen. Evaluating large language models trained
+on code. arXiv preprint arXiv:2107.03374, 2021.
+[16] Tianqi Chen, Thierry Moreau, Ziheng Jiang, Lianmin
+Zheng, Eddie Yan, Haichen Shen, Meghan Cowan,
+Leyuan Wang, Yuwei Hu, Luis Ceze, et al. {TVM}: An
+automated {End-to-End} optimizing compiler for deep
+learning. In Proceedings of the 13th USENIX Sympo-
+sium on Operating Systems Design and Implementation
+(OSDI’ 18), Carlsbad, CA, USA, 2018.
+[17] Vitaly Chipounov, Volodymyr Kuznetsov, and George
+Candea. S2E: a platform for in-vivo multi-path anal-
+ysis of software systems. In Proceedings of the 16th
+International Conference on Architectural Support for
+Programming Languages and Operating Systems (ASP-
+LOS ’11), Newport Beach, California, USA, 2011.
+[18] Claude. Claude docs, 2025. https://platform.claude.
+com/docs/en/build-with-claude/context-windows#
+1-m-token-context-window.
+[19] Cole.
+LLMs
+with
+largest
+context
+win-
+dows,
+2025.
+https://codingscape.com/blog/
+llms-with-largest-context-windows.
+[20] The Qt Company.
+CUDA code verification for
+safety-critical systems, 2025.
+https://www.qt.io/
+quality-assurance/axivion-for-cuda.
+[21] NVIDIA Corporation.
+CUDA C++ programming
+guide, 2025. https://docs.nvidia.com/cuda/pdf/CUDA_
+C_Programming_Guide.pdf.
+[22] Sumit Kumar Dam, Choong Seon Hong, Yu Qiao, and
+Chaoning Zhang. A complete survey on LLM-based AI
+chatbots. arXiv preprint arXiv:2406.16937, 2024.
+[23] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and
+Christopher Ré.
+Flashattention: Fast and memory-
+efficient exact attention with IO-awareness. Advances
+13
+in neural information processing systems, 35:16344–
+16359, 2022.
+[24] Leonardo De Moura and Nikolaj Bjørner. Z3: an effi-
+cient SMT solver. In Proceedings of 14th International
+Conference on Tools and Algorithms for the Construc-
+tion and Analysis of Systems (ETAPS ’08), Budapest,
+Hungary, 2008.
+[25] Bang Di, Jianhua Sun, and Hao Chen. A study of over-
+flow vulnerabilities on GPUs. In IFIP International
+Conference on Network and Parallel Computing, Xi’an,
+China, 2016.
+[26] Bang Di, Jianhua Sun, Hao Chen, and Dong Li. Efficient
+buffer overflow detection on GPU. IEEE Transactions
+on Parallel and Distributed Systems, 32(5):1161–1177,
+2020.
+[27] Bang Di, Jianhua Sun, Dong Li, Hao Chen, and Zhe
+Quan.
+GMOD: A dynamic GPU memory overflow
+detector. In Proceedings of the 27th International Con-
+ference on Parallel Architectures and Compilation Tech-
+niques (PACT ’18), Limassol, Cyprus, 2018.
+[28] Ariel Eizenberg, Yuanfeng Peng, Toma Pigli, William
+Mansky, and Joseph Devietti. BARRACUDA: binary-
+level analysis of runtime RAces in CUDA programs.
+In Proceedings of the 38th ACM SIGPLAN Conference
+on Programming Language Design and Implementation
+(PLDI ’17), Barcelona, Spain, 2017.
+[29] Hugging Face. The AI community building the future.
+https://huggingface.co/.
+[30] Hugging Face. Transformers. https://huggingface.co/
+docs/transformers/en/index.
+[31] Hugging Face. DeepSeek-R1-tiny/config.json, 2025.
+https://huggingface.co/kebeliu/DeepSeek-R1-tiny/
+blob/main/config.json.
+[32] Tom Adamczewski Greg Burnham.
+LLMs now ac-
+cept longer inputs, and the best models can use them
+more effectively, 2025. https://epoch.ai/data-insights/
+context-windows.
+[33] Shengjian Guo, Markus Kusano, Chao Wang, Zijiang
+Yang, and Aarti Gupta. Assertion guided symbolic ex-
+ecution of multithreaded programs. In Proceedings of
+the 10th Joint Meeting on Foundations of Software En-
+gineering (ESEC/FSE ’15), Bergamo, Italy, 2015.
+[34] Yanan Guo, Zhenkai Zhang, and Jun Yang. GPU mem-
+ory exploitation for fun and profit. In Proceedings of
+the 33rd USENIX Conference on Security Symposium
+(SEC ’24), Philadelphia, PA, USA, 2024.
+[35] Indradeep Ghosh Guodong Li, Sreeranga P. Rajan. Sym-
+bolic execution and test generation for gpu programs.
+U.S. Patent US8595701B2, 2013. https://patents.google.
+com/patent/US8595701B2/en.
+[36] David Holtz and Daniël de Kok. From zero to GPU: A
+guide to building and scaling production-ready cuda ker-
+nels, 2025. https://huggingface.co/blog/kernel-builder.
+[37] Edmund Horner, David Fraser, Juha Jeronen, and Patrick
+Massot. pyan: Static call-dependency graph generator
+for python, 2020. https://github.com/davidfraser/pyan.
+[38] Xing Hu, Ge Li, Xin Xia, David Lo, Shuai Lu, and Zhi
+Jin. Summarizing source code with transferred API
+knowledge. In Proceedings of the Twenty-Seventh In-
+ternational Joint Conference on Artificial Intelligence
+(IJCAI ’18), Stockholm, Sweden, 2018.
+[39] Wei Huang, Yue Liao, Jianhui Liu, Ruifei He, Haoru Tan,
+Shiming Zhang, Hongsheng Li, Si Liu, and Xiaojuan
+Qi. Mixture compressor for mixture-of-experts LLMs
+gains more. In Proceedings of the 13th International
+Conference on Learning Representations (ICLR ’25),
+Singapore, 2025.
+[40] Juyong Jiang, Fan Wang, Jiasi Shen, Sungju Kim, and
+Sunghun Kim.
+A survey on large language models
+for code generation. arXiv preprint arXiv:2406.00515,
+2024.
+[41] Yunho Kim, Moonzoo Kim, Young Joo Kim, and
+Yoonkyu Jang. Industrial application of concolic testing
+approach: A case study on libexif by using CREST-BV
+and KLEE. In Proceedings of the 34th International
+Conference on Software Engineering (ICSE’ 12), Zurich,
+Switzerland, 2012.
+[42] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonza-
+lez, Hao Zhang, and Ion Stoica. Efficient memory man-
+agement for large language model serving with page-
+dattention. In Proceedings of the ACM SIGOPS 29th
+Symposium on Operating Systems Principles (SOSP
+’23), Koblenz, Germany, 2023.
+[43] Jaewon Lee, Yonghae Kim, Jiashen Cao, Euna Kim,
+Jaekyu Lee, and Hyesoon Kim.
+Securing GPU via
+region-based bounds checking. In Proceedings of the
+49th Annual International Symposium on Computer Ar-
+chitecture (ISCA ’22), New York, NY, USA, 2022.
+[44] Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio
+Petroni, Vladimir Karpukhin, Naman Goyal, Heinrich
+Küttler, Mike Lewis, Wen-tau Yih, Tim Rocktäschel,
+et al. Retrieval-augmented generation for knowledge-
+intensive nlp tasks. Advances in neural information
+processing systems, 33:9459–9474, 2020.
+14
+[45] Aitor Lewkowycz, Anders Andreassen, David Dohan,
+Ethan Dyer, Henryk Michalewski, Vinay Ramasesh, Am-
+brose Slone, Cem Anil, Imanol Schlag, Theo Gutman-
+Solo, et al. Solving quantitative reasoning problems
+with language models. Advances in neural information
+processing systems, 35:3843–3857, 2022.
+[46] Guodong Li, Ganesh Gopalakrishnan, Robert M Kirby,
+and Dan Quinlan. A symbolic verifier for CUDA pro-
+grams. In Proceedings of the 15th ACM SIGPLAN Sym-
+posium on Principles and Practice of Parallel Program-
+ming (PPoPP’ 10), Bangalore, India, 2010.
+[47] Guodong Li, Peng Li, Geof Sawaya, Ganesh Gopalakr-
+ishnan, Indradeep Ghosh, and Sreeranga P Rajan. GK-
+LEE: concolic verification and test generation for GPUs.
+In Proceedings of the 17th ACM SIGPLAN Symposium
+on Principles and Practice of Parallel Programming
+(PPoPP’ 12), New Orleans, LA, USA, 2012.
+[48] Peng Li, Guodong Li, and Ganesh Gopalakrishnan. Prac-
+tical symbolic race checking of GPU programs. In Pro-
+ceedings of the International Conference for High Per-
+formance Computing, Networking, Storage and Analysis
+(SC’ 14), New Orleans, LA, USA, 2014.
+[49] Pengcheng Li, Chen Ding, Xiaoyu Hu, and Tolga Soy-
+ata. LDetector: A low overhead race detector for GPU
+programs. In 5th Workshop on Determinism and Cor-
+rectness in Parallel Programming (WODET ’14), Salt
+Lake City, UT, USA, 2014.
+[50] Wentao Li, Jianhua Sun, and Hao Chen. Detecting un-
+defined behaviors in CUDA C. IEEE Access, 7:182559–
+182572, 2019.
+[51] You Li, Zhendong Su, Linzhang Wang, and Xuandong
+Li. Steering symbolic execution to less traveled paths.
+ACM SigPlan Notices, 48(10):19–32, 2013.
+[52] Jiawei Liu, Jinkun Lin, Fabian Ruffy, Cheng Tan,
+Jinyang Li, Aurojit Panda, and Lingming Zhang. Nn-
+smith: Generating diverse and valid test cases for deep
+learning compilers. In Proceedings of the 28th ACM
+International Conference on Architectural Support for
+Programming Languages and Operating Systems, Vol-
+ume 2, pages 530–543, 2023.
+[53] Mingwei Liu, Xin Peng, Andrian Marcus, Zhenchang
+Xing, Wenkai Xie, Shuangshuang Xing, and Yang Liu.
+Generating query-specific class api summaries. In Pro-
+ceedings of the 2019 27th ACM Joint Meeting on Euro-
+pean Software Engineering Conference and Symposium
+on the Foundations of Software Engineering (ESEC/FSE
+’19), Tallinn, Estonia, 2019.
+[54] Haohui Mai, Jiacheng Zhao, Hongren Zheng, Yiyang
+Zhao, Zibin Liu, Mingyu Gao, Cong Wang, Huimin Cui,
+Xiaobing Feng, and Christos Kozyrakis. Honeycomb:
+Secure and efficient {GPU} executions via static valida-
+tion. In Proceedings of the 17th USENIX Symposium on
+Operating Systems Design and Implementation (OSDI’
+23), Boston, MA, USA, 2023.
+[55] Vladimir Malinovskii, Denis Mazur, Ivan Ilin, Denis
+Kuznedelev, Konstantin Burlachenko, Kai Yi, Dan Alis-
+tarh, and Peter Richtárik. PV-Tuning: Beyond straight-
+through estimation for extreme llm compression. In
+Proceedings of 38th Annual Conference on Neural Infor-
+mation Processing Systems (NeurIPS ’24), Vancouver,
+Canada, 2024.
+[56] Microsoft.
+GpuMmu
+model, 2025.
+https:
+//learn.microsoft.com/en-us/windows-hardware/
+drivers/display/gpummu-model.
+[57] Andrea Miele. Buffer overflow vulnerabilities in CUDA:
+a preliminary analysis. Journal of Computer Virology
+and Hacking Techniques, 2016.
+[58] Hoda Naghibijouybari, Ajaya Neupane, Zhiyun Qian,
+and Nael Abu-Ghazaleh. Rendered insecure: GPU side
+channel attacks are practical. In Proceedings of the 2018
+ACM SIGSAC Conference on Computer and Communi-
+cations Security (CCS ’18), 2018.
+[59] NVIDIA.
+CUDA-MEMCHECK,
+2022.
+https://docs.nvidia.com/cuda/archive/11.4.4/
+cuda-memcheck/index.html.
+[60] NVIDIA. NVIDIA Compute Sanitizer, 2025. https:
+//developer.nvidia.com/compute-sanitizer.
+[61] OpenAI. Chatgpt agent. https://chatgpt.com/features/
+agent/.
+[62] Parasoft. NVIDIA CUDA and Parasoft, 2025. https:
+//www.parasoft.com/integrations/nvidia-cuda/.
+[63] Sang-Ok Park, Ohmin Kwon, Yonggon Kim, Sang Kil
+Cha, and Hyunsoo Yoon. Mind control attack: Under-
+mining deep learning with GPU memory exploitation.
+Computers & Security, 2021.
+[64] Yeonhong Park, Jake Hyun, SangLyul Cho, Bonggeun
+Sim, and Jae W. Lee. Any-Precision LLM: Low-cost
+deployment of multiple, different-sized llms. In Proceed-
+ings of the 41st International Conference on Machine
+Learning (ICML ’24), Vienna, Austria, 2024.
+[65] Phillipe Pereira, Higo Albuquerque, Hendrio Marques,
+Isabela Silva, Celso Carvalho, Lucas Cordeiro, Vanessa
+15
+Santos, and Ricardo Ferreira. Verifying CUDA pro-
+grams using SMT-based context-bounded model check-
+ing. In Proceedings of the 31st Annual ACM Symposium
+on Applied Computing (SAC’ 16), Pisa, Italy, 2016.
+[66] Roberto Di Pietro, Flavio Lombardi, and Antonio Vil-
+lani. CUDA leaks: A detailed hack for CUDA and a
+(partial) fix. ACM Transactions on Embedded Comput-
+ing Systems, 2016.
+[67] pybind11. pybind11 (v3) — seamless interoperabil-
+ity between C++ and Python, 2025. https://pybind11.
+readthedocs.io/en/stable/.
+[68] Python. ast — abstract syntax trees. https://docs.python.
+org/3/library/ast.html.
+[69] Jonas Roels, Adriaan Jacobs, and Stijn Volckaert.
+CUDA, woulda, shoulda: Returning exploits in a SASS-
+y world. In Proceedings of the 18th European Workshop
+on Systems Security (EuroSec’25), Rotterdam, Nether-
+lands, 2025.
+[70] Vitalis Salis, Thodoris Sotiropoulos, Panos Louridas,
+Diomidis Spinellis, and Dimitris Mitropoulos. PyCG:
+Practical call graph generation in Python. In Proceed-
+ings of the 43rd International Conference on Software
+Engineering (ICSE ’21), Madrid, Spain, 2021.
+[71] Michael B Sullivan, Mohamed Tarek Ibn Ziad, Aamer
+Jaleel, and Stephen W Keckler.
+Implicit memory
+tagging: No-overhead memory safety using alias-free
+tagged ecc. In Proceedings of the 50th Annual Interna-
+tional Symposium on Computer Architecture (ISCA ’23),
+Orlando, FL, USA, 2023.
+[72] Laszlo Szekeres, Mathias Payer, Tao Wei, and Dawn
+Song. Sok: Eternal war in memory. In Proceedings
+of the 2013 IEEE Symposium on Security and Privacy
+(S&P’ 13), San Francisco, CA, USA, 2013.
+[73] Mohamed Tarek Ibn Ziad, Sana Damani, Aamer Jaleel,
+Stephen W. Keckler, and Mark Stephenson. cuCatch: A
+debugging tool for efficiently catching memory safety
+violations in CUDA applications. In Proceedings of the
+ACM on Programming Languages, PLDI (PLDI ’23),
+New York, NY, USA, 2023.
+[74] Gemini Team, Petko Georgiev, Ving Ian Lei, Ryan Bur-
+nell, Libin Bai, Anmol Gulati, Garrett Tanzer, Damien
+Vincent, Zhufeng Pan, Shibo Wang, et al. Gemini 1.5:
+Unlocking multimodal understanding across millions
+of tokens of context. arXiv preprint arXiv:2403.05530,
+2024.
+[75] Haining Tong, Natalia Gavrilenko, Hernan Ponce de
+Leon, and Keijo Heljanko. Towards unified analysis
+of GPU consistency. In Proceedings of the 29th ACM
+International Conference on Architectural Support for
+Programming Languages and Operating Systems (ASP-
+LOS ’24), San Diego, CA, USA, 2024.
+[76] David Trabish, Andrea Mattavelli, Noam Rinetzky, and
+Cristian Cadar. Chopped symbolic execution. In Pro-
+ceedings of the 40th International Conference on Soft-
+ware Engineering (ICSE ’18), Gothenburg, Sweden,
+2018.
+[77] Hanchen Wang, Tianfan Fu, Yuanqi Du, Wenhao Gao,
+Kexin Huang, Ziming Liu, Payal Chandak, Shengchao
+Liu, Peter Van Katwyk, Andreea Deac, et al. Scientific
+discovery in the age of artificial intelligence. Nature,
+620(7972):47–60, 2023.
+[78] Tielei Wang, Tao Wei, Zhiqiang Lin, and Wei Zou.
+Intscope: Automatically detecting integer overflow vul-
+nerability in x86 binary using symbolic execution. In
+Proceedings of the 16th Annual Network and Distributed
+System Security Symposium (NDSS ’09), San Diego, Cal-
+ifornia, 2009.
+[79] Wikipedia.
+Symbolic execution, 2025.
+https://en.
+wikipedia.org/wiki/Symbolic_execution.
+[80] Likang Wu, Zhi Zheng, Zhaopeng Qiu, Hao Wang,
+Hongchao Gu, Tingjia Shen, Chuan Qin, Chen Zhu,
+Hengshu Zhu, Qi Liu, et al.
+A survey on large lan-
+guage models for recommendation. World Wide Web,
+27(5):60, 2024.
+[81] Haoran You, Yipin Guo, Yichao Fu, Wei Zhou, Hui-
+hong Shi, Xiaofan Zhang, Souvik Kundu, Amir Yazdan-
+bakhsh, and Yingyan Celine Lin. ShiftAddLLM: Accel-
+erating pretrained llms via post-training multiplication-
+less reparameterization. In Proceedings of 38th Annual
+Conference on Neural Information Processing Systems
+(NeurIPS ’24), Vancouver, Canada, 2024.
+[82] Chaochao Zhang and Rui Hou. Lak: A low-overhead
+lock-and-key based schema for GPU memory safety. In
+Proceedings of the 2022 IEEE 40th International Con-
+ference on Computer Design (ICCD ’22), Lake Tahoe,
+NV, USA, 2022.
+[83] Gang Zhang and Jin Wuxia. ¨depends: A fast, compre-
+hensive code dependency analysis tool¨, 2019. https:
+//github.com/multilang-depends/depends.
+[84] Wayne Xin Zhao, Kun Zhou, Junyi Li, Tianyi Tang, Xi-
+aolei Wang, Yupeng Hou, Yingqian Min, Beichen Zhang,
+Junjie Zhang, Zican Dong, et al. A survey of large lan-
+guage models. arXiv preprint arXiv:2303.18223, 1(2),
+2023.
+16
+[85] Yu Zhao, Wenjie Xue, Weijie Chen, Weizhong Qiang,
+Deqing Zou, and Hai Jin. Owl: differential-based side-
+channel leakage detection for CUDA applications. In
+2024 54th Annual IEEE/IFIP International Conference
+on Dependable Systems and Networks (DSN ’24), Bris-
+bane, Queensland, Australia, 2024.
+[86] Zihuai Zhao, Wenqi Fan, Jiatong Li, Yunqing Liu, Xi-
+aowei Mei, Yiqi Wang, Zhen Wen, Fei Wang, Xiangyu
+Zhao, Jiliang Tang, et al. Recommender systems in
+the era of large language models (LLMs).
+IEEE
+Transactions on Knowledge and Data Engineering,
+36(11):6889–6907, 2024.
+[87] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue
+Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos
+Kozyrakis, Ion Stoica, Joseph E. Gonzalez, Clark Bar-
+rett, and Ying Sheng. SGLang: efficient execution of
+structured language model programs. In Proceedings
+of the 38th International Conference on Neural Infor-
+mation Processing Systems (NIPS ’24), Vancouver, BC,
+Canada, 2024.
+[88] Mai Zheng, Vignesh T. Ravi, Feng Qin, and Gagan
+Agrawal. GRace: a low-overhead mechanism for de-
+tecting data races in gpu programs. In Proceedings of
+the 16th ACM Symposium on Principles and Practice of
+Parallel Programming (PPoPP ’11), San Antonio, TX,
+USA, 2011.
+[89] Mai Zheng, Vignesh T. Ravi, Feng Qin, and Gagan
+Agrawal. GMRace: Detecting data races in GPU pro-
+grams via a low-overhead scheme. IEEE Transactions
+on Parallel and Distributed Systems (TPDS ’14), 2014.
+[90] Zibin Zheng, Kaiwen Ning, Yanlin Wang, Jingwen
+Zhang, Dewu Zheng, Mingxi Ye, and Jiachi Chen.
+A survey of large language models for code: Evolu-
+tion, benchmarking, and future trends. arXiv preprint
+arXiv:2311.10372, 2023.
+[91] Yutao Zhu, Huaying Yuan, Shuting Wang, Jiongnan Liu,
+Wenhan Liu, Chenlong Deng, Haonan Chen, Zheng Liu,
+Zhicheng Dou, and Ji-Rong Wen. Large language mod-
+els for information retrieval: A survey. ACM Transac-
+tions on Information Systems, 44(1):1–54, 2025.
+[92] Mohamed Tarek Ibn Ziad, Sana Damani, Mark Stephen-
+son, Stephen W Keckler, and Aamer Jaleel. GPUAr-
+mor: A hardware-software co-design for efficient and
+scalable memory safety on GPUs.
+arXiv preprint
+arXiv:2502.17780, 2025.
+17

@@ -1,0 +1,1584 @@
+Training LLMs for Multi-Step Tool Orchestration with
+Constrained Data Synthesis and Graduated Rewards
+Jiayang Cheng 1 2 Xin Liu 1 Zhihan Zhang 1 Haoyang Wen 1 Zixuan Zhang 1 Qingyu Yin 1 Shiyang Li 1
+Priyanka Nigam 1 Bing Yin 1 Chao Zhang 1 3 Yangqiu Song 1 2
+Abstract
+Multi-step tool orchestration, where LLMs must
+invoke multiple dependent APIs in the correct
+order while propagating intermediate outputs, re-
+mains challenging. State-of-the-art models fre-
+quently fail on full sequence execution, with pa-
+rameter value errors accounting for a significant
+portion of failures. Training models to handle
+such workflows faces two obstacles: existing en-
+vironments focus on simple per-turn function calls
+with simulated data, and binary rewards provide
+no signal for partial correctness.
+We present a framework addressing both chal-
+lenges. First, we construct a reinforcement learn-
+ing environment backed by a large-scale cache
+of real API responses, enabling a data synthe-
+sis pipeline that samples valid multi-step orches-
+tration traces with controllable complexity and
+significantly higher generation efficiency than un-
+constrained methods. Second, we propose a grad-
+uated reward design that decomposes correctness
+into atomic validity (individual function call cor-
+rectness at increasing granularity) and orchestra-
+tion (correct tool sequencing with dependency
+respect). On ComplexFuncBench, our approach
+demonstrates substantial improvements in turn
+accuracy. Ablation studies confirm both reward
+components are essential: using either alone sig-
+nificantly degrades performance.
+1. Introduction
+Large language models (LLMs) have demonstrated remark-
+able capabilities in using external tools through function
+1Stores Foundational AI, Amazon Inc., Palo Alto, CA, USA
+2Department of Computer Science and Engineering, HKUST,
+Hong Kong SAR, China 3School of Computational Science and
+Engineering, Georgia Institute of Technology, Atlanta, GA, USA.
+Correspondence to: Jiayang Cheng <jchengaj@cse.ust.hk>, Xin
+Liu <xliucr@amazon.com>.
+Preprint. March 27, 2026.
+calling (Patil et al., 2024; Qin et al., 2023). While signifi-
+cant progress has been made on single-step tool invocation,
+real-world applications often require multi-step tool orches-
+tration, i.e., invoking a sequence of APIs in the correct order
+while propagating outputs from earlier calls as inputs to
+subsequent ones.
+Recent benchmarks reveal that even state-of-the-art mod-
+els struggle with multi-step orchestration. On Complex-
+FuncBench (Zhong et al., 2025), which averages 3.26 steps
+per query, parameter value errors dominate failure modes
+(up to 78.8% for Qwen2.5-72B), indicating that models
+often select the correct function but fail to infer precise pa-
+rameter values. Similarly, NESTFUL (Basu et al., 2025)
+reports that the best models achieve only 28% full sequence
+accuracy on nested function calls, with performance degrad-
+ing sharply at depth ≥2.
+These findings suggest two key insights: (1) models need
+fine-grained feedback that rewards partial correctness rather
+than the standard all-or-nothing evaluation; and (2) training
+on multi-step workflows with explicit dependency handling
+is essential. Existing RL-based tool-use frameworks, such
+as ToolRL (Qian et al., 2025) and PARL-MT (Chai et al.,
+2025), primarily rely on terminal success signals or binary
+execution feedback. This sparsity is particularly problematic
+in orchestration tasks, where a single incorrect parameter
+in a multi-step sequence leads to total failure, providing no
+signal for the model to learn from partially correct reasoning
+paths.
+Applying reinforcement learning (RL) to multi-step tool
+orchestration faces two fundamental obstacles.
+Chal-
+lenge 1 concerns the lack of suitable training environments.
+While execution environments exist for tool learning (e.g.,
+BFCL (Patil et al., 2025), tau-bench), they primarily target
+multi-user-turn scenarios with simple per-turn function calls
+rather than complex multi-step orchestration where a single
+user query requires multiple dependent API calls. Moreover,
+these environments often rely on simulated or synthetic data
+rather than real API responses, which can produce inconsis-
+tent dependency chains (e.g., a hotel ID returned in step 1
+may not yield valid results when queried in step 2). Chal-
+lenge 2 concerns sparse rewards. Standard binary rewards
+1
+arXiv:2603.24709v1  [cs.LG]  25 Mar 2026
+Training LLMs for Multi-Step Tool Orchestration
+provide no learning signal for partial progress: a model that
+selects the right function but provides a slightly wrong date
+receives the same zero reward as one that calls a completely
+unrelated function. RAGEN (Wang et al., 2025) identifies
+this issue but focuses on reasoning tasks and has not yet
+been adapted for the specific constraints of multi-step tool
+use.
+We present a systematic framework addressing both chal-
+lenges (Figure 1):
+1. Deterministic RL Training Environment with Con-
+strained Data Synthesis. We construct a cache-based
+execution environment with 100k+ real API responses,
+ensuring consistent dependency chains across training
+iterations. Our constrained synthesis pipeline leverages
+workflow templates to achieve high generation success
+rates.
+2. Graduated Reward Design. We decompose correct-
+ness into Ratomic (validating individual function calls
+at increasing granularity) and Rorch (validating correct
+sequencing with dependency respect), providing dense
+learning signals for complex trajectories.
+3. Empirical Validation. We evaluate in two settings:
+training on synthetic data to test generalization, and
+an oracle setting (training on in-domain evaluation
+queries) to establish an upper bound. RL training
+demonstrates substantial improvements in turn accu-
+racy, and ablation studies confirm that both reward
+components are essential for success.
+2. Methodology
+2.1. Problem Formulation
+We formulate multi-step tool orchestration as a sequential
+decision-making problem. Given a user query q and a set
+of available tools F, the agent must generate a sequence of
+actions y = (y1, . . . , yT ), where each action yt = (ft, θt)
+consists of a function selection ft ∈F and parameter as-
+signment θt.
+The execution environment is deterministic. Executing yt
+yields an observation ot = Exec(ft, θt). Crucially, a subse-
+quent action yt′ (where t′ > t) may possess a dependency
+on previous outputs. This is modeled as θt′ ←ϕ(o1:t′−1),
+where ϕ represents the ground truth logic for extracting and
+propagating values (e.g., extracting a hotel id to query
+room details). The agent must learn to approximate this
+dependency logic.
+Our objective is to learn a policy πθ(y|q) that maximizes
+a reward R(y, y∗), where y∗represents the ground truth
+workflow. Unlike standard generation tasks, validity is con-
+strained by the underlying API logic: an action yt is valid if
+and only if all its dependencies are satisfied by the history
+Ht−1 = {(yk, ok)}t−1
+k=1.
+2.2. Deterministic Training Environment
+Training LLMs for multi-step tool orchestration via RL
+requires a suitable execution environment. Existing ap-
+proaches like BFCL (Patil et al., 2025) or τ-bench (Yao
+et al., 2024) often rely on simulated responses or lack com-
+plex intra-turn dependencies. We address this by construct-
+ing a deterministic environment grounded in real data. Our
+construction process follows three steps: defining workflow
+logic, collecting targeted data, and enabling constrained
+synthesis.
+• Workflow Template Curation. Before collecting data,
+we must define valid orchestration patterns. We formalize
+recurring patterns as Workflow Templates that capture: or-
+dered function sequences (f1, . . . , fT ), dependency struc-
+tures specifying how θt depends on previous observations
+o<t, and field paths for value extraction (implementing
+ϕ). We curate over 100 templates spanning five domains
+(a concrete JSON example is provided in Section C).
+• Workflow-Aware Cache Collection. To enable deter-
+ministic RL training without the latency and instability
+of live API calls, we build a cache-based environment
+that implements ot = Exec(ft, θt). Crucially, we em-
+ploy workflow-aware collection: rather than caching ran-
+dom independent API calls, we execute complete action
+sequences (y1, . . . , yT ) from the templates against live
+Booking.com APIs. This ensures that for every cached
+observation ot, the corresponding dependent observations
+ot+1, . . . that rely on values extracted from ot are also
+present.
+We collected 100k+ real API responses covering 40 func-
+tions in F. Responses are indexed by hash of (f, θ),
+enabling O(1) deterministic lookups. We implement com-
+prehensive input validation with 8 specialized validators
+(date formats, coordinate ranges, enum values) to return
+structured error messages matching real API behavior.
+• Constrained Data Synthesis. Rather than caching func-
+tion responses independently, we execute complete work-
+flow chains (workflow-aware cache expansion) to ensure
+cached responses form valid multi-step traces. The key
+insight is that freely exploring function chains leads to
+low data generation efficiency, as arbitrary combinations
+often violate dependency constraints or produce unsat-
+isfiable parameter bindings. Instead, we use workflow
+templates (pre-validated on live APIs) as skeletons, then
+sample cache entries step-by-step following the depen-
+dency structure, and finally prompt an LLM to synthesize
+a query q that would elicit the sampled action sequence
+{(ft, θt)}T
+t=1. The pipeline works as follows:
+2
+Training LLMs for Multi-Step Tool Orchestration
+PHASE 2
+Workflow
+Template
+Structure
+Get
+Details
+Search
+Hotels
+Search
+Dest
+PHASE 1
+Data Collection & Environment
+Workflow Template
+Search
+Dest
+Search
+Hotels
+dest_id
+hotel_id
+Get
+Details
+Booking.com
+APIs
+100k+ cached
+responses
+Constrained Data Synthesis
+Reverse Index
+func
+param
+value
+cache
+Step 1
+Sampling
+following
+dependencies
+“Find hotels in 
+Manchester for 
+Dec 20-27 ...”
+Step 2
+Step 3
+cache
+cache
+cache
+.
+.
+.
+.
+.
+.
+.
+.
+.
+.
+.
+.
+PHASE 3
+LLM
+Execution
+Environment
+Function Call
+API Response
+Rollout sequence
+Search Dest
+R_atomic:
+name→structure→values
+GRPO Update
+R_orch:
+order + dependencies
+Search Hotels
+Get Details
+RL Training with Graduated Rewards
+Cache
+Figure 1. Framework overview using hotel booking as a running example. Phase 1: Collect real API responses and curate workflow
+templates with dependency structures. Phase 2: Sample cache entries following dependencies, then generate queries matching sampled
+parameters. Phase 3: LLM interacts with the deterministic environment through multi-turn rollouts, receiving graduated rewards (Ratomic
++ Rorch) for GRPO updates.
+(1) Reverse Index Construction. We build a three-level
+inverted index I : (f, param, val) →{cache ids}. For
+example, I(Search Hotels, dest id, "ABC123")
+returns all cache entries where Search Hotels was
+called with dest id="ABC123".
+(2) Constraint-Aware Cache Sampling. For each work-
+flow template, we sample action-observation pairs (yt, ot)
+step-by-step from the cache. Independent steps (no de-
+pendencies) sample θt randomly from cached entries for
+ft. Dependent steps use the reverse index: extract the
+required value from ot−1, query the index, and intersect
+with other constraints to obtain valid θt. If the intersection
+is empty (no compatible cache entries), sampling restarts
+from step 1 with different random choices. After a fixed
+number of retries, the current attempt is abandoned and
+a new workflow is sampled. This guarantees all success-
+fully sampled entries form a valid ground truth sequence
+y∗.
+(3) Query Generation. Given the sampled ground truth
+y∗= {(ft, θt)}T
+t=1, we prompt an LLM to generate
+a query q that would elicit this action sequence. The
+prompt design prioritizes parameter fidelity over linguis-
+tic diversity: we instruct the model to incorporate all
+θt values verbatim and require it to echo back the pa-
+rameters in structured JSON format alongside q. This
+echo-back mechanism enables automatic consistency ver-
+ification between the natural language surface form and
+the underlying parameter bindings. We employ zero-shot
+prompting without few-shot exemplars, relying on the
+instruction-following capabilities of modern LLMs. The
+complete prompt template is provided in Section G.
+(4) Validation. We execute each y∗
+t = (ft, θt) through
+the cache-based environment and verify: (a) cache hit for
+(ft, θt), (b) successful execution yielding valid ot. Since
+parameters are sampled directly from cache, validation
+serves as a sanity check. Any step failure invalidates the
+entire (q, y∗) pair.
+The complete synthesis process is formalized in Algo-
+rithm 1.
+Example Training Sample (Car Rental Workflow)
+Query q: “I’m at the San Diego Marriott La Jolla. We’re
+planning to rent a car for Halloween 2024, departing at
+10 AM and returning at the same place at 10 AM the next
+day. Check the rental package price?”
+Ground Truth y∗= (y∗
+1, y∗
+2, y∗
+3):
+Step 1: Search_Car_Location(query="San Diego
+Marriott La Jolla")
+-> o1: {coordinates: {lat: 32.87, lon: -117.22}}
+Step 2: Search_Car_Rentals(pick_up_lat=32.87,
+pick_up_lon=-117.22,
+pick_up_date="2024-10-31",
+drop_off_date="2024-11-01", ...)
+-> o2: {search_results: [{vehicle_id: "637318066",
+...}],
+search_context: {searchKey: <base64>}}
+Step 3: Get_Packages(vehicle_id="637318066",
+search_key=<base64>)
+-> o3: {packages: [...]}
+Dependencies: y∗
+2 uses lat, lon from o1; y∗
+3 uses
+vehicle id, search key from o2.
+2.3. Graduated Reward Design
+The Sparse Reward Problem.
+In multi-step tool orches-
+tration, standard binary rewards (Success/Failure) fail to
+3
+Training LLMs for Multi-Step Tool Orchestration
+Algorithm 1 Constrained Data Synthesis Pipeline
+Input: Workflow Templates T , Cache C, Generator LLM
+M
+Output: Synthetic Dataset Dsyn
+Build Inverted Index I : (f, param, val) →{cache ids}
+for each template T = (f1, . . . , fn) ∈T do
+Initialize empty trace τ = []
+for step t = 1 to n do
+if step t has dependencies on previous outputs then
+Extract required values V from τ
+Candidates St ←T
+v∈V I(ft, paramv, v)
+else
+Candidates St ←All entries for ft in C
+end if
+Sample entry (ft, θt, ot) ∼St
+Append (ft, θt, ot) to τ
+end for
+Extract y∗= {(ft, θt)}n
+t=1 from τ
+Generate query q ←M(“Generate user query...”, τ)
+Validate q by executing against environment
+if success then
+Add (q, y∗) to Dsyn
+end if
+end for
+provide adequate learning signals. This failure stems from
+two factors. First, the combinatorial explosion of the action
+space: if a workflow requires T steps and the probability of
+correctness at any step is p < 1, the probability of receiving
+a positive reward is pT , which vanishes rapidly as T in-
+creases. Second, the credit assignment ambiguity: a binary
+reward of 0 does not distinguish between a model that failed
+at step 1 (wrong tool) and a model that succeeded for T −1
+steps but failed at step T due to a minor parameter typo.
+Without intermediate feedback, the agent faces a “needle in
+a haystack” optimization landscape where gradients are flat
+almost everywhere.
+Two-Component Reward Structure.
+We decompose cor-
+rectness into two complementary components that capture
+different aspects:
+• Ratomic evaluates each predicted action yt = (ft, θt),
+i.e., whether the model generates syntactically and
+semantically valid function calls.
+• Rorch evaluates workflow completion against y∗, i.e.,
+whether all required steps are executed in the correct
+order with dependencies respected.
+Ratomic: Atomic Validity.
+For each predicted call, we
+assess correctness through two complementary validations:
+Abstract Syntax Tree (AST) Validation. We check syntactic
+correctness via three-level graduated scoring:
+• Level 1 (α1): Correct function name
+• Level 2 (α2): Correct parameter structure and types
+• Level 3 (α3): Exact parameter value matching
+For a predicted call ˆy = ( ˆf, ˆθ) matched against ground
+truth y∗= (f ∗, θ∗):
+RAST(ˆy, y∗) = α1 · 1[ ˆf = f ∗] + α2 · sstruct(ˆθ, θ∗)
++ α3 · 1[ˆθ = θ∗]
+(1)
+where sstruct measures parameter overlap and type accuracy
+(detailed definitions in Section B).
+Semantic Validation. We execute the call through our de-
+terministic environment and check for success: Rsem(ˆy) =
+1[execution succeeds]. Concretely, we verify three condi-
+tions: (1) the call was executed and produced a response,
+(2) the response contains no error indicators (e.g., error
+fields or failure status), and (3) the response has valid struc-
+ture (non-empty with expected data fields). Note that this
+is execution-based validation rather than output matching:
+we reward successful execution regardless of whether the
+returned data exactly matches ground truth. This catches
+errors that pass AST checks but fail at runtime (e.g., invalid
+date ranges, non-existent IDs).
+Combined Score. AST and semantic validations are comple-
+mentary: AST rewards structural correctness while semantic
+rewards functional correctness. We combine them equally
+and average over all K predicted calls:
+Ratomic = 1
+K
+K
+X
+k=1
+RAST(ˆyk) + Rsem(ˆyk)
+2
+(2)
+Rorch: Orchestration Consistency.
+While Ratomic as-
+sesses local correctness, Rorch enforces the global causal
+structure. Let G = (V, E) be the dependency graph of the
+ground truth workflow y∗, where V = {y∗
+1, . . . , y∗
+T } and
+an edge (j, i) ∈E indicates that θ∗
+i depends on observation
+oj.
+We define a mapping function µ : V →{1, . . . , K} ∪{∅}
+that aligns each ground truth action y∗
+i to the index of the
+first matching call in the predicted sequence ˆy. A match
+requires the correct function name (parameter values are val-
+idated separately by Ratomic, enabling the two components
+to provide orthogonal learning signals).
+The orchestration reward credits steps whose causal depen-
+4
+Training LLMs for Multi-Step Tool Orchestration
+dencies are satisfied:
+Rorch =
+1
+|V |
+X
+i∈V
+1[i is matched] ·
+Y
+(j,i)∈E
+1[µ(j) < µ(i)]
+(3)
+Here, 1[·] is the indicator function. The term 1[µ(j) < µ(i)]
+ensures that dependency j is not only executed but executed
+before the dependent step i. The multiplicative product acts
+as a strict gate: a step receives zero orchestration credit if
+any of its prerequisites are missing or out of order, providing
+a strong gradient signal against causal violations.
+The total reward combines both components:
+Rtotal = λ · Ratomic + (1 −λ) · Rorch
+(4)
+where λ ∈[0, 1] is a hyperparameter controlling the trade-
+off between atomic correctness and orchestration quality.
+3. Experiments
+We first validate that our cache-based RL environment pro-
+vides effective learning signals (Section 3.2), then evaluate
+whether models trained on synthetic data can generalize to
+unseen queries (Section 3.3). We conduct ablation studies
+to understand the contribution of each reward component
+(Section 3.4) and analyze how performance scales with data
+quantity (Section 3.5). Finally, we examine which task char-
+acteristics benefit most from RL training through stratified
+and error analyses (Sections 3.6 and 3.8).
+3.1. Setup
+We evaluate on ComplexFuncBench (Zhong et al., 2025), a
+benchmark specifically designed to assess multi-step tool
+orchestration. The benchmark comprises 1,000 test samples
+spanning five API domains (hotels, flights, car rentals, attrac-
+tions, and taxis), with an average of 3.26 steps per query. We
+apply GRPO (Shao et al., 2024) for reinforcement learning
+using the verl framework (Sheng et al., 2024). We conduct
+training experiments on two base models: Qwen3-8B (Yang
+et al., 2025) and Qwen2.5-7B-Instruct (Qwen et al., 2024).
+Zero-shot refers to the original model without any task-
+specific training: the model receives a system prompt with
+tool descriptions and the user query, without in-context ex-
+amples or fine-tuning.
+Evaluation Metrics.
+Let D denote the evaluation set. For
+each sample i ∈D, the ground truth sequence y∗(i) is
+organized into N (i) turns, where each turn contains one or
+more function calls (possibly parallel).
+Turn Accuracy measures workflow completion progress by
+counting consecutive turns completed from the beginning:
+Turn Acc =
+P
+i∈D N (i)
+succ
+P
+i∈D N (i)
+(5)
+Table 1. Oracle Performance: Training and Evaluating on the Same
+Queries (Turn Acc %)
+Model
+Zero-shot
++RL
+Improv.
+Qwen3-8B
+37.5
+52.1
++14.6
+Qwen2.5-7B-Instruct
+16.7
+33.8
++17.1
+where N (i)
+succ is the number of consecutive successful turns
+for sample i. This metric reflects the cascading nature of
+multi-step orchestration: an early failure prevents all subse-
+quent steps from succeeding. We also report Call Accuracy
+(proportion of correctly matched individual calls) as a sec-
+ondary metric; detailed definitions are in Section D.
+Training Configuration.
+All experiments are conducted
+on 8×H100 GPUs. We select batch size 16 and rollout
+size 16 based on preliminary experiments for stable training
+over extended steps. The Kullback-Leibler (KL) divergence
+coefficient is set to 0.001 (verl default), as we found it does
+not significantly affect performance. The reward weight
+λ = 0.5 gives equal weighting to Ratomic and Rorch.
+3.2. Effectiveness of RL Training Environment
+Before evaluating generalization, we first verify that our
+cache-based RL environment can effectively improve model
+performance. This requires isolating the effect of the execu-
+tion environment from confounding factors such as distribu-
+tion shift between training and test data.
+Oracle Setting.
+We design an “oracle” experiment where
+models are trained and evaluated on the same 100 queries
+sampled from ComplexFuncBench. This setup eliminates
+generalization requirements: if the model fails to improve,
+the issue lies with the RL environment or reward signal
+rather than data coverage. Conversely, substantial improve-
+ment validates that the environment provides useful learning
+signals. Note that baseline numbers in this section differ
+from Table 2 due to the smaller evaluation set.
+Results.
+Both models show substantial improvements
+through RL training (Table 1), with gains of 14–17% in
+turn accuracy. These results demonstrate that our deter-
+ministic cache-based environment provides the consistent
+feedback necessary for effective policy optimization. The
+improvement confirms that the graduated reward design
+(Ratomic + Rorch) successfully guides the model toward cor-
+rect multi-step orchestration. Subsequent experiments (Ta-
+ble 2 and Figure 4) evaluate whether these gains generalize
+to unseen queries.
+5
+Training LLMs for Multi-Step Tool Orchestration
+3.3. Effectiveness of Constrained Data Synthesis
+Having validated that the RL environment enables learning
+(Section 3.2), we now evaluate generalization: can models
+trained on synthetic data solve unseen queries?
+Generalization Setting.
+Unlike the oracle experiment,
+training and evaluation sets are now disjoint. We gener-
+ate synthetic training data using the constrained synthesis
+pipeline (Section 2.2), varying the number of samples per
+workflow template (3 or 10). Models are evaluated on the
+full 1000-sample ComplexFuncBench test set. We compare
+three training strategies: supervised fine-tuning (SFT) on
+ground-truth trajectories, GRPO with our graduated rewards,
+and SFT followed by GRPO.
+Results.
+Table 2 shows several observations: (1) SFT
+alone yields negligible gains or even degradation. Our error
+analysis (Table 5) reveals the root cause: SFT increases func-
+tion selection errors at the sequence level (12.9%→28.3%
+samples stopped after function error) and worsens query
+parameter extraction (14.7%→15.8% error rate), suggest-
+ing that imitation learning on limited templates does not
+generalize well to novel query phrasings. Per-domain analy-
+sis (Table 7) corroborates this: SFT overfits to a subset of
+domains while degrading on others. (2) GRPO with fewer
+samples per template (GRPO-3) sometimes outperforms
+more samples (GRPO-10), though results vary across mod-
+els and learning rates. (3) Qwen2.5-7B shows the largest
+gain with SFT+GRPO-3 combination (+13.7% over base-
+line). These results suggest that for strong base models,
+direct RL training may be more effective than SFT when
+data is scarce.
+3.4. Reward Component Analysis
+To understand the contribution of each reward component,
+we conduct ablation studies comparing Ratomic only, Rorch
+only, and the combined reward.
+Final Performance.
+Table 3 shows that both components
+are essential. Using Ratomic alone yields the worst results
+(15.3% call accuracy), while Rorch alone performs moder-
+ately (37.6% call accuracy). The combined reward substan-
+tially outperforms both, achieving 49.5% call accuracy.
+Training
+Dynamics.
+To
+understand
+why
+single-
+component rewards fail, we examine the training dynamics
+(Figure 2). Training with Ratomic only leads to orchestration
+collapse: the model achieves near-perfect individual call
+accuracy (Ratomic →0.97) but loses the ability to coordinate
+multi-step sequences (Rorch →0.35). Conversely, Rorch
+only leads to atomic collapse:
+the model completes
+workflows (Rorch →1.0) but generates low-quality calls
+(Ratomic →0.55).
+0
+20
+40
+60
+80
+100
+Training Step
+0.6
+0.7
+0.8
+0.9
+Reward
+Ratomic
+0
+20
+40
+60
+80
+100
+Training Step
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Reward
+Rorch
+0
+20
+40
+60
+80
+100
+Training Step
+0.65
+0.70
+0.75
+0.80
+0.85
+0.90
+0.95
+1.00
+Reward
+Mean Reward
+R_atomic only
+R_orch only
+Combined
+Figure 2. Training dynamics under different reward configurations.
+Left: Ratomic only achieves high atomic validity but orchestration
+collapses. Middle: Rorch only achieves perfect orchestration but
+atomic validity drops. Right: Combined reward achieves balanced
+improvement.
+0
+20
+40
+60
+80
+100
+Training Step
+0.750
+0.775
+0.800
+0.825
+0.850
+0.875
+0.900
+0.925
+0.950
+Score
+RAST (Static Validation)
+0
+20
+40
+60
+80
+100
+Training Step
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Score
+Rsem (Execution Success)
+R_atomic only
+R_orch only
+Combined
+Figure 3. Breakdown of Ratomic into AST validation (static) and se-
+mantic validation (execution). Rorch only training maintains RAST
+but Rsem collapses, indicating syntactically valid but semantically
+broken calls.
+Mechanism of Atomic Collapse.
+Figure 3 further dis-
+sects the atomic collapse phenomenon by breaking down
+Ratomic into its AST and semantic components. Under Rorch
+only training, AST validity remains reasonable (∼0.82), but
+semantic validity drops to ∼0.45. This indicates the model
+learns to generate syntactically correct but semantically
+broken function calls—valid parameter names with invalid
+values that fail at execution. The combined reward avoids
+both failure modes by providing complementary learning
+signals: Rorch guides tool selection and sequencing, while
+Ratomic ensures parameter correctness.
+3.5. Scaling Analysis
+How much synthetic data is needed for effective RL train-
+ing? We investigate data efficiency by varying the number
+of samples generated per workflow template.
+Setting.
+Using our constrained synthesis pipeline, we gen-
+erate training sets with varying density: 1, 3, 5, or 7 target
+samples per workflow template, yielding datasets of 67, 179,
+283, and 383 samples respectively. All models are trained
+with GRPO using the combined reward and evaluated on
+the full test set.
+Results.
+Table 4 shows that performance plateaus quickly:
+increasing from 67 to 383 samples (a ∼6× increase)
+yields no consistent improvement. This suggests high data
+efficiency—models capture workflow structural patterns
+6
+Training LLMs for Multi-Step Tool Orchestration
+Table 2. Training with Constrained Synthetic Data (Turn Acc %). Numbers in column headers indicate samples per workflow template
+(e.g., SFT-3 = SFT with 3 samples/template, GRPO-10 = GRPO with 10 samples/template). Evaluated on full 1000-sample test set.
+Model-LR
+Zero-shot
+SFT-3
+SFT-10
+GRPO-3
+GRPO-10
+SFT+GRPO-3
+SFT+GRPO-10
+Qwen3-8B-1e-6
+34.4
+32.6
+31.7
+36.4
+30.2
+31.1
+29.9
+Qwen3-8B-5e-6
+–
+–
+–
+28.7
+29.6
+22.9
+28.4
+Qwen2.5-7B-1e-6
+13.4
+11.5
+13.5
+25.8
+23.9
+27.1
+16.0
+Qwen2.5-7B-5e-6
+–
+–
+–
+24.1
+21.3
+16.5
+12.1
+Table 3. Reward Component Ablation (Turn Acc / Call Acc %)
+Config
+Turn Acc
+Call Acc
+Ratomic only
+32.2
+15.3
+Rorch only
+37.5
+37.6
+Combined
+52.1
+49.5
+Table 4. Effect of Data Scale (Turn Acc %). Scale denotes target
+samples per workflow; actual totals are 67, 179, 283, 383 samples.
+Model-LR
+1
+3
+5
+7
+Qwen3-8B-1e-6
+31.0
+32.4
+32.5
+31.1
+Qwen3-8B-5e-6
+29.4
+26.4
+30.3
+27.3
+Qwen2.5-7B-1e-6
+19.0
+19.0
+22.2
+22.3
+Qwen2.5-7B-5e-6
+22.4
+27.4
+22.8
+19.3
+from limited examples. However, this also indicates di-
+minishing returns from sample density alone; expanding
+template diversity (the 40 templates that failed validation)
+may be more valuable than generating more samples per
+existing template.
+3.6. Stratified Performance Analysis
+Overall accuracy improvements do not reveal where RL
+training helps most. We stratify results by task complexity
+to understand which scenarios benefit from our approach.
+Setting.
+We analyze performance along two dimensions:
+(1) dependency depth—the longest chain of sequential func-
+tion calls where each depends on previous outputs, and
+(2) dependency pattern—whether the workflow follows a
+linear chain or fans out into parallel branches. We com-
+pare three models: Zero-shot (no task-specific training),
+GRPO-3 (trained on synthetic data, disjoint from test), and
+RL-Oracle (trained on test queries, representing the upper
+bound).
+Figure 4(a) shows performance by dependency depth. Both
+GRPO-3 and RL-Oracle improve over Zero-shot, with rel-
+ative gains increasing at greater depths (+20% at depth 2,
++31% at depth 4 for RL-Oracle). Figure 4(b) shows that
+fan-out patterns are harder than linear chains, but RL train-
+ing helps consistently. Additional stratification by logical
+composition is in Section E.
+2
+3
+4
+5
+Dependency Depth
+0
+10
+20
+30
+40
+50
+60
+70
+Turn Accuracy (%)
+(a) By Depth
+Linear
+Fan-out
+Dependency Pattern
+0
+10
+20
+30
+40
+50
+60
+70
+(b) By Pattern
+Zero-shot
+GRPO-3
+RL-Oracle
+Figure 4. Turn Accuracy (%) stratified by (a) dependency depth
+and (b) dependency pattern. Performance degrades with depth and
+for fan-out patterns. RL training provides consistent improvements
+across all stratifications.
+3.7. Qualitative Analysis
+To illustrate how RL training improves orchestration, Fig-
+ure 5 examines a failure case in the parallel conjunction
+category.
+The baseline model fails to recognize that the query im-
+plies two independent search branches, stopping after the
+hotel search. This is not a parameter error but a structural
+one. The RL-trained model, penalized by Rorch for partial
+coverage of the dependency graph G, learns to execute all
+required sub-tasks.
+3.8. Error Analysis
+To understand where errors occur, we categorize failures at
+three levels: (1) call-level—among function calls the model
+produces, what fraction have incorrect function names vs. in-
+correct parameters; (2) parameter-level—among calls with
+correct function names, comparing errors in query-derived
+parameters vs. dependency-propagated parameters; and (3)
+sequence-level—whether the model completes the full work-
+flow.
+Table 5 reveals several insights. First, dependency prop-
+agation is not the primary bottleneck—dependency pa-
+rameter errors (5–8%) are substantially lower than query
+parameter errors (13–16%), suggesting the harder challenge
+is extracting parameters from natural language rather than
+propagating values between calls. Second, “stopped after
+param error” is the dominant failure mode (22–28%);
+GRPO reduces all incomplete categories, with the largest
+improvement in “stopped after correct” (17.2%→12.7%),
+encouraging models to continue execution. Third, SFT in-
+creases function selection errors (12.9%→28.3%) while
+7
+Training LLMs for Multi-Step Tool Orchestration
+Query: “Recommend two top-rated activities and two highly-
+reviewed hotels in Montreal for Nov 20–23.”
+Ground Truth (4 steps, 2 parallel branches):
+1.
+Search Attraction Location({query:
+"Montreal"})
+2.
+Search Hotel Destination({query:
+"Montreal"})
+3.
+Search Attractions({id:
+..., sortBy:
+"score"})
+4.
+Search Hotels({dest id:
+...,
+arrival date:
+...})
+Zero-shot:
+1.
+Search Hotel Destination({query:
+"Montreal"}) ✓
+2.
+Search Hotels({dest id:
+"-569541"}) ✗
+,→Missed attraction branch entirely
+GRPO-3:
+1.
+Search Hotel Destination({query:
+"Montreal"}) ✓
+2.
+Search Hotels({dest id:
+"-569541",
+arrival:
+"2024-11-20"}) ✓
+3.
+Search Attraction Location({query:
+"Montreal"}) ✓
+(recovered)
+4.
+Search Attractions({id:
+"ChIJDbdkHFQayUwR7-8fITgxTmU", sortBy:
+"score"}) ✓
+Figure 5. Case study: parallel conjunction requiring both hotel and
+attraction searches. The baseline completes only one branch; the
+RL model learns to execute both.
+GRPO provides balanced improvements, suggesting imita-
+tion learning encourages more calls with lower accuracy,
+whereas RL improves both quality and completion.
+4. Related Work
+Tool Learning Benchmarks.
+Early benchmarks primar-
+ily focused on API retrieval and single-step function call-
+ing. Recently, comprehensive evaluations like BFCL (Patil
+et al., 2025) and APIBench/Gorilla (Patil et al., 2024) have
+standardized tool-use assessment. However, these often tar-
+get multi-turn conversational scenarios with simple per-turn
+calls. Our work specifically targets multi-step tool orchestra-
+tion, where a single query necessitates complex, dependent
+API sequences. We evaluate on ComplexFuncBench (Zhong
+et al., 2025), which identifies parameter value errors as the
+dominant failure mode—a finding that motivates our gradu-
+ated reward design. Additionally, NESTFUL (Basu et al.,
+2025) and Seal-Tools (Wu et al., 2024) highlight the sharp
+performance degradation in nested function calls (depth
+≥2), further validating the need for the specialized depen-
+dency handling we propose.
+Execution Environments.
+Prior work addressed repro-
+ducibility through standardized evaluation (Patil et al.,
+2025), virtual API servers (Guo et al., 2024), and sand-
+Table 5. Error analysis on ComplexFuncBench (Qwen3-8B). Call-
+level errors are among produced calls; parameter-level errors are
+conditional on correct function selection; sequence-level errors
+show why incomplete samples stopped.
+Error Type (%)
+Zero-shot
+SFT
+GRPO
+Call-Level (among produced calls)
+Function Selection Err
+15.0
+15.3
+14.8
+Parameter Err
+18.7
+18.2
+16.5
+Parameter-Level (given correct function)
+Query Param Err
+14.7
+15.8
+12.7
+Dependency Param Err
+7.9
+4.9
+5.6
+Sequence-Level (incomplete breakdown)
+Stopped after Correct
+17.2
+18.9
+12.7
+Stopped after Func Err
+12.9
+28.3
+16.6
+Stopped after Param Err
+24.8
+27.7
+22.1
+boxed environments (Yao et al., 2024), but these primarily
+target stable evaluation with synthetic or domain-limited
+data. We extend this philosophy to the training phase by
+constructing a deterministic, cache-based environment with
+100k+ real responses, enabling the intensive trial-and-error
+exploration required for RL training on complex multi-step
+trajectories.
+Training Data Generation.
+Generating high-quality
+multi-step traces is a significant bottleneck.
+ToolAl-
+paca (Tang et al., 2023) utilized multi-agent simulation,
+while ToolLLM (Qin et al., 2023) scaled to 16k APIs. More
+recent approaches like APIGen-MT (Prabhakar et al., 2025)
+employ LLM committees for multi-stage verification. Our
+constrained data synthesis pipeline achieves comparable suc-
+cess rates using a single LLM call by leveraging workflow
+templates as structural skeletons.
+Reinforcement Learning for Tool Use.
+Standard RL ap-
+proaches suffer from sparse, binary rewards. ToolRL (Qian
+et al., 2025) demonstrated PPO for single-step selection;
+ReTool (Feng et al., 2025) applied iterative fine-tuning but
+focused on math/code rather than API orchestration; RA-
+GEN (Wang et al., 2025) and PARL-MT (Chai et al., 2025)
+identify the sparse reward issue but remain reliant on binary
+success signals. Our approach addresses this by introduc-
+ing a graduated reward design, decomposing rewards into
+Ratomic (structural validity) and Rorch (dependency fulfill-
+ment) to provide dense learning signals.
+5. Conclusion
+We presented a framework for training LLMs on multi-step
+tool orchestration: a deterministic cache-based environment
+with 100k+ real API responses, a workflow-aware data syn-
+thesis pipeline, and a graduated reward design combining
+Ratomic and Rorch. Experiments demonstrate substantial im-
+provements in turn accuracy, with ablations confirming both
+reward components are essential.
+8
+Training LLMs for Multi-Step Tool Orchestration
+Impact Statement
+This paper improves the reliability of LLMs in multi-step
+tool orchestration. As LLMs are integrated into autonomous
+agents executing real-world actions, ensuring they adhere to
+dependency constraints and parameter validity is crucial for
+safety. While our work reduces risks of incorrect API calls,
+autonomous agents carry inherent societal implications. Our
+constrained data synthesis and graduated rewards aim to
+provide more robust safeguards, contributing to safer agentic
+systems.
+References
+Basu, K., Abdelaziz, I., Kate, K., Agarwal, M., Crouse,
+M., Rizk, Y., Bradford, K., Munawar, A., Kumaravel, S.,
+Goyal, S., et al. Nestful: A benchmark for evaluating
+llms on nested sequences of api calls. In Proceedings of
+the 2025 Conference on Empirical Methods in Natural
+Language Processing, pp. 33526–33535, 2025.
+Chai, H., Cao, Z., Ran, M., Yang, Y., Lin, J., Peng, X.,
+Wang, H., Ding, R., Wan, Z., Wen, M., et al. Parl-mt:
+Learning to call functions in multi-turn conversation with
+progress awareness. arXiv preprint arXiv:2509.23206,
+2025.
+Feng, J., Huang, S., Qu, X., Zhang, G., Qin, Y., Zhong, B.,
+Jiang, C., Chi, J., and Zhong, W. Retool: Reinforcement
+learning for strategic tool use in llms. arXiv preprint
+arXiv:2504.11536, 2025.
+Guo, Z., Cheng, S., Wang, H., Liang, S., Qin, Y., Li, P.,
+Liu, Z., Sun, M., and Liu, Y. Stabletoolbench: Towards
+stable large-scale benchmarking on tool learning of large
+language models.
+In Findings of the Association for
+Computational Linguistics ACL 2024, pp. 11143–11156,
+2024.
+Patil, S. G., Zhang, T., Wang, X., and Gonzalez, J. E. Go-
+rilla: Large language model connected with massive apis.
+Advances in Neural Information Processing Systems, 37:
+126544–126565, 2024.
+Patil, S. G., Mao, H., Yan, F., Ji, C. C.-J., Suresh, V., Stoica,
+I., and Gonzalez, J. E. The berkeley function calling
+leaderboard (bfcl): From tool use to agentic evaluation
+of large language models. In Forty-second International
+Conference on Machine Learning, 2025.
+Prabhakar, A., Liu, Z., Zhu, M., Zhang, J., Awalgaonkar,
+T., Wang, S., Liu, Z., Chen, H., Hoang, T., Niebles, J. C.,
+et al. Apigen-mt: Agentic pipeline for multi-turn data
+generation via simulated agent-human interplay. arXiv
+preprint arXiv:2504.03601, 2025.
+Qian, C., Acikgoz, E. C., He, Q., Wang, H., Chen, X.,
+Hakkani-T¨ur, D., Tur, G., and Ji, H. Toolrl: Reward is
+all tool learning needs. arXiv preprint arXiv:2504.13958,
+2025.
+Qin, Y., Liang, S., Ye, Y., Zhu, K., Yan, L., Lu, Y., Lin, Y.,
+Cong, X., Tang, X., Qian, B., et al. Toolllm: Facilitating
+large language models to master 16000+ real-world apis.
+In The Twelfth International Conference on Learning
+Representations, 2023.
+Qwen, A. Y., Yang, B., Zhang, B., Hui, B., Zheng, B., Yu,
+B., Li, C., Liu, D., Huang, F., Wei, H., et al. Qwen2. 5
+technical report. arXiv preprint, 2024.
+Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., Bi, X., Zhang,
+H., Zhang, M., Li, Y., Wu, Y., et al. Deepseekmath: Push-
+ing the limits of mathematical reasoning in open language
+models. arXiv preprint arXiv:2402.03300, 2024.
+Sheng, G., Zhang, C., Ye, Z., Wu, X., Zhang, W., Zhang,
+R., Peng, Y., Lin, H., and Wu, C. Hybridflow: A flexi-
+ble and efficient rlhf framework. arXiv preprint arXiv:
+2409.19256, 2024.
+Tang, Q., Deng, Z., Lin, H., Han, X., Liang, Q., Cao, B.,
+and Sun, L. Toolalpaca: Generalized tool learning for lan-
+guage models with 3000 simulated cases. arXiv preprint
+arXiv:2306.05301, 2023.
+Wang, Z., Wang, K., Wang, Q., Zhang, P., Li, L., Yang, Z.,
+Jin, X., Yu, K., Nguyen, M. N., Liu, L., et al. Ragen:
+Understanding self-evolution in llm agents via multi-turn
+reinforcement learning. arXiv preprint arXiv:2504.20073,
+2025.
+Wu, M., Zhu, T., Han, H., Tan, C., Zhang, X., and Chen,
+W.
+Seal-tools: Self-instruct tool learning dataset for
+agent tuning and detailed benchmark. arXiv preprint
+arXiv:2405.08355, 2024.
+Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng, B.,
+Yu, B., Gao, C., Huang, C., Lv, C., et al. Qwen3 technical
+report. arXiv preprint arXiv:2505.09388, 2025.
+Yao, S., Shinn, N., Razavi, P., and Narasimhan, K. τ-bench:
+A benchmark for tool-agent-user interaction in real-world
+domains. arXiv preprint arXiv:2406.12045, 2024.
+Zhong, L., Du, Z., Zhang, X., Hu, H., and Tang, J. Complex-
+funcbench: exploring multi-step and constrained func-
+tion calling under long-context scenario. arXiv preprint
+arXiv:2501.10132, 2025.
+9
+Training LLMs for Multi-Step Tool Orchestration
+0
+20
+40
+60
+80
+100
+Training Step
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Rate
+Tool Calling Success Rate
+0
+20
+40
+60
+80
+100
+Training Step
+0.86
+0.88
+0.90
+0.92
+0.94
+0.96
+0.98
+1.00
+Rate
+Tool Executable Rate
+R_atomic only
+R_orch only
+Combined
+Figure 6. Tool calling success metrics during training. Left: Tool
+calling success rate measures whether predicted calls match ground
+truth. Right: Tool executable rate measures whether calls execute
+without errors. Ratomic only achieves highest success rates, while
+Rorch only shows lower execution success despite high orchestra-
+tion scores.
+0
+20
+40
+60
+80
+100
+Training Step
+0.60
+0.65
+0.70
+0.75
+0.80
+0.85
+Score
+Ratomic
+Train
+Val
+0
+20
+40
+60
+80
+100
+Training Step
+0.75
+0.80
+0.85
+0.90
+0.95
+1.00
+Score
+Rorch
+Train
+Val
+0
+20
+40
+60
+80
+100
+Training Step
+0.70
+0.75
+0.80
+0.85
+0.90
+Score
+Mean Reward
+Train
+Val
+Training vs Validation (Combined Model)
+Figure 7. Training vs validation metrics for the Combined model.
+All three metrics (Ratomic, Rorch, Mean Reward) show consistent
+improvement on both training and validation sets, with a moderate
+generalization gap indicating some overfitting to the training dis-
+tribution.
+A. Additional Training Analysis
+This appendix provides additional training metrics that com-
+plement the main analysis in Section 3.
+Figure 6 shows tool calling success metrics from a different
+perspective. The tool calling success rate (left) measures
+exact match with ground truth, while the executable rate
+(right) measures runtime success. Notably, Rorch only train-
+ing achieves only ∼52% tool calling success despite ∼90%
+executable rate, confirming that the model learns to generate
+different but executable calls rather than the correct ones.
+Figure 7 demonstrates that the Combined model generalizes
+reasonably well, with validation metrics tracking training
+metrics throughout optimization. The gap between train and
+validation suggests opportunities for regularization or data
+augmentation in future work.
+B. Reward Computation Details
+This section provides detailed definitions for the reward
+computation variables introduced in Section 2.3.
+Notation.
+For a predicted call ˆy = ( ˆf, ˆθ) and ground truth
+y∗= (f ∗, θ∗):
+• ˆΘ = keys(ˆθ): the set of parameter names in the pre-
+dicted call
+• Θ∗= keys(θ∗): the set of parameter names in the
+ground truth
+• ˆΘ ∩Θ∗: parameters present in both predicted and
+ground truth calls
+Structure Score sstruct.
+The structure score measures how
+well the predicted parameters match the expected schema:
+sstruct(ˆθ, θ∗) = |ˆΘ ∩Θ∗|
+|Θ∗|
+|
+{z
+}
+coverage
+· |type-correct|
+|ˆΘ ∩Θ∗|
+|
+{z
+}
+type accuracy
+(6)
+where:
+• Coverage: fraction of required parameters that are
+present in the prediction
+• Type accuracy: among overlapping parameters, the
+fraction with correct types (e.g., string vs. integer, list
+vs. scalar)
+• |type-correct| = |{p ∈
+ˆΘ ∩Θ∗: type(ˆθ[p]) =
+type(θ∗[p])}|
+Weight Values.
+We use the following weights for gradu-
+ated AST scoring:
+• α1 = 1/3: function name correctness
+• α2 = 1/3: parameter structure and type correctness
+• α3 = 1/3: exact parameter value matching
+These weights sum to 1.0, ensuring RAST ∈[0, 1].
+C. Workflow Template Example
+The following JSON structure illustrates a car rental work-
+flow template with three steps and their dependency rela-
+tionships:
+10
+Training LLMs for Multi-Step Tool Orchestration
+Example Workflow Template (Car Rental)
+{"pattern": ["Search_Car_Location",
+"Search_Car_Rentals", "Get_Packages"],
+"dependencies": {
+"1": {"depends_on": [0],
+"dependency_args": {
+"pick_up_latitude": {"from_step": 0,
+"from_field":
+"[0].coordinates.latitude"},
+"pick_up_longitude": {"from_step": 0,
+"from_field":
+"[0].coordinates.longitude"}}},
+"2": {"depends_on": [1],
+"dependency_args": {
+"vehicle_id": {"from_step": 1,
+"from_field":
+"search_results[0].vehicle_id"},
+"search_key": {"from_step": 1,
+"from_field":
+"search_context.searchKey"}}}}}
+The template specifies: (1) an ordered function sequence,
+(2) a dependency graph where step 1 depends on step 0
+(for coordinates) and step 2 depends on step 1 (for vehicle
+ID), and (3) field paths for extracting values from previous
+observations.
+D. Evaluation Metrics Details
+Call Accuracy.
+This secondary metric measures the
+proportion of individual function calls that are correctly
+matched, regardless of turn boundaries:
+Call Acc =
+P
+i∈D K(i)
+correct
+P
+i∈D |y∗(i)|
+(7)
+where K(i)
+correct counts matched calls and |y∗(i)| is the total
+number of ground truth calls for sample i.
+Matching Criteria.
+A predicted call ˆy = ( ˆf, ˆθ) matches
+ground truth y∗= (f ∗, θ∗) iff:
+• ˆf = f ∗(exact function name match)
+• ˆθ = θ∗(exact match on all parameter values)
+This strict matching ensures that partial correctness (e.g.,
+correct function but wrong parameters) is not credited.
+E. Stratified Analysis by Logical Composition
+Among logical compositions, alternative options (condi-
+tional branching) shows dramatic gains: GRPO-3 nearly
+doubles the Zero-shot baseline (43.7% vs 24.4%), with RL-
+Oracle reaching 48.1%. Interestingly, for fallback logic,
+GRPO-3 (54.7%) slightly outperforms RL-Oracle (51.6%),
+suggesting that synthetic data training may generalize better
+for certain compositional patterns.
+Table 6. Turn Accuracy (%) stratified by logical composition type.
+The dataset is dominated by explicit conjunction (86%), with other
+patterns representing edge cases.
+Type
+Dist.
+Zero-shot
+GRPO-3
+RL-Oracle
+fallback logic
+5%
+43.2
+54.7
+51.6
+explicit conj.
+86%
+34.9
+35.8
+43.6
+alternative opt.
+4%
+24.4
+43.7
+48.1
+parallel conj.
+5%
+21.5
+18.1
+23.6
+Overall
+–
+34.4
+36.4
+43.4
+F. Per-Domain Performance Analysis
+Table 7. Turn Accuracy (%) by API domain. Single-domain tasks
+(Attraction, Car-Rental) are generally easier than cross-domain
+tasks. SFT degrades cross-domain performance while GRPO main-
+tains or improves across all domains.
+Domain
+Zero-shot
+SFT-3
+GRPO-3
+Attraction
+49.8
+57.9
+60.7
+Car-Rental
+52.6
+57.7
+58.6
+Hotels
+25.4
+22.6
+29.0
+Flights
+33.4
+29.4
+33.6
+Cross-domain
+27.6
+21.9
+25.9
+Overall
+34.4
+32.6
+36.4
+Table 7 reveals domain-specific trends. Single-domain tasks
+(Attraction, Car-Rental) achieve 50–60% turn accuracy,
+while cross-domain orchestration remains challenging at 22–
+28%. Notably, SFT improves single-domain performance
+(Attraction: +8.1%, Car-Rental: +5.1%) but degrades cross-
+domain performance (27.6%→21.9%, −5.7%), suggesting
+that SFT overfits to simpler patterns. In contrast, GRPO-3
+maintains or improves performance across all domains.
+G. Prompt Templates
+This section provides the prompt template used for query
+generation in our constrained data synthesis pipeline (Sec-
+tion 2).
+11
+Training LLMs for Multi-Step Tool Orchestration
+Query Generation Prompt
+System message:
+You are generating natural language queries for a
+travel booking assistant. You will be given EXACT
+API parameter values to use (from validated cache).
+Your task is ONLY to generate a natural language
+query that matches these exact parameters. DO NOT
+modify the parameter values.
+User message:
+Workflow pattern: {pattern}
+EXACT PARAMETERS TO USE (do not modify):
+Step 0 - {function_name}:
+{param}: ’{value}’ ...
+Step 1 - {function_name}:
+(Parameters from previous step results) ...
+Task: Generate a query matching these exact
+parameters.
+OUTPUT FORMAT (JSON):
+{"query": "...", "chosen_parameters": [...],
+"variation_notes": "Brief scenario description"}
+IMPORTANT: Query must match the exact parameters
+above.
+The chosen parameters field serves as an echo-back
+mechanism for automatic consistency verification between
+the generated query and the underlying parameter bindings.
+Training/Inference System Prompt
+You are a helpful assistant with access to
+booking.com APIs. You can help users search for
+hotels, flights, attractions, and more.
+When you need to use a tool, output your tool call
+in this format:
+<tool_call>
+{"name": "function_name",
+"arguments": {"arg1": "value1", "arg2": "value2"}}
+</tool_call>
+After you make a tool call, you will receive a
+response:
+<tool_response>
+{"result": "..."}
+</tool_response>
+You may need to make multiple tool calls to complete
+a task. After gathering all necessary information,
+provide a helpful summary to the user.
+This system prompt is used during both RL training (roll-
+outs) and SFT. Tool schemas are injected separately via
+the tokenizer’s apply chat template(tools=...)
+parameter.
+H. Case Studies
+This section presents case studies illustrating how RL train-
+ing improves tool orchestration. Cases are selected where
+the baseline model fails but the RL-trained model succeeds.
+H.1. Alternative Options (Conditional Logic)
+The alternative options category shows the largest improve-
+ment (24.4% →48.1%). These tasks require handling con-
+ditional branches based on query results.
+Case Study: Fallback Logic (Query Format Error)
+Query: “Check for anime activities in Tokyo with tickets
+after 12 PM on Nov 17. If not, check Osaka for tickets
+after 12 PM on Nov 20.”
+Ground Truth:
+1. Search_Attraction_Location({query: "Anime,
+Tokyo"})
+2. Get_Availability({slug: "...", date:
+"2024-11-17"})
+3. Search_Attraction_Location({query: "Anime,
+Osaka"})
+Zero-shot
+(0%
+Turn
+Acc):
+Search Attraction Location({query:
+"Tokyo anime"}) →Query format mismatch
+RL-Oracle (100% Turn Acc): Correctly executes all 3
+steps with proper query format.
+The baseline model uses an incorrect query format (“Tokyo
+anime” instead of “Anime, Tokyo”), causing the search to
+fail. The RL-trained model learns the correct parameter
+format through execution feedback.
+H.2. Sequential Dependencies
+Sequential dependency tasks require correct parameter prop-
+agation between steps. The baseline often fails to use out-
+puts from previous calls correctly.
+Case Study: Sequential Dependencies (Parameter Propaga-
+tion)
+Query: “Find car rentals at Paris CDG Airport and get
+supplier ratings for the top result.”
+Ground Truth:
+1. Search_Car_Rentals({pick_up_lat: 49.0, ...})
+-> {search_results: [...], search_context: {
+searchKey: "eyJ..."}}
+2. Vehicle_Supplier_Ratings({vehicle_id: "774442521",
+search_key: "eyJkcml2ZXJz..."})
+Zero-shot (0% Turn Acc): Step 1 correct, but failed to
+extract and propagate search key to Step 2.
+RL-Oracle (100% Turn Acc):
+Correctly extracts
+vehicle id and search key from o1 for Step 2.
+The RL-trained model correctly extracts and propagates
+the search key parameter, demonstrating improved inter-
+call dependency handling.
+H.3. Parallel Conjunction
+Parallel conjunction tasks require executing multiple inde-
+pendent operations and combining results.
+12
+Training LLMs for Multi-Step Tool Orchestration
+Case Study: Parallel Conjunction (Multi-Domain Query)
+Query: “Recommend two top-rated activities and two
+highly-reviewed hotels in Montreal, Nov 20-23.”
+Ground Truth:
+1. Search_Attraction_Location({query: "Montreal"})
+2. Search_Hotel_Destination({query: "Montreal"})
+3. Search_Attractions({id: "...", sortBy: "score"})
+4. Search_Hotels({dest_id: "...", ...})
+Zero-shot (0% Turn Acc): Only executes hotel branch;
+missing parallel attraction search entirely.
+RL-Oracle (100% Turn Acc): Executes both branches:
+hotels (Steps 1-2) and attractions (Steps 3-4).
+The baseline model completes only the hotel branch, miss-
+ing the parallel attraction search. The RL-trained model
+learns to execute both branches of the conjunction.
+13

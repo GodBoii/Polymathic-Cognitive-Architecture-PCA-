@@ -1,0 +1,2277 @@
+Project and Generate:
+Divergence-Free Neural Operators for Incompressible Flows
+Xigui Li * 1 2 Hongwei Zhang * 1 2 Ruoxi Jiang † 1 2 Deshu Chen 1 2 Chensen Lin 1 2 Limei Han 1 2 Yuan Qi 1 2
+Xin Guo † 1 2 Yuan Cheng † 1 2
+Abstract
+Learning-based models for fluid dynamics often
+operate in unconstrained function spaces, leading
+to physically inadmissible, unstable simulations.
+While penalty-based methods offer soft regulariza-
+tion, they provide no structural guarantees, result-
+ing in spurious divergence and long-term collapse.
+In this work, we introduce a unified framework
+that enforces the incompressible continuity equa-
+tion as a hard, intrinsic constraint for both deter-
+ministic and generative modeling. First, to project
+deterministic models onto the divergence-free sub-
+space, we integrate a differentiable spectral Leray
+projection grounded in the Helmholtz–Hodge de-
+composition, which restricts the regression hy-
+pothesis space to physically admissible velocity
+fields.
+Second, to generate physically consis-
+tent distributions, we show that simply project-
+ing model outputs is insufficient when the prior
+is incompatible. To address this, we construct
+a divergence-free Gaussian reference measure
+via a curl-based pushforward, ensuring the entire
+probability flow remains subspace-consistent by
+construction. Experiments on 2D Navier–Stokes
+equations demonstrate exact incompressibility up
+to discretization error and substantially improved
+stability and physical consistency.
+1. Introduction
+Learning-based models have shown remarkable success in
+predicting and generating fluid flows, driven by advances
+in neural operators (Li et al., 2021; Lu et al., 2021; Adrian
+*Equal contribution
+1Artificial Intelligence Innovation and
+Incubation
+Institute,
+Fudan
+University,
+Shanghai,
+China
+2Shanghai
+Academy
+of
+Artificial
+Intelligence
+for
+Sci-
+ence, Shanghai, China.
+Correspondence to:
+Ruoxi Jiang
+<roxie jiang@fudan.edu.cn>, Xin Guo <guoxin@sais.org.cn>,
+Yuan Cheng <cheng yuan@fudan.edu.cn>.
+Preprint. March 26, 2026.
+et al., 2025; Sanz-Alonso & Waniorek, 2025) and modern
+generative modeling frameworks (Ho et al., 2020; Song
+et al., 2021; Lipman et al., 2023; Liu et al., 2023; Chen
+et al., 2024). These methods offer substantial computational
+speedups over classical solvers and enable data-driven emu-
+lation of complex dynamical systems. However, most exist-
+ing approaches operate in unconstrained function spaces and
+do not explicitly encode the physical structures that govern
+fluid dynamics. As a result, even models that achieve low
+short-term prediction error may produce velocity fields that
+violate fundamental physical principles, exhibiting spurious
+divergence, distorted energy spectra, or other nonphysical
+artifacts (Richter-Powell et al., 2022; Hansen et al., 2023;
+Krishnapriyan et al., 2021; Wang et al., 2022; Shu et al.,
+2023).
+This issue is particularly pronounced for incompressible
+flows, where physical admissibility is determined by an
+exact conservation law rather than an empirical regularity.
+In incompressible fluid dynamics, the velocity field u is
+required to satisfy the continuity equation
+∇· u = 0,
+(1)
+which expresses mass conservation and restricts solutions
+to a closed linear subspace of divergence-free vector fields.
+Unlike approximate physical priors, this constraint does
+not admit small, localized violations: any deviation nec-
+essarily alters the global flow structure. As a result, even
+weak divergence errors can lead to artificial sources or sinks
+and qualitatively incorrect dynamics (Mohan et al., 2019;
+Richter-Powell et al., 2022).
+From a learning perspective, however, most data-driven
+models are formulated and trained in unconstrained function
+spaces, where the divergence-free structure is not preserved
+by construction. Even when training data satisfy ∇· u = 0,
+approximation errors, finite model capacity, and optimiza-
+tion artifacts can introduce spurious divergence into predic-
+tions. Because incompressibility defines a global subspace
+rather than a pointwise condition, such violations cannot be
+eliminated by local corrections and may accumulate over
+time, degrading long-term stability. In contrast, classical
+numerical solvers enforce incompressibility exactly through
+1
+arXiv:2603.24500v1  [cs.LG]  25 Mar 2026
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+(a) Qualitative Comparison of Physical Consistency
+(b) Comparison of Computational Paradigms
+Baseline
+(Unconstrained)
+Input
+Base Predictor
+Output
+Violates
+Continuity
+Leray Projection
+(Constrained)
+Input
+Base Predictor
+Leray Projector
+Output
+Intermediate
+!"
+Strictly 
+Conservative
+Numerical Solver 
+(CFD)
+Input
+Advection-Diffusion
+Pressure Poisson
+Solver
+Output
+Tentative
+(!∗)
+Computationally
+Expensive
+Figure 1. Motivation for the PROJECT & GENERATE framework illustrated using numerical solvers. (a) Visual comparison. Velocity
+streamlines (top, colored by error magnitude), divergence fields (middle), and recovered physical pressure (bottom). The Baseline
+approach (middle), which enforces only the momentum equation, exhibits severe violations of mass conservation with nonzero divergence
+and noisy pressure fields. A Leray-projected solution (right) enforces incompressibility via a spectral Leray projection, yielding a
+divergence-free velocity field (∇· u = 0) with machine precision and recovering a smooth, physically consistent pressure field. The
+result is visually indistinguishable from the Ground Truth numerical solution (left). (b) Computational paradigms. Left: Classical
+numerical solvers (CFD) enforce incompressibility through iterative Poisson solves, which require accessing the pressure variable and are
+computationally expensive. Middle: Unconstrained end-to-end learning approaches typically violate the continuity constraint. Right: We
+leverage Leray projection to decouple dynamics from constraint enforcement, enabling hard physical constraints to be imposed via a fast,
+differentiable spectral operator.
+projection-based schemes, typically by introducing an aux-
+iliary pressure variable and solving a Poisson equation at
+each time step. While effective, this approach is difficult to
+integrate into modern learning pipelines due to its implicit
+coupling and iterative nature. Motivated by this classical
+perspective, we identify the Leray projection as the essen-
+tial structural component that enforces incompressibility,
+without explicitly introducing pressure.
+A common strategy to mitigate this issue is to enforce incom-
+pressibility through soft penalties, as in physics-informed
+neural networks (PINNs) and related approaches (Raissi
+et al., 2019). While such methods can reduce divergence in
+practice, they do not guarantee exact satisfaction of the con-
+straint and often require careful tuning of penalty weights.
+More fundamentally, soft constraints treat incompressibil-
+ity as an auxiliary optimization objective rather than as a
+defining property of the solution space, causing instability
+in challenging regimes such as high Reynolds numbers or
+long-term rollouts.
+In this work, we adopt a different perspective and treat
+incompressibility as a hard structural constraint on both
+model outputs and generative processes. As shown in Fig-
+ure 1, this approach effectively eliminates the non-physical
+artifacts observed in baselines and recovers strict mass con-
+servation. Our approach is based on the Leray projection
+arising from the Helmholtz–Hodge decomposition (Chorin,
+1967; 1968), which maps arbitrary vector fields onto the
+divergence-free subspace by removing the irrotational com-
+ponents. We integrate this projection as a modular operator
+that can be applied consistently across both learning and in-
+ference paradigms, without modifying the underlying model
+architecture. This operator-level enforcement ensures that
+all predicted velocity fields lie exactly in the physically
+admissible function space.
+For regression tasks, the proposed projection guarantees
+incompressibility of model predictions by construction. For
+generative modeling, however, enforcing divergence-free
+structure poses additional challenges. In generative frame-
+works such as flow matching, not only the generated sam-
+ples but also the reference measure, interpolation paths, and
+learned dynamics must remain compatible with the under-
+lying physical constraint. Naively projecting samples or
+velocities can lead to inconsistencies between probability
+measures and may render the probability path ill-defined,
+particularly in infinite-dimensional settings where mutual
+2
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+absolute continuity is not guaranteed. Building on the func-
+tional flow matching perspective (Kerrigan et al., 2024),
+we extend our framework to generative modeling by con-
+structing probability paths that evolve entirely within the
+divergence-free subspace. To this end, we design the refer-
+ence measure to be compatible with the projection operator,
+so that the induced probability path is well-defined on the
+space of incompressible velocity fields. This alignment
+ensures that all intermediate states and learned dynamics
+remain physically admissible throughout the generation.
+While all models are implemented on finite-resolution grids,
+our methodology is motivated by a function-space perspec-
+tive, in which both regression and generation are viewed as
+approximations to operators acting on spaces of divergence-
+free velocity fields. From this viewpoint, the Leray projec-
+tion and the design of the reference measure are structural
+components of the modeling pipeline, rather than auxil-
+iary regularization mechanisms. Empirical results on two-
+dimensional Navier–Stokes equations demonstrate that en-
+forcing incompressibility as a hard constraint leads to im-
+proved physical fidelity, enhanced stability under long-term
+rollout, and superior performance.
+Our main contributions are summarized as follows:
+• We propose a unified framework that treats incompress-
+ibility as an intrinsic geometric property of the function
+space, enabling exact physical enforcement across both
+regression and generative modeling tasks.
+• We introduce a modular Leray projection and a
+divergence-free Gaussian reference measure based on
+stream functions, yielding well-defined flow matching
+probability paths in function space.
+• We demonstrate through extensive experiments on
+two-dimensional Navier–Stokes equations that the pro-
+posed approach significantly improves physical fidelity
+and long-term stability.
+2. Related Work
+Data-Driven Neural Operators.
+Neural operators have
+emerged as efficient surrogates for PDE solvers by learn-
+ing mappings between infinite-dimensional function spaces.
+Methods such as the Fourier Neural Operator (Li et al., 2021)
+and DeepONet (Lu et al., 2021) achieve substantial speedups
+by predicting flow evolution in a single forward pass, and
+have been applied to a wide range of fluid problems (Pathak
+et al., 2022; Price et al., 2023; Lippe et al., 2023; Azizzade-
+nesheli et al., 2024; Jiang et al., 2025; Barthel Sorensen
+et al., 2026). However, deterministic operators often ex-
+hibit spectral bias, leading to over-smoothed predictions that
+under-represent high-frequency turbulent structures (Jiang
+et al., 2023; Falasca, 2025). To address this limitation, re-
+cent work has explored stochastic and generative models
+for fluid dynamics, including diffusion and flow-matching-
+based approaches (Molinaro et al., 2024; Kohl et al., 2024).
+Despite their improved expressivity, these models typically
+operate in unconstrained vector spaces and may violate fun-
+damental physical constraints such as incompressibility.
+Physics-Informed Constraints in Learning.
+Physical
+constraints are commonly incorporated into learning frame-
+works through either soft penalties or inference-time cor-
+rections. PINNs (Raissi et al., 2019) and related extensions
+penalize PDE residuals during training, an approach that
+has also been adopted in generative models (Ben-Hamu
+et al., 2024; Shu et al., 2023; Huang et al., 2024; Bastek
+et al., 2025). Despite their flexibility, such soft constraints
+provide no guarantee of exact physical validity and often
+lead to ill-conditioned optimization landscapes (Wang et al.,
+2022). Related approaches in differentiable physics, such as
+Hamiltonian (Greydanus et al., 2019) and Lagrangian neural
+networks (Cranmer et al., 2020), encode physical structure
+directly into the model to preserve invariants. Alternatively,
+some methods enforce constraints only at inference time via
+projection or correction steps (Sojitra & San, 2025; Utkarsh
+et al., 2025; Cheng et al., 2025), which, while effective at
+the output level, introduce additional computational over-
+head and do not structurally constrain the learned model or
+the underlying probability flow.
+3. Preliminaries
+3.1. Notations and Functional Spaces
+Let R and Z denote the sets of real numbers and integers,
+respectively, and define the unit torus T2 := R2/Z2. We
+denote by ∇and ∆the spatial gradient and Laplacian oper-
+ators. For a vector field u = (u1, u2)⊤on T2, we define the
+scalar curl as ∇× u := ∂1u2 −∂2u1 and the vector curl as
+∇⊥ψ := (∂2ψ, −∂1ψ)⊤.
+Let L2
+per(T2; R2) denote the Hilbert space of square-
+integrable periodic vector fields, and Hr
+per the periodic
+Sobolev spaces of order r ≥0. Unless otherwise speci-
+fied, all norms and inner products are taken in L2.
+3.2. Navier–Stokes Equations and Hodge Decomposition
+Incompressible Dynamics.
+We consider the 2D incom-
+pressible Navier–Stokes equations on the torus T2:
+(
+∂tu + (u · ∇)u = ν∆u + f −∇p,
+∇· u = 0,
+(2)
+where u is the velocity field and ν > 0 the viscosity.
+Hodge Decomposition and the Subspace V.
+To handle
+the incompressibility constraint ∇· u = 0, we invoke the
+3
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+(a) Projective Regression
+(b) Projective Generative Model
+Input
+!
+Unconstrained 
+prediction
+Prediction w/ divergence
+Target output
+Divergence-Free Neural Operator
+Initial Condition
+!
+Divergence-free
+noise
+Divergence-Free Neural Operator
+Unconstrained 
+Prediction
+Target output
+Figure 2. Schematic of the proposed Projective Framework. The grey surface represents the divergence-free subspace V (the physical
+manifold). (a) Projective Regression: The framework takes an input and uses a base neural operator fθ to produce an intermediate
+prediction in the ambient space (shown hovering above the manifold). This unconstrained prediction is then strictly mapped onto V
+via the spectral Leray projection P. The composite system constitutes a Divergence-Free Neural Operator, ensuring the final output is
+physically consistent. (b) Projective Generative Model: The generation process is initialized with a sample from a divergence-free
+noise distribution (bottom left) constrained to V. During the probability flow evolution (τ ∈[0, 1]), the vector field predicted by fθ is
+continuously projected via P (red arrows) back onto the manifold. This enforces hard constraints at every step of the flow matching
+process, ensuring the entire trajectory stays within the physically admissible subspace.
+Hodge decomposition. Throughout this work, we restrict
+attention to zero-mean velocity fields, thereby excluding
+the harmonic (constant) component. Under this convention,
+L2
+per admits the orthogonal decomposition
+L2
+per = V ⊕V⊥,
+(3)
+where V is the subspace of divergence-free vector fields
+with zero mean (solenoidal fields), and V⊥is the subspace
+of gradient fields (irrotational fields):
+V :=
+
+v ∈L2
+per
+ ∇· v = 0,
+Z
+T2 v dx = 0
+
+,
+V⊥:=
+
+∇q
+ q ∈H1
+per(T2; R)
+	
+.
+(4)
+4. Method
+In this section, focusing on 2D incompressible flows, we
+present a unified framework for learning incompressible
+fluid dynamics with hard divergence-free constraints. By
+embedding incompressibility directly into the operator struc-
+ture, all model states including intermediate dynamics, final
+outputs, and stochastic perturbations, are restricted to the
+divergence-free subspace by construction. As illustrated in
+Figure 2, this is realized through two complementary mech-
+anisms: (i) a Leray projection enforcing incompressibility,
+and (ii) a divergence-free noise construction for generative
+modeling.
+4.1. Enforcing Incompressibility via Leray Projection
+To ensure that learned velocity fields lie strictly in the
+divergence-free subspace, we embed the Leray projection P
+as a structural component of the neural operator. Unlike soft-
+penalty methods (e.g., PINNs), this construction restricts
+the hypothesis space to V, ensuring physical consistency
+regardless of the optimization state.
+Our approach builds on the Helmholtz–Hodge decompo-
+sition.
+Under periodic boundary conditions, the space
+L2
+per(T2; R2) admits an orthogonal decomposition into
+divergence-free and irrotational components. We denote
+by P : L2
+per →V the associated Leray projection onto the
+divergence-free subspace.
+For any w
+∈L2
+per, the operator P denotes the L2-
+orthogonal projection onto the divergence-free subspace
+V, which removes the gradient component and yields the
+closest divergence-free field in the L2 sense, equivalently
+characterized by
+Pw = argmin
+u∈V
+∥w −u∥L2.
+(5)
+By composing the neural operator output with P, incom-
+pressibility is enforced by construction, without auxiliary
+loss terms or post-hoc corrections.
+Spectral Implementation.
+Under periodic boundary con-
+ditions, the Leray projector admits an efficient Fourier-space
+implementation. Let ˆw(k) denote the Fourier coefficient of
+w at wave vector k = (kx, ky) ∈Z2. The incompressibility
+constraint ∇· u = 0 is then characterized by k · ˆu(k) = 0.
+For k ̸= 0, the Leray projection is given by
+d
+Pw(k) =
+
+I −k ⊗k
+∥k∥2
+2
+
+ˆw(k),
+(6)
+where I denotes the 2 × 2 identity matrix. The zero mode
+is set to zero to enforce a zero-mean condition, thereby
+ensuring the uniqueness of the Helmholtz–Hodge decom-
+4
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+Algorithm 1 Leray Projection in Fourier Space
+Require: Vector field v ∈L2
+per(T2; R2)
+Ensure: Divergence-free field Pv ∈V
+1: Compute Fourier transform: ˆv ←F[v]
+2: for each wave vector k ̸= 0 do
+3:
+α ←(k · ˆv(k))/∥k∥2
+2
+4:
+c
+Pv(k) ←ˆv(k) −αk
+5: end for
+6: Set c
+Pv(0) ←0
+7: Pv ←ℜ(F−1[ c
+Pv])
+8: return Pv
+position under periodic boundaries (see Appendix F for the
+corresponding code implementation).
+4.2. Learning Divergence-Free Vector Fields
+We parametrize time-dependent velocity fields vθ(·, t) using
+neural operators. To enforce incompressibility, the Leray
+projection is composed with the model output, ensuring that
+all learned dynamics evolve in V.
+Regression.
+For deterministic prediction tasks, a neural
+operator fθ produces an unconstrained velocity field predic-
+tion fθ(·, t) ∈L2
+per(T2; R2). We enforce incompressibility
+by applying the Leray projection pointwise in time,
+ˆu(·, t) = Pfθ(·, t),
+(7)
+ensuring the resulting prediction remains divergence-free
+by construction.
+This projection-based formulation contrasts with PINNs,
+where incompressibility is typically imposed via soft penalty
+terms in the loss function. Such approaches require balanc-
+ing multiple objectives (including data fidelity, divergence
+penalties, and boundary conditions), often necessitating
+problem-specific tuning of loss weights. In contrast, com-
+posing the neural operator with the Leray projection en-
+forces incompressibility at the level of the hypothesis space,
+eliminating auxiliary divergence losses and ensuring physi-
+cal admissibility by design.
+Generative Modeling via Flow Matching.
+Standard flow
+matching is formulated in the ambient L2 space and does
+not explicitly account for incompressibility constraints. We
+instead restrict the learned probability flow to the divergence-
+free subspace V.
+Flow Matching performs regression on a target velocity field
+defined along an interpolation between data samples and
+reference samples. We therefore enforce incompressibility
+by ensuring that this regression target lies in V. To this end,
+we parametrize an unconstrained vector field
+vθ : L2
+per × [0, 1] →L2
+per,
+and enforce incompressibility by composing it with the
+Leray projection.
+Let ν denote the data distribution supported on V, and let
+µ0 be a reference distribution. Given u1 ∼ν and u0 ∼µ0,
+define the linear interpolation
+uτ = (1 −τ)u0 + τu1,
+τ ∼U(0, 1),
+(8)
+with target velocity vτ = u1 −u0.
+When both endpoints lie in V, vτ is divergence-free due to
+linearity. Under this condition, the resulting divergence-free
+flow matching objective is
+L(θ) = Eτ,u0,u1|c
+hPvθ(uτ, τ; c) −vτ
+2
+L2
+i
+.
+(9)
+Here c denotes conditioning information, such as observed
+states at earlier time instances or physical initial conditions.
+This objective enforces incompressibility at the level of the
+learned velocity field. However, consistency of the induced
+probability flow additionally requires the reference distribu-
+tion µ0 to be supported on V, posing a nontrivial technical
+challenge, particularly in infinite-dimensional settings. We
+address this issue in the following subsection.
+4.3. Divergence-Free Gaussian Noise via Curl
+Pushforward
+While the Leray projection guarantees that the learned ve-
+locity field is divergence-free, it is not sufficient to ensure
+a well-defined flow matching formulation. If the reference
+noise distribution is not supported on V, the regression tar-
+get generally contains compressible components, whereas
+the model output is constrained to be divergence-free after
+projection, resulting in a structurally inconsistent objective
+and ill-posed regression problem. Moreover, probability
+mass may leave the physically admissible space, and the in-
+duced continuity equation may become ill-defined in infinite-
+dimensional settings. To ensure consistency between the
+regression target, the learned dynamics, and the underly-
+ing probability measures, the reference noise must itself be
+supported on V, motivating the divergence-free Gaussian
+construction introduced below.
+Curl-Based Gaussian Reference Measure on V.
+We con-
+struct a divergence-free Gaussian reference measure using
+the stream function formulation of 2D incompressible flows.
+Let X := H1
+per(T2; R) ∩
+
+ψ :
+R
+T2 ψ = 0
+	
+denote the
+space of zero-mean stream functions, and define the operator
+∇⊥: X →L2
+per(T2; R2) by ∇⊥ψ = (∂2ψ, −∂1ψ)⊤.
+5
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+Lemma 4.1. The operator ∇⊥is a bounded linear map
+whose image is exactly the closed subspace of divergence-
+free, zero-mean vector fields in L2.
+This property allows us to lift Gaussian measures from the
+scalar space X to the divergence-free velocity space V. Let
+γψ = N(0, Cψ) be a centered Gaussian measure on X, and
+define the reference measure
+µ0 := (∇⊥)#γψ.
+Then µ0 is a centered Gaussian measure supported on V,
+with covariance operator Cu = ∇⊥Cψ(∇⊥)∗and Cameron–
+Martin space Hµ0 = ∇⊥(Hγψ).
+Conditional Probability Paths.
+Conditioned on a fixed
+data sample y ∈V, we define a family of time-indexed ran-
+dom fields (uy
+τ )τ∈[0,1] via an affine interpolation in function
+space,
+uy
+τ = στu0 + τy,
+u0 ∼µ0,
+(10)
+where στ = 1 −(1 −σmin)τ is a variance schedule with
+σmin > 0.
+For each fixed τ ∈[0, 1), the random field uy
+τ follows a
+Gaussian distribution on V with mean τy and covariance
+operator Cτ = σ2
+τCu. In particular, all such conditional
+distributions share the same covariance structure and differ
+only in their means.
+Under the assumption that the data distribution ν is sup-
+ported on the Cameron–Martin space Hµ0 of the reference
+Gaussian measure, these conditional Gaussian distributions
+are mutually absolutely continuous for ν-almost every y.
+Existence of a Divergence-Free Flow Matching Vector
+Field.
+A key difficulty in infinite-dimensional flow match-
+ing is the potential mutual singularity of probability mea-
+sures, which can obstruct the definition of a global velocity
+field. To ensure well-posedness, we construct probability
+paths that remain absolutely continuous by design.
+Let ν ∈P(V) denote the data distribution. For each y ∼ν,
+the conditional path (µy
+τ )τ∈[0,1] is defined as in Eq. (10),
+with u0 ∼µ0. The corresponding marginal path
+µτ :=
+Z
+µy
+τ dν(y)
+is therefore supported on V. Under the assumption that all
+conditional measures share the same covariance operator
+and differ only by admissible Cameron–Martin shifts, the
+measures µy
+τ are mutually absolutely continuous.
+Theorem 4.2 (Existence of a Divergence-Free Flow Match-
+ing Vector Field). Let (µτ)τ∈[0,1] be the marginal path on V
+constructed above. Under the absolute continuity condition
+µy
+τ ≪µτ, the Radon–Nikodym derivative
+wτ(x, y) := dµy
+τ
+dµτ
+(x)
+is well-defined for µτ-almost every x. The vector field
+vτ(x) =
+Z
+V
+vy
+τ (x) wτ(x, y) dν(y)
+(11)
+generates the path (µτ)τ∈[0,1], where vy
+τ denotes the veloc-
+ity field associated with the conditional path µy
+τ .
+The proof is provided in Appendix D. In theory, the exis-
+tence result relies on the assumption that the data distri-
+bution ν is supported on the Cameron–Martin space asso-
+ciated with the reference covariance operator. Verifying
+this condition directly is generally intractable, particularly
+in infinite-dimensional settings. In practice, however, our
+models operate on finite-resolution discretizations, where
+all probability measures are supported on finite-dimensional
+subspaces and the above absolute continuity condition is
+automatically satisfied. Consequently, following prior work
+on functional flow matching (Kerrigan et al., 2024), we do
+not explicitly enforce or verify this assumption in our experi-
+ments. A rigorous characterization of when such conditions
+hold in the infinite-dimensional limit is left for future work.
+5. Experiments
+In this section, we validate the effectiveness of our pro-
+posed framework on two-dimensional incompressible turbu-
+lent flows. We compare our method against state-of-the-art
+regression and generative baselines, focusing on physical
+consistency (divergence, spectrum) and long-term stability.
+Specifically, the evaluation centers on two primary objec-
+tives: (1) demonstrating that enforcing incompressibility as
+a hard constraint improves prediction accuracy and stability
+compared to unconstrained models; and (2) establishing that
+our generative framework produces diverse, high-fidelity
+rollouts that rigorously respect conservation laws without
+sacrificing sample quality.
+5.1. Experimental Setup
+Dataset and Implementation Details.
+Experiments focus
+on the 2D incompressible Navier–Stokes equations with pe-
+riodic boundary conditions at Re = 1000. The dataset, gen-
+erated via a pseudo-spectral solver, contains 10,000 training
+trajectories (64 × 64, 50 timesteps). Following benchmarks
+(Li et al., 2021; Cheng et al., 2025), the task involves pre-
+dicting 35-frames from a 15-frame history, with long-term
+rollouts (300 steps) to assess stability. We evaluate per-
+formance using mean squared error (MSE) and divergence
+(|∇· u|2). Details are provided in Appendices G and H.
+6
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+Test
+Rollout
+(a) u velocity
+Test
+Rollout
+(b) v velocity
+Test
+Rollout
+(c) Streamlines
+Test
+Rollout
+(d) Reconstructed Pressure
+Figure 3. Flow Field Visualization. Top Row: Snapshot of velocity components (u, v). Bottom Row: Streamlines and Pressure field.
+The pressure is reconstructed from the predicted velocity field via the pressure Poisson equation, serving as a proxy for the dynamical
+consistency of the flow structure.
+Benchmarking utilizes the FNO backbone across regression
+and generative tasks. We compare unconstrained baselines
+(Reg. / Gen. Base) against our proposed methods (Reg. /
+Gen. Ours), which enforce physical constraints via Leray
+projection and curl-based priors (Figure 2). Flow matching
+paths are sampled using the dopri5 solver. For generative
+evaluation, metrics are reported as the ensemble mean and
+standard deviation over 20 independent realizations.
+5.2. Results and Analysis
+Quantitative Performance.
+Table 1 summarizes the quan-
+titative results across prediction (training horizon), short-
+term rollout, and long-term extrapolation. In the regression
+setting, Reg. (Base) achieves reasonable initial accuracy but
+degrades drastically during extrapolation, eventually diverg-
+ing due to rapid divergence error accumulation. In contrast,
+Reg. (Ours) maintains structural stability throughout the
+rollout by enforcing exact incompressibility up to discretiza-
+tion error, preventing the growth of non-physical modes.
+A similar trend is observed in the generative comparison.
+Gen. (Base) produces plausible short-term samples but fails
+catastrophically in the long run (“Inf” indicates numerical
+overflow). Our method, Gen. (Ours), achieves the best per-
+formance across all metrics. Notably, it outperforms even
+the regression models in MSE. This can be attributed to the
+model’s ability to capture the correct statistical distribution
+of the flow, rather than converging to a smoothed mean
+prediction that dampens physically relevant fluctuations.
+7
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+Table 1. Quantitative Comparison on Re = 1000. We report Mean ± Std over the test set. Bold indicates best performance. Gray
+values indicate model divergence. Prediction and Short-term metrics are scaled by 10−3 and 10−2 respectively.
+Model
+Prediction (T15-49)
+Short-term (T50-100)
+Long-term (T101-300)
+U-MSE
+V-MSE
+Div
+U-MSE
+V-MSE
+Div
+U-MSE
+V-MSE
+Div
+Regression Models
+Base 4.0 ± 3.6
+5.6 ± 5.4
+625.0 ± 576.0
+16.6 ± 17.5 17.5 ± 15.5
+21.7 ± 18.6
+4.3e3 ± 5.1e3
+4.4e3 ± 5.2e3
+1.5e5 ± 1.9e5
+Ours 3.4 ± 3.0 3.2 ± 2.9
+0.1 ± 0.1
+5.9 ± 4.3
+6.9 ± 5.4
+0.0 ± 0.0
+227.0 ± 335.0
+210.0 ± 328.0
+118.0 ± 160.0
+Generative Models
+Base 4.3 ± 3.6
+4.6 ± 4.3
+1.7 ± 1.6
+1.0 ± 0.7
+1.2 ± 1.4
+0.6 ± 2.5
+Inf
+Inf
+Inf
+Ours 1.0 ± 1.2 1.1 ± 1.3 4.0e-4 ± 2.0e-4
+0.5 ± 0.3
+0.6 ± 0.4
+2.0e-5 ± 1.0e-5 7.0e-3 ± 4.0e-3 7.0e-3 ± 4.0e-3 1.6e-7 ± 4.1e-8
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Enstrophy
+Avg: t
+[15,49]
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Avg: t
+[50,200]
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Avg: t
+[201,300]
+Ground Truth
+Reg. (Base)
+Reg. (Ours)
+Gen. (Base)
+Gen. (Ours)
+Figure 4. Enstrophy Spectrum Analysis. Comparison of energy spectra. Our method accurately recovers the inertial range scalings,
+preserving the correct energy cascade across scales.
+Physical Consistency and Spectral Fidelity.
+The “Div”
+column in Table 1 highlights the critical role of the hard
+constraint. The baselines exhibit significant divergence vio-
+lations (O(102) to O(105)), whereas our methods maintain
+divergence errors near machine precision (e.g., 2×10−7 for
+Gen. Ours). This structural advantage is further evidenced
+by the pressure reconstruction (Figure 3d). Since pressure
+is governed by the Poisson equation −∆p = ∇· (u · ∇u),
+its accurate recovery depends on the correct computation
+of velocity gradients, which is only possible if the field is
+smooth and divergence-free. Furthermore, the streamline
+visualization (Figure 3c) demonstrates that our method gen-
+erates coherent vortex structures without the non-physical
+sources or sinks often observed in unconstrained baselines.
+Figure 4 presents the enstrophy spectrum analysis. The
+energy cascade in turbulence follows a specific power law.
+Unconstrained models tend to deviate from this physical law,
+either by dissipating energy too quickly (spectral damping)
+or by accumulating spurious energy at high frequencies
+(spectral blocking). Our method closely matches the ground
+truth spectrum, indicating that the predicted flows not only
+satisfy kinematic constraints but also preserve the correct
+multi-scale energy distribution of the turbulent system.
+Regression vs. Generative Modeling
+We observe that
+Gen. (Ours) yields superior long-term stability (MSE ≈
+0.007) compared to Reg. (Ours) (MSE ≈210). This
+significant gap suggests that for chaotic dynamical systems,
+learning the probability flow of the trajectory (Generative) is
+more robust than minimizing pointwise error (Regression),
+provided that the generative process is constrained to the
+physical manifold. By confining the probability path to
+the divergence-free subspace, our framework maximizes
+the benefits of generative modeling while ensuring physical
+validity.
+6. Conclusion
+In this work, we presented a unified framework that en-
+forces incompressibility as an intrinsic constraint within
+neural operator architectures. By leveraging the Helmholtz–
+Hodge decomposition, we restrict the hypothesis space via
+a differentiable spectral Leray projection, ensuring that both
+deterministic predictions and generative dynamics remain
+divergence-free. To achieve consistency in generative mod-
+eling, we construct a divergence-free Gaussian reference
+measure using a curl-based pushforward, which preserves
+subspace consistency of the induced probability flow. Our
+evaluation on 2D Navier–Stokes equations confirms that
+8
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+embedding physical constraints directly into the operator
+structure enhances the stability and physical fidelity of the
+simulations. The results demonstrate that the proposed
+framework achieves exact incompressibility and accurately
+captures the statistical characteristics of the flow.
+While focusing on periodic domains, the principles estab-
+lished here provide a foundation for future extensions to
+complex boundary conditions and 3D fluid systems.
+Impact Statement
+This paper presents work whose goal is to advance the field
+of Machine Learning. There are many potential societal
+consequences of our work, none which we feel must be
+specifically highlighted here.
+References
+Adrian, M., Sanz-Alonso, D., and Willett, R. Data assim-
+ilation with machine learning surrogate models: A case
+study with fourcastnet.
+Artificial Intelligence for the
+Earth Systems, 4(3):e240050, 2025.
+Azizzadenesheli, K., Kovachki, N., Li, Z., Liu-Schiaffini,
+M., Kossaifi, J., and Anandkumar, A. Neural operators
+for accelerating scientific simulations and design. Nature
+Reviews Physics, 6(5):320–328, 2024.
+Barthel Sorensen, B., Zepeda-N´u˜nez, L., Lopez-Gomez, I.,
+Wan, Z. Y., Carver, R., Sha, F., and Sapsis, T. P. A proba-
+bilistic framework for learning non-intrusive corrections
+to long-time climate simulations from short-time training
+data. Journal of Advances in Modeling Earth Systems, 18
+(1):e2024MS004755, 2026.
+Bastek, J.-H., Sun, W., and Kochmann, D. Physics-informed
+diffusion models. In The Thirteenth International Con-
+ference on Learning Representations, 2025.
+Ben-Hamu, H., Puny, O., Gat, I., Karrer, B., Singer, U., and
+Lipman, Y. D-flow: Differentiating through flows for
+controlled generation. In International Conference on
+Machine Learning, pp. 3462–3483. PMLR, 2024.
+Chen, Y., Goldstein, M., Hua, M., Albergo, M. S., Boffi,
+N. M., and Vanden-Eijnden, E. Probabilistic forecast-
+ing with stochastic interpolants and f\” ollmer processes.
+arXiv preprint arXiv:2403.13724, 2024.
+Cheng, C., Han, B., Maddix, D. C., Ansari, A. F., Stuart,
+A., Mahoney, M. W., and Wang, B. Gradient-free gen-
+eration for hard-constrained systems. In The Thirteenth
+International Conference on Learning Representations,
+2025.
+Chorin, A. J. A numerical method for solving incompress-
+ible viscous flow problems. Journal of computational
+physics, 2(1):12–26, 1967.
+Chorin, A. J. Numerical solution of the navier-stokes equa-
+tions. Mathematics of computation, 22(104):745–762,
+1968.
+Cranmer, M., Greydanus, S., Hoyer, S., Battaglia, P.,
+Spergel, D., and Ho, S. Lagrangian neural networks.
+arXiv preprint arXiv:2003.04630, 2020.
+Falasca, F. Probing forced responses and causality in data-
+driven climate emulators: Conceptual limitations and the
+role of reduced-order models. Physical Review Research,
+7(4):043314, 2025.
+Greydanus, S., Dzamba, M., and Yosinski, J. Hamiltonian
+neural networks. Advances in neural information process-
+ing systems, 32, 2019.
+Hansen, D., Maddix, D. C., Alizadeh, S., Gupta, G., and
+Mahoney, M. W.
+Learning physical models that can
+respect conservation laws. In International Conference
+on Machine Learning, pp. 12469–12510. PMLR, 2023.
+Ho, J., Jain, A., and Abbeel, P. Denoising diffusion proba-
+bilistic models. In Advances in Neural Information Pro-
+cessing Systems (NeurIPS), volume 33, pp. 6840–6851,
+2020.
+Huang, J., Yang, G., Wang, Z., and Park, J. J. Diffusion-
+pde: Generative pde-solving under partial observation.
+Advances in Neural Information Processing Systems, 37:
+130291–130323, 2024.
+Jiang, R., Lu, P. Y., Orlova, E., and Willett, R. Training
+neural operators to preserve invariant measures of chaotic
+attractors. Advances in Neural Information Processing
+Systems, 36:27645–27669, 2023.
+Jiang, R., Zhang, X., Jakhar, K., Lu, P. Y., Hassanzadeh, P.,
+Maire, M., and Willett, R. Hierarchical implicit neural
+emulators. arXiv preprint arXiv:2506.04528, 2025.
+Kerrigan, G., Migliorini, G., and Smyth, P. Functional
+flow matching. In International Conference on Artificial
+Intelligence and Statistics, pp. 3934–3942. PMLR, 2024.
+Kohl, G., Chen, L.-W., and Thuerey, N. Turbulent flow sim-
+ulation using autoregressive conditional diffusion models.
+arXiv preprint arXiv:2309.01745, 2024.
+Krishnapriyan, A., Gholami, A., Zhe, S., Kirby, R., and
+Mahoney, M. W. Characterizing possible failure modes
+in physics-informed neural networks. Advances in neural
+information processing systems, 34:26548–26560, 2021.
+9
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+Li, Z., Kovachki, N., Azizzadenesheli, K., Liu, B., Bhat-
+tacharya, K., Stuart, A., and Anandkumar, A. Fourier neu-
+ral operator for parametric partial differential equations.
+In International Conference on Learning Representations
+(ICLR), 2021.
+Lipman, Y., Chen, R. T., Ben-Hamu, H., Nickel, M., and Le,
+M. Flow matching for generative modeling. In Interna-
+tional Conference on Learning Representations, 2023.
+Lippe, P., Veeling, B., Perdikaris, P., Turner, R., and Brand-
+stetter, J. Pde-refiner: Achieving accurate long rollouts
+with neural pde solvers. Advances in Neural Information
+Processing Systems, 36:67398–67433, 2023.
+Liu, X., Gong, C., et al. Flow straight and fast: Learning to
+generate and transfer data with rectified flow. In Interna-
+tional Conference on Learning Representations (ICLR),
+2023.
+Lu, L., Jin, P., Pang, G., Zhang, Z., and Karniadakis, G. E.
+Learning nonlinear operators via deeponet based on the
+universal approximation theorem of operators. Nature
+machine intelligence, 3(3):218–229, 2021.
+Mohan, A. T., Lubbers, N., Livescu, D., and Chertkov, M.
+Embedding hard physical constraints in convolutional
+neural networks for 3d turbulence. In ICLR 2020 Work-
+shop on Integration of Deep Neural Models and Differen-
+tial Equations, 2019.
+Molinaro, R., Lanthaler, S., Raoni´c, B., Rohner, T., Arme-
+gioiu, V., Simonis, S., Grund, D., Ramic, Y., Wan, Z. Y.,
+Sha, F., et al. Generative ai for fast and accurate statistical
+computation of fluids. arXiv preprint arXiv:2409.18359,
+2024.
+Pathak, J., Subramanian, S., Harrington, P., Raja, S.,
+Chattopadhyay, A., Mardani, M., Kurth, T., Hall, D.,
+Li, Z., Azizzadenesheli, K., et al.
+Fourcastnet: A
+global data-driven high-resolution weather model us-
+ing adaptive fourier neural operators.
+arXiv preprint
+arXiv:2202.11214, 2022.
+Price, I., Sanchez-Gonzalez, A., Alet, F., Andersson, T. R.,
+El-Kadi, A., Masters, D., Ewalds, T., Stott, J., Mohamed,
+S., Battaglia, P., et al. Gencast: Diffusion-based ensemble
+forecasting for medium-range weather. arXiv preprint
+arXiv:2312.15796, 2023.
+Raissi, M., Perdikaris, P., and Karniadakis, G. E. Physics-
+informed neural networks: A deep learning framework for
+solving forward and inverse problems involving nonlinear
+partial differential equations. Journal of Computational
+physics, 378:686–707, 2019.
+Richter-Powell, J., Lipman, Y., and Chen, R. T. Neural
+conservation laws: A divergence-free perspective. Ad-
+vances in Neural Information Processing Systems, 35:
+38075–38088, 2022.
+Sanz-Alonso, D. and Waniorek, N. Long-time accuracy of
+ensemble kalman filters for chaotic dynamical systems
+and machine-learned dynamical systems. SIAM Journal
+on Applied Dynamical Systems, 24(3):2246–2286, 2025.
+Shu, D., Li, Z., and Farimani, A. B. A physics-informed
+diffusion model for high-fidelity flow field reconstruction.
+Journal of Computational Physics, 478:111972, 2023.
+Sojitra, A. and San, O. Method of manufactured learning
+for solver-free training of neural operators. arXiv preprint
+arXiv:2511.12890, 2025.
+Song, Y., Sohl-Dickstein, J., Kingma, D. P., Kumar, A., Er-
+mon, S., and Poole, B. Score-based generative modeling
+through stochastic differential equations. 2021.
+Utkarsh, U., Cai, P., Edelman, A., Gomez-Bombarelli, R.,
+and Rackauckas, C. V. Physics-constrained flow match-
+ing: Sampling generative models with hard constraints.
+In The Thirty-ninth Annual Conference on Neural Infor-
+mation Processing Systems, 2025.
+Wang, S., Yu, X., and Perdikaris, P. When and why pinns
+fail to train: A neural tangent kernel perspective. Journal
+of Computational Physics, 449:110768, 2022.
+10
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+A. Incompressibility and Projection-Based Methods
+In this section, we elaborate on the motivation behind adopting the Spectral Leray Projection. We contrast our approach
+with classical pressure-correction schemes and soft-penalty methods, specifically addressing the computational bottlenecks
+of traditional solvers within deep learning graphs and the theoretical inconsistencies they introduce in generative modeling.
+Classical Pressure-Correction and Its Limitations in Deep Learning. In classical Computational Fluid Dynamics (CFD),
+particularly in fractional-step methods, incompressibility (∇· u = 0) is strictly enforced by solving a pressure Poisson
+equation:
+∇2p = ∇· u∗
+∆t
+,
+(12)
+where u∗is a tentative velocity field. While this method effectively handles complex boundaries (Chorin, 1968), it relies
+on iterative linear solvers (e.g., Conjugate Gradient) that are computationally intensive. Integrating such iterative solvers
+directly into a neural network training loop presents fundamental optimization challenges. Training a neural operator
+requires differentiating through the entire model; embedding an iterative solver necessitates implicit differentiation or
+unrolling solver steps during backpropagation. This process is not only computationally expensive but also numerically
+unstable, often leading to vanishing or exploding gradients that hinder convergence.
+Manifold Consistency in Generative Modeling. Beyond computational costs, relying on post-hoc Poisson corrections
+introduces theoretical inconsistencies in generative frameworks like Flow Matching. The goal of these models is to learn a
+vector field that generates a continuous probability path from noise to data. If a model operates in an unconstrained space
+and applies a Poisson correction only at discrete steps, the underlying probability flow becomes ill-defined. The vector
+field attempting to bridge the Gaussian noise and the incompressible data would continuously drift off the divergence-free
+subspace V, resulting in a “broken” generative process where the learned dynamics contradict physical constraints (Kerrigan
+et al., 2024; Lipman et al., 2023).
+Methodological Advantages. To address these issues, our framework integrates the Spectral Leray Projection directly
+into the architecture. This approach offers distinct advantages:
+• Exact Differentiability and Stability: Unlike iterative solvers, the Spectral Leray Projection is a closed-form, linear
+operator based on Fast Fourier Transforms (FFT). It enables exact, stable, and efficient backpropagation, allowing the
+network to learn the projection mechanism as an intrinsic geometric constraint.
+• Decoupling from Pressure: This approach eliminates the need to explicitly model the pressure field p, simplifying the
+learning task by focusing purely on the kinematic velocity field.
+• Hard Constraints with Machine Precision: Unlike soft-penalty methods (e.g., PINNs (Raissi et al., 2019)) that treat
+divergence as an optimization objective, which often results in “spectral creep” and high-frequency errors (Jiang et al.,
+2023), our method enforces ∇· u = 0 to machine precision by construction.
+• Generalizability: While implemented spectrally for efficiency on periodic domains, the principle of differentiable
+projection is generalizable to complex geometries via other differentiable bases or sparse solvers in future work.
+B. Gaussian Measures in Hilbert Spaces
+The push-forward measure is characterized by:
+(F#γ)(B) = γ ({x ∈H : F(x) ∈B})
+for every Borel set B ∈B(R).
+The existence and uniqueness of m and C are guaranteed by the Riesz Representation Theorem, which ensures that the
+bounded linear and bilinear forms appearing on the right-hand sides of the above equations correspond to unique elements
+and operators in H.
+Specifically, the mean m satisfies
+⟨m, h⟩=
+Z
+H
+⟨x, h⟩γ(dx),
+∀h ∈H,
+(13)
+11
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+Table 2. Summary of notation. We distinguish between data samples, probability measures, and vector fields used in divergence-free
+flow matching.
+Symbol
+Category
+Meaning
+y ∈V
+data sample
+divergence-free velocity field from the dataset
+ν
+data distribution
+probability distribution of data samples on V
+µ0
+reference distribution
+divergence-free Gaussian noise on V
+u0 ∼µ0
+noise sample
+reference divergence-free random field
+uy
+τ
+interpolated sample
+noisy interpolation between u0 and data sample y
+µy
+τ
+conditional distribution
+distribution induced by uy
+τ
+µτ
+marginal distribution
+mixture of µy
+τ over y ∼ν
+vy
+τ
+conditional vector field
+velocity field generating the conditional path
+vτ
+vector field
+velocity field generating the marginal probability path
+vθ(·, τ)
+neural operator
+learned (unconstrained) velocity field
+P
+projection operator
+Leray projection onto the divergence-free subspace V
+and the covariance operator C, which is symmetric, non-negative, and trace-class, is defined by
+⟨Ch, k⟩=
+Z
+H
+⟨x −m, h⟩⟨x −m, k⟩γ(dx),
+∀h, k ∈H.
+(14)
+The regularity of samples from γ is governed by the Cameron–Martin space Hγ. Since C is self-adjoint, non-negative and
+trace-class, it admits a unique square root C1/2. We define
+Hγ := Im(C1/2),
+equipped with the inner product
+⟨h1, h2⟩Hγ = ⟨C−1/2h1, C−1/2h2⟩H,
+where C−1/2 denotes the pseudo-inverse of C1/2.
+C. Proof of Lemma 4.1
+Lemma C.1 (Properties of the Curl Push-forward). The operator ∇⊥is a bounded linear map whose image is exactly the
+closed subspace of divergence-free, zero-mean vector fields in L2.
+Proof. We verify the linearity, boundedness, and the properties of the image sequentially.
+1. Linearity.
+The linearity of ∇⊥follows directly from the linearity of the weak differentiation operators. We verify this
+by checking additivity and homogeneity explicitly.
+Additivity: Let ψ1, ψ2 ∈X be arbitrary stream functions. By the distributive property of partial derivatives, we have:
+∇⊥(ψ1 + ψ2) =
+ ∂2(ψ1 + ψ2) −∂1(ψ1 + ψ2)
+=
+ ∂2ψ1 + ∂2ψ2 −∂1ψ1 −∂1ψ2
+
+=
+ ∂2ψ1 −∂1ψ1
+
++
+ ∂2ψ2 −∂1ψ2
+
+= ∇⊥ψ1 + ∇⊥ψ2.
+(15)
+Homogeneity: Let c ∈R be an arbitrary scalar and ψ ∈X. By the commutativity of differentiation with scalar multiplication:
+∇⊥(cψ) =
+ ∂2(cψ) −∂1(cψ)
+=
+ c∂2ψ −c∂1ψ
+& = c
+ ∂2ψ −∂1ψ
+= c∇⊥ψ.
+(16)
+Thus, ∇⊥is a linear operator.
+2. Boundedness and Closed Image.
+For any ψ ∈X ⊂H1
+per, the L2-norm of the vector field is:
+∥∇⊥ψ∥2
+L2 = ∥∂2ψ∥2
+L2 + ∥−∂1ψ∥2
+L2 = ∥∇ψ∥2
+L2 ≤∥ψ∥2
+H1.
+(17)
+This implies that ∇⊥is a bounded operator with operator norm at most 1. Furthermore, since X consists of zero-mean
+functions, the Poincar´e inequality holds: ∥ψ∥L2 ≤C∥∇ψ∥L2. Consequently, the map is an isomorphism onto its image
+(specifically, it is bounded from below), which implies that the image is a closed subspace in L2
+per(T2; R2).
+12
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+3. Divergence-Free and Zero-Mean Property.
+The resulting vector field u = (u1, u2)⊤= (∂2ψ, −∂1ψ)⊤is divergence-
+free in the distributional sense. For smooth approximations, Schwarz’s theorem gives:
+∇· u = ∂1u1 + ∂2u2 = ∂1(∂2ψ) + ∂2(−∂1ψ) = ∂12ψ −∂21ψ = 0.
+(18)
+Additionally, by the periodicity of the domain T2, the integral of any partial derivative of a periodic function vanishes (e.g.,
+R
+T2 ∂2ψ = 0). Thus, the vector field has zero mean.
+D. Proof of Theorem D.1
+Theorem D.1 (Existence of a Divergence-Free Flow Matching Vector Field). Let (µτ)τ∈[0,1] be the marginal path on V
+constructed above. Under the absolute continuity condition µy
+τ ≪µτ, the Radon–Nikodym derivative
+wτ(x, y) := dµy
+τ
+dµτ
+(x)
+is well-defined for µτ-almost every x. The vector field
+vτ(x) =
+Z
+V
+vy
+τ (x) wτ(x, y) dν(y)
+(19)
+generates the path (µτ)τ∈[0,1], where vy
+τ denotes the velocity field associated with the conditional path µy
+τ .
+Proof. We follow the argument of Theorem 1 in (Kerrigan et al., 2024).
+Let φ ∈C∞
+c (V × [0, 1]) be an arbitrary smooth test function. We aim to show that (µτ)τ∈[0,1] and the vector field vτ
+defined in (19) satisfy the continuity equation in weak form, namely
+Z 1
+0
+Z
+V
+∂τφ(x, τ) dµτ(x) dτ = −
+Z 1
+0
+Z
+V
+⟨vτ(x), ∇φ(x, τ)⟩dµτ(x) dτ.
+(20)
+By definition of the marginal measure µτ =
+R
+µy
+τ dν(y) and by Fubini–Tonelli, the left-hand side can be written as
+Z 1
+0
+Z
+V
+∂tφ(x, τ) dµt(x) dτ =
+Z 1
+0
+Z
+V
+Z
+V
+∂tφ(x, τ) dµy
+t (x) dν(y) dτ.
+(21)
+Since, for ν-almost every y, the conditional path (µy
+τ )τ∈[0,1] is generated by the velocity field vy
+τ through the continuity
+equation, we obtain
+= −
+Z 1
+0
+Z
+V
+Z
+V
+⟨vy
+τ (x), ∇φ(x, τ)⟩dµy
+τ (x) dν(y) dτ.
+(22)
+Under the absolute continuity assumption µy
+τ ≪µt, we may change measure and write
+= −
+Z 1
+0
+Z
+V
+Z
+V
+⟨vy
+τ (x), ∇φ(x, τ)⟩wt(x, y) dµτ(x) dν(y) dτ,
+(23)
+where wτ(x, y) = dµy
+τ /dµτ(x).
+Since Bochner integrals commute with inner products, another application of Fubini–Tonelli yields
+= −
+Z 1
+0
+Z
+V
+Z
+V
+vy
+τ (x) wτ(x, y) dν(y), ∇φ(x, τ)
+
+dµτ(x) dτ.
+(24)
+By definition of vτ in (19), this coincides with the right-hand side of (20). Therefore, (µτ)τ∈[0,1] and vτ solve the continuity
+equation in weak form, and vτ generates the marginal probability path (µτ)τ∈[0,1].
+Finally, since each conditional velocity field vy
+τ takes values in the divergence-free subspace V and V is linear, the averaged
+field vτ also belongs to V.
+13
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+E. Continuity Equation and Probability Flows
+Probability paths (µτ)τ∈[0,1] on V are generated by time-dependent vector fields (vτ)τ∈[0,1] through the continuity equation
+∂τµτ + div(vτµτ) = 0.
+(25)
+Equation (25) is interpreted in the weak sense: for all test functions φ : V × [0, 1] →R,
+Z 1
+0
+Z
+V
+
+∂τφ(x, τ) + ⟨vτ(x), ∇xφ(x, τ)⟩
+
+dµτ(x) dτ = 0.
+(26)
+F. Implementation Details and Algorithmic Realization
+Algorithm 2 Gaussian Divergence-Free Noise (stream function).
+from torchvision.transforms.functional import gaussian_blur
+def sample_div_free_noise(B, H, W, T, sigma, device):
+# dims: (B, H, W, T) spatial-temporal dimensions
+# sigma: smoothing standard deviation
+# output: divergence-free velocity field u
+# 1. Sample scalar stream function
+psi = torch.randn(B, H, W, T, device=device)
+psi = gaussian_blur(psi, sigma)
+# smooth in spatial dimensions
+# 2. Spatial gradients
+dpsi_dy, dpsi_dx = torch.gradient(psi, dim=(1, 2))
+# 3. Curl construction (2D incompressible)
+u = torch.stack([dpsi_dy, -dpsi_dx], dim=-1)
+return u
+Algorithm 3 Spectral Leray Projection (Divergence-Free Velocity).
+def leray_projection(uv_raw):
+# uv_raw: Tensor of shape (B, 2, H, W, T)
+u, v = uv_raw[:, 0], uv_raw[:, 1]
+u_hat = fft2(u)
+v_hat = fft2(v)
+# Wave numbers
+H, W = u.shape[-2], u.shape[-1]
+kx, ky = make_wavenumbers(H, W)
+k2 = kx**2 + ky**2
+proj = (kx * u_hat + ky * v_hat) / k2
+proj = torch.where(k2 == 0, torch.zeros_like(proj), proj)
+u_hat = u_hat - kx * proj
+v_hat = v_hat - ky * proj
+u = ifft2(u_hat)
+v = ifft2(v_hat)
+return torch.stack([u, v], dim=1)
+14
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+G. Experimental Implementation Details
+We evaluate our proposed framework on the task of turbulent flow prediction, formulated as a sequence-to-sequence learning
+problem following standard benchmarks (Li et al., 2021). The model observes a historical velocity context of 15 frames
+(u0:14) to predict the subsequent 35 frames (u15:49).
+For the regression task, the model learns a direct deterministic mapping from the history to the future sequence. For the
+generative modeling task, the historical context u0:14 serves as the condition c; the model generates the target sequence
+u15:49 by transforming an initial divergence-free noise distribution conditioned on c.
+To strictly assess long-term stability and physical conservation beyond the standard training horizon, we additionally perform
+autoregressive rollouts (extrapolation) up to T = 300 steps during evaluation.
+Model Architectures and Baselines.
+To strictly isolate the impact of our proposed geometric constraints, we maintain
+identical backbone architectures across all comparisons. We utilize the Fourier Neural Operator (FNO) (Li et al., 2021)
+as the core parameterized mapping. The baseline models (Reg. Base and Gen. Base) map directly to the ambient space
+L2
+per(T2; R2) without structural constraints. In contrast, our proposed methods (Reg. Ours and Gen. Ours) integrate
+the differentiable spectral Leray projection as a final layer. This design ensures that all model outputs, covering both
+deterministic predictions and generative samples, lie exactly on the divergence-free manifold ∇· u = 0.
+Flow Matching Configuration.
+For generative modeling, we employ the Flow Matching framework (Lipman et al., 2023)
+to learn the probability flow of the turbulent trajectory. The baseline uses a standard Gaussian prior in the ambient space,
+which is incompatible with the incompressible subspace. Our method constructs a specific divergence-free Gaussian process
+via a stream-function pushforward, ensuring that the entire probability path is subspace-consistent. Sampling is performed
+using the dopri5 (Dormand-Prince) adaptive ODE solver with strict absolute and relative tolerances set to 10−5. This
+high-precision integration ensures that valid samples are not corrupted by numerical drift. We use a Neural ODE formulation
+with 50 function evaluations (NFE) per step to balance computational cost and sample fidelity.
+H. Data Generation and Numerical Methods
+We detail the rigorous procedure used to generate the high-fidelity turbulent flow dataset. The data is produced by solving
+the 2D Navier–Stokes equations in the vorticity-streamfunction formulation using a pseudo-spectral method.
+H.1. Governing Equations and Solver
+The underlying dynamics are governed by the vorticity transport equation with a viscous damping term and an external
+forcing component:
+∂tω(x, t) + (u · ∇)ω(x, t) = ν∆ω(x, t) + f(x),
+(27)
+where ω = ∇× u is the vorticity, ν = 10−3 is the kinematic viscosity (Reynolds number Re = 1000), and f is a
+deterministic forcing term. The system is evolved in the spectral domain. We apply the Crank–Nicolson scheme for the
+linear viscous term and an explicit forward step for the non-linear advection and forcing terms. The discrete update rule in
+Fourier space (ˆω) with time step ∆t = 10−3 is given by:
+(1 + 0.5νk2∆t)ˆωt+1 = (1 −0.5νk2∆t)ˆωt + ∆t
+
+ˆf −\
+u · ∇ω
+
+t ,
+(28)
+where k2 = 4π2(k2
+x + k2
+y). Dealiasing is performed using the 2/3 rule to suppress spectral blocking artifacts.
+H.2. Velocity Extraction and Incompressibility
+Since our machine learning models operate directly on velocity fields, we strictly recover u from the evolved vorticity ω at
+each storage step. This process ensures the data is divergence-free by construction. First, the stream function ψ is solved via
+the Poisson equation in the spectral domain:
+−∆ψ = ω
+=⇒
+ˆψ(k) =
+ˆω(k)
+4π2|k|2 ,
+for k ̸= 0.
+(29)
+15
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+The velocity components u = (u, v) are then derived as:
+u = ∂ψ
+∂y ,
+v = −∂ψ
+∂x .
+(30)
+Numerically, this corresponds to ˆu = i2πky ˆψ and ˆv = −i2πkx ˆψ. This exact spectral relationship guarantees that
+∇· u = ∂xu + ∂yv = 0 is satisfied to machine precision in the generated dataset.
+H.3. Specific Dataset Configurations
+The dataset is generated on a spatial grid of resolution 64 × 64 over a unit domain Ω= [0, 1]2.
+• Initialization: Initial vorticity fields ω0 are sampled from a Gaussian Random Field (GRF) ω0 ∼N(0, C). The
+covariance operator C is defined diagonally in the Fourier domain with a power-law decay, ensuring smoothness of the
+initial condition. Specifically, the Fourier coefficients ˆω0(k) are independent Gaussian variables with variance:
+E[|ˆω0(k)|2] ∝
+ 4π2|k|2 + τ 2−α ,
+(31)
+where we set α = 2.5 and τ = 7.0. This parameter choice balances the energy spectrum to produce physically realistic
+turbulent structures at t = 0.
+• Forcing: We effectively use a Kolmogorov-style forcing defined as f(x, y) = 0.1
+√
+2 sin(2π(x + y) + ϕi), where the
+phase ϕi varies across trajectories to induce diverse flow patterns.
+• Temporal Resolution: The solver runs with an internal step of δt = 10−3. We record snapshots every ∆T = 1.0
+physical time units (every 1000 solver steps).
+• Trajectory Length: Each training trajectory contains 50 snapshots (Ttotal = 50). For testing, we generate extended
+trajectories of 300 snapshots (Ttest = 300) to evaluate long-term stability.
+• Scale: The final dataset comprises 10,000 trajectories for training and 100 for testing/validation.
+I. Generative Model Variance Analysis
+This section provides a detailed variance analysis of the generative models to explicitly quantify the stability and consistency
+of the generated ensembles. Unlike deterministic regression approaches such as the standard Fourier Neural Operator
+(Li et al., 2021), generative models like Flow Matching (Lipman et al., 2023; Liu et al., 2023) produce a distribution of
+trajectories for a given initial condition. Capturing the variability of this distribution is essential for assessing whether the
+model learns the true physical statistics of the turbulent flow or merely memorizes a mean path.
+To evaluate this, we generated R = 20 independent realizations for each test window in the dataset. We measured
+performance using the Mean Squared Error (MSE) for velocity components (u, v) and the divergence error (Div), aggregating
+these metrics over three distinct temporal stages: (1) Prediction (T = 15 . . . 50), corresponding to the training horizon;
+(2) Short-term Extrapolation (T = 51 . . . 150); and (3) Long-term Extrapolation (T = 151 . . . 300). The statistics
+reported in Table 3 represent the global mean and standard deviation computed over the pooled population of all realizations
+across all test samples. For the baseline Conditional Flow Matching model, we note that the reported statistics include
+trajectories that numerically diverged, effectively highlighting the catastrophic failure modes inherent in unconstrained
+generative modeling (Kerrigan et al., 2024).
+Instability of Unconstrained Baselines.
+The results in Table 3 reveal a critical instability in the standard Flow Matching
+baseline. While the baseline performs reasonably well within the training distribution (Prediction stage), it exhibits
+catastrophic divergence during the Short-term Extrapolation phase (T = 51 . . . 150), with errors exploding to astronomical
+values (MSE ∼1028). This demonstrates that without explicit physical constraints, the generated trajectories rapidly drift
+off the valid data manifold, leading to numerical blow-up. In strong contrast, our proposed Divergence-Free Flow Matching
+maintains numerical stability and physical consistency throughout the entire rollout. Even in the extended extrapolation
+regime (T = 151 . . . 300), our method maintains a low MSE (≈0.007) and machine-precision divergence (O(10−7)),
+confirming that enforcing the divergence-free constraint via the Leray projection is essential for robust long-term generation
+of turbulent flows.
+16
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+Table 3. Quantitative Comparison on Re = 1000 (Generative Models). We report the Mean ± Std computed across all windows and
+realizations (20×). Bold indicates best performance. Note the astronomical error values for the Base model in Short-term Extrapolation,
+indicating model blow-up.
+Model
+Stage
+Total MSE
+U-MSE
+V-MSE
+Div-MSE
+Gen. (Base)
+Prediction (T15-50)
+0.0046 ± 0.0035
+0.0044 ± 0.0033
+0.0047 ± 0.0038
+0.0075 ± 0.0120
+Short-term Ext. (T51-150)
+2.40e28 ± NaN
+9.22e30 ± NaN
+2.60e28 ± NaN
+2.64e26 ± NaN
+Long-term Ext. (T151-End)
+0.0076 ± 0.0009
+0.0079 ± 0.0009
+0.0072 ± 0.0012
+0.0024 ± 0.0046
+Gen. (Ours)
+Prediction (T15-50)
+0.0011 ± 0.0010
+0.0011 ± 0.0009
+0.0011 ± 0.0011
+9.3e-7 ± 1.2e-7
+Short-term Ext. (T51-150)
+0.0073 ± 0.0024
+0.0071 ± 0.0025
+0.0074 ± 0.0023
+7.5e-7 ± 4.0e-8
+Long-term Ext. (T151-End)
+0.0074 ± 0.0013
+0.0073 ± 0.0013
+0.0076 ± 0.0012
+7.4e-7 ± 2.7e-8
+J. Extended Visual Analysis
+In this section, we present a comprehensive fine-grained visual and spectral assessment of the performance of the models.
+We inspect primitive velocity variables, derived physical quantities including vorticity and pressure, and spectral error
+distributions across three distinct temporal regimes. The evaluation strictly compares our proposed divergence-free
+framework against the unconstrained baseline to highlight the benefits of enforcing hard physical constraints.
+All models are trained to observe a historical context of 15 frames (u0:14) to predict the future evolution. For the extrapolation
+regimes where T > 49, we employ a recursive rolling window strategy. In this setup, the predictions from the model are fed
+back as input for the next step, extending the rollout up to T = 300 to rigorously assess long-term stability and conservation
+properties.
+J.1. Regime I: Standard Prediction Horizon (T15-49)
+This regime serves to validate the ability of the model to reconstruct fine-scale turbulent features within the training
+distribution. Figure 5 presents a multi-panel visualization of the flow state which juxtaposes kinematic fidelity with physical
+consistency checks.
+Kinematic Reconstruction. The top row, showing velocity components u and v, demonstrates that our constrained model
+faithfully captures the instantaneous velocity distribution. The contour lines are sharp and the extrema magnitudes match the
+Ground Truth. This indicates that the model successfully learns the fine-grained advection dynamics without suffering from
+the over-smoothing often seen in regression-based approaches.
+Conservation and Pressure Recovery. The middle row highlights the critical structural advantage of our framework. The
+unconstrained baseline exhibits significant “checkerboard” artifacts in the divergence field. This is a characteristic symptom
+of spectral leakage where high-frequency errors alias into the grid scale. This violation has a catastrophic downstream
+effect on the pressure field p. Since physical pressure is governed by the Poisson equation −∆p = ∇· (u · ∇u), the
+nonzero divergence in the baseline acts as a corrupted source term. Consequently, the recovered pressure degenerates into
+non-physical white noise. In contrast, our method enforces ∇· u ≈0 to machine precision by construction. This allows for
+the recovery of smooth and structurally coherent pressure fields that accurately reflect the internal stress of the fluid.
+Topological Realism and Spectral Fidelity. The bottom row, displaying streamlines and vorticity ω, confirms the
+topological realism of our approach. Our method recovers filamentary vorticity structures and coherent vortex loops
+effectively. This prevents the spectral blocking observed in simpler baselines where energy piles up at the cutoff frequency.
+This observation is quantitatively corroborated by the Enstrophy spectrum in Figure 6 (Top). Our method matches the
+inertial range energy cascade where E(k) ∝k−3 up to the Nyquist frequency, whereas the baseline suffers from spectral
+damping.
+J.2. Regime II: Short-term Extrapolation (T50-100)
+This regime marks the onset of out-of-distribution recursive prediction where prediction errors typically accumulate.
+Drift and Spectral Bias. Figure 7 illustrates the flow state at T = 100. The baseline model begins to drift off the physical
+17
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+manifold. The vorticity field ω loses its sharp gradients and becomes amorphous and overly smooth. This represents a
+common failure mode in MSE-trained neural operators known as spectral bias. In this mode, the model preferentially fits
+low-frequency components while discarding the high-frequency turbulent details that are essential for accurate evolution.
+Mechanism of Divergence Explosion. Crucially, the middle row reveals the mechanism of failure for the baseline.
+Divergence errors do not simply persist but amplify through the recurrent process. In the absence of a correction step, small
+non-zero divergence acts as a spurious source term in the transport equations. This leads to a numerical “blow-up” where
+the pressure field collapses into high-magnitude noise as shown in Fig. 7d. This indicates that the trajectory has left the valid
+solution manifold.
+Stabilization via Projection. In contrast, our framework maintains tight structural coherence. By strictly enforcing the
+solenoidal constraint at every timestep, the spectral Leray projection acts as an inductive bias that stabilizes the recurrent
+dynamics. The generated flows remain on the attractive manifold of the Navier-Stokes equations. This prevents the “spectral
+creep” observed in unconstrained models and ensures the simulation remains physically plausible even outside the training
+horizon.
+J.3. Regime III: Long-term Extrapolation (T101-300)
+This final regime evaluates the ergodicity and asymptotic stability of the generative process. We assess whether the model
+can remain on the physical attractor indefinitely.
+Catastrophic Decoherence of Baseline. As shown in Figure 9, the baseline model completely loses physical integrity by
+T = 300. The velocity field degrades into smooth and wave-like patterns that bear no resemblance to chaotic turbulence.
+The divergence errors saturate at a high level which renders both the pressure in the middle row and vorticity in the bottom
+row physically meaningless. The energy spectrum in Figure 10 (Top) confirms this with a severe drop-off in high-frequency
+energy. This indicates the model has ceased to simulate turbulence effectively.
+Invariant Measure Sampling. Conversely, our proposed generative method continues to generate sharp and rich turbulent
+features indefinitely. Crucially, the statistics remain stationary. The Enstrophy spectrum in Figure 10 (Top) overlaps almost
+perfectly with the ground truth. This demonstrates that our model is effectively sampling from the invariant measure of
+the system. It implies that the framework does not merely memorize trajectories but has effectively learned the underlying
+conservation laws. This ensures that the probability mass stays within the valid configuration space and prevents leakages
+that would otherwise destroy the long-term statistics.
+18
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+Ground Truth
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.1695
+0.0000
+0.1695
+u
+(a) Zonal Velocity u
+Ground Truth
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.1875
+0.0000
+0.1875
+v
+(b) Meridional Velocity v
+Ground Truth
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.5
+0.0
+0.5
+Divergence (FD)
+(c) Divergence Error
+Ground Truth
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.01585
+0.00000
+0.01585
+Pressure (Reconstructed)
+(d) Pressure
+GT (Streamlines)
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.0000
+0.2387
+Speed magnitude
+(e) Streamlines
+Ground Truth
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+1.723
+0.000
+1.723
+w
+(f) Vorticity ω
+Figure 5. Physical Field Reconstruction (Prediction). A unified view of the kinematic and topological state. Top: Velocity fields.
+Middle: Conservation metrics showing baseline failure. Bottom: Topology.
+19
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Enstrophy
+Avg: t
+[15,24]
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Avg: t
+[25,34]
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Avg: t
+[35,49]
+Ground Truth
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+(a) Enstrophy Spectrum
+Reg.(Base)
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.000000
+0.003152
+MSE: u
+(b) MSE u
+Reg.(Base)
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.000000
+0.003025
+MSE: v
+(c) MSE v
+Reg.(Base)
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.000000
+0.008502
+Divergence (FD)
+(d) MSE Divergence
+Reg.(Base)
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.000
+4.922
+Pressure (Reconstructed)
+1e 5
+(e) MSE Pressure
+Reg.(Base)
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.000000
+0.002944
+MSE: speed
+(f) MSE Speed
+Reg.(Base)
+t=15
+t=25
+t=30
+t=35
+t=40
+t=49
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.0000
+0.1058
+MSE: w
+(g) MSE ω
+Figure 6. Spectral Fidelity and Error Distributions (Prediction). Top: Enstrophy Spectrum showing partial alignment with ground
+truth. Rows 2-4: Squared error distributions for primitive and derived variables.
+20
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+Ground Truth
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.1896
+0.0000
+0.1896
+u
+(a) Zonal Velocity u
+Ground Truth
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.187
+0.000
+0.187
+v
+(b) Meridional Velocity v
+Ground Truth
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.5
+0.0
+0.5
+Divergence (FD)
+(c) Divergence Accumulation
+Ground Truth
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.01661
+0.00000
+0.01661
+Pressure (Reconstructed)
+(d) Pressure Collapse
+GT (Streamlines)
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.000
+0.248
+Speed magnitude
+(e) Streamlines
+Ground Truth
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+1.325
+0.000
+1.325
+w
+(f) Vorticity ω
+Figure 7. Short-term Stability (Extrapolation). Snapshots at T = 100. Top: Velocity drift in baseline. Middle: Conservation failure.
+Bottom: Topological degradation.
+21
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Enstrophy
+Avg: t
+[50,60]
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Avg: t
+[61,70]
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Avg: t
+[71,80]
+Ground Truth
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+(a) Enstrophy Spectrum
+Reg.(Base)
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.00000
+0.02513
+MSE: u
+(b) MSE u
+Reg.(Base)
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.00000
+0.03197
+MSE: v
+(c) MSE v
+Reg.(Base)
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.000
+2.469
+Divergence (FD)
+(d) MSE Divergence
+Reg.(Base)
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.000000
+0.001585
+Pressure (Reconstructed)
+(e) MSE Pressure
+Reg.(Base)
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.00000
+0.03066
+MSE: speed
+(f) MSE Speed
+Reg.(Base)
+t=50
+t=55
+t=60
+t=65
+t=70
+t=80
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.000
+5.184
+MSE: w
+(g) MSE ω
+Figure 8. Stationarity and Error Growth (Short-term). Top: Enstrophy spectrum remains stable. Rows 2-4: Significant divergence
+errors appear in the baseline.
+22
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+Ground Truth
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.1909
+0.0000
+0.1909
+u
+(a) Zonal Velocity u
+Ground Truth
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.1907
+0.0000
+0.1907
+v
+(b) Meridional Velocity v
+Ground Truth
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.5
+0.0
+0.5
+Divergence (FD)
+(c) Divergence Accumulation
+Ground Truth
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.01802
+0.00000
+0.01802
+Pressure (Reconstructed)
+(d) Pressure Collapse
+GT (Streamlines)
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.0000
+0.2686
+Speed magnitude
+(e) Streamlines
+Ground Truth
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+1.257
+0.000
+1.257
+w
+(f) Vorticity ω
+Figure 9. Long-term Stability (Extrapolation). Snapshots at T = 300. Top: Complete decoherence in baseline. Middle: Continued
+physical validity in ours. Bottom: Stationarity of topological features.
+23
+Project and Generate: Divergence-Free Neural Operators for Incompressible Flows
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Enstrophy
+Avg: t
+[200,220]
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Avg: t
+[221,260]
+10
+0
+10
+1
+k (Wavenumber)
+10
+8
+10
+6
+10
+4
+10
+2
+10
+0
+Avg: t
+[261,300]
+Ground Truth
+Reg.(Base)
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+(a) Enstrophy Spectrum
+Reg.(Base)
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.00
+0.05
+MSE: u
+(b) MSE u
+Reg.(Base)
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.00
+0.05
+MSE: v
+(c) MSE v
+Reg.(Base)
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.00
+0.01
+Divergence (FD)
+(d) MSE Divergence
+Reg.(Base)
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.000
+0.001
+Pressure (Reconstructed)
+(e) MSE Pressure
+Reg.(Base)
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0.0
+0.1
+MSE: speed
+(f) MSE Speed
+Reg.(Base)
+t=200
+t=210
+t=220
+t=250
+t=260
+t=270
+Reg.(Ours)
+Gen.(Base)
+Gen.(Ours)
+0
+1
+MSE: w
+(g) MSE ω
+Figure 10. Long-term Stability (Extrapolation). Top: Enstrophy spectrum. Rows 2-4: Baseline errors saturate, while ours remain
+bounded.
+24

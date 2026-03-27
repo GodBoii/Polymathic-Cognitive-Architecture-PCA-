@@ -1,0 +1,1999 @@
+BACK TO BASICS: REVISITING ASR IN THE AGE OF
+VOICE AGENTS
+Geeyang Tay†, Wentao Ma†∗, Jaewon Lee, Yuzhi Tang, Daniel Lee, Weisu Yin,
+Dongming Shen, Silin Meng, Yi Zhu, Mu Li, Alex Smola
+Boson AI
+ABSTRACT
+Automatic speech recognition (ASR) systems have achieved near-human accuracy
+on curated benchmarks, yet still fail in real-world voice agents under conditions
+that current evaluations do not systematically cover. Without diagnostic tools
+that isolate specific failure factors, practitioners cannot anticipate which condi-
+tions, in which languages, will cause what degree of degradation. We introduce
+WildASR, a multilingual (four-language) diagnostic benchmark sourced entirely
+from real human speech that factorizes ASR robustness along three axes: environ-
+mental degradation, demographic shift, and linguistic diversity. Evaluating seven
+widely used ASR systems, we find severe and uneven performance degradation,
+and model robustness does not transfer across languages or conditions. Critically,
+models often hallucinate plausible but unspoken content under partial or degraded
+inputs, creating concrete safety risks for downstream agent behavior. Our results
+demonstrate that targeted, factor-isolated evaluation is essential for understand-
+ing and improving ASR reliability in production systems. Besides the benchmark
+itself, we also present three analytical tools that practitioners can use to guide
+deployment decisions.
+https://huggingface.co/datasets/bosonai/WildASR
+https://github.com/boson-ai/WildASR-public
+1
+INTRODUCTION
+The field of Automatic Speech Recognition (ASR) has witnessed a decade of unprecedented
+progress, driven largely by the scaling of neural architectures and the availability of massive datasets.
+The declaration of “human parity” by (Amodei et al., 2016; Xiong et al., 2017) marked a pivotal mo-
+ment, and this progress has been further accelerated by (Zhang et al., 2020; Radford et al., 2022;
+Pratap et al., 2023) which leverage hundreds of thousands of hours of web-scraped audio to achieve
+remarkable performance across diverse languages. Contemporary systems now routinely obtain
+word error rates (WER) lower than 5% on curated benchmarks (Panayotov et al., 2015; Ardila et al.,
+2020). This rapid advancement raises the question: Is multilingual ASR a solved problem?
+Voice agents, AI systems capable of engaging in spoken dialogue with users, have been rapidly
+proliferating in the past few years (Shi et al., 2025; Zeng et al., 2024; Arora et al., 2025). As voice
+emerges as a dominant interface modality, these agents must contend with a wide spectrum of out-
+of-distribution (OOD) conditions: telephony compression, overlapping speech, regional accents,
+disfluencies, and code-switching. For the well performed ASR system, when they are deployed in
+real-world voice agents, failures still occur (Chen et al., 2024; Jain et al., 2025; Xu et al., 2025).
+Moreover, voice agents do not merely use ASR outputs as passive transcription, but rely on them
+to trigger downstream tools, retrieve context, and execute actions. Under OOD conditions, tran-
+scription errors are not merely cosmetic, as can be seen in Figure 1. Yet existing ASR evaluations
+predominantly test on in-domain data and report aggregate word error rate (WER) (Panayotov et al.,
+2015; Ardila et al., 2020; Shah et al., 2024; Wang et al., 2025a; Sakshi et al., 2024), obscuring which
+specific acoustic or linguistic factors drive failures. As a result, current ASR benchmarks cannot
+∗Corresponding to: wentao@boson.ai. † Equal contribution.
+1
+arXiv:2603.25727v1  [cs.AI]  26 Mar 2026
+Figure 1: Multilingual ASR robustness under real-world distribution shifts in WildASR. We
+evaluate seven ASR systems across four languages and aggregate performance over three OOD di-
+mensions. The horizontal line denotes the in-distribution clean-set model-average reference (5.7%),
+defined as the average error rate on the FLEURS test set across all models and languages. The
+sharp and uneven degradation across OOD conditions shows that human-parity performance on in-
+distribution data does not reliably transfer to real-world settings.
+answer whether robustness to one perturbation transfers across languages, environments, or conver-
+sational settings. This creates a diagnostic gap: practitioners have no systematic way to identify
+where (environment), who (demographics), and what (linguistic phenomena) drives ASR failures
+in their specific deployment. To close this diagnostic gap, we introduce WildASR, a multilingual
+(four-language) benchmark that provides systematic, factor-isolated evaluation of ASR robustness
+under real-world OOD conditions. Our contributions are threefold:
+• WildASR: a diagnostic benchmark for real-world OOD shifts We introduce a multi-
+lingual (four-language), multi-dimensional benchmark whose source audio comes entirely
+from real human speech rather than TTS-generated data. To systematically isolate failure
+modes, we decompose robustness into three axes: Environmental Degradation (the where),
+Demographic Shift (the who), and Linguistic Diversity (the what).
+• Í Thorough evaluation under a unified protocol We benchmark seven state-of-the-art
+systems (including proprietary and open-source models) under a unified protocol. We re-
+port both standard metrics and factor-isolated degradations, revealing that robustness does
+not transfer reliably, and performance rankings fluctuate wildly across languages.
+• û Diagnostic analyses as deployment decision tools Moving beyond average WER, we
+characterize specific deployment risks and present analytical tools that practitioners can
+directly apply: a P90 Elbow analysis to identify instability thresholds under increasing
+distortion, prompt sensitivity profiling to quantify variance from instruction phrasing, and
+hallucination error rate to expose semantic fabrications in linguistic edge cases.
+2
+RELATED WORK
+ASR
+Modern ASR systems have advanced rapidly due to self-supervised learning and large-scale
+multilingual training. Models (Baevski et al., 2020; Gulati et al., 2020; Radford et al., 2022) have
+achieved near-human accuracy on widely used benchmarks (Panayotov et al., 2015; Hernandez
+et al., 2018; Ardila et al., 2020; Pratap et al., 2020; 2023; Conneau et al., 2022). These datasets have
+played a critical role in driving progress by standardizing evaluation and enabling fair comparison.
+However, these ASR benchmarks largely reflect in-distribution conditions, resulting in saturated
+performance and limited insight into system behavior under realistic deployment shifts (Koenecke
+et al., 2024; Bara´nski et al., 2025; Frieske & Shi, 2024). To address this gap, several works study
+ASR robustness under specific perturbations such as additive noise, reverberation, accented speech,
+or domain mismatch (Shah et al., 2024; Wang et al., 2025b), demonstrating substantial degradation
+under adverse conditions and motivating robustness-oriented training. While valuable, these eval-
+uations typically focus on a limited set of languages or datasets and often rely on TTS-generated
+2
+speech to construct test samples. However, synthetic speech lacks the authentic paralinguistic phe-
+nomena present in real human recordings (Liao et al., 2025; Li et al., 2024), such as hesitations,
+disfluencies, and unstable articulation, and can substantially underestimate failure rates (see Sec-
+tion 5 for empirical evidence). Preserving real human speech sources is therefore critical for valid
+robustness evaluation. In contrast, our WildASR sources all audio from real human speech and ap-
+plies controlled augmentations to enable factorized evaluation across multiple perturbation axes and
+languages, enabling systematic analysis of ASR failure modes and robustness trade-offs.
+AudioLLM
+Recent work has explored integrating speech understanding with large language mod-
+els (Tang et al., 2024; Chu et al., 2023; Ghosh et al., 2024; Rubenstein et al., 2023; Huang et al.,
+2023; ElevenLabs, 2025; OpenAI, 2025a; Chu et al., 2024; Deepgram, 2025), giving rise to Audi-
+oLLMs that combine pretrained audio encoders with text-centric LLM backbones for unified speech
+recognition, translation, and audio reasoning, or even with other modalities (Comanici et al., 2025;
+Google Deepmind, 2025). Parallel efforts have explored end-to-end speech-to-speech (S2S) sys-
+tems (D´efossez et al., 2024; Google Research, 2025; OpenAI, 2025b; Roy et al., 2026; Wu et al.,
+2025), which reduce latency and preserve paralinguistic cues.
+To evaluate such models, benchmarks (Wang et al., 2025a; Chen et al., 2024; Sakshi et al., 2024)
+emphasize multimodal audio understanding and reasoning rather than transcription accuracy alone.
+More efforts (Cheng et al., 2025; Liu et al., 2025b; Zhang et al., 2025; Koudounas et al., 2025;
+Zhang et al., 2024; Liu et al., 2025a) try to highlight hallucination and instability in audio-language
+systems(Tang et al., 2024; Kuan & Lee, 2024; Atwany et al., 2025; Wang et al., 2025c). However,
+these benchmarks often evaluate task success, implicitly assuming that upstream ASR outputs are
+sufficiently reliable. In contrast, our WildASR focuses specifically on the trustworthiness of ASR
+as a foundational component in such systems. By exposing substantial transcription failures under
+realistic conditions, WildASR highlights a critical gap between benchmark ASR performance and
+the reliability required for safe downstream decision-making.
+3
+WILDASR
+Real-world voice agents encounter a long tail of acoustic and linguistic conditions that curated
+benchmarks rarely cover, and these conditions can trigger not just higher error rates but outright hal-
+lucinations. Rather than optimizing for average-case accuracy, we construct a diagnostic benchmark
+that (i) reflects real voice-chat usage, (ii) isolates concrete OOD factors, and (iii) enables per-factor
+analysis. We organize these factors into three dimensions: environmental degradation (the where),
+demographic shift (the who), and linguistic diversity (the what).
+To operationalize these failure modes, we construct WildASR. We first describe our curation
+pipeline, then detail each dimension. An overview is presented in Table 1.
+3.1
+CURATION PIPELINE
+The design of WildASR follows a real source, controlled perturbation principle: all source audio
+originates from real human speech to preserve authentic paralinguistic phenomena (e.g., hesitations,
+disfluencies, and articulatory variation) that TTS systems fail to reproduce; controlled augmentations
+are then applied post-hoc to isolate specific acoustic factors without introducing synthetic artifacts.
+The benchmark covers four languages: English (EN), Chinese (ZH), Japanese (JA), and Korean
+(KO), with three distinct data splits corresponding to our three OOD dimensions.
+The curation pipeline consists of seven stages: DC (Data Collection), SF (Speaker Filtering), QF
+(Quality Filtering), NR (Audio Normalization), AA (Acoustic Augmentation), MT (Manual Trun-
+cation & Transcript Alignment), and MV (Manual Verification). Not all steps apply to every subset;
+the rightmost column of Table 1 indicates which steps were applied to each subcategory. Detailed
+descriptions of each step are provided in Appendix C.
+3.2
+ENVIRONMENTAL DEGRADATION
+Voice agents operate on user-generated audio recorded in uncontrolled conditions that are often far
+from the distributions represented in standard ASR training and evaluation. To isolate environment-
+driven acoustic shifts while keeping the linguistic content fixed, we apply five controlled, transcript-
+preserving augmentations to each utterance.
+3
+Table 1: Overview of the proposed WildASR. Each OOD dimension is decomposed into explicitly
+defined subcategories. For each subcategory, we report the covered languages, the number of sam-
+ples per language, the average utterance duration, and the curation steps applied (defined in §3.1).
+Detailed data sources are listed in Appendix D.
+Categories
+Languages
+#Samples
+Avg Duration (s)
+Curation Steps
+Environmental degradation
+Reverberation
+EN/ZH/JA/KO
+2841/3735/2850/2046
+10.0/12.9/12.5/10.4
+DC→QF→NR→AA→MV
+Far-field
+EN/ZH/JA/KO
+2841/3735/2850/2046
+10.0/13.0/12.5/10.4
+DC→QF→NR→AA→MV
+Phone codec
+EN/ZH/JA/KO
+1894/2490/1900/1364
+7.5/10.4/10.0/7.9
+DC→QF→NR→AA→MV
+Noise gap
+EN/ZH/JA/KO
+3788/4980/3800/2728
+8.6/11.6/11.2/9.1
+DC→QF→NR→AA→MV
+Clipping
+EN/ZH/JA/KO
+947/1245/950/682
+7.5/10.4/10.0/7.9
+DC→QF→NR→AA→MV
+Demographic shift
+Children
+EN/ZH
+300/1000
+4.06/3.02
+DC→SF→QF→NR→MV
+Older adults
+EN/ZH
+300/1000
+5.93/1.95
+DC→SF→QF→NR→MV
+Accent
+EN/ZH
+1000/1000
+3.48/5.69
+DC→SF→QF→NR→MV
+Linguistic diversity
+Short utterances
+EN/ZH/JA/KO
+318/367/467/255
+1.2/0.7/1.1/1.0
+DC→QF→NR→MV
+Incomplete audio
+EN/ZH/JA/KO
+2345/2517/195/396
+3.9/2.1/1.9/2.6
+DC→QF→NR→MT→MV
+Code-switching
+(EN)+ZH/JA/KO
+700/700/700
+8.6/11.7/11.5
+DC→QF→NR→MV
+Reverberation Reverberation is one of the most common factors that reduces indoor audio quality.
+We simulate room acoustics using the image-source method (Scheibler et al., 2018), which intro-
+duces temporal smearing from reflections. We parameterize severity by the reverberation time RT60
+(i.e., the time for the sound energy to decay by 60 dB). To be specific, we vary RT60 across three
+distinct levels (0.4/0.8/1.6s) to cover mild to strong reverberation.
+Far-field Distinct from simple reverberation (which relies on room absorption), far-field audio is
+characterized by a low direct-to-reverberant ratio (Haeb-Umbach et al., 2020). It creates a smear-
+ing effect where reflections overwhelm the direct path, severely degrading the intelligibility of short
+phonemes (e.g., consonants). To isolate this effect, we fix the room acoustics (RT60) using a simu-
+lated room geometry, and vary only the source-microphone distance to (4/8/16m).
+Phone Codec Real-world voice agents frequently encounter narrowband telephone audio rather
+than wideband, studio-like recordings. To simulate legacy communication channels, we process
+audio through two standard codecs: GSM (representing classic mobile telephony) and G.711 µ-
+law (representing standard landline/VoIP infrastructure). Both operations involve downsampling the
+input to 8 kHz, applying the codec’s quantization artifacts, and resampling back to 16 kHz, testing
+the model’s ability to recover phonemes from band-limited representations.
+Noise gap Hallucinations are often associated with long non-speech spans within an utterance (Koe-
+necke et al., 2024). To probe this failure mode, we inject synthetic stationary noise between con-
+tiguous speech fragments, increasing the non-vocal duration while preserving the original lexical
+content. Specifically, we vary the density and duration of these insertions: 3 or 5 gaps of either
+0.2 s or 0.4 s duration, leading to (Ngap, ∆t) ∈{(3, 0.2), (5, 0.2), (3, 0.4), (5, 0.4)}. This stresses
+the model’s endpointing mechanisms without introducing confounding linguistic complexity.
+Clipping Clipping occurs when input gain saturates the recording hardware (e.g., loud speech or
+background music), clamping the waveform against a maximum limit. We model this by setting a
+per-utterance clipping threshold such that the top 40% of signal amplitude values are flattened, fol-
+lowed by RMS rescaling to recover loudness. This introduces harsh non-linear harmonic distortion
+that standard noise-robustness techniques often fail to model.
+We establish a high-quality base corpus by sampling utterances from two complementary sources:
+the widely adopted FLEURS (Conneau et al., 2022) test split, which provides read speech, and
+a few conversational datasets from MagicData (Zhou et al., 2025; MagicData, 2024; 2025), which
+captures spontaneous speech. Both sources cover all four target languages. We discard unintelligible
+samples, and apply five controlled perturbations to enable factor-isolated analysis.
+3.3
+DEMOGRAPHIC SHIFT
+Standard ASR training and evaluation corpora are dominated by working-age adults speaking rela-
+tively standard varieties. This mismatch constitutes both a fairness concern and a product risk, par-
+ticularly salient for two fast-growing use cases: children’s education and geriatric care. To bridge
+4
+Figure 2: Error heatmap for seven ASR models on WildASR. Each cell visualizes error rate
+(WER for EN and CER for CJK), with lighter colors indicating lower error. This patchy landscape
+reveals that ASR systems still exhibit large performance degradation and uneven robustness gaps.
+this gap, we curate three sub-corpora that represent critical user groups for which current systems
+often fail.
+Children Recognition of child speech is uniquely challenging due to higher fundamental frequency,
+irregular prosody, frequent disfluencies, and evolving linguistic patterns that defy adult-trained
+model assumptions. In WildASR, we source English data from Zenodo’s children speech record-
+ing (Kennedy et al., 2016) and TomRoma/Child Speech (TomRoma, 2024); Chinese data from the
+BAAI/ChildMandarin (Zhou et al., 2024) targeting children aged 3–5. We perform rigorous filtering
+to exclude samples with poor signal-to-noise ratios and manually validate transcripts for accuracy.
+Older adults Elderly speech is affected by presbyphonia, causing reduced vocal intensity, breathi-
+ness, hoarseness, tremors, and slower articulation that degrade ASR performance. We sample En-
+glish speakers aged 50+ from MushanW/GLOBE V3 (Wang et al., 2024) and Chinese elderly speech
+from evan0617/seniortalk (Chen et al., 2025). Given that elderly speakers may exhibit confounding
+factors such as dialect variations, we perform manual filtering to select samples where age-related
+acoustic degradation is the dominant feature, minimizing the influence of other variables.
+Accent While native accents are well-represented, global deployment requires robustness to second
+language accents, which introduce phonemic substitutions and stress shifts. English accented sam-
+ples are drawn from MushanW/GLOBE V2 (Wang et al., 2024) with diverse non-native accents,
+while Chinese samples from TwinkStart/KeSpeech (Shi et al., 2026) focusing on regional Mandarin
+varieties, excluding mutually unintelligible dialects like Cantonese.
+Note that the demographic shift subset only covers English and Chinese at this moment, as high-
+quality child and elderly speech resources are scarce for the other languages. We balance data quality
+and acquisition difficulty to ensure reproducibility of our WildASR benchmark.
+3.4
+LINGUISTIC DIVERSITY
+While acoustic robustness focuses on signal quality, semantic robustness targets linguistic phenom-
+ena and structural edge cases that occur frequently in spontaneous dialogue but are systematically
+underrepresented in standard training corpora. In this work, we identify three specific failure modes
+where the model’s reliance on learned probabilities becomes a liability.
+Short utterances Real-world dialogue relies heavily on backchannels (e.g., “hmm” “right”), phatic
+greeting (e.g., “how are you,” “what’s up?”) and terse commands (e.g., “stop,” “next”). These are
+critical for natural turn-taking and latency management in voice agents. However, current models
+suffer from such short utterance, leading to wrong transcriptions and hallucinations in most cases.
+Here we select utterances containing fewer than 6 words (or 6 characters for CJK languages) from
+YODAS (Li et al., 2023) for all four languages.
+Incomplete audio In streaming voice applications, users are frequently cut off by aggressive voice
+activity detection (VAD), network latency, or interruptions. However, ASR models are typically
+5
+Table 2: Impact of environmental degradations on multilingual ASR performance. Average
+error rates across seven ASR models under controlled acoustic perturbations. Results are reported as
+MagicData / FLEURS. ∆denotes the absolute increase in error rates relative to the clean condition.
+Bold highlights the largest degradation magnitude per language and dataset.
+Perturbations
+EN
+ZH
+JA
+KO
+WER (%)
+∆
+CER (%)
+∆
+CER (%)
+∆
+CER (%)
+∆
+Original
+19.9/4.1
+–/–
+14.6/7.8
+–/–
+19.7/5.1
+–/–
+19.5/5.9
+–/–
+Reverberation
+31.9/9.5
++12.0/+5.3
+25.7/13.0
++11.1/+5.2
+45.3/15.5
++25.5/+10.4
+46.6/15.5
++27.0/+9.6
+Far-field
+26.0/15.8
++6.1/+11.7
+23.1/12.3
++8.5/+4.5
+33.7/13.5
++13.9/+8.4
+40.1/19.1
++20.6/+13.2
+Phone (G.711)
+20.5/10.4
++0.6/+6.3
+16.9/8.6
++2.3/+0.8
+29.1/6.7
++9.4/+1.6
+24.8/8.8
++5.3/+2.9
+Phone (GSM)
+22.9/5.2
++3.0/+1.1
+25.0/9.4
++10.4/+1.6
+33.8/10.5
++14.1/+5.4
+47.6/7.9
++28.0/+2.0
+Noise gap
+87.6/6.7
++67.7/+2.5
+24.9/13.2
++10.3/+5.4
+138.7/10.0
++118.9/+5.0
+140.5/12.8
++121.0/+6.8
+Clipping
+30.6/15.6
++10.7/+11.5
+37.3/17.9
++22.7/+10.1
+52.0/13.6
++32.3/+8.5
+46.6/18.5
++27.0/+12.5
+trained on complete, well-formed sentences. When presented with a cut-off word, model may fill in
+a likely continuation based on language priors, producing fluent completions that were never spoken
+- a direct pathway to hallucination. This hallucinated completion is dangerous for agents executing
+API calls, where “delete” vs. “delete all” requires precise transcription of the actual audio. Given
+selected utterances from YODAS (Li et al., 2023), we manually edit waveforms to truncate speech
+mid-sentence or mid-word while referencing the truncated transcript as the ground truth.
+Code-switching Code-switching is frequent in multilingual communities and is a common interac-
+tion pattern for voice agents. Most ASR models rely on an initial Language Identification token to
+condition generation. Code-switching breaks this “one-utterance-one-language” assumption. Mod-
+els often force the transcribed output into a single script, resulting in phonetic transliteration errors
+(i.e., foreign terms are mapped to nonsensical homophones in the primary language) or simply drop-
+ping the secondary language content. Here we sample the data directly from SwitchLingua (Xie
+et al., 2025) and perform light-weight filtering to remove samples without rich multilingual mixes.
+4
+EXPERIMENTS
+In this work, we evaluate a total of 7 state-of-the-art ASR models on the proposed WildASR, cover-
+ing both proprietary and open-source models. Specifically, we include Whisper Large V3 (Radford
+et al., 2022), GPT-4o Transcribe (OpenAI, 2025a), Gemini 2.5 Pro (Comanici et al., 2025), Gem-
+ini 3 Pro (Google Deepmind, 2025), Qwen2-Audio (Chu et al., 2024), Nova 2 (Deepgram, 2025)
+and Scribe V1 (ElevenLabs, 2025). Details of inference protocol are included in Appendix A. Due
+to space constraints, results in the main text are presented in aggregated form to facilitate cross-
+condition analysis; full per-model breakdowns for each subset and language are provided in Ap-
+pendix G.
+4.1
+MULTILINGUAL ASR IS NOT SOLVED
+To have an overall understanding of models’ ASR performance on WildASR, we conduct a system-
+atic evaluation and present the general results in Figure 2. Each cell aggregates error across available
+languages. It reveals a patchy landscape where each model shows pockets of strong performance
+alongside severe failures, indicating that ASR systems still exhibit large performance degradation
+and uneven robustness gaps across realistic OOD conditions.
+Furthermore, robustness does not uniformly transfer across environmental, semantic, and demo-
+graphic shifts. For instance, Gemini 3 Pro achieves low error on FLEURS/Clean (3.8%) but degrades
+sharply on MagicData/Noise gap (61.2%) and Linguistic/Short utterances (52.7%). These patterns
+are common in Figure 2, making extrapolation from one setting to another unreliable, which indi-
+cates models can excel on standard benchmarks yet fail drastically under real-world conditions. This
+validates the importance of our benchmark in revealing weaknesses masked by aggregate metrics.
+We next present detailed findings across three dimensions to systematically analyze robustness of
+multilingual ASR.
+4.2
+ENVIRONMENTAL DEGRADATION SUBSET
+6
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+1.8
+RT60 (s)
+0
+10
+20
+30
+40
+WER / CER (%)
+baseline clean WER (%)
+WER (%)
+P90 WER (%)
+P90 elbow
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+1.4
+1.6
+1.8
+RT60 (s)
+0
+5
+10
+15
+20
+25
+30
+35
+40
+WER / CER (%)
+baseline clean WER (%)
+WER (%)
+P90 WER (%)
+P90 elbow
+Figure 3: ASR error dynamics under
+increasing reverberation for Qwen2-
+Audio on FLEURS (top: English, bot-
+tom: Chinese).
+In Table 2, we report the results separately on FLEURS and
+MagicData to have a holistic understanding of the impact from
+environmental degradations on both read speech and sponta-
+neous conversational speech. For each dataset and language,
+we average the resulting WER/CER across models for each
+perturbation type, and additionally report paired degradations
+as ∆WER/∆CER relative to the original (clean) condition.
+We observe that all acoustic perturbations result in positive
+error increases across both corpora, indicating that each per-
+turbation category introduces measurable performance degra-
+dation.
+Overall, the average degradation is often larger on
+MagicData than on FLEURS, likely because conversational
+speech exhibits greater variability and poses more challenges
+than read speech. Notably, noise gap is the most detrimen-
+tal perturbation for conversational speech, increasing the error
+rate on MagicData by +67.7% (EN) and +10.3% (ZH).
+We also find that degradation patterns are highly non-
+uniform across languages and recording settings. For exam-
+ple, on MagicData, noise gap increases ZH CER by +10.3%,
+yet increases JA and KO CER by +118.9% and +121.0%, re-
+spectively.
+Together, these discrepancies indicate that robustness measured in one language or
+recording setting can substantially mispredict behavior in another.
+In addition, we analyze performance as a function of distortion strength, using reverberation as an
+example with Qwen2-Audio on FLEURS, shown in Figure 3. The blue solid curve shows corpus-
+level WER at each distortion level, with the blue dotted line denoting the clean baseline; the shaded
+band indicates ±1 standard deviation of utterance-level WER. The orange dashed curve reports the
+P90 (90th percentile) WER, capturing tail behavior, and the vertical orange dashed line marks the
+P90 elbow point. As distortion severity increases, corpus-level WER grows gradually, while the
+error distribution widens substantially: the P90 curve rises faster than the mean and variabil-
+ity across utterances increases. This pattern indicates the emergence of severe outliers even when
+average performance remains acceptable, a critical concern for voice-agent deployment where tail
+failures strongly affect user experience. To quantify the onset of instability, we define the P90 elbow
+as the distortion level at which the P90 curve exhibits accelerated growth, computed using knee-
+detection methods. This elbow provides a practical instability threshold for deployment decisions,
+such as bounding allowable distortion or triggering abstention.
+4.3
+DEMOGRAPHIC SHIFT SUBSET
+Table 3: ASR performance under demo-
+graphic shift. English remains relatively ro-
+bust, while Chinese and child speech exhibit
+substantially higher error rates.
+Accent
+Children
+Older
+Model
+ZH
+EN
+ZH
+EN
+ZH
+EN
+Nova 2
+59.2
+6.6
+54.4
+27.4
+51.6
+2.9
+GPT-4o Transcribe
+40.7
+2.6
+39.9
+29.4
+36.0
+1.1
+Gemini 2.5 Pro
+49.9
+5.0
+58.6
+25.1
+52.6
+1.8
+Gemini 3 Pro
+62.5
+3.0
+55.3
+18.2
+41.4
+0.7
+Qwen2-Audio
+7.5
+6.8
+23.4
+26.7
+18.6
+1.5
+Scribe V1
+37.9
+2.2
+65.1
+29.3
+42.3
+0.8
+Whisper Large V3
+51.0
+4.1
+52.0
+21.7
+34.0
+0.2
+Table 3 reports performance of seven models un-
+der demographic shift. Across models, robustness
+is consistently higher for English than for Chinese:
+WERs for Accent and Older speech in English re-
+main in the low single digits, whereas Chinese
+exhibits substantially higher error rates.
+Notably,
+child speech in English remains challenging for
+all models, with the lowest observed error still at
+18.2 WER, indicating a deployment-critical failure
+mode given the prevalence of child and family use
+cases. For Chinese, Qwen2-Audio shows the lowest
+error across all three demographic conditions, likely
+reflecting broader coverage in its Chinese training
+data.
+We further analyze prompt sensitivity in multilingual ASR by evaluating Gemini 2.5 Pro with ten
+paraphrased prompts on the three demographic OOD subsets in both languages. The prompts are
+listed in Appendix E. All prompts express the same instruction: transcribe the speech in the target
+language and output only the transcript, but differ in wording and style. For each prompt, we com-
+7
+Table 4: ASR performance and hallucination behavior under linguistic diversity. We can see
+that short and truncated inputs induce high error and frequent hallucinations, revealing semantic
+failures not captured by lexical metrics alone (EN not applicable for code-switching).
+WER/CER/MER (%)
+HER (%)
+Model
+Category
+ZH
+EN
+JA
+KO
+ZH
+EN
+JA
+KO
+Nova 2
+code-switch
+33.7
+-
+32.0
+56.4
+68.4
+-
+58.1
+71.9
+short
+57.6
+43.2
+56.8
+65.3
+52.6
+36.3
+46.9
+59.6
+incomplete
+35.0
+13.5
+37.2
+61.0
+38.1
+7.8
+37.4
+56.8
+Gemini 2.5 Pro
+code-switch
+20.7
+-
+9.8
+18.2
+7.0
+-
+9.4
+19.1
+short
+40.6
+64.4
+48.6
+55.6
+30.5
+35.4
+28.1
+34.1
+incomplete
+31.9
+15.3
+37.1
+23.5
+31.6
+10.5
+32.8
+11.1
+Gemini 3 Pro
+code-switch
+7.2
+-
+9.0
+9.4
+3.7
+-
+6.3
+11.9
+short
+33.9
+73.9
+55.4
+47.8
+15.5
+27.3
+31.2
+23.5
+incomplete
+21.7
+10.6
+36.7
+18.5
+16.9
+6.7
+25.6
+14.1
+GPT-4o Transcribe
+code-switch
+21.9
+-
+24.4
+29.9
+12.0
+-
+17.9
+36.9
+short
+26.9
+38.7
+37.3
+26.9
+21.5
+20.5
+21.9
+21.2
+incomplete
+25.4
+38.1
+26.6
+22.9
+22.3
+12.4
+26.1
+12.6
+Qwen2-Audio
+code-switch
+12.3
+-
+80.5
+211.7
+8.9
+-
+35.6
+85.7
+short
+21.4
+40.7
+59.2
+102.6
+14.7
+23.3
+40.6
+73.3
+incomplete
+20.5
+13.0
+224.4
+34.2
+14.7
+6.1
+21.5
+37.6
+Scribe V1
+code-switch
+10.2
+-
+22.8
+23.9
+7.6
+-
+20.1
+31.7
+short
+38.3
+57.2
+94.9
+58.3
+30.0
+38.5
+50.0
+32.6
+incomplete
+25.5
+12.9
+36.4
+18.8
+30.5
+10.9
+38.5
+15.7
+Whisper Large V3
+code-switch
+12.0
+-
+22.8
+29.6
+10.9
+-
+23.6
+38.0
+short
+41.6
+39.8
+154.1
+92.0
+31.6
+21.4
+9.4
+22.0
+incomplete
+24.0
+12.2
+26.7
+17.7
+21.0
+7.7
+19.5
+12.9
+pute corpus-level error rates and visualize their distribution, along with mean and standard deviation,
+in Figure 4.
+Figure 4: Prompt sensitivity of Gemini 2.5 Pro
+on demographic subsets across ten paraphrased
+prompts (EN/ZH).
+Results show that ASR performance could be
+highly sensitive to prompt phrasing, particularly
+in Chinese. Across Chinese subsets, the standard
+deviation across prompts reaches σ = 13.7% (Ac-
+cent), σ
+= 46.1% (Children), and σ
+= 8.3%
+(Older), whereas English exhibits minimal variation
+(σ ≤0.6% across all conditions). These findings
+demonstrate that even for basic transcription, para-
+phrased instructions can materially affect model be-
+havior, especially in non-English settings. As the
+optimal prompt is rarely known in advance in real-
+world deployments, prompt choice alone can induce
+substantial performance degradation. This motivates
+evaluating ASR systems not only by mean error un-
+der a single prompt, but also by prompt robustness,
+e.g., variance across a controlled prompt set as a first-class stability metric. On the other hand, the
+profiling methodology itself is reusable: practitioners can apply the same controlled prompt set to
+any new model or language to assess prompt stability before deployment.
+4.4
+LINGUISTIC DIVERSITY SUBSET
+In this section, we evaluate models across three challenging linguistic scenarios: short utterances,
+incomplete audio and code-switching. To understand hallucination behavior, we compute Hallucina-
+tion Error Rate (HER) (Atwany et al., 2025) to assess semantic-level errors beyond lexical metrics.
+Detailed results can be seen in Table 4. Across all languages, short utterances consistently induce
+high error rates, reaching 38.7%–73.9% even in English. The reason might be threefold: (i) short
+segments contain limited acoustic evidence and are more sensitive to VAD errors; (ii) decoder-
+8
+only models with strong language priors may over-generate plausible continuations when context is
+scarce; and (iii) many training pipelines downweight or remove very short clips, reducing coverage
+of these patterns entirely.
+We further observe insertion-dominated auto-completion failures, with WER/CER exceeding
+100%, indicating that models generate substantial hallucinated content rather than transcribing faith-
+fully. For example, Qwen2-Audio reaches 102.6% CER on KO short utterances, 211.7% MER on
+KO code-switching, and 224.4% on JA incomplete audio. These failures suggest a tendency to
+“complete” truncated or ambiguous inputs instead of producing conservative transcriptions.
+Finally, HER reveals semantic failures that lexical metrics alone obscure. Discrepancies be-
+tween WER/CER and HER highlight cases where surface-level transcription appears reasonable
+despite severe meaning distortion. For instance, Nova 2 on ZH code-switching exhibits 33.7% MER
+but 68.4% HER, indicating substantial semantic fabrication. Such meaning-altering hallucinations,
+e.g., negation introduced by a single insertion (“no I can” →“no I can’t”) pose significant risks in
+high-stakes applications. Joint analysis of WER and HER therefore enables a more faithful charac-
+terization of ASR reliability by distinguishing benign lexical errors from critical semantic failures.
+This joint evaluation protocol can be readily applied to any ASR system to surface semantic risks
+that WER alone would miss.
+Overall, incomplete audio is relatively manageable for EN, while code-switching is substantially
+harder for JA/KO mixed with English. Another observation is, proprietary models tend to perform
+better (more robust) than open-source models on our linguistic diversity subset, e.g., occurrences
+where error rates beyond 80 happen mostly in Qwen2-Audio and Whisper Large V3.
+5
+FURTHER DISCUSSION
+Is WildASR intrinsically difficult for humans? Although WildASR induces severe failures in
+state-of-the-art ASR systems, the underlying speech remains largely intelligible to human listeners.
+We conducted a human evaluation in which samples were reviewed in randomized and anonymized
+order by independent annotators. The resulting average error rate was 4.7%, consistent with estab-
+lished estimates of human-level transcription performance. This gap confirms that WildASR does
+not derive its difficulty from ambiguity or poor signal quality, but rather exposes modeling limi-
+tations under realistic long-tail conditions. The disparity between human and model performance
+highlights substantial headroom for improving robustness in deployed ASR systems.
+Why real speech sources matter for robustness evaluation? A central design choice of WildASR
+is that all source audio originates from real human speech, rather than being generated by text-to-
+speech systems. To assess the impact of this choice, we compared real child speech with synthetic
+counterparts generated from identical transcripts using Qwen3-TTS (Hu et al., 2026). Take Whisper
+Large V3 as an example, it achieved near-ceiling performance on synthetic audio (3.7%), but error
+rates increased dramatically on real child speech (21.7%) for English (shown in table 3). Quali-
+tative inspection reveals that synthetic samples capture coarse acoustic cues (e.g., pitch) but fail to
+reproduce authentic paralinguistic phenomena such as hesitations and unstable articulation. This
+discrepancy suggests that evaluations relying on synthetic data can underestimate failure rates. Real
+speech remains essential for revealing robustness gaps that directly affect voice-agent reliability.
+What is the “ground truth” for multilingual ASR? Although ASR is often treated as a well-
+defined transcription task, its notion of ground truth is inherently use-case and culture dependent.
+Decisions such as whether to preserve filler words or partial utterances vary across languages
+and conversational norms, and can materially affect downstream interpretation. In some settings,
+these phenomena convey pragmatic meaning, while in others they are routinely normalized. While
+WildASR adopts a fixed transcription target for consistency, our observations highlight the need for
+multilingual benchmarks that account for culturally specific transcription norms and evaluate how
+different normalization choices impact robustness, hallucination behavior, and downstream utility.
+Is ASR obsolete in the era of speech-to-speech systems? Recent progress in large multimodal
+and S2S models has motivated the view that explicit transcription may become unnecessary, as
+end-to-end systems can directly operate on acoustic representations while preserving paralinguistic
+cues. Indeed, modern voice agents can often sustain fluent conversations even when retrospective
+transcripts contain recognition errors or hallucinated phrases. However, our results argue that this
+9
+does not diminish the importance of ASR; rather, it reframes its role. Explicit ASR provides a
+transparent, auditable, and inspectable interface that is critical for debugging, compliance, retrieval,
+indexing, and structured tool use. Moreover, while S2S systems may tolerate minor errors in benign
+conditions, our findings on severe hallucinations under OOD inputs suggest that uninterpretable
+end-to-end failures may be harder to detect and correct. From this perspective, robust ASR should
+be viewed not as a legacy component, but as a stabilizing input layer and safety guardrail for next-
+generation voice agents. Future work should study hybrid architectures that dynamically combine
+explicit transcription with audio-native reasoning, rather than treating them as mutually exclusive.
+6
+CONCLUSION AND FUTURE WORK
+This work introduces WildASR, a multilingual benchmark designed to stress-test ASR systems un-
+der a diverse set of OOD conditions spanning acoustic environments (where), demographic charac-
+teristics (who), and linguistic phenomena (what). Across all evaluated models, our results reveal a
+fragmented robustness landscape: strong performance on in-domain benchmarks does not reliably
+transfer across domains, demographics, or interaction settings, and failure modes often manifest as
+severe semantic distortions rather than gradual degradation. These findings carry broader implica-
+tions beyond ASR as a standalone task since voice interfaces and conversational agents become an
+increasingly prominent mode of human–AI interaction.
+Due to the scope of constructing a multilingual benchmark from real human speech sources and
+the resources required for large-scale evaluation, WildASR naturally has limitations that point to
+promising future directions:
+From diagnosis to mitigation. Our current work focuses on identifying and characterizing failure
+modes, including hallucination behavior, rather than resolving them. The factor-isolated structure of
+WildASR directly reveals which OOD conditions cause the largest degradation for each model and
+language, providing a natural starting point for targeted data augmentation, fine-tuning, or adaptation
+strategies. In particular, our hallucination analysis motivates the development of hallucination-aware
+decoding and abstention mechanisms that withhold transcription when confidence is low.
+Broader language, condition, and sample coverage. The current benchmark covers four lan-
+guages and a defined set of OOD factors, leaving out low-resource languages and conditions such as
+multi-speaker overlap and real-time streaming artifacts. Additionally, certain subsets, particularly
+the demographic split, have limited sample sizes due to the scarcity of publicly available real speech
+data for specific populations. As a diagnostic benchmark designed to expose failure modes and iden-
+tify broad degradation patterns, these sizes are sufficient for our analytical goals, but expanding both
+language coverage and per-condition sample sizes would further strengthen the diagnostic coverage.
+Finer-grained reporting and broader model coverage. Due to space constraints, results in the
+main text are presented in aggregated form to support cross-condition analysis and narrative clar-
+ity; full per-model breakdowns are provided in the appendix. We also welcome future work that
+evaluates additional models on WildASR to broaden the comparative landscape.
+More broadly, WildASR highlights the need for benchmarks grounded in real human speech sources
+and realistic usage patterns, as synthetic or narrowly curated evaluations risk obscuring failure
+modes that matter most in deployment. We hope this work serves as a foundation for developing
+ASR systems that are not only accurate, but dependable in real-world voice agents.
+10
+REFERENCES
+Dario Amodei, Sundaram Ananthanarayanan, Rishita Anubhai, Jingliang Bai, Eric Battenberg, Carl
+Case, Jared Casper, Bryan Catanzaro, Qiang Cheng, Guoliang Chen, Jie Chen, Jingdong Chen,
+Zhijie Chen, Mike Chrzanowski, Adam Coates, Greg Diamos, Ke Ding, Niandong Du, Erich
+Elsen, Jesse Engel, Weiwei Fang, Linxi Fan, Christopher Fougner, Liang Gao, Caixia Gong, Awni
+Hannun, Tony Han, Lappi Johannes, Bing Jiang, Cai Ju, Billy Jun, Patrick LeGresley, Libby Lin,
+Junjie Liu, Yang Liu, Weigao Li, Xiangang Li, Dongpeng Ma, Sharan Narang, Andrew Ng, Sherjil
+Ozair, Yiping Peng, Ryan Prenger, Sheng Qian, Zongfeng Quan, Jonathan Raiman, Vinay Rao,
+Sanjeev Satheesh, David Seetapun, Shubho Sengupta, Kavya Srinet, Anuroop Sriram, Haiyuan
+Tang, Liliang Tang, Chong Wang, Jidong Wang, Kaifu Wang, Yi Wang, Zhijian Wang, Zhiqian
+Wang, Shuang Wu, Likai Wei, Bo Xiao, Wen Xie, Yan Xie, Dani Yogatama, Bin Yuan, Jun Zhan,
+and Zhenyao Zhu. Deep Speech 2 : End-to-End Speech Recognition in English and Mandarin. In
+ICML, 2016.
+Rosana Ardila, Megan Branson, Kelly Davis, Michael Henretty, Michael Kohler, Josh Meyer,
+Reuben Morais, Lindsay Saunders, Francis M. Tyers, and Gregor Weber.
+Common voice:
+A massively multilingual speech corpus.
+In Proceedings of LREC, 2020.
+URL https:
+//arxiv.org/abs/1912.06670.
+Siddhant Arora, Haidar Khan, Kai Sun, Xin Luna Dong, Sajal Choudhary, Seungwhan Moon,
+Xinyuan Zhang, Adithya Sagar, Surya Teja Appini, Kaushik Patnaik, et al. Stream rag: Instant and
+accurate spoken dialogue systems with streaming tool usage. arXiv preprint arXiv:2510.02044,
+2025.
+Hanin Atwany, Abdul Waheed, Rita Singh, Monojit Choudhury, and Bhiksha Raj. Lost in transcrip-
+tion, found in distribution shift: Demystifying hallucination in speech foundation models. arXiv
+preprint arXiv:2502.12414, 2025.
+Alexei Baevski, Yuhao Zhou, Abdelrahman Mohamed, and Michael Auli. wav2vec 2.0: A Frame-
+work for Self-Supervised Learning of Speech Representations. In Advances in Neural Information
+Processing Systems (NeurIPS), 2020. URL https://arxiv.org/abs/2006.11477.
+Mateusz Bara´nski, Jan Jasi´nski, Julitta Bartolewska, Stanisław Kacprzak, Marcin Witkowski, and
+Konrad Kowalczyk. Investigation of Whisper ASR Hallucinations Induced by Non-Speech Au-
+dio. In ICASSP 2025 - 2025 IEEE International Conference on Acoustics, Speech and Signal
+Processing (ICASSP), pp. 1–5, 2025. doi: 10.1109/ICASSP49660.2025.10890105.
+Yang Chen, Hui Wang, Shiyao Wang, Junyang Chen, Jiabei He, Jiaming Zhou, Xi Yang, Yequan
+Wang, Yonghua Lin, and Yong Qin. SeniorTalk: A Chinese Conversation Dataset with Rich
+Annotations for Super-Aged Seniors, 2025.
+Yiming Chen, Xianghu Yue, Chen Zhang, Xiaoxue Gao, Robby T. Tan, and Haizhou Li.
+VoiceBench: Benchmarking LLM-Based Voice Assistants. arXiv preprint arXiv:2410.17196,
+2024. URL https://arxiv.org/abs/2410.17196.
+Xize Cheng, Dongjie Fu, Chenyuhao Wen, Shannon Yu, Zehan Wang, Shengpeng Ji, Siddhant
+Arora, Tao Jin, Shinji Watanabe, and Zhou Zhao. AHa-Bench: Benchmarking Audio Hallu-
+cinations in Large Audio-Language Models. In The Thirty-ninth Annual Conference on Neu-
+ral Information Processing Systems Datasets and Benchmarks Track, 2025.
+URL https:
+//openreview.net/forum?id=vCej5sO61x.
+Yunfei Chu, Jin Xu, Xiaohuan Zhou, Qian Yang, Shiliang Zhang, Zhijie Yan, Chang Zhou,
+and Jingren Zhou. Qwen-Audio: Advancing Audio-Language Models, 2023. URL https:
+//arxiv.org/abs/2311.07919.
+Yunfei Chu, Jin Xu, Qian Yang, Haojie Wei, Xipin Wei, Zhifang Guo, Yichong Leng, Yuanjun Lv,
+Jinzheng He, Junyang Lin, Chang Zhou, and Jingren Zhou. Qwen2-Audio Technical Report.
+arXiv preprint arXiv:2407.10759, 2024.
+Gheorghe Comanici et al. Gemini 2.5: Pushing the Frontier with Advanced Reasoning, Multimodal-
+ity, Long Context, and Next Generation Agentic Capabilities. arXiv preprint arXiv:2507.06261,
+2025.
+11
+Alexis Conneau, Min Ma, Simran Khanuja, Yu Zhang, Vera Axelrod, Siddharth Dalmia, Jason
+Riesa, Clara Rivera, and Ankur Bapna. FLEURS: Few-shot Learning Evaluation of Universal
+Representations of Speech. arXiv preprint arXiv:2205.12446, 2022. URL https://arxiv.
+org/abs/2205.12446.
+Deepgram,
+2025.
+URL
+https://deepgram.com/learn/
+nova-2-speech-to-text-api.
+Alexandre D´efossez, Laurent Mazar´e, Manu Orsini, Am´elie Royer, Patrick P´erez, Herv´e J´egou,
+Edouard Grave, and Neil Zeghidour. Moshi: a Speech-Text Foundation Model for Real-Time
+Dialogue. arXiv preprint arXiv:2410.00037, 2024.
+ElevenLabs, 2025. URL https://elevenlabs.io/blog/meet-scribe.
+Rita Frieske and Bertram E. Shi. Hallucinations in Neural Automatic Speech Recognition: Iden-
+tifying Errors and Hallucinatory Models, 2024. URL https://arxiv.org/abs/2401.
+01572.
+Sreyan Ghosh, Sonal Kumar, Ashish Seth, Chandra Kiran Reddy Evuru, Utkarsh Tyagi, S Sakshi,
+Oriol Nieto, Ramani Duraiswami, and Dinesh Manocha. GAMA: A General Audio Model for
+Audio Understanding. arXiv preprint arXiv:2406.11768, 2024. URL https://arxiv.org/
+abs/2406.11768.
+Google Deepmind, 2025. URL https://deepmind.google/models/gemini/pro/.
+Google Research. Gemini live: Real-time multimodal conversational ai, 2025. Technical report.
+Anmol Gulati, James Qin, Chung-Cheng Chiu, Niki Parmar, Yu Zhang, Jiahui Yu, Wei Han, Shibo
+Wang, Zhengdong Zhang, Yonghui Wu, and Ruoming Pang. Conformer: Convolution-augmented
+Transformer for Speech Recognition. In Proceedings of Interspeech, 2020. URL https://
+arxiv.org/abs/2005.08100.
+Reinhold Haeb-Umbach, Jahn Heymann, Lukas Drude, Shinji Watanabe, Marc Delcroix, and To-
+mohiro Nakatani. Far-Field Automatic Speech Recognition. Proceedings of the IEEE, 2020.
+Franc¸ois Hernandez, Vincent Nguyen, Sahar Ghannay, Natalia Tomashenko, and Yannick Est`eve.
+TED-LIUM 3: Twice as Much Data and Corpus Repartition for Experiments on Speaker Adapta-
+tion. In Proceedings of Interspeech, 2018. URL https://arxiv.org/abs/1805.04699.
+Hangrui Hu, Xinfa Zhu, Ting He, Dake Guo, Bin Zhang, Xiong Wang, Zhifang Guo, Ziyue Jiang,
+Hongkun Hao, Zishan Guo, Xinyu Zhang, Pei Zhang, Baosong Yang, Jin Xu, Jingren Zhou, and
+Junyang Lin. Qwen3-TTS Technical Report. arXiv preprint arXiv:2601.15621, 2026. URL
+https://arxiv.org/abs/2601.15621.
+Rongjie Huang, Mingze Li, Dongchao Yang, Jiatong Shi, Xuankai Chang, Zhenhui Ye, Yuning Wu,
+Zhiqing Hong, Jiawei Huang, Jinglin Liu, Yi Ren, Zhou Zhao, and Shinji Watanabe. Audio-
+GPT: Understanding and Generating Speech, Music, Sound, and Talking Head. arXiv preprint
+arXiv:2304.12995, 2023. URL https://arxiv.org/abs/2304.12995.
+Dhruv Jain, Harshit Shukla, Gautam Rajeev, Ashish Kulkarni, Chandra Khatri, and Shubham
+Agarwal.
+Voiceagentbench: Are voice assistants ready for agentic tasks?
+arXiv preprint
+arXiv:2510.07978, 2025.
+James Kennedy, Severin Lemaignan, Caroline Montassier, Pauline Lavalade, Bahar Irfan, Fo-
+tios Papadopoulos, Emmanuel Senft, and Tony Belpaeme. Children speech recording (english,
+spontaneous speech + pre-defined sentences).
+Human-Robot Interaction (HRI), 2016.
+URL
+https://doi.org/10.5281/zenodo.200495.
+Allison Koenecke, Anna Seo Gyeong Choi, Katelyn X. Mei, Hilke Schellmann, and Mona Sloane.
+Careless Whisper: Speech-to-Text Hallucination Harms. In Proceedings of the 2024 ACM Con-
+ference on Fairness, Accountability, and Transparency, 2024.
+12
+Alkis Koudounas, Moreno La Quatra, Manuel Giollo, Sabato Marco Siniscalchi, and Elena Baralis.
+Hallucination Benchmark for Speech Foundation Models. In Proceedings of Interspeech, 2025.
+URL https://arxiv.org/abs/2510.16567. Under review.
+Chun-Yi. Kuan and Hung-yi Lee. Can Large Audio-Language Models Truly Hear? Tackling Hallu-
+cinations with Multi-Task Assessment and Stepwise Audio Reasoning. In Proceedings of ICASSP,
+2024. URL https://arxiv.org/abs/2410.16130.
+Weiqin Li, Peiji Yang, Yicheng Zhong, Yixuan Zhou, Zhisheng Wang, Zhiyong Wu, Xixin Wu, and
+Helen Meng. Spontaneous style text-to-speech synthesis with controllable spontaneous behaviors
+based on language models. arXiv preprint arXiv:2407.13509, 2024.
+Xinjian Li, Shinnosuke Takamichi, Takaaki Saeki, William Chen, Sayaka Shiota, and Shinji Watan-
+abe. Yodas: Youtube-Oriented Dataset for Audio and Speech. In IEEE Automatic Speech Recog-
+nition and Understanding Workshop (ASRU), 2023.
+Huan Liao, Qinke Ni, Yuancheng Wang, Yiheng Lu, Haoyue Zhan, Pengyuan Xie, Qiang Zhang, and
+Zhizheng Wu. Nvspeech: An integrated and scalable pipeline for human-like speech modeling
+with paralinguistic vocalizations. arXiv preprint arXiv:2508.04195, 2025.
+Heyang Liu, Yuhao Wang, Ziyang Cheng, Ronghua Wu, Qunshan Gu, Yanfeng Wang, and Yu Wang.
+VocalBench: Benchmarking the Vocal Conversational Abilities for Speech Interaction Models.
+arXiv preprint arXiv:2505.15727, 2025a.
+Hongcheng Liu, Yixuan Hou, Heyang Liu, Yuhao Wang, Yanfeng Wang, and Yu Wang. VocalBench-
+DF: A Benchmark for Evaluating Speech LLM Robustness to Disfluency.
+arXiv preprint
+arXiv:2510.15406, 2025b.
+MagicData.
+ASR-KCSC: A Korean Conversational Speech Corpus, 2024.
+URL https://
+magichub.com/datasets/korean-conversational-speech-corpus/.
+MagicData. Japanese Duplex Conversation Training Dataset, 2025. URL https://magichub.
+com/datasets/japanese-duplex-conversation-training-dataset/.
+OpenAI,
+2025a.
+URL
+https://openai.com/index/
+introducing-our-next-generation-audio-models/.
+OpenAI. GPT-Realtime: Low-Latency Speech-to-Speech Models, 2025b. Technical report.
+Vassil Panayotov, Guoguo Chen, Daniel Povey, and Sanjeev Khudanpur. LibriSpeech: An ASR
+Corpus Based on Public Domain Audio Books. In Proceedings of ICASSP, 2015. URL https:
+//ieeexplore.ieee.org/document/7178964.
+Vineel Pratap, Qiantong Xu, Anuroop Sriram, Gabriel Synnaeve, and Ronan Collobert. MLS: A
+Large-Scale Multilingual Dataset for Speech Research. In Proceedings of Interspeech, 2020.
+URL https://arxiv.org/abs/2012.03411.
+Vineel Pratap, Andros Tjandra, Bowen Shi, Paden Tomasello, Arun Babu, Sayani Kundu, Ali
+Elkahky, Zhaoheng Ni, Apoorv Vyas, Maryam Fazel-Zarandi, Alexei Baevski, Yossi Adi, Xi-
+aohui Zhang, Wei-Ning Hsu, Alexis Conneau, and Michael Auli. Scaling Speech Technology to
+1,000+ Languages. arXiv preprint arXiv:2305.13516, 2023.
+Alec Radford, Jong Wook Kim, Tao Xu, Greg Brockman, Christine McLeavey, and Ilya Sutskever.
+Robust Speech Recognition via Large-Scale Weak Supervision. arXiv preprint arXiv:2212.04356,
+2022.
+Rajarshi Roy, Jonathan Raiman, Sang-gil Lee, Teodor-Dumitru Ene, Robert Kirby, Sungwon Kim,
+Jaehyeon Kim, and Bryan Catanzaro. PersonaPlex: Voice and Role Control for Full Duplex Con-
+versational Speech Models. 2026. URL https://github.com/NVIDIA/personaplex.
+13
+Paul K. Rubenstein, Chulayuth Asawaroengchai, Duc Dung Nguyen, Ankur Bapna, Zal´an Bor-
+sos, F´elix de Chaumont Quitry, Peter Chen, Dalia El Badawy, Wei Han, Eugene Kharitonov,
+Hannah Muckenhirn, Dirk Padfield, James Qin, Danny Rozenberg, Tara Sainath, Johan Schalk-
+wyk, Matt Sharifi, Michelle Tadmor Ramanovich, Marco Tagliasacchi, Alexandru Tudor, Mi-
+hajlo Velimirovi´c, Damien Vincent, Jiahui Yu, Yongqiang Wang, Vicky Zayats, Neil Zeghi-
+dour, Yu Zhang, Zhishuai Zhang, Lukas Zilka, and Christian Frank.
+AudioPaLM: A Large
+Language Model That Can Speak and Listen. arXiv preprint arXiv:2306.12925, 2023. URL
+https://arxiv.org/abs/2306.12925.
+S Sakshi, Utkarsh Tyagi, Sonal Kumar, Ashish Seth, Ramaneswaran Selvakumar, Oriol Nieto, Ra-
+mani Duraiswami, Sreyan Ghosh, and Dinesh Manocha. MMAU: A Massive Multi-Task Au-
+dio Understanding and Reasoning Benchmark. arXiv preprint arXiv:2410.19168, 2024. URL
+https://arxiv.org/abs/2410.19168.
+Robin Scheibler, Eric Bezzam, and Ivan Dokmani´c. Pyroomacoustics: A Python Package for Audio
+Room Simulation and Array Processing Algorithms. In 2018 IEEE International Conference on
+Acoustics, Speech and Signal Processing (ICASSP), pp. 351–355, 2018. doi: 10.1109/ICASSP.
+2018.8461310.
+Muhammad A Shah, David Solans Noguero, Mikko A Heikkila, Bhiksha Raj, and Nicolas Kourtel-
+lis.
+Speech robust bench: A robustness benchmark for speech recognition.
+arXiv preprint
+arXiv:2403.07937, 2024.
+Qundong Shi, Jie Zhou, Biyuan Lin, Junbo Cui, Guoyang Zeng, Yixuan Zhou, Ziyang Wang, Xin
+Liu, Zhen Luo, Yudong Wang, and Zhiyuan Liu. UltraEval-Audio: A Unified Framework for
+Comprehensive Evaluation of Audio Foundation Models. arXiv preprint arXiv:2601.01373, 2026.
+Yemin Shi, Yu Shu, Siwei Dong, Guangyi Liu, Jaward Sesay, Jingwen Li, and Zhiting Hu. Voila:
+Voice-language foundation models for real-time autonomous interaction and voice role-play.
+arXiv preprint arXiv:2505.02707, 2025.
+Changli Tang, Wenyi Yu, Guangzhi Sun, Xianzhao Chen, Tian Tan, Wei Li, Lu Lu, Zejun Ma, and
+Chao Zhang. SALMONN: Towards Generic Hearing Abilities for Large Language Models. In
+Proceedings of ICLR, 2024. URL https://arxiv.org/abs/2310.13289.
+TomRoma.
+Child Speech dataset Whisper.
+https://huggingface.co/datasets/
+TomRoma/Child_Speech_dataset_Whisper, 2024. Accessed: 2026-01-23.
+Bin Wang, Xunlong Zou, Geyu Lin, Shuo Sun, Zhuohan Liu, Wenyu Zhang, Zhengyuan Liu, AiTi
+Aw, and Nancy F. Chen. Audiobench: A universal benchmark for audio large language models.
+In Proceedings of the 2025 Conference of the Nations of the Americas Chapter of the Associa-
+tion for Computational Linguistics: Human Language Technologies (NAACL), pp. 4297–4316.
+Association for Computational Linguistics, 2025a.
+He Wang, Linhan Ma, Dake Guo, Xiong Wang, Lei Xie, Jin Xu, and Junyang Lin. Contextasr-
+bench: A massive contextual speech recognition benchmark. arXiv preprint arXiv:2507.05727,
+2025b.
+Wenbin Wang, Yang Song, and Sanjay Jha. Globe: A high-quality english corpus with global accents
+for zero-shot speaker adaptive text-to-speech, 2024.
+Yingzhi Wang, Anas Alhmoud, Saad Alsahly, Muhammad Alqurishi, and Mirco Ravanelli. Calm-
+Whisper: Reduce Whisper Hallucination On Non-Speech By Calming Crazy Heads Down. In
+Interspeech 2025, pp. 3414–3418, 2025c. doi: 10.21437/Interspeech.2025-201.
+Boyong Wu, Chao Yan, Chen Hu, Cheng Yi, Chengli Feng, Fei Tian, Feiyu Shen, Gang Yu, Haoyang
+Zhang, Jingbei Li, Mingrui Chen, Peng Liu, Wang You, Xiangyu Tony Zhang, Xingyuan Li,
+Xuerui Yang, Yayue Deng, Yechang Huang, Yuxin Li, Yuxin Zhang, Zhao You, Brian Li, Changyi
+Wan, Hanpeng Hu, Jiangjie Zhen, Siyu Chen, Song Yuan, Xuelin Zhang, Yimin Jiang, Yu Zhou,
+Yuxiang Yang, Bingxin Li, Buyun Ma, Changhe Song, Dongqing Pang, Guoqiang Hu, Haiyang
+Sun, Kang An, Na Wang, Shuli Gao, Wei Ji, Wen Li, Wen Sun, Xuan Wen, Yong Ren, Yuankai
+Ma, Yufan Lu, Bin Wang, Bo Li, Changxin Miao, Che Liu, Chen Xu, Dapeng Shi, Dingyuan Hu,
+14
+Donghang Wu, Enle Liu, Guanzhe Huang, Gulin Yan, Han Zhang, Hao Nie, Haonan Jia, Hongyu
+Zhou, Jianjian Sun, Jiaoren Wu, Jie Wu, Jie Yang, Jin Yang, Junzhe Lin, Kaixiang Li, Lei Yang,
+Liying Shi, Li Zhou, Longlong Gu, Ming Li, Mingliang Li, Mingxiao Li, Nan Wu, Qi Han,
+Qinyuan Tan, Shaoliang Pang, Shengjie Fan, Siqi Liu, Tiancheng Cao, Wanying Lu, Wenqing
+He, Wuxun Xie, Xu Zhao, Xueqi Li, Yanbo Yu, Yang Yang, Yi Liu, Yifan Lu, Yilei Wang,
+Yuanhao Ding, Yuanwei Liang, Yuanwei Lu, Yuchu Luo, Yuhe Yin, Yumeng Zhan, Yuxiang
+Zhang, Zidong Yang, Zixin Zhang, Binxing Jiao, Daxin Jiang, Heung-Yeung Shum, Jiansheng
+Chen, Jing Li, Xiangyu Zhang, and Yibo Zhu. Step-Audio 2 Technical Report, 2025. URL
+https://arxiv.org/abs/2507.16632.
+Peng Xie, Xingyuan Liu, Tsz Wai Chan, Yequan Bie, Yangqiu Song, Yang Wang, Hao Chen, and
+Kani Chen. SwitchLingua: The First Large-Scale Multilingual and Multi-Ethnic Code-Switching
+Dataset. arXiv preprint arXiv:2506.00087, 2025.
+Wayne Xiong, Jasha Droppo, Xuedong Huang, Frank Seide, Michael L. Seltzer, Andreas Stolcke,
+Dong Yu, and Geoffrey Zweig. Toward Human Parity in Conversational Speech Recognition.
+IEEE/ACM Transactions on Audio, Speech, and Language Processing, 2017.
+Pengyu Xu, Shijia Li, Ao Sun, Feng Zhang, Yahan Li, Bo Wu, Zhanyu Ma, Jiguo Li, Jun Xu,
+Jiuchong Gao, et al. Voiceagenteval: A dual-dimensional benchmark for expert-level intelligent
+voice-agent evaluation of xbench’s professional-aligned series. arXiv preprint arXiv:2510.21244,
+2025.
+Aohan Zeng, Zhengxiao Du, Mingdao Liu, Kedong Wang, Shengmin Jiang, Lei Zhao, Yuxiao Dong,
+and Jie Tang. Glm-4-voice: Towards intelligent and human-like end-to-end spoken chatbot. arXiv
+preprint arXiv:2412.02612, 2024.
+Jian Zhang, Linhao Zhang, Bokai Lei, Chuhan Wu, Wei Jia, and Xiao Zhou. WildSpeech-Bench:
+Benchmarking Audio LLMs in Natural Speech Conversation. arXiv preprint arXiv:2506.21875,
+2025.
+Jiawei Zhang, Tianyu Pang, Chao Du, Yi Ren, Bo Li, and Min Lin. Benchmarking large multimodal
+models against common corruptions. arXiv preprint arXiv:2401.11943, 2024.
+Yu Zhang, James Qin, Daniel S. Park, Wei Han, Chung-Cheng Chiu, Ruoming Pang, Quoc V.
+Le, and Yonghui Wu. Pushing the Limits of Semi-Supervised Learning for Automatic Speech
+Recognition. arXiv preprint arXiv:2010.10504, 2020.
+Jiaming Zhou, Shiyao Wang, Shiwan Zhao, Jiabei He, Haoqin Sun, Hui Wang, Cheng Liu, Aobo
+Kong, Yujie Guo, and Yong Qin. ChildMandarin: A Comprehensive Mandarin Speech Dataset
+for Young Children Aged 3-5. arXiv preprint arXiv:2409.18584, 2024.
+Zhitong Zhou, Qingqing Zhang, Lei Luo, Jiechen Liu, and Ruohua Zhou.
+Open-Source Full-
+Duplex Conversational Datasets for Natural and Interactive Speech Synthesis. arXiv preprint
+arXiv:2509.04093, 2025.
+15
+A
+UNIFIED INFERENCE PROTOCOL
+All systems are evaluated under a unified inference protocol unless specified otherwise. We evaluate
+each model on all subsets listed in Table 1, and report performance independently for each factor.
+We report corpus-level WER for English (EN) and CER for Chinese/Japanese/Korean (ZH/JA/KO).
+For the code-switching subset, we report Mixed Error Rate (MER): each transcript is tokenized
+into a mixed sequence where Latin/English spans are word-tokenized (after normalization) and CJK
+scripts are character-tokenized, and we compute WER over the mixed token stream at the corpus
+level. Hyperparameter settings can be seen in Table5.
+Inference setting
+Value
+Temperature
+0.2
+Top-p
+0.9
+Max new tokens
+2048
+Language conditioning
+Prompt ({language name}) and/or SDK language code
+Table 5: Unified inference setting for ASR benchmarking. Audio inputs are resampled to 16kHz.
+The default instruction is: ‘Please transcribe the audio in {language name}.
+Do not add any additional text that is not in the speech content.’
+B
+ACCENT DISTRIBUTION
+The accent distribution in WildASR is visualized in Figure 5. For English (Figure 5 left), the dataset
+encompasses a diverse range of accents including Canadian (12.4%), Australian (12.1%), German
+(11.5%), etc. This distribution ensures comprehensive coverage of non-native English accents. For
+Chinese (Figure 5 right), the dataset focuses on regional Mandarin varieties with representation from
+Zhongyuan (29.6%), Ji Lu (21.9%), Jiang Huai (20.3%), etc, capturing the phonological diversity
+across different Mandarin-speaking regions while maintaining mutual intelligibility.
+12.4%
+12.1%
+11.5%
+9.8%
+9.6%
+9.5%
+8.9%
+8.2%
+7.7%
+4.7%
+5.6%
+Canadian
+Australian
+German
+NewZealand
+SouthAsia
+US
+Filipino
+England
+Irish
+Scottish
+Other
+29.6%
+21.9%
+20.3%
+14.3%
+11.6%
+2.3%
+Zhongyuan
+Ji-Lu
+Jiang-Huai
+Mandarin
+Jiao-Liao
+Other
+Figure 5: Accent Distribution in WildASR. Left: English. Right: Chinese.
+C
+CURATION PIPELINE DETAILS
+We describe each stage of the curation pipeline introduced in §3.1:
+DC (Data Collection). We source raw audio from publicly available speech corpora with verified
+transcripts across our target languages. Source datasets for each subcategory are listed in Table 6.
+SF (Speaker Filtering). For demographic subsets, we verify speaker metadata (age, accent, native
+language) against dataset annotations and discard samples with ambiguous or missing labels. For
+older adults, we filter to select samples where age-related acoustic degradation is the dominant
+feature, minimizing confounding factors such as dialect variation.
+16
+QF (Quality Filtering). We discard unintelligible or corrupted recordings and remove samples with
+poor signal-to-noise ratios. For children speech, we perform rigorous filtering to exclude low-SNR
+samples. For code-switching, we remove samples without substantive multilingual mixing.
+NR (Audio Normalization). All audio is resampled to 16 kHz mono with loudness normalization
+to ensure consistent input conditions across sources.
+AA (Acoustic Augmentation). For the environmental degradation subset, we apply five controlled,
+transcript-preserving perturbations (reverberation, far-field, phone codec, noise gap, clipping) at
+multiple calibrated severity levels, as detailed in §3.2.
+MT (Manual Truncation & Transcript Alignment). For incomplete audio, we manually edit
+waveforms to truncate speech mid-sentence or mid-word, and use the truncated transcript as the
+ground truth, as described in §3.4.
+MV (Manual Verification). We manually validate transcript correctness across all subsets. For
+children and older adult speech, transcripts are manually reviewed for accuracy.
+D
+DATA SOURCES
+Table 6 lists the source datasets used for each subcategory of WildASR.
+Table 6: Source datasets for each WildASR subcategory.
+Subcategory
+Sources
+Environmental degradation
+FLEURS, MagicData
+Children
+Zenodo, Child Speech, ChildMandarin
+Older adults
+GLOBE V3, seniortalk
+Accent
+GLOBE V2, KeSpeech
+Short utterances
+YODAS
+Incomplete audio
+YODAS
+Code-switching
+SwitchLingua
+E
+PROMPT SENSITIVITY
+We run prompt-sensitivity experiments in two languages (English and Chinese) using Gemini 2.5
+Pro to measure how much the model’s transcripts change when the instruction wording changes.
+We evaluate on demographic slices (Accent, Children, Older Adult). For fairness, we express the
+same transcription request using 10 paraphrased prompt variants in each language. For each audio
+sample, we test all 10 variants in the sample’s original language. The English prompt variants are
+shown in Table 7.
+F
+QUALITATIVE FAILURE PATTERNS
+Table 8 shows representative errors made by different models on the English subset, across several
+dataset slices. We highlight the incorrect parts of the model prediction in bold. We observe several
+recurring failure types:
+• Non-transcription outputs (e.g., producing tokens such as [noise] instead of words)
+• Full hallucinations (e.g., “ah yeah” →“I’m with breast”; “who identified” →“I don’t
+know if I can.”)
+• Auto-Completion beyond the audio (e.g., continuing “so Putin took the” with invented
+content)
+• Refusals (e.g., responding with apologies or capability disclaimers instead of transcribing)
+• Phonetically similar substitutions(e.g. ‘searching” →“shouting”)
+17
+Table 7: English prompt variants used for prompt-sensitivity evaluation. All prompts share
+the same intent—transcribe the audio into {english} and output only the transcript—but differ in
+wording and style.
+ID
+English prompt variant
+p01
+English transcription only. Return the spoken words as text—nothing else.
+p02
+Task: produce a verbatim english transcript of the audio. Output transcript text only; omit all other
+content.
+p03
+Perform speech-to-text for this audio in english. Respond with plain transcript text only (no labels or
+commentary).
+p04
+Please write the english transcript of what you hear. Reply with only the transcription.
+p05
+Create the most faithful english transcript possible. Output ONLY the transcript (no summaries, notes,
+or formatting).
+p06
+In english, transcribe the audio. Provide only the transcript.
+p07
+You are an ASR engine. Emit the english transcript as raw text only; do not add headers, punctuation
+notes, or extra lines.
+p08
+Return exactly one thing: the english transcription of the audio. No preamble, no JSON, no quotes—
+just the transcript.
+p09
+Write the spoken content as a english transcript. Do not include timestamps, speaker tags, explanations,
+or any non-transcript text.
+p10
+Provide the english transcript of the audio. Your entire response should be the transcript text and nothing
+more.
+Reporting these qualitative errors is important because it reveals failure modes that are not well
+captured by WER/CER. These errors can be semantically plausible yet not present in the audio,
+which can introduce significant risks for downstream systems that rely on accurate transcripts.
+Table 8: Representative English failure cases from WildASR. Rows are grouped by OOD dimen-
+sion. We highlight the erroneous or safety-relevant portion in bold
+Subset
+Ground Truth
+Model Prediction
+Environmental degradation
+Noise gap
+“a car bomb detonated at police headquar-
+ters in gaziantep turkey yesterday morn-
+ing killed two police officers and injured
+more than twenty other people”
+“a car bomb detonated at police headquar-
+ters in geyve tepe turkey yesterday morn-
+ing killing two police officers and injuring
+more than a hundred other people”
+phone codec
+“the center of tibetan meditation is the
+deity yoga through the visualization of
+various deities the energy channels are
+cleaned the chakras are activated and the
+enlightenment consciousness is created”
+“[noise] [sigh] [sigh] [sigh]
+[sigh] [sigh] [sigh] [sigh]
+. . . ”
+clipping
+“ah yeah.”
+“I’m with breast.”
+Demographic shift
+child
+“he was searching for him everywhere”
+“they were shouting for him every-
+where”
+Linguistic diversity
+incomplete audio
+“who identified”
+“I don’t know if I can.”
+short utterance
+“Yeah”
+“I’m sorry, but I cannot listen to audio
+files. I can only process and generate text
+. . . ”
+short utterance
+“so Putin took the”
+“So Putin took the measure of the West
+and he decided that he could handle
+whatever we threw at him.”
+18
+G
+DETAILED PER-MODEL RESULTS
+This appendix provides full per-model results for each subset and language, complementing the
+aggregated tables in the main text.
+Table 9: Nova 2 — Environmental degradation on FLEURS. ∆: absolute change relative to original.
+Augmentation
+ZH
+EN
+JA
+KO
+Perturbation
+Method
+CER (%)
+∆
+WER (%)
+∆
+CER (%)
+∆
+CER (%)
+∆
+Original
+–
+10.1
+–
+6.0
+–
+7.0
+–
+6.5
+–
+Clipping
+–
+42.6
++32.5
+60.4
++54.4
+32.0
++25.0
+51.9
++45.4
+Far-field
+–
+25.6
++15.5
+71.0
++65.0
+19.5
++12.5
+45.9
++39.4
+Phone
+G.711
+12.6
++2.5
+6.6
++0.6
+8.8
++1.8
+6.6
++0.1
+GSM
+14.5
++4.4
+7.9
++1.9
+11.6
++4.6
+7.7
++1.2
+Noise gap
+–
+16.8
++6.7
+8.2
++2.2
+11.9
++4.9
+10.7
++4.2
+Reverberation
+–
+23.3
++13.2
+31.0
++24.9
+17.1
++10.1
+30.8
++24.3
+Table 10: Gemini 2.5 Pro — Environmental degradation on FLEURS. ∆: absolute change relative
+to original.
+Augmentation
+ZH
+EN
+JA
+KO
+Perturbation
+Method
+CER (%)
+∆
+WER (%)
+∆
+CER (%)
+∆
+CER (%)
+∆
+Original
+–
+6.7
+–
+3.6
+–
+2.7
+–
+4.0
+–
+Clipping
+–
+13.6
++6.9
+7.9
++4.3
+6.3
++3.6
+7.4
++3.4
+Far-field
+–
+9.6
++2.9
+6.5
++2.9
+4.2
++1.5
+4.5
++0.6
+Phone
+G.711
+7.0
++0.3
+3.5
+-0.1
+3.2
++0.5
+4.0
++0.0
+GSM
+7.9
++1.2
+4.2
++0.6
+5.4
++2.7
+4.1
++0.1
+Noise gap
+–
+8.2
++1.5
+4.2
++0.6
+3.5
++0.8
+4.4
++0.4
+Reverberation
+–
+9.2
++2.5
+4.7
++1.1
+6.4
++3.7
+5.2
++1.2
+Table 11: Gemini 3 Pro — Environmental degradation on FLEURS. ∆: absolute change relative to
+original.
+Augmentation
+ZH
+EN
+JA
+KO
+Perturbation
+Method
+CER (%)
+∆
+WER (%)
+∆
+CER (%)
+∆
+CER (%)
+∆
+Original
+–
+6.1
+–
+2.8
+–
+2.7
+–
+3.8
+–
+Clipping
+–
+10.8
++4.8
+5.7
++2.9
+5.8
++3.1
+5.4
++1.6
+Far-field
+–
+7.7
++1.6
+5.1
++2.3
+3.7
++1.1
+4.4
++0.6
+Phone
+G.711
+6.2
++0.1
+2.9
++0.1
+2.8
++0.2
+3.8
++0.0
+GSM
+6.8
++0.8
+3.5
++0.6
+4.2
++1.6
+3.8
++0.1
+Noise gap
+–
+11.9
++5.9
+3.1
++0.3
+6.6
++4.0
+4.2
++0.5
+Reverberation
+–
+7.9
++1.9
+4.1
++1.2
+5.6
++2.9
+4.9
++1.1
+19
+Table 12: GPT-4o Transcribe — Environmental degradation on FLEURS. ∆: absolute change
+relative to original.
+Augmentation
+ZH
+EN
+JA
+KO
+Perturbation
+Method
+CER (%)
+∆
+WER (%)
+∆
+CER (%)
+∆
+CER (%)
+∆
+Original
+–
+6.4
+–
+2.8
+–
+3.0
+–
+4.0
+–
+Clipping
+–
+17.4
++11.0
+8.8
++5.9
+7.9
++4.9
+10.2
++6.2
+Far-field
+–
+8.3
++1.9
+7.5
++4.7
+5.5
++2.5
+5.1
++1.1
+Phone
+G.711
+6.7
++0.3
+2.9
++0.0
+3.7
++0.7
+4.0
++0.1
+GSM
+7.3
++0.9
+3.1
++0.3
+5.8
++2.8
+4.3
++0.3
+Noise gap
+–
+7.6
++1.2
+4.5
++1.6
+4.5
++1.5
+4.9
++0.9
+Reverberation
+–
+10.0
++3.6
+5.1
++2.3
+9.7
++6.7
+6.3
++2.4
+Table 13: Qwen2-Audio — Environmental degradation on FLEURS. ∆: absolute change relative
+to original.
+Augmentation
+ZH
+EN
+JA
+KO
+Perturbation
+Method
+CER (%)
+∆
+WER (%)
+∆
+CER (%)
+∆
+CER (%)
+∆
+Original
+–
+9.1
+–
+5.8
+–
+10.9
+–
+12.7
+–
+Clipping
+–
+11.6
++2.5
+12.6
++6.8
+19.6
++8.7
+35.8
++23.1
+Far-field
+–
+10.1
++1.0
+8.9
++4.1
+40.2
++29.3
+57.0
++44.3
+Phone
+G.711
+8.8
+-0.3
+48.3
++42.5
+15.3
++4.4
+30.9
++18.2
+GSM
+9.4
++0.3
+8.8
++3.0
+30.4
++29.5
+23.3
++10.6
+Noise gap
+–
+16.6
++7.5
+9.8
++4.0
+20.7
++9.8
+40.0
++27.3
+Reverberation
+–
+11.1
++2.0
+9.5
++3.7
+46.2
++35.3
+44.1
++21.4
+Table 14: Scribe V1 — Environmental degradation on FLEURS. ∆: absolute change relative to
+original.
+Augmentation
+ZH
+EN
+JA
+KO
+Perturbation
+Method
+CER (%)
+∆
+WER (%)
+∆
+CER (%)
+∆
+CER (%)
+∆
+Original
+–
+8.7
+–
+3.6
+–
+4.8
+–
+5.6
+–
+Clipping
+–
+15.7
++7.1
+5.6
++2.0
+15.9
++11.1
+9.6
++4.1
+Far-field
+–
+14.0
++5.4
+5.5
++1.9
+14.5
++9.7
+10.6
++5.1
+Phone
+G.711
+11.0
++2.4
+4.2
++0.6
+8.0
++3.2
+6.4
++0.8
+GSM
+11.5
++2.8
+4.3
++0.7
+10.1
++5.3
+6.9
++1.3
+Noise gap
+–
+20.3
++11.6
+11.3
++7.7
+14.8
++10.0
+17.8
++12.3
+Reverberation
+–
+16.5
++7.8
+5.1
++1.5
+14.7
++9.9
+9.9
++4.4
+Table 15: Whisper Large V3 — Environmental degradation on FLEURS. ∆: absolute change
+relative to original.
+Augmentation
+ZH
+EN
+JA
+KO
+Perturbation
+Method
+CER (%)
+∆
+WER (%)
+∆
+CER (%)
+∆
+CER (%)
+∆
+Original
+–
+7.5
+–
+4.2
+–
+4.6
+–
+5.0
+–
+Clipping
+–
+13.5
++5.9
+8.5
++4.3
+7.5
++3.0
+9.0
++4.0
+Far-field
+–
+10.8
++3.3
+6.3
++2.0
+6.6
++2.1
+6.1
++1.1
+Phone
+G.711
+7.8
++0.3
+4.8
++0.6
+5.0
++0.5
+5.9
++0.9
+GSM
+8.7
++1.1
+4.9
++0.7
+5.6
++1.1
+5.2
++0.3
+Noise gap
+–
+10.8
++3.3
+5.5
++1.3
+8.3
++3.8
+7.1
++2.2
+Reverberation
+–
+13.1
++5.5
+6.8
++2.6
+9.0
++4.5
+7.1
++2.2
+20

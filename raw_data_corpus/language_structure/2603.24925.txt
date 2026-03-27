@@ -1,0 +1,1094 @@
+Preprint. Under review.
+GraphER: An Efficient Graph-Based Enrichment and Rerank-
+ing Method for Retrieval-Augmented Generation
+Ruizhong Miao, Yuying Wang, Rongguang Wang, Chenyang Li,
+Tao Sheng, Sujith Ravi, Dan Roth
+Oracle AI
+Correspondence: ruizhong.miao@oracle.com
+Abstract
+Semantic search in retrieval-augmented generation (RAG) systems is of-
+ten insufficient for complex information needs, particularly when relevant
+evidence is scattered across multiple sources. Prior approaches to this
+problem include agentic retrieval strategies, which expand the semantic
+search space by generating additional queries. However, these methods do
+not fully leverage the organizational structure of the data and instead rely
+on iterative exploration, which can lead to inefficient retrieval. Another
+class of approaches employs knowledge graphs to model non-semantic
+relationships through graph edges. Although effective in capturing richer
+proximities, such methods incur significant maintenance costs and are often
+incompatible with the vector stores used in most production systems. To
+address these limitations, we propose GraphER, a graph-based enrichment
+and reranking method that captures multiple forms of proximity beyond
+semantic similarity. GraphER independently enriches data objects dur-
+ing offline indexing and performs graph-based reranking over candidate
+objects at query time. This design does not require a knowledge graph,
+allowing GraphER to integrate seamlessly with standard vector stores. In
+addition, GraphER is retriever-agnostic and introduces negligible latency
+overhead. Experiments on multiple retrieval benchmarks demonstrate the
+effectiveness of the proposed approach.
+1
+Introduction
+In retrieval-augmented generation (RAG; Lewis et al., 2020; Yasunaga et al., 2023) systems,
+ensuring the complete retrieval of all relevant information is often the primary bottleneck
+affecting the quality of the generated responses. Modern neural retrieval methods estimate
+query-document relevance based on semantic proximity. For instance, embedding-based
+bi-encoders and cross-encoders map queries and documents into vector representations
+that capture their semantic meaning, enabling the calculation of closeness in the embedding
+space. Despite their simplicity and scalability, these encoder models often struggle with
+complex queries that require integrating information from multiple sources. This limita-
+tion arises for two main reasons: (1) they function as point-wise rankers, estimating the
+relevance of each query-document pair in isolation without considering the relationships
+among candidate documents; and (2) semantic proximity alone may not fully capture the
+organizational structure of the data within the retrieval corpus.
+Consider the example of table retrieval for SQL generation shown in Figure 1. To generate
+an executable and accurate SQL command, the instruction provided to the generation
+model needs to include all relevant table and column names. In this example, three tables
+- Customers, Orders, and Stores - must be retrieved. The baseline approach, which uses
+semantic search alone, ranks the Stores and Orders tables highly due to their semantic
+proximity to the question. The Customers table is ranked lower and does not appear in the
+top-5 results. This occurs because the Customers table, despite being integral to generating
+the correct SQL command, is semantically distant from the question. Furthermore, its
+1
+arXiv:2603.24925v1  [cs.LG]  26 Mar 2026
+Preprint. Under review.
+Customers
+id
+first_name
+last_name
+Orders
+id
+cust_id
+store_id
+order_time
+Stores
+id
+address
+category
+Question: List all the addresses of
+the stores where John Smith has
+previously visited.
+SQL command:
+SELECT DISTINCT s.address
+FROM Customers c
+JOIN Orders o ON c.id = o.cust_id
+JOIN Stores s ON o.store_id = s.id
+WHERE c.first_name = 'John'
+  AND c.last_name = 'Smith';
+Products
+id
+product_name
+price
+factory_id
+Inventory
+id
+store_id
+product_id
+product_inventory
+Factory
+id
+address
+Shipments
+id
+cust_id
+order_id
+shipment_address
+delivery_status
+Retrieval Corpus
+Baseline:
+1. Stores
+2. Orders
+3. Shipments
+4. Inventory
+5. Factory
+Search
+Top-5 Retrieval Results
+GraphER:
+1. Stores
+2. Orders
+3. Shipments
+4. Customers
+5. Inventory
+Return
+RAG
+Figure 1: Example of RAG for SQL Generation: The baseline uses semantic search alone
+and yields search results in which the Stores and Orders tables are ranked highly due to
+their semantic proximity to the question, while the Customers table does not appear among
+the top-5 results. In contrast, GraphER reranks the candidate tables to produce a ranked list
+whose top-5 results include all relevant tables.
+foreign-key relationship with the Orders table, which indicates that the two tables are
+frequently used together, is not captured by semantic search.
+These observations motivate retrieval methods that consider not only semantic proximity
+between query–document pairs but also relationships among candidate documents. Such
+relationships encode forms of proximity beyond the embedding space and are missed by
+standard semantic retrievers. Incorporating them into the retrieval process enables more
+complete coverage of relevant information.
+A number of related methods have been proposed in the field to improve retrieval complete-
+ness in RAG. For instance, agentic retrieval methods tackle complex queries through large
+language model (LLM) reasoning and iterative retrieval (Yao et al., 2022; Khot et al., 2023;
+Zhou et al., 2023; Trivedi et al., 2023; Asai et al., 2024). These methods use an LLM-based
+agent that reasons about actions, specifically search queries, based on current observations.
+Each query expands the agent’s search in the embedding space and returns new documents.
+The iteration continues until the agent determines it has gathered sufficient information
+to answer the question. The agentic approach is well-suited for retrieving information
+from external, open-ended environments (e.g., web search), where the data organization is
+largely unknown and users lack control over the indexing process. However, for private or
+enterprise databases where users do have control over the organization of the available data,
+these methods are limited by their inefficiency, since they do not leverage the existing data
+organization and instead conduct unnecessary iterations, resulting in increased inference
+latency and cost.
+Alignment-oriented approaches attempt to jointly reason over content and structure (Chen
+et al., 2025), but often rely on computationally expensive online LLM calls and constrained
+decoding, limiting their practicality in many production settings.
+Another class of methods augments retrieval with additional data structures, such as knowl-
+edge graphs or hierarchical indexes, to capture relationships beyond semantic similarity
+(Sun et al., 2024; Luo et al., 2024; Guti´errez et al., 2024; Guti´errez et al., 2025; Sarthi et al., 2024;
+Sourati et al., 2025). These approaches typically rely on maintaining extra infrastructure
+alongside the base retriever. While effective in their respective settings, such added infras-
+tructure introduces computational and storage overhead, which limits their applicability in
+general-purpose RAG systems.
+2
+Preprint. Under review.
+Data Object 1
+Initial Score = 0.8
+Initial Retrieval, Thresholding, and
+Graph Construction
+Offline Indexing
+Titanic is a 1997 American epic romantic
+disaster film directed, written, co-produced and
+co-edited by James Cameron. Incorporating
+both historical and fictionalized aspects, it is
+based on accounts of the sinking of RMS
+Titanic in 1912. Leonardo DiCaprio and Kate
+Winslet star as members of different social
+classes who fall in love during the ship's
+maiden voyage...
+Titanic is a 1997 American epic romantic
+disaster film directed, written, co-produced and
+co-edited by James Cameron. Incorporating
+both historical and fictionalized aspects, it is
+based on accounts of the sinking of RMS
+Titanic in 1912. Leonardo DiCaprio and Kate
+Winslet star as members of different social
+classes who fall in love during the ship's
+maiden voyage...
+Entities: ["titanic", "1997", "american",
+"james cameron", "rms titanic", "1912",
+"leonardo dicaprio", "kate winslet"]
+Index
+Query
+Index
+Online Retrieval
+Data Object 2
+Initial Score = 0.39
+Data Object 3
+Initial Score = 0.7
+Data Object 4
+Initial Score = 0.36
+Data Object 5
+Initial Score = 0.4
+Data Object 1
+Final Score = 0.8
+Data Object 2
+Final Score = 0.46
+Data Object 3
+Final Score = 0.7
+Data Object 4
+Final Score = 0.48
+Data Object 5
+Final Score = 0.47
+Graph Construction
+...Nolan had been trying to work with Leonardo
+DiCaprio for years and met him several times,
+but was unable to recruit him for any of his
+films until Inception. DiCaprio finally agreed
+because he was "intrigued by this concept—
+this dream-heist notion and how this
+character's going to unlock his dreamworld and
+ultimately affect his real life...
+Entities: ["nolan", "leonardo dicaprio",
+"inception"]
+Titanic is a 1997 American epic romantic
+disaster film directed, written, co-produced and
+co-edited by James Cameron. Incorporating
+both historical and fictionalized aspects, it is
+based on accounts of the sinking of RMS
+Titanic in 1912. Leonardo DiCaprio and Kate
+Winslet star as members of different social
+classes who fall in love during the ship's
+maiden voyage...
+Entities: ["titanic", "1997", "american",
+"james cameron", "rms titanic", "1912",
+"leonardo dicaprio", "kate winslet"]
+"leonardo dicaprio"
+Graph-based Reranking
+Figure 2: During offline indexing, each data item is enriched with metadata that informs
+edge relationships. The data object is then indexed using standard retrieval methods,
+such as vector embedding. In the online retrieval phase, a base retriever first retrieves a
+set of candidate data objects and assigns an initial score to each of them. Next, a graph
+is constructed from these candidate objects based on the enrichments that indicate edge
+existence. Finally, a graph-based ranking algorithm is applied to the constructed graph,
+outputting the final relevance scores for the candidate data objects.
+To address these limitations, we introduce GraphER, a Graph-based Enrichment and
+Reranking method for general-purpose RAG systems. GraphER is capable of incorporating
+various forms of proximity relationships beyond semantic proximity. Additionally, unlike
+knowledge graph-based approaches, GraphER requires no additional infrastructure beyond
+a base retriever, which may be semantic or keyword search. From an efficiency perspective,
+any potential LLM calls in GraphER are confined to the offline phase, while online retrieval
+is LLM-free and incurs minimal query-time latency. Together, these advantages make
+GraphER easy to integrate with most production RAG systems. An example of retrieval
+results produced by GraphER is shown in Figure 1, where GraphER incorporates proximity
+information induced by foreign-key relationships to achieve more complete retrieval of
+relevant tables.
+2
+Methodology
+GraphER consists of two main components: (1) an offline enrichment process that incorpo-
+rates graph information during indexing, and (2) an online graph-based reranking process
+that leverages the enriched graph information to refine the initial search results. Figure 2
+gives an overview of the GraphER methodology. More details on these components are
+provided below.
+2.1
+Offline indexing enriched with graph information
+During offline indexing, we enrich each data object1 with additional fields that capture
+information about its potential graph edges to other data objects. After this enrichment,
+any two data objects can be compared, and a graph edge is drawn between them if they are
+deemed close to each other according to a specific type of proximity relationship. In this
+paper, we focus on the following three types of proximity:
+1The term data object here can refer to either a text passage or a table that has been serialized into
+text format.
+3
+Preprint. Under review.
+Structural proximity: This type of proximity is established through predefined rules, which
+are derived from applying a specific data model or incorporating business logic into the
+graph structure. For instance, when data objects are webpages, two pages are considered
+structurally close, and thus connected by an edge, if one contains a hyperlink to the other.
+Similarly, when working with tables in a relational database, two tables are structurally
+close and connected if they share a foreign-key relationship.
+Conceptual proximity: For this type, we extract a list of named entities from each data
+object’s content using an instruction-tuned LLM. We then append this list as a new field to
+the data object. Two data objects are considered conceptually close if their respective lists of
+named entities overlap.
+Contextual proximity: This type of proximity arises from chunking a long document into
+smaller chunks, which is a common practice in RAG systems. Two adjacent chunks from
+the same document are contextually close, since the later chunk is the direct continuation
+of the previous one. To capture this, we append the unique document ID and chunk ID of
+each chunk to its associated data object. This enables us to link adjacent chunks from the
+same document.
+The enrichment process involves extracting information from each data object independently
+and does not require any pairwise operations between objects. Therefore, a single pass
+through all data objects in the index is sufficient, resulting in linear time complexity with
+respect to the index size. After the enrichment process, data objects are indexed using
+established retrieval methods, such as BM25, vector embedding, or hybrid approaches.
+2.2
+Online graph construction and graph-based reranking
+Our online retrieval process can be described at a high level by the following: initial retrieval
+by the base retriever, results thresholding, graph construction on candidate objects, graph-
+based reranking, and outputting the final ranked list.
+The initial retrieval by the base retriever and results thresholding are standard procedures
+in RAG systems: The base retriever first retrieves the top-n candidate data objects, which
+are then passed to a downstream reranking module. We expect the base retriever to output
+a candidate list, with each data object in the list assigned an initial relevance score.
+Graph construction on candidate objects
+After receiving the top-n candidate objects,
+we construct a graph where each node represents a candidate object, and an edge exists
+between two nodes if their graph information enrichments indicate the presence of an edge,
+as described in Section 2.1. For instance, for two text passages that have both been enriched
+with lists of named entities, an edge exists between them if their respective lists share at
+least one named entity in common.
+Note that the graph here differs from a knowledge graph in two key aspects. Firstly, graph
+construction occurs only for candidate objects during online retrieval, and no knowledge
+graph is maintained in the index. This design enables GraphER to seamlessly integrate with
+standard vector stores. Secondly, unlike a knowledge graph, where nodes represent entities
+and edges represent relationships, in GraphER, a graph node represents a data object, which
+is typically a text string containing multiple entities, and the edges are unlabeled.
+Graph-based ranking algorithms
+We then run graph-based ranking algorithms on the
+constructed graph. Personalized PageRank (PPR) has been used in various RAG systems
+(Guti´errez et al., 2024; Guti´errez et al., 2025; Xu et al., 2026) to rank candidate objects. As a
+comparative graph ranking algorithm, we also include PPR in our experiments. However,
+PPR has a tendency to favor hub nodes, i.e., nodes with a large number of connections to
+other nodes. This occurs even when both the hub node itself and its neighbors have low
+initial scores. This is due to PPR’s random walk mechanism, which causes the hub node to
+be frequently visited and accumulate probability flows from its numerous neighbors. As
+a result, the hub node tends to be ranked highly, regardless of its actual relevance to the
+query.
+4
+Preprint. Under review.
+Algorithm 1 Graph Cohesive Smoothing
+Input: Adjacency matrix A ∈Rn×n with Aij ≥0, seed score vector s ∈Rn, damping
+factor α ∈(0, 1), tolerance ϵ > 0.
+Output: Relevance score vector p ∈Rn
+Definition: Let W be the row-normalized transition matrix, where
+Wij =
+(
+Aij
+∑n
+k=1 Aik
+if Aij > 0
+0
+otherwise.
+initialize p(0) = s, t = 0.
+repeat
+p(t+1) = αs + (1 −α) W p(t)
+Compute residual δ = ∥p(t+1) −p(t)∥1
+t = t + 1
+until δ < ϵ
+return max(p(t), s)
+(element-wise maximum)
+To address this limitation of PPR, we adopt a graph cohesion approach (Li et al., 2019; Le
+& Li, 2022), which assumes that connected nodes in a graph tend to act as a cohesive unit
+and exhibit similar behavior. In this approach, graph effects are often incorporated as a
+smoothing mechanism that regularizes the attributes of connected nodes. Inspired by this
+idea, we propose an iterative algorithm, termed Graph Cohesive Smoothing (GCS), which is
+grounded in the principle of graph cohesion. Details of GCS are described in Algorithm 1.
+Compared to PPR, GCS has two key modifications. Firstly, the transition matrix in GCS is
+row-normalized, whereas in PPR it is column-normalized. This difference in normalization
+leads to different behaviors and interpretations of the transition matrix: In PPR, multiplying
+the column-normalized W and p(t) corresponds to a random walk where score flows out
+of node j and is distributed to its neighbors. In contrast, multiplying the row-normalized
+W and p(t) in GCS means the score of node i is calculated as the weighted average of
+its neighbors’ scores. The second modification in GCS is that it returns the element-wise
+maximum of p(t) and s. This adjustment is necessary because if a hub node has a high initial
+score due to its relevance to the query, averaging its score with those of its neighbors could
+potentially lower its ranking. By taking the maximum value, we ensure that a node’s score
+is at least as high as its initial score.
+Graph attention network ranker
+The ranking of candidate objects can be viewed as a
+node-level prediction task. When the base retriever involves an embedding model, we also
+train a graph attention network (GAT) (Veliˇckovi´c et al., 2018) to leverage the nodal features
+and the graph structure defined on the candidate objects. Specifically, the GAT architecture
+used in our experiments consists of five GATv2 layers (Brody et al., 2022), followed by two
+fully connected layers. For each graph node, the GAT takes as input a feature vector formed
+by concatenating the GCS score, the query embedding, and the data object embedding, and
+outputs a scalar value that serves as the final ranking score for that node.
+3
+Experiments
+3.1
+Experimental Setup
+Datasets
+We evaluate GraphER on three task types, using a number of different datasets
+for each. The three task types are: (1) table retrieval, for which we use the Spider 1.0 (Yu et al.,
+2018), Bird (Li et al., 2023), and Beaver (Chen et al., 2024) datasets; (2) multi-hop QA retrieval,
+for which we use the HotpotQA (Yang et al., 2018), 2WikiMultihopQA (Ho et al., 2020),
+and MuSiQue (Trivedi et al., 2022) datasets. For HotpotQA and 2WikiMultihopQA, we
+randomly sampled 2000 queries from their dev branches and included the corresponding
+passages of the sampled queries as the retrieval corpus. For MuSiQue, we use the entire
+5
+Preprint. Under review.
+musique ans v1.0 dev branch; (3) chunked documents retrieval, for which we use the BEIR-NQ
+(Thakur et al., 2021) dataset. For this dataset, we only keep documents that contain at least
+one chunk identified as a relevant object for one or more queries.
+Each of these three task types corresponds to a specific type of proximity described in Section
+2.1. Specifically, in addition to semantic proximity, we consider structural proximity for
+table retrieval tasks, conceptual proximity for multi-hop QA retrieval tasks, and contextual
+proximity for chunked document retrieval tasks.
+In each of the datasets considered, a significant portion of the queries have more than one
+relevant object for retrieval. The detailed statistics of these datasets are listed in A.2.
+Base retriever
+We use a hybrid search approach as the base retriever, which combines
+semantic embedding and keyword search. For embedding models, we use Llama-Embed-
+Nemotron-8B (Babakhin et al., 2025) and Cohere-Embed-4 (Cohere, 2025). For the BEIR-
+NQ dataset in particular, we use Llama-Embed-Nemotron-8B and Multilingual-E5-large
+(Wang et al., 2024). For each of these embedding models, we combine it with the BM25
+algorithm (Robertson et al., 2009; Trotman et al., 2014) by calculating a weighted average
+of the normalized BM25 score and the cosine similarity between the query and document
+embeddings. The weights used are 0.3 for BM25 and 0.7 for cosine similarity, respectively.
+In all experiments, the base retriever retrieves 200 candidate objects, or all available objects
+if there are fewer than 200. A graph is then constructed from these retrieved candidate
+objects, and GraphER’s reranking algorithm is applied to rerank them. Additional details
+regarding the hyper-parameter tuning and model training protocols are described in A.3.
+Metrics
+To evaluate the retrieval performance, we use perfect recall@K (PR@K). For a given
+question, PR@K is 1 if all relevant objects are included in the top-K search results, and
+0 otherwise. In contrast to regular recall@K, which measures the proportion of relevant
+objects retrieved, PR@K is particularly important for questions that require information from
+multiple sources, as failing to retrieve even a single relevant object can result in incomplete
+information and therefore incorrect answers.
+For multi-hop QA retrieval tasks, we also use the top-10 retrieved data objects to generate
+answers for both GraphER-GAT and the baseline using GPT-5 (OpenAI, 2025). The gener-
+ated answers are evaluated by prompting GPT-5 to compare them against the ground-truth
+answers. When available, we report the percentages of queries answered correctly, as judged
+by GPT-5. The prompt templates used for answer generation and evaluation are provided
+in Appendices A.1.2 and A.1.3.
+3.2
+Retrieval Performance
+In Tables 1, 2, and 3, we list the PR@5 and PR@10 for the three retrieval tasks considered.
+In terms of PR@10, the GraphER-GAT method improves upon the baseline in 14 out of 15
+dataset-base retriever settings where it was applied. The GraphER-GCS method improves
+upon the baseline in all 18 dataset-base retriever settings to which it was applied. These
+improvements are particularly pronounced if we filter for queries that have more than one
+relevant object.
+On the other hand, GraphER-PPR only outperforms the baseline in 12 out of 18 dataset-base
+retriever settings to which it was applied. Moreover, in two of these settings, it even leads to
+regressions of more than 7% compared to the baseline. Our examination of its failure cases
+reveals that this occurs because, under the PPR algorithm, hub objects (i.e., objects with a
+large number of links) are almost always ranked at the top if they appear among the top 200
+candidate objects, regardless of their true relevance to the query.
+Notably, the hyper-parameter α of GraphER-GCS is tuned only on the Bird train dataset,
+and GraphER-GAT is trained only on the Bird train and Spider1 train datasets. Neverthe-
+less, when applied to different task types, they still yield improved retrieval performance.
+This further demonstrates GraphER’s capacity to integrate diverse types of proximities into
+a unified framework, as well as its robustness to changes in the retrieval corpus.
+6
+Preprint. Under review.
+Dataset
+Retriever
+Spider1 train
+Spider1 dev
+Spider1 test
+Bird dev
+Beaver dev
+PR@5 (%)
+Llama-Embed-Nemotron-8B+BM25
+23.7 (42.5)
+37.3 (57.3)
+22.2 (41.8)
+21.8 (30.8)
+14.1 (14.8)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-PPR
+29.7 (44.4)
+44.7 (58.8)
+26.9 (41.6)
+33.0 (40.3)
+11.7 (12.4)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GCS
+29.4 (44.9)
+47.6 (61.0)
+29.2 (44.6)
+29.4 (36.6)
+17.0 (17.7)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GAT
+N/A
+49.7 (62.5)
+40.9 (54.4)
+36.9 (43.2)
+15.0 (15.8)
+GraphER-GAT’s improvement
+N/A
++12.4 (+5.2)
++18.7 (+12.5)
++15.2 (+12.3)
++1.0 (+1.0)
+Cohere-Embed-V4+BM25
+46.6 (71.0)
+75.9 (89.2)
+50.4 (75.3)
+74.2 (79.3)
+11.2 (12.4)
+Cohere-Embed-V4+BM25 + GraphER-PPR
+55.0 (73.1)
+85.2 (92.4)
+63.7 (78.9)
+86.2 (88.4)
+10.7 (12.0)
+Cohere-Embed-V4+BM25 + GraphER-GCS
+52.9 (73.7)
+80.4 (91.1)
+63.0 (80.3)
+80.0 (83.9)
+12.6 (13.9)
+Cohere-Embed-V4+BM25 + GraphER-GAT
+N/A
+80.2 (90.8)
+65.7 (81.8)
+83.4 (86.7)
+13.1 (13.9)
+GraphER-GAT’s improvement
+N/A
++4.2 (+1.6)
++15.2 (+6.5)
++9.2 (+7.4)
++1.9 (+1.4)
+PR@10 (%)
+Llama-Embed-Nemotron-8B+BM25
+38.8 (57.5)
+58.7 (73.6)
+38.5 (59.6)
+70.4 (75.7)
+30.6 (31.1)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-PPR
+44.3 (59.1)
+66.7 (75.7)
+46.1 (61.1)
+78.2 (81.4)
+20.9 (21.5)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GCS
+45.1 (59.9)
+69.0 (77.4)
+50.4 (64.2)
+72.8 (77.0)
+31.1 (31.6)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GAT
+N/A
+70.1 (78.5)
+59.1 (71.0)
+77.0 (80.4)
+29.6 (30.1)
+GraphER-GAT’s improvement
+N/A
++11.4 (+4.8)
++20.6 (+11.4)
++6.6 (+4.6)
+−1.0 (−1.0)
+Cohere-Embed-V4+BM25
+60.3 (80.4)
+86.0 (93.8)
+65.2 (84.8)
+89.3 (91.5)
+19.9 (21.1)
+Cohere-Embed-V4+BM25 + GraphER-PPR
+67.4 (82.6)
+94.2 (97.3)
+75.7 (88.2)
+95.9 (96.6)
+19.4 (20.6)
+Cohere-Embed-V4+BM25 + GraphER-GCS
+66.5 (83.0)
+95.2 (97.5)
+75.2 (88.4)
+95.5 (96.3)
+21.4 (22.5)
+Cohere-Embed-V4+BM25 + GraphER-GAT
+N/A
+96.3 (97.8)
+77.4 (89.7)
+96.6 (97.3)
+23.3 (24.4)
+GraphER-GAT’s improvement
+N/A
++10.3 (+4.1)
++12.2 (+4.9)
++7.3 (+5.8)
++3.4 (+3.3)
+Table 1: Retrieval performance on table retrieval benchmarks. We highlight the best and
+second-best results within each dataset-base retriever setting. Numbers in parentheses
+denote PR@K computed over the entire query set, while numbers outside the parentheses
+denote PR@K computed for queries with more than one relevant object.
+Dataset
+Retriever
+HotpotQA
+2WikiMultihopQA
+MuSiQue
+PR@5 (%)
+Llama-Embed-Nemotron-8B+BM25
+78.5
+42.6
+24.2
+Llama-Embed-Nemotron-8B+BM25 + GraphER-PPR
+72.9
+42.1
+17.3
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GCS
+78.8
+43.8
+25.4
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GAT
+78.0
+44.1
+25.6
+GraphER-GAT’s improvement
+−0.5
++1.5
++1.4
+Cohere-Embed-V4+BM25
+74.2
+42.0
+23.0
+Cohere-Embed-V4+BM25 + GraphER-PPR
+71.6
+45.7
+22.1
+Cohere-Embed-V4+BM25 + GraphER-GCS
+74.4
+43.3
+24.0
+Cohere-Embed-V4+BM25 + GraphER-GAT
+74.7
+43.8
+24.5
+GraphER-GAT’s improvement
++0.4
++1.8
++1.5
+PR@10 (%)
+Llama-Embed-Nemotron-8B+BM25
+88.2 (QA Acc. = 84.2)
+49.4 (QA Acc. = 43.1)
+35.5 (QA Acc. = 44.1)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-PPR
+84.5
+49.6
+27.7
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GCS
+88.7
+51.1
+36.9
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GAT
+88.9 (QA Acc. = 84.9)
+53.0 (QA Acc. = 45.4)
+37.4 (QA Acc. = 45.2)
+GraphER-GAT’s improvement
++0.6 (QA Acc. +0.7)
++3.6 (QA Acc. +2.3)
++1.9 (QA Acc. +1.0)
+Cohere-Embed-V4+BM25
+85.5 (QA Acc. = 82.2)
+48.3 (QA Acc. = 43.5)
+34.1 (QA Acc. = 42.2)
+Cohere-Embed-V4+BM25 + GraphER-PPR
+85.8
+52.8
+34.6
+Cohere-Embed-V4+BM25 + GraphER-GCS
+86.4
+50.1
+35.5
+Cohere-Embed-V4+BM25 + GraphER-GAT
+87.0 (QA Acc. = 83.7)
+50.7 (QA Acc. = 44.9)
+36.3 (QA Acc. = 43.5)
+GraphER-GAT’s improvement
++1.4 (QA Acc. +1.5)
++2.4 (QA Acc. +1.4)
++2.2 (QA Acc. +1.3)
+Table 2: Retrieval performance on multi-hop QA benchmarks. Numbers in parentheses
+denote the percentages of queries answered correctly, as evaluated by GPT-5.
+4
+Discussions
+4.1
+Capturing Proximities Beyond Semantics
+Our experiments show that the improvements provided by GraphER-GCS and GraphER-
+GAT are robust to the choice of semantic embedding model used in the base retriever. This
+can be attributed to the fact that GraphER does not alter the object representations within the
+7
+Preprint. Under review.
+Dataset
+Retriever
+BEIR-NQ
+PR@5 (%)
+Llama-Embed-Nemotron-8B+BM25
+50.9 (77.4)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-PPR
+53.3 (76.8)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GCS
+52.3 (78.1)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GAT
+54.4 (78.2)
+GraphER-GAT’s improvement
++3.5 (+0.8)
+Multilingual-E5-large+BM25
+10.7 (25.2)
+Multilingual-E5-large+BM25 + GraphER-PPR
+7.2 (20.9)
+Multilingual-E5-large+BM25 + GraphER-GCS
+11.4 (26.0)
+GraphER-GCS’s improvement
++0.8 (+0.8)
+PR@10 (%)
+Llama-Embed-Nemotron-8B+BM25
+71.3 (86.6)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-PPR
+71.3 (86.1)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GCS
+73.4 (87.9)
+Llama-Embed-Nemotron-8B+BM25 + GraphER-GAT
+73.0 (87.4)
+GraphER-GAT’s improvement
++1.7 (+0.7)
+Multilingual-E5-large+BM25
+17.0 (32.9)
+Multilingual-E5-large+BM25 + GraphER-PPR
+13.8 (29.1)
+Multilingual-E5-large+BM25 + GraphER-GCS
+19.8 (34.5)
+GraphER-GCS’s improvement
++2.9 (+1.6)
+Table 3: Retrieval performance on BEIR-NQ (chunked documents) benchmark. Numbers in
+parentheses denote PR@K computed over the entire query set, while numbers outside the
+parentheses denote PR@K computed for queries with more than one relevant object.
+semantic space. Instead, it leverages proximity relationships that extend beyond semantic
+proximity. These additional proximity relationships reside in dimensions that are linearly
+independent of, or orthogonal to, the semantic space and are therefore not fully captured by
+similarity measures such as cosine or L2 distance between semantic embeddings.
+GraphER incorporates these additional proximity relationships by explicitly adding edges
+between data objects that are “close” to each other. In this work, we identified and exper-
+imented with three commonly encountered proximity types beyond semantic proximity:
+structural proximity in table retrieval, conceptual proximity in multi-hop QA retrieval, and
+contextual proximity in chunked document retrieval. It is worth noting that these three
+types are not exhaustive, and the proximity relationships can be adapted to accommodate
+specific use cases or to inject domain-specific logic.
+4.2
+Learning Higher-Order Dependencies
+Both PPR and GCS can be expressed and solved as linear systems, and the resulting PPR and
+GCS scores are linear transformations of the initial scores. While this formulation is simple
+and efficient, it can be restrictive and lacks expressiveness when higher-order interactions
+exist between node features. To model such higher-order interactions, we employ a graph
+attention network (GAT) as the graph-based ranking component within the GraphER
+framework. The GAT uses message passing to aggregate information from neighboring
+nodes, where the aggregation weights (attention coefficients) are learned functions of the
+features of connected node pairs. This mechanism enables the model to capture higher-order
+node-node interactions. In our experiments, GraphER-GAT outperforms GraphER-GCS in
+terms of PR@10 in 13 out of 15 dataset-base retriever settings where it is applied.
+To verify that the performance gains of GraphER-GAT over GraphER-GCS are not solely
+due to feature refinements but also arise from higher-order interactions propagated through
+graph edges, we conduct an ablation study in which the message-passing component of
+the GAT is disabled while the number of layers, hidden dimensions, and input features
+are unchanged. This modification reduces the GAT to a per-node multilayer perceptron
+(MLP) applied independently to each node, which we refer to as GraphER-MLP. Note that
+GraphER-MLP still incorporates graph information by including the GCS scores as its input,
+but it does not model interactions between node features across edges. For both models,
+8
+Preprint. Under review.
+Dataset
+Reranker
+Spider1 dev
+Spider1 test
+Bird dev
+Beaver dev
+HotpotQA
+2WikiMultihopQA
+MuSiQue
+BEIR-NQ
+PR@5 (%)
+GraphER-GCS
+47.6 (61.0)
+29.2 (44.6)
+29.4 (36.6)
+17.0 (17.7)
+78.8
+43.8
+25.4
+52.3 (78.1)
+GraphER-GAT
+49.7 (62.5)
+40.9 (54.4)
+36.9 (43.2)
+15.0 (15.8)
+78.0
+44.1
+25.6
+54.4 (78.2)
+GraphER-MLP
+45.2 (60.5)
+36.7 (52.7)
+35.2 (42.5)
+15.0 (15.8)
+78.9
+42.5
+21.6
+50.3 (76.2)
+PR@10 (%)
+GraphER-GCS
+69.0 (77.4)
+50.4 (64.2)
+72.8 (77.0)
+31.1 (31.6)
+88.7
+51.1
+36.9
+73.4 (87.9)
+GraphER-GAT
+70.1 (78.5)
+59.1 (71.0)
+77.0 (80.4)
+29.6 (30.1)
+88.9
+53.0
+37.4
+73.0 (87.4)
+GraphER-MLP
+67.2 (76.0)
+55.1 (69.2)
+79.0 (82.1)
+28.2 (28.7)
+87.2
+51.1
+32.4
+71.2 (85.6)
+Table 4: Comparison of GraphER-GCS, GraphER-GAT, and GraphER-MLP on evaluation
+benchmarks. The base retriever is Llama-Embed-Nemotron-8B+BM25.
+we use Llama-Embed-Nemotron-8B+BM25 as the base retriever. We employ the same
+hyper-parameter tuning protocol for GraphER-MLP as for GraphER-GAT and train both
+models on identical datasets. The comparison of its retrieval performance to GraphER-GCS
+and GraphER-GAT on the evaluation datasets is reported in Table 4.
+In terms of PR@10, GraphER-GAT achieves the best performance on 5 of the 8 datasets,
+whereas GraphER-MLP attains the best performance only on the Bird dev dataset. A similar
+trend is observed for PR@5. These results indicate that GraphER, as a general framework, is
+not limited to linear graph effects and can benefit from explicitly modeling higher-order
+interactions among node features. When sufficient training data are available, a GAT-based
+ranker is an effective model choice.
+4.3
+Retrieval Latency
+GraphER involves the online construction of an n × n adjacency matrix, where n is the
+number of candidate objects. The GCS algorithm performs matrix multiplications on this
+matrix. Because n is a user-defined parameter, the additional time and space complexity
+introduced by GraphER beyond the base retriever can be controlled by adjusting this
+parameter. When GraphER-GAT is used, the GAT model incurs an additional forward pass.
+Overall, the LLM-free nature of GraphER makes it highly efficient. Our experiments were
+conducted on a compute node with two AMD EPYC 7J13 processors, 1 TB of RAM, and a
+single NVIDIA A100-SXM4-40GB GPU. On average, GraphER-GCS required approximately
+0.49 seconds to rank 200 objects, while GraphER-GAT required approximately 0.55 seconds,
+which are negligible when compared to the time required for subsequent LLM inference.
+5
+Conclusion
+In this work, we present GraphER, a graph-based offline enrichment and online reranking
+method to integrate diverse types of proximities, beyond semantic proximity, into the
+retrieval component of RAG systems. We identify three commonly encountered proximity
+types and our experiments demonstrate that, by integrating them into the retrieval process,
+retrieval accuracy can be improved on top of a semantics-based base retriever. Additionally,
+we introduce the Graph Cohesive Smoothing algorithm, which yields more robust gains in
+retrieval accuracy compared to Personalized PageRank. GraphER can also utilize a Graph
+Attention Network as its graph-based ranking algorithm to capture non-linear graph effects.
+Furthermore, GraphER integrates seamlessly with existing retrieval infrastructure, such
+as vector stores, without requiring additional resources. The retrieval latency introduced
+by GraphER is orders of magnitude smaller than that of LLM inference. Together, these
+advantages make GraphER readily applicable to a wide range of RAG systems.
+9
+Preprint. Under review.
+References
+Akari Asai, Zeqiu Wu, Yizhong Wang, Avi Sil, and Hannaneh Hajishirzi. Self-rag: Learning
+to retrieve, generate, and critique through self-reflection. In International Conference on
+Learning Representations, 2024.
+Yauhen Babakhin, Radek Osmulski, Ronay Ak, Gabriel Moreira, Mengyao Xu, Benedikt
+Schifferer, Bo Liu, and Even Oldridge. Llama-embed-nemotron-8b: A universal text
+embedding model for multilingual and cross-lingual tasks, 2025. URL https://arxiv.
+org/abs/2511.07025.
+Shaked Brody, Uri Alon, and Eran Yahav. How attentive are graph attention networks? In
+International Conference on Learning Representations, 2022. URL https://openreview.net/
+forum?id=F72ximsx7C1.
+Peter Baile Chen, Fabian Wenz, Yi Zhang, Devin Yang, Justin Choi, Nesime Tatbul, Michael
+Cafarella, C¸ a˘gatay Demiralp, and Michael Stonebraker. Beaver: an enterprise benchmark
+for text-to-sql. arXiv preprint arXiv:2409.02038, 2024.
+Peter Baile Chen, Yi Zhang, Mike Cafarella, and Dan Roth. Can we retrieve everything all at
+once? arm: An alignment-oriented llm-based retrieval method. In Proceedings of the 63rd
+Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pp.
+30298–30317, 2025.
+Cohere. Introducing embed 4: Multimodal search for business. https://cohere.com/blog/
+embed-4, 2025.
+Bernal Jim´enez Guti´errez, Yiheng Shu, Yu Gu, Michihiro Yasunaga, and Yu Su. Hipporag:
+Neurobiologically inspired long-term memory for large language models. In Advances in
+Neural Information Processing Systems, volume 37, pp. 59532–59569, 2024.
+Bernal Jim´enez Guti´errez, Yiheng Shu, Weijian Qi, Sizhe Zhou, and Yu Su. From RAG to
+memory: Non-parametric continual learning for large language models. In Forty-second
+International Conference on Machine Learning, 2025.
+Xanh Ho, Anh-Khoa Duong Nguyen, Saku Sugawara, and Akiko Aizawa. Constructing a
+multi-hop qa dataset for comprehensive evaluation of reasoning steps. In Proceedings of
+the 28th International Conference on Computational Linguistics, pp. 6609–6625, 2020.
+Aaron Hurst, Adam Lerer, Adam P Goucher, Adam Perelman, Aditya Ramesh, Aidan Clark,
+AJ Ostrow, Akila Welihinda, Alan Hayes, Alec Radford, et al. Gpt-4o system card. arXiv
+preprint arXiv:2410.21276, 2024.
+Tushar Khot, Harsh Trivedi, Matthew Finlayson, Yao Fu, Kyle Richardson, Peter Clark, and
+Ashish Sabharwal. Decomposed prompting: A modular approach for solving complex
+tasks. In The Eleventh International Conference on Learning Representations, 2023.
+Can M Le and Tianxi Li. Linear regression and its inference on noisy network-linked data.
+Journal of the Royal Statistical Society Series B: Statistical Methodology, 84(5):1851–1885, 2022.
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman
+Goyal, Heinrich K¨uttler, Mike Lewis, Wen-tau Yih, Tim Rockt¨aschel, et al. Retrieval-
+augmented generation for knowledge-intensive nlp tasks. Advances in neural information
+processing systems, 33:9459–9474, 2020.
+Jinyang Li, Binyuan Hui, Ge Qu, Jiaxi Yang, Binhua Li, Bowen Li, Bailin Wang, Bowen Qin,
+Ruiying Geng, Nan Huo, Xuanhe Zhou, Chenhao Ma, Guoliang Li, Kevin C.C. Chang, Fei
+Huang, Reynold Cheng, and Yongbin Li. Can llm already serve as a database interface? a
+big bench for large-scale database grounded text-to-sqls. Advances in Neural Information
+Processing Systems, 36:42330–42357, 2023.
+Tianxi Li, Elizaveta Levina, and Ji Zhu. Prediction models for network-linked data. The
+Annals of Applied Statistics, 13(1):132 – 164, 2019. doi: 10.1214/18-AOAS1205. URL
+https://doi.org/10.1214/18-AOAS1205.
+10
+Preprint. Under review.
+Linhao Luo, Yuan-Fang Li, Gholamreza Haffari, and Shirui Pan. Reasoning on graphs:
+Faithful and interpretable large language model reasoning. In The Twelfth International
+Conference on Learning Representations, 2024.
+OpenAI. Gpt-5 system card. https://openai.com/index/gpt-5-system-card/, 2025.
+Stephen Robertson, Hugo Zaragoza, et al. The probabilistic relevance framework: Bm25
+and beyond. Foundations and Trends® in Information Retrieval, 3(4):333–389, 2009.
+Parth Sarthi, Salman Abdullah, Aditi Tuli, Shubh Khanna, Anna Goldie, and Christopher D
+Manning. Raptor: Recursive abstractive processing for tree-organized retrieval. In The
+Twelfth International Conference on Learning Representations, 2024.
+Zhivar Sourati, Zheng Wang, Marianne Menglin Liu, Yazhe Hu, Mengqing Guo, Su-
+jeeth Bharadwaj, Kyu Han, Tao Sheng, Sujith Ravi, Morteza Dehghani, et al. Lad-rag:
+Layout-aware dynamic rag for visually-rich document understanding. arXiv preprint
+arXiv:2510.07233, 2025.
+Jiashuo Sun, Chengjin Xu, Lumingyuan Tang, Saizhuo Wang, Chen Lin, Yeyun Gong, Lionel
+Ni, Heung-Yeung Shum, and Jian Guo. Think-on-graph: Deep and responsible reasoning
+of large language model on knowledge graph. In The Twelfth International Conference on
+Learning Representations, 2024.
+Nandan Thakur, Nils Reimers, Andreas R¨uckl´e, Abhishek Srivastava, and Iryna Gurevych.
+BEIR: A heterogeneous benchmark for zero-shot evaluation of information retrieval
+models. In Thirty-fifth Conference on Neural Information Processing Systems Datasets and
+Benchmarks Track (Round 2), 2021. URL https://openreview.net/forum?id=wCu6T5xFjeJ.
+Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot, and Ashish Sabharwal. Musique:
+Multi-hop questions via single-hop question composition. Transactions of the Association
+for Computational Linguistics, 10:539–554, 2022.
+Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot, and Ashish Sabharwal. Interleaving
+retrieval with chain-of-thought reasoning for knowledge-intensive multi-step questions.
+In Proceedings of the 61st annual meeting of the association for computational linguistics (volume
+1: long papers), pp. 10014–10037, 2023.
+Andrew Trotman, Antti Puurula, and Blake Burgess. Improvements to bm25 and language
+models examined. In Proceedings of the 19th Australasian Document Computing Symposium,
+pp. 58–65, 2014.
+Petar Veliˇckovi´c, Guillem Cucurull, Arantxa Casanova, Adriana Romero, Pietro Li`o, and
+Yoshua Bengio. Graph attention networks. In International Conference on Learning Represen-
+tations, 2018. URL https://openreview.net/forum?id=rJXMpikCZ.
+Liang Wang, Nan Yang, Xiaolong Huang, Linjun Yang, Rangan Majumder, and Furu Wei.
+Multilingual e5 text embeddings: A technical report. arXiv preprint arXiv:2402.05672, 2024.
+Derong Xu, Yi Wen, Pengyue Jia, Yingyi Zhang, Wenlin Zhang, Yichao Wang, Huifeng
+Guo, Ruiming Tang, Xiangyu Zhao, Enhong Chen, and Tong Xu. From single to multi-
+granularity: Toward long-term memory association and selection of conversational agents.
+In The Fourteenth International Conference on Learning Representations, 2026. URL https:
+//openreview.net/forum?id=i2yIvZARnG.
+Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Bengio, William Cohen, Ruslan Salakhutdi-
+nov, and Christopher D Manning. Hotpotqa: A dataset for diverse, explainable multi-hop
+question answering. In Proceedings of the 2018 conference on empirical methods in natural
+language processing, pp. 2369–2380, 2018.
+Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik R Narasimhan, and
+Yuan Cao. React: Synergizing reasoning and acting in language models. In The eleventh
+international conference on learning representations, 2022.
+11
+Preprint. Under review.
+Michihiro Yasunaga, Armen Aghajanyan, Weijia Shi, Richard James, Jure Leskovec, Percy
+Liang, Mike Lewis, Luke Zettlemoyer, and Wen-Tau Yih. Retrieval-augmented multi-
+modal language modeling. In International Conference on Machine Learning, pp. 39755–39769.
+PMLR, 2023.
+Tao Yu, Rui Zhang, Kai Yang, Michihiro Yasunaga, Dongxu Wang, Zifan Li, James Ma,
+Irene Li, Qingning Yao, Shanelle Roman, Zilin Zhang, and Dragomir Radev. Spider:
+A large-scale human-labeled dataset for complex and cross-domain semantic parsing
+and text-to-sql task. In Proceedings of the 2018 Conference on Empirical Methods in Natural
+Language Processing, Brussels, Belgium, 2018. Association for Computational Linguistics.
+Denny Zhou, Nathanael Sch¨arli, Le Hou, Jason Wei, Nathan Scales, Xuezhi Wang, Dale
+Schuurmans, Claire Cui, Olivier Bousquet, Quoc V Le, and Ed H. Chi. Least-to-most
+prompting enables complex reasoning in large language models. In The Eleventh Interna-
+tional Conference on Learning Representations, 2023.
+12
+Preprint. Under review.
+A
+Appendix
+A.1
+Prompt Template
+A.1.1
+Prompt Template for Named Entity Extraction
+Identify the key entities (people, organizations, locations, dates, etc.)
+from the following paragraph.
+Return the result as a valid Python list of strings, with no explanations,
+only the list.
+Example:
+Text:
+"Barack Obama was born in Honolulu, Hawaii, and served as the 44th
+President of the United States."
+Output:
+["Barack Obama", "Honolulu", "Hawaii", "United States", "44th President"]
+Text:
+{content}
+Output:
+A.1.2
+Prompt Template for Retrieval-Augmented Answer Generation
+You are an AI assistant. Use ONLY the information provided in the context
+below to answer the user's question.
+If the context does not contain enough information to answer the question,
+say:
+"I don't have enough information in the provided context to answer this."
+<context>
+{retrieved_objects}
+</context>
+Question:
+{query}
+Answer:
+13
+Preprint. Under review.
+A.1.3
+Prompt Template for RAG Answer Evaluation
+You are an impartial evaluator tasked with judging the correctness of an
+answer generated by an LLM.
+=== Task ===
+Evaluate whether the Ground Truth Answer is present in the Generated
+Answer.
+Your goal is to determine if the essential meaning and key facts of the
+Ground Truth Answer are correctly captured in the Generated Answer.
+=== Instructions ===
+1. Carefully compare the Generated Answer with the Ground Truth Answer.
+2. Focus on substance and meaning, not exact wording.
+3. Treat paraphrases, synonyms, or logically equivalent statements as
+correct if they preserve the same factual meaning.
+4. Ignore irrelevant extra information unless it directly contradicts the
+Ground Truth.
+5. If any vital fact from the Ground Truth is missing or incorrect, the
+decision should be "no".
+6. If all essential information from the Ground Truth is present and
+correct, the decision should be "yes".
+=== Input Data ===
+- Question: {query}
+- Generated Answer: {generated_answer}
+- Ground Truth Answer: {ground_truth_answer}
+=== Output Format ===
+Provide your final evaluation strictly in the following format:
+Explanation: <Brief explanation of how you made the decision>
+Decision: <yes or no>
+Proceed carefully and base your judgment strictly on the criteria above.
+A.2
+Dataset Statistics
+Spider1 train Spider1 dev Spider1 test Bird train Bird dev Beaver dev HotpotQA 2WikiMultihopQA MuSiQue BEIR-NQ
+# queries
+8650
+1032
+2147
+9398
+1534
+209
+2000
+2000
+2417
+3452
+# queries with >1 rel. object
+3658
+378
+787
+7679
+1218
+206
+2000
+2000
+2417
+666
+# data objects
+876
+876
+1056
+522
+75
+463
+19323
+12601
+21100
+117683
+A.3
+Hyper-Parameter Tuning and Model Training Protocols
+Both PPR and GCS have one hyper-parameter, namely the damping factor α. For each
+base retriever setting, specifically Llama-Embed-Nemotron-8B+BM25 and Cohere-Embed-
+4+BM25, we perform a grid search over α, evaluating candidate values from 0.1 to 0.9 in
+increments of 0.1 on the Bird train dataset. The best-performing value of α on this dataset
+is then selected and fixed for the remaining datasets. For the Multilingual-E5-large+BM25
+setting, which is only applied to the BEIR-NQ dataset, we use the same value of α as in
+Llama-Embed-Nemotron-8B+BM25.
+In both PPR and GCS, edge weights of the adjacency matrix A are user-specified hyper-
+parameters that are predetermined and not subject to tuning. Throughout our experiments,
+14
+Preprint. Under review.
+we use the same edge weights within each task type. Specifically, for table retrieval datasets,
+we assign an edge weight of 1 between two tables if they are linked through a foreign-key
+relationship, and 0 otherwise. Similarly, for chunked document retrieval, we set the edge
+weight between two chunks to 1 if they are adjacent chunks from the same un-chunked
+document, and 0 otherwise. For multi-hop QA retrieval, we compute the edge weight
+Aij as the number of unique named entities shared by objects i and j, divided by the total
+number of unique named entities in object j. This normalization helps control the influence
+of passages that contain a large number of entities by diluting their emphasis on any single
+entity in proportion to the total number of entities they contain. The extraction of named
+entities for each data object is done by prompting GPT-4o (Hurst et al., 2024). The prompt
+template is provided in Appendix A.1.1.
+For the GAT rankers, we first train the neural network on Bird train while monitoring
+its performance on a sample of Spider1 train. The validation results on this sample of
+Spider1 train are used to select the learning rate, L2 regularization coefficient, and number
+of training epochs. After fixing these hyper-parameters, we retrain the network using the
+combined set of Bird train and Spider1 train, and report their evaluation metrics on the
+dev and test splits of these two datasets, as well as on other datasets. The GAT rankers
+learn edge weights automatically via the attention mechanism, so users do not need to
+specify edge weights in this case.
+15

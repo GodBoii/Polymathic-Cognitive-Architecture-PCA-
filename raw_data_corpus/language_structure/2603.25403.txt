@@ -1,0 +1,1401 @@
+1
+Shape and Substance: Dual-Layer Side-Channel
+Attacks on Local Vision-Language Models
+Eyal Hadad, and Mordechai Guri
+Abstract—On-device Vision-Language Models (VLMs) promise
+data privacy via local execution. However, we show that the ar-
+chitectural shift toward Dynamic High-Resolution preprocessing
+(e.g., AnyRes) introduces an inherent algorithmic side-channel.
+Unlike static models, dynamic preprocessing decomposes images
+into a variable number of patches based on their aspect ratio,
+creating workload-dependent inputs. We demonstrate a dual-
+layer attack framework against local VLMs. In Tier 1, an unpriv-
+ileged attacker can exploit significant execution-time variations
+using standard unprivileged OS metrics to reliably fingerprint
+the input’s geometry. In Tier 2, by profiling Last-Level Cache
+(LLC) contention, the attacker can resolve semantic ambiguity
+within identical geometries, distinguishing between visually dense
+(e.g., medical X-rays) and sparse (e.g., text documents) content.
+By evaluating state-of-the-art models such as LLaVA-NeXT and
+Qwen2-VL, we show that combining these signals enables reliable
+inference of privacy-sensitive contexts. Finally, we analyze the
+security engineering trade-offs of mitigating this vulnerability,
+reveal substantial performance overhead with constant-work
+padding, and propose practical design recommendations for
+secure Edge AI deployments.
+Index Terms—Side-channel attacks, Vision-Language Models,
+Edge AI, Hardware performance counters, Microarchitectural
+security.
+I. INTRODUCTION
+T
+HE deployment of Large Language Models (LLMs) is
+experiencing a significant shift from centralized cloud
+services to local, on-device execution [1], [2]. A primary moti-
+vation for this transition is privacy. Users and organizations are
+increasingly unwilling to share sensitive personal data, such
+as medical records, financial documents, and personal photos,
+with third-party providers. This concern is well-founded, as
+prior research has demonstrated that cloud-based models can
+inadvertently memorize and leak training data [3], [4]. The
+overall assumption is that running a model locally guarantees
+data sovereignty. However, if another unprivileged process
+runs on the same machine, it may still infer sensitive infor-
+mation by observing shared hardware behavior [5].
+One might ask why an attacker who is already co-located
+on the victim’s device would rely on side channels instead
+of direct screen capture or memory access. The answer lies
+in modern operating system security models. Contemporary
+systems enforce strong address-space isolation and memory
+randomization [6], which prevents malicious applications from
+E. Hadad is with Ben-Gurion University of the Negev, Israel (e-mail:
+eyalhad@post.bgu.ac.il).
+M. Guri is with Ben-Gurion University of the Negev, Israel (email:
+gurim@post.bgu.ac.il).
+Manuscript received March 27, 2026; revised March 27, 2026.
+Fig. 1: Dual-layer threat model overview. A co-located,
+unprivileged process observes shared hardware behavior while
+a local VLM processes an image with dynamic resolution. The
+input-dependent workload creates two distinct side-channels:
+Tier 1 leverages OS-level timing metrics from CPU cores to
+infer the input’s geometric grid (aspect ratio). In contrast,
+Tier 2 exploits HPC from the LLC to infer the input’s visual
+semantic density.
+directly reading another process’s memory or intercepting its
+input buffer.
+However, these systems often expose low-level CPU teleme-
+try, specifically hardware performance counters, to user-space
+processes for debugging and profiling. As a result, while
+direct access to the input data is blocked, the computational
+behavior induced by processing that data remains observable
+through shared hardware resources. This class of leakage has
+been widely exploited in cryptographic and microarchitectural
+attacks [7], [8], [9]. Figure 1 illustrates our threat model and
+the attacker’s two observation channels.
+This threat is further amplified by the growing use of unified
+memory architectures, in which the CPU, GPU, and other
+accelerators share the same physical memory hierarchy [10].
+In such systems, offloading computation to an accelerator
+does not eliminate side-channel exposure, as memory access
+patterns remain observable through shared caches and memory
+resources [11]. As a result, microarchitectural side channels,
+including those exploiting DRAM addressing [12], persist even
+in modern heterogeneous computing platforms.
+To understand the threat surface, it is essential to ex-
+amine the evolution of VLMs. Earlier generations, such as
+LLaVA v1.5 [13], favored simple and uniform preprocessing
+by resizing all images to a fixed square resolution (e.g.,
+336 × 336) [14]. While computationally wasteful [15], this
+arXiv:2603.25403v1  [cs.CR]  26 Mar 2026
+2
+design normalized the computational workload across inputs.
+In contrast, recent models such as LLaVA-NeXT [16] and
+Qwen2-VL [17] adopt dynamic high-resolution preprocessing
+to better preserve visual structure. These mechanisms maintain
+the original aspect ratio by decomposing an image into a
+variable number of patches (e.g., 1×2 for portrait images and
+2×2 for square images). We argue that this shift fundamentally
+changes image preprocessing from a fixed, input-agnostic
+operation into an input-dependent control flow, expanding the
+observable side-channel surface.
+We frame this vulnerability not as a specific implementation
+bug, but as a broader algorithmic side-channel class inherent
+to input-dependent preprocessing pipelines in Edge AI. As
+models optimize for efficiency by adapting to the input data,
+they inevitably create data-dependent execution paths. This
+fundamental trade-off requires a fresh risk assessment for local
+AI deployments.
+Specifically, we show that this architectural choice intro-
+duces a dual-layer vulnerability. First, at the control-flow level,
+execution time directly reflects the number of image patches.
+This allows an attacker to easily infer the underlying grid
+configuration and the image’s aspect ratio. Second, at the
+memory-access level, the vision encoder’s attention operations
+[18] create input-dependent cache activity. Images with high
+visual complexity cause significantly more cache contention
+than sparse, text-like documents [19]. By combining timing
+information with cache behavior, an attacker can resolve the
+ambiguity of a single metric and extract both geometric and
+semantic information.
+Our evaluation demonstrates that this dynamic preprocess-
+ing design creates a practical security risk, enabling detailed
+context inference:
+• Aspect Ratio Inference: Execution-time variations in
+dynamic models, such as Qwen2-VL, allow reliable in-
+ference of image dimensions due to substantial latency
+differences across grid configurations.
+• Semantic Context Inference: By jointly analyzing tim-
+ing and cache activity, the attack distinguishes between
+different high-level input contexts, including visually
+dense and sparse scenarios, with high recall.
+• Structural vs. Hardware-Dependent Leakage: We
+show that geometric leakage arises from the dynamic pre-
+processing design itself, while semantic leakage depends
+on hardware characteristics and is mitigated on systems
+with larger LLC [7].
+II. BACKGROUND
+A. Local Vision-Language Models
+A VLM is composed of multiple components rather than a
+single monolithic model. Typically, it consists of three main
+stages:
+1) A Vision encoder (e.g., CLIP [20] or SigLIP [21]) that
+converts the input image into visual features, typically
+utilizing a Vision Transformer backbone [14].
+2) A Projector (or adapter) that maps visual features into
+a representation compatible with the language model, as
+used in architectures such as BLIP-2 [22] and Flamingo
+[23].
+3) An LLM that jointly processes the projected visual
+features and text instructions to generate a response [13].
+In cloud-based deployments, such as GPT-4V [24], these
+components may execute on separate or dedicated hardware. In
+contrast, during local on-device inference on personal systems
+such as laptops or workstations, the entire pipeline runs on
+a single physical device. As a result, the vision encoder
+and the language model share the same memory hierarchy,
+including LLC. In our experiments, we consider common
+local inference setups, such as implementations based on
+llama.cpp [25], which optimize the LLaMA architecture
+for consumer hardware.
+B. Dynamic Resolution (AnyRes)
+To understand the root cause of the side-channel, it is nec-
+essary to examine how modern VLMs process image inputs.
+Earlier models, such as LLaVA v1.5 [13], relied on static
+preprocessing, where all images were resized or padded to
+a fixed square resolution (e.g., 336 × 336), following standard
+computer vision practices [26]. This approach resulted in
+largely input-agnostic computational workloads.
+In contrast, recent architectures such as LLaVA-NeXT [16]
+and Qwen2-VL [17] adopt dynamic high-resolution prepro-
+cessing strategies, commonly referred to as AnyRes. Inspired
+by architectures like NaViT [27], rather than enforcing a fixed
+input shape, these models adapt to the image’s original aspect
+ratio using a grid-based decomposition. Figure 2 illustrates
+how AnyRes maps aspect ratios to different grid configurations
+and patch counts.
+To preserve global context that may be lost when process-
+ing high-resolution local crops (e.g., observing only part of
+an object), AnyRes pipelines typically include an additional
+downsampled global view alongside the local patches. For
+a given input image, the model selects a grid configuration
+(m × n) that minimizes aspect ratio distortion, resulting in a
+total number of processed patches given by
+Ntotal = (m × n) + 1.
+For example, a vertical smartphone image commonly trig-
+gers a 1 × 2 grid, yielding three patches (two local crops
+and one global view), whereas a square document triggers
+a 2 × 2 grid, yielding five patches. Since the vision encoder
+processes each patch either sequentially or in batches, utilizing
+optimization techniques like FlashAttention [28], square inputs
+incur a higher computational workload than portrait inputs,
+effectively creating an exploitable algorithmic complexity gap
+[29].
+C. Hardware Performance Counters
+To bridge the gap between this algorithmic complexity and
+observable physical phenomena, we rely on microarchitectural
+telemetry. Hardware Performance Counters (HPCs) allow soft-
+ware to monitor low-level architectural events during program
+execution. Since foundational research on timing attacks [30]
+and cache-based side channels [9], it has been well established
+3
+Fig. 2: AnyRes dynamic preprocessing. The model tiles the
+image into an (m × n) grid based on aspect ratio and adds a
+global view, yielding (m×n)+1 patches. Different grids (e.g.,
+1 × 2 vs. 2 × 2) produce different amounts of work, creating
+a timing signal.
+that such measurements can leak information about a victim’s
+execution behavior.
+On Linux systems, hardware counters are accessible through
+the perf_event_open interface. While modern operating
+systems enforce strong isolation mechanisms that prevent
+direct access to another process’s memory, they often permit
+user-space access to performance counters for profiling and
+debugging. Accordingly, our threat model assumes a co-
+located attacker running an unprivileged process that monitors
+hardware events under default system configurations, such as
+those where perf_event_paranoid ≤2.
+As described in Section II-B, dynamic image preprocessing
+introduces input-dependent variation in computational work-
+load. We show that this variation induces a distinct and
+measurable signal in execution time and cache activity, which
+can be exploited by an unprivileged attacker to infer properties
+of the visual input [31].
+In
+our
+experiments,
+we
+use
+the
+Linux
+perf
+subsystem
+to
+collect
+hardware
+performance
+counters.
+While certain controls, such as clearing the cache via
+/proc/sys/vm/drop_caches, require root privileges
+for reproducibility, accessing hardware counters themselves
+is available to unprivileged user-space processes in default
+Linux configurations.
+III. RELATED WORK
+Our attack relies on the hardware behaviors described in
+the previous section. In this section, we compare our approach
+with existing model extraction and side-channel techniques.
+A. Model Extraction vs. Physical Leakage
+A significant body of research focuses on stealing machine
+learning models or extracting sensitive training data via Ap-
+plication Programming Interfaces (APIs). Techniques such as
+Model Inversion [32] or Membership Inference [4] rely on
+extensive model querying to reconstruct data from its outputs
+and confidence scores. In contrast, our work explores physical,
+passive microarchitectural leakage. While prior studies have
+successfully demonstrated the extraction of DNN architectures
+and hyperparameters via hardware side-channels [33], we
+expand this threat paradigm to the inference data itself. We
+demonstrate that an attacker does not need API access to
+the model’s outputs. Instead, they can infer properties of the
+private inputs solely by observing shared hardware resources
+during local execution.
+B. Text-Only LLMs vs. Multimodal Encoders
+Recent work has shown that LLMs are vulnerable to side-
+channel attacks. For instance, previous studies have demon-
+strated that hardware cache behavior can leak information
+during the token generation phase of local LLMs [34]. Other
+studies have exploited timing variations in cloud-based serving
+systems or prompt caching [35], [36], [37], or targeted specific
+architectural choices, such as Mixture-of-Experts [38]. How-
+ever, these attacks focus solely on the text-decoding phase.
+Our research uniquely targets the vision encoder in multimodal
+pipelines, demonstrating that processing image data introduces
+new vulnerabilities before any text is generated.
+C. Privacy Leaks in User Workloads
+Inferring user context from hardware performance is a
+known threat in applied systems security. Prior research has
+shown that graphics rendering pipelines and browser activities
+can leak sensitive information [11]. For example, attackers
+can use cache-based side channels to recover keystrokes
+from graphics libraries [39], [40] or identify encrypted video
+streams and websites based on traffic and memory patterns
+[41], [42]. Moreover, recent advances highlight the potency of
+leveraging LLC telemetry and hardware events to model and
+detect complex microarchitectural patterns [43], reinforcing
+the viability of cache activity as a rich semantic signal. Our
+findings extend this threat model to local AI applications,
+showing that structural visual complexity translates into a
+highly reliable side-channel signal.
+D. Our Positioning
+Our work introduces a new perspective on AI privacy
+by bridging multimodal architectures with systems security.
+Specifically, we contribute the following:
+• A New Leakage Class: We identify dynamic high-
+resolution preprocessing (e.g., AnyRes) as an inherent
+algorithmic side-channel, shifting the focus from simple
+text generation to input-dependent vision pipelines.
+• Dual-Layer
+Attack
+Vectors: We combine a zero-
+privilege timing attack (geometry inference) with a cache-
+based attack (semantic inference) to overcome the limi-
+tations of single-metric observations.
+• Risk Assessment for Edge AI: We provide practical
+evidence that running VLMs locally does not guarantee
+data privacy, highlighting a systematic vulnerability aris-
+ing from input-dependent preprocessing in modern edge
+AI deployments.
+4
+IV. THREAT MODEL
+Building on these concepts, we now define the formal threat
+model for our attack, detailing the attacker’s capabilities and
+the assumptions about the victim’s environment.
+A. Attacker Capabilities
+We define the attacker as a malicious native application
+running in user space on the victim’s device. To present a
+realistic scenario, we assume the attacker runs under the same
+user account (UID) as the victim but operates in a separate
+process. The operating system enforces standard address-space
+isolation, meaning the attacker cannot directly access the
+victim’s memory, read the victim’s input images, or capture
+the victim’s screen. Furthermore, the attacker is unprivileged
+and lacks root (administrator) access.
+Because the attacker shares the same physical hardware as
+the VLM process, we structure our threat model into two
+distinct tiers of observation capabilities:
+1) Tier 1: Coarse Timing Observation (Zero-Privilege):
+The leakage in our system causes large differences in
+inference execution time, often on the order of tens of
+seconds. As a result, an attacker does not need access to
+hardware performance counters. Instead, they can simply
+measure the inference phase duration using standard OS-
+level metrics, such as CPU utilization or wall-clock time
+(e.g., via /proc/stat on Linux). This attack requires
+no special privileges and remains possible even if access
+to performance telemetry is restricted.
+2) Tier 2: Microarchitectural Profiling (perf): To infer
+semantic information about the processed input, the at-
+tacker monitors hardware performance counters, partic-
+ularly LLC misses, using the perf_event_open in-
+terface. Although some Linux systems restrict access to
+these counters (e.g., when perf_event_paranoid
+is set to 3 or higher), our target users—AI developers and
+researchers running local VLMs—often enable perfor-
+mance profiling for debugging and optimization. In such
+environments, perf_event_paranoid is commonly
+set to ≤2, allowing unprivileged processes to access
+these counters and exposing the system to our semantic
+side-channel.
+The attacker’s combined goal is to use Tier 1 (timing) to
+determine the image’s geometry and Tier 2 (cache contention)
+to resolve its sensitive semantic context.
+B. Victim Assumptions
+The victim is a user or organization utilizing a VLM locally
+to process sensitive data. The primary motivation for local
+deployment is privacy, ensuring that data does not leave the
+physical device.
+We assume the following about the victim’s environment:
+• Software Stack: The victim uses widely adopted infer-
+ence frameworks, such as open-source implementations
+based on llama.cpp or PyTorch, to run the VLM.
+• Hardware: The victim operates on standard consumer or
+workstation hardware (e.g., Intel or AMD CPUs). While
+Component
+Intel Setup
+AMD Setup
+Experimental Role
+Primary Evaluation
+Cross-Platform Validation
+CPU
+Core i7-13700 (16 Cores)
+Ryzen 9 7950X (16 Cores)
+LLC
+30 MB
+64 MB
+OS Kernel
+Linux 6.8 (Ubuntu 24.04)
+Linux 6.8 (Ubuntu 24.04)
+TABLE I: Hardware Specifications. The Intel setup serves as
+the primary reference platform, while the AMD setup is used
+to validate architectural robustness under a significantly larger
+LLC.
+the system may include a GPU, the CPU remains actively
+involved in input preprocessing, memory management,
+and control flow decisions of dynamic resolution mech-
+anisms. As a result, shared microarchitectural resources
+remain a source of information leakage [9].
+• Data Sensitivity: The input images contain private infor-
+mation, such as medical imagery (e.g., X-rays), financial
+documents, or personal identification, for which geomet-
+ric properties and visual complexity may correlate with
+the underlying content.
+V. DETERMINISTIC LEAKAGE
+We begin our evaluation by validating the first tier of our
+threat model: the zero-privilege timing attack. In this section,
+we aim to prove that the algorithmic control-flow introduced
+by dynamic preprocessing produces a deterministic and easily
+observable timing signal.
+A. Experimental Setup
+We evaluated the vulnerability on two distinct hardware
+configurations representing high-end consumer workstations
+(Table I). The Intel Core i7-13700 served as the primary
+reference platform for the deterministic and semantic leakage
+analysis. The AMD Ryzen 9 7950X was used to validate
+robustness across microarchitectural designs.
+Unless otherwise noted, all reported measurements were
+collected on the Intel setup running Ubuntu 24.04 LTS with
+the llama.cpp inference engine [25] (for full reproducibility
+details, including core pinning and software versions, see
+Appendix A in the supplementary material).
+B. Experimental Methodology
+To isolate side-channel leakage induced by dynamic resolu-
+tion preprocessing, we constructed a synthetic dataset contain-
+ing N = 250 unique images per category. The dataset consists
+of two primary subsets:
+• Geometric Benchmarks: Images with controlled aspect
+ratios (square 1:1 vs. portrait 1:2), designed to trigger
+distinct grid configurations and isolate geometry-driven
+execution time.
+• Semantic Benchmarks: Content-specific categories, in-
+cluding documents (sparse text), X-rays (dense structure),
+crypto-noise (randomized patterns), and synthetic scenes
+designed to mimic the visual characteristics of natural
+landscapes (e.g., color gradients and structural edges). For
+5
+Portrait (1:2)
+Square (1:1)
+Landscape (2:1)
+50
+60
+70
+80
+90
+100
+110
+120
+Inference Time (Seconds)
+(a) Cold Cache State
+Portrait (1:2)
+Square (1:1)
+Landscape (2:1)
+(b) Warm Cache State
+Fig. 3: Deterministic Geometric Leakage. Distribution of inference time across aspect ratios in (a) Cold Cache and (b) Warm
+Cache states. Note the distinct ”pyramid” structure: Square inputs (1:1) incur a ∼2.3× latency penalty compared to rectangular
+inputs (1:2, 2:1), creating non-overlapping clusters that enable 100% classification accuracy regardless of cache state.
+brevity, we refer to this synthetic category as Nature in
+the following analysis. (generation scripts available in the
+repository).
+This dataset design allows us to isolate both algorith-
+mic control-flow effects (via the geometric benchmarks) and
+memory-access behavior (via the semantic categories), while
+maintaining controlled visual characteristics (see Appendix B
+in the supplementary material).
+To establish precise ground truth for the algorithmic vulner-
+ability, we monitored the prompt evaluation time reported by
+the inference engine, isolating the visual processing workload.
+While an unprivileged attacker cannot access these internal
+logs, this preprocessing phase consumes the majority of the
+overall execution time. As we demonstrate later (see Section
+V), the temporal differences in this phase are vast enough
+that standard end-to-end wall-clock timing captures the same
+exploitable signal without requiring internal metrics.
+To assess robustness under different system conditions,
+experiments were conducted in two cache states:
+1) Cold Cache: System caches were flushed prior to each
+run using drop_caches to enforce a clean execution
+state.1
+2) Warm Cache: The model was executed repeatedly
+without clearing caches, simulating a typical interactive
+usage scenario.
+C. Analysis of Execution Time
+To isolate the contribution of the vision encoder from the
+rest of the inference pipeline, we use the prompt evaluation
+1Privileges: Root access was used solely to enforce a deterministic cold-
+cache condition for experimental reproducibility. The attack itself runs entirely
+in user space and relies only on observable execution time.
+time reported by the inference engine logs as ground truth. 2
+This metric captures the time spent encoding image patches
+and projecting them into the language model’s embedding
+space, excluding system initialization overhead.
+Attacker Perspective: While a real-world attacker cannot
+access internal inference logs, they can observe the total wall-
+clock duration of the high-CPU-load interval during image
+processing. Our measurements confirm that the prompt eval-
+uation phase dominates overall execution time, accounting
+for more than 95% of the duration. Consequently, the tim-
+ing differences reported here are directly observable by an
+unprivileged attacker using standard timing measurements, a
+standard assumption in microarchitectural timing attacks [7].
+As shown in Figure 3, inference time exhibits a clear
+and consistent separation across aspect ratios. Square inputs
+(1:1) incur substantially higher latency than rectangular inputs
+(portrait or landscape), resulting in well-separated timing
+distributions.
+Specifically, square inputs require approximately 110 sec-
+onds on average, corresponding to the processing of five
+patches (four local patches and one global view). In contrast,
+rectangular inputs complete in approximately 48 seconds,
+reflecting the processing of only three patches. This yields
+a latency ratio of approximately ×2.3.
+Importantly, this separation persists across cache states.
+Although absolute execution times are slightly lower in the
+warm-cache setting, the relative gap and non-overlapping
+clusters remain unchanged, indicating that caching effects do
+not mitigate this architectural side-channel.
+2Measurement methodology. For experimental reproducibility, we collect
+measurements using the standard Linux perf subsystem. However, the
+attack described in this section does not require access to performance
+counters and relies only on observable execution time. Although our threat
+model assumes an attacker using the perf_event_open interface, the
+perf utility provides a stable and widely used mechanism for collecting
+performance counter data.
+6
+VI. SEMANTIC INFERENCE
+A. Motivation for Semantic Leakage
+Having shown the feasibility of the Tier 1 zero-privilege
+geometry attack, we now explore the Tier 2 microarchitec-
+tural attack. The aspect-ratio leakage described in Section V
+arises from deterministic control-flow decisions in dynamic
+preprocessing. In this section, we examine whether additional
+information can be inferred from the visual content itself, even
+when input images share identical dimensions and therefore
+trigger the same preprocessing grid.
+Modern vision encoders rely on attention-based architec-
+tures whose memory access patterns depend on the structure
+and complexity of the input [28]. Images with dense visual
+structure, such as medical imagery, induce different memory
+access behavior than sparse inputs, such as scanned documents
+with large uniform regions. While these differences may not
+significantly affect total execution time, they can manifest as
+variations in cache usage and memory contention.
+We therefore hypothesize that visual content introduces a
+secondary, probabilistic side-channel that complements the
+deterministic geometric leakage. In the following experiments,
+we empirically evaluate whether this signal is observable
+through hardware performance counters and whether it can
+be exploited to infer semantic properties of the input image.
+B. The Single-Dimension Limit
+To evaluate whether semantic information can be inferred
+independently of image geometry, we analyzed raw hardware
+metrics for N = 250 images of identical dimensions (672 ×
+672) but varying visual content. Table II reports the mean
+execution time and LLC miss counts for each content class
+under a warm-cache configuration.
+Execution Time: As expected, execution time is a strong
+discriminator for aspect ratio but loses predictive power when
+the geometry is fixed. Since all inputs trigger the same 2 × 2
+preprocessing grid, the relative execution-time difference be-
+tween sparse documents and dense X-ray images is below 3%,
+rendering it indistinguishable from normal system variability.
+LLC Miss Behavior: In contrast, LLC miss counts reveal
+a consistent pattern across content classes. Noise-like inputs
+exhibit the lowest cache contention, while visually dense and
+structured images induce higher cache pressure.
+• Lowest Contention (Noise): Randomized, noise-like im-
+ages produce the lowest LLC miss counts (1.69 × 1010),
+suggesting relatively uniform memory access. Although
+randomness typically increases cache misses, attention-
+based vision encoders fail to extract meaningful features
+from noise, resulting in smaller active working sets. This
+aligns with findings linking input entropy to observable
+side-channel leakage boundaries [44].
+• Highest Contention (Dense Images): Structured visual
+content, such as X-rays and natural scenes, induces higher
+LLC miss rates (≈1.79 × 1010). Dense structures force
+the attention mechanism to actively extract and process a
+larger number of features across the spatial grid, increas-
+ing memory pressure and LLC contention.
+Content Class
+Time (s)
+LLC Misses (109)
+Crypto-Noise
+107.4
+16.9 (Lowest)
+Document
+107.6
+17.6
+Nature
+109.0
+17.8
+X-Ray
+110.5
+17.9 (Highest)
+TABLE II: Mean hardware metrics (warm cache). Execu-
+tion time remains nearly constant across content classes, while
+LLC misses exhibit a consistent semantic ordering.
+Representative visual examples across classes are provided
+in Appendix B of the supplementary material.
+C. The Ambiguity Challenge
+While Table II reveals a measurable divergence between
+classes, relying on a single hardware metric is insufficient
+for robust single-shot inference. Microarchitectural state is
+inherently noisy due to dynamic OS memory management,
+background interrupts, and non-deterministic cache replace-
+ment policies. Consequently, the LLC miss distributions of
+visually dense classes exhibit non-negligible overlap. This
+inherent system variance prevents the isolation of semantic
+context using cache telemetry alone, motivating our dual-layer
+approach.
+These limitations highlight the need for a multi-dimensional
+approach that combines complementary signals. In the follow-
+ing section, we demonstrate that jointly analyzing execution
+time and cache behavior resolves this ambiguity and enables
+reliable semantic inference.
+VII. THE COMBINED ATTACK
+A. The Multi-Dimensional Attack Vector
+In Section VI, we established that while LLC Misses can
+indicate semantic density, using this metric alone is inherently
+noisy. Similarly, Section V showed that execution time creates
+broad, distinct clusters based on aspect ratio, but it cannot
+resolve content differences within those clusters because inputs
+of the same geometry incur almost identical processing times.
+To overcome these limitations, we propose a Combined
+Attack that models the leakage as a two-dimensional vector
+⃗v = (t, c), where t denotes execution time and c denotes LLC
+miss activity.
+B. Attack Methodology
+To contextualize this combined attack within realistic en-
+vironments, we translate our base synthetic categories into
+specific high-risk assets. Unlike the isolated semantic eval-
+uation in Section VI, where all images were fixed to a square
+geometry, this dataset assigns both a characteristic aspect ratio
+and a structural density to each class.
+Specifically, we map the base image generation functions
+to real-world proxies as follows:
+• Medical Report: Generated using the sparse text func-
+tion, formatted as a Portrait (1 : 2).
+7
+• Chest X-Ray: Generated using the dense structural func-
+tion, formatted as a Portrait (1 : 2).
+• Encrypted Data: Generated using the random noise
+function, formatted as a Square (1 : 1). As established
+earlier, noise fails to activate the attention mechanism,
+resulting in low cache contention.
+• Technical Schematic: Generated using the dense struc-
+tural function, formatted as a Square (1 : 1) to proxy
+highly detailed engineering diagrams.
+By creating these physical combinations, we establish two
+representative real-world scenarios to evaluate the effective-
+ness of the attack:
+1) Scenario A: Distinguishing Medical Reports (low cache
+contention) from Chest X-Rays (high cache contention)
+within the Portrait geometry cluster.
+2) Scenario B: Distinguishing Encrypted Data (low cache
+contention) from Technical Schematics (high cache con-
+tention) within the Square geometry cluster.
+1) Visualizing the Joint Feature Space: Figure 4 visualizes
+these scenarios by projecting the collected data into the pro-
+posed two-dimensional vector space. The physical behavior of
+the dynamic VLM perfectly explains the resulting distribution:
+First, the X-axis (Execution Time) cleanly separates the inputs
+into two distant clusters. This massive gap occurs because the
+Portrait inputs (Scenario A) are decomposed into three patches,
+whereas the Square inputs (Scenario B) are decomposed
+into five patches. However, within each isolated cluster, the
+data points overlap horizontally, confirming that timing alone
+cannot resolve semantic content. Second, the Y-axis (LLC
+Misses) resolves this ambiguity. Within each geometry cluster,
+the data points separate vertically based on visual complexity,
+allowing an attacker to distinguish dense structures from sparse
+ones.
+40000
+60000
+80000
+100000
+120000
+Execution Time (ms) → [Geometry]
+0.25
+0.50
+0.75
+1.00
+1.25
+1.50
+1.75
+2.00
+2.25
+Cache Misses → [Semantics]
+1e10
+Scenario A:
+Medical Triage
+Scenario B:
+Espionage
+Content Type
+Medical Report
+Chest X-Ray
+Tech Schematic
+Encrypted Data
+Fig. 4: Joint timing and cache leakage. Projection of the
+Combined Attack vector into a two-dimensional space. The
+X-axis (execution time) separates inputs by geometry clusters
+(portrait vs. square) due to varying patch counts. The Y-axis
+(LLC misses) resolves the semantic ambiguity within each
+geometric cluster (e.g., separating dense X-ray images from
+sparse documents).
+Intel (30MB)
+AMD (64MB)
+Evaluation Phase
+Low
+High
+Low
+High
+Time (s)
+49
+111
+18
+29
+(Portrait vs. Square)
+2.27x Gap
+1.61x Gap
+LLC Misses (109)
+16.9
+17.9
+4.6
+4.6
+(Noise vs. X-Ray)
+Observable
+Not Observable
+TABLE III: Cross-Architecture Evaluation. The geometric
+timing gap remains clear across platforms, reflecting algorith-
+mic control-flow. Conversely, the semantic cache signal is not
+observable on the AMD architecture due to its larger LLC
+capacity.
+2) Dataset and Protocol:
+We constructed a dedicated
+dataset spanning these four content combinations. The dataset
+was split into training (70%) and testing (30%) sets using
+stratified sampling to preserve class balance.
+3) Model Choice: Interpretable Baseline Classifier: Our
+rationale is that if a simple and interpretable classifier can
+achieve strong performance using only timing and cache fea-
+tures, this indicates that the leakage is systematic rather than
+arising from incidental noise. The use of a shallow decision
+tree (maximum depth of 3) further enables inspection of the
+learned decision boundaries, highlighting the separability of
+the leakage signals without relying on complex or black-box
+models, aligning with principles of explainable AI [45].
+C. Experimental Results
+The model achieved an overall accuracy of 0.84 on the
+test set. However, a closer look at the performance metrics
+(Table IV) and the prediction distribution (Figure 5) helps
+explain how the attack works and why it raises privacy
+concerns.
+First, as shown in Figure 5, the model never confuses
+images with different aspect ratios. This shows that the first
+signal (the overall inference time) separates images by their
+geometric layout in a fully deterministic manner. In other
+words, the timing information alone reliably reveals the input’s
+grid structure.
+The second signal comes from LLC activity. Unlike the
+deterministic timing, this microarchitectural signal introduces
+small variations. However, it is essential for resolving semantic
+ambiguity, allowing the model to distinguish between visually
+dense and sparse content within the same geometry.
+Interestingly, the model’s decision tree (Figure 6) closely
+follows the physical structure of our threat model: it first splits
+the data by inference time (capturing the image shape). Then
+it uses cache activity to refine the prediction based on visual
+content.
+Most importantly, as detailed in Table IV, the model
+achieves the highest recall for the most sensitive image cate-
+gories, correctly identifying 100% of Encrypted Data and 93%
+of Chest X-rays. This means that even if some less structured
+documents are occasionally misclassified, an attacker can
+8
+Class
+Precision
+Recall
+F1-Score
+Medical Report (Portrait)
+0.92
+0.73
+0.81
+Chest X-Ray (Portrait)
+0.78
+0.93
+0.85
+Encrypted Data (Square)
+0.79
+1.00
+0.88
+Tech Schematic (Square)
+1.00
+0.67
+0.80
+Overall Accuracy
+84.0%
+TABLE IV: Classification Report for the Combined Attack.
+While achieving an overall accuracy of 84.0%, the attack
+demonstrates asymmetric effectiveness. It achieves perfect
+(1.00) and near-perfect (0.93) recall for privacy-critical targets
+(Encrypted Data and Chest X-Rays). This indicates that the
+side-channel is highly reliable at identifying sensitive, visually
+dense inputs, ensuring they are rarely missed despite microar-
+chitectural noise.
+Chest X-Ray
+Medical Report
+Encrypted Data
+Tech Schematic
+Attacker Inference
+Chest X-Ray
+Medical Report
+Encrypted Data
+Tech Schematic
+True Content Type
+93.3%
+6.7%
+26.7%
+73.3%
+100.0%
+33.3%
+66.7%
+Time < 80s
+(Portrait Geometry)
+Time > 80s
+(Square Geometry)
+Fig. 5: Confusion Matrix of the Combined Attack. The
+results visually validate the dual-layer threat model: deter-
+ministic timing differences eliminate cross-geometry errors
+(empty off-diagonal quadrants), while cache-miss telemetry
+resolves semantic ambiguity within identical geometries. No-
+tably, the attack achieves perfect or near-perfect classification
+for privacy-critical targets, such as encrypted data and X-ray
+images.
+still reliably infer highly sensitive visual contexts from the
+execution of a local VLM.
+VIII. EVALUATION AND GENERALIZATION
+Having introduced the attack vectors, we now evaluate the
+generality and robustness of the observed leakage across differ-
+ent VLM architectures, hardware platforms, and background
+system conditions.
+A. Cross-Model Validation
+To evaluate whether the observed side-channel is specific
+to a single implementation or reflects a broader design pat-
+Fig. 6: The Physical Logic of the Attack. The extracted
+decision tree perfectly mirrors the proposed dual-layer leakage
+model. Layer 1 (Shape): A fully deterministic root split
+based on inference time (e.g., t < 80s vs. t > 80s) isolates
+the input’s geometric grid into Portrait or Square. Layer 2
+(Substance): Within each geometry cluster, cache contention
+levels (Low vs. High LLC Misses) differentiate inputs by
+visual density. This allows the attacker to reliably isolate dense
+structures (Chest X-Rays, Tech Schematics) from sparse ones
+(Medical Reports, Encrypted Data).
+tern, we compare LLaVA v1.6 against LLaVA v1.5 (static
+preprocessing) and Qwen2-VL (dynamic preprocessing). To
+execute this comparison, we developed an automated profiling
+framework that processes our geometric benchmark dataset
+through each model. The script directs the inference engine
+and extracts the prompt evaluation latency per image, system-
+atically mapping input aspect ratios to their resulting execution
+times.
+As shown in Figure 7, the static model exhibits a nearly
+constant latency across aspect ratios. In contrast, Qwen2-VL
+reproduces the step-like timing behavior observed in our pri-
+mary experiments, where square inputs incur an approximately
+60% latency increase compared to rectangular inputs. This
+consistency across independently developed models indicates
+that the leakage originates from the dynamic preprocessing
+algorithm itself. Because the number of processed patches
+depends on the input grid (m × n), different aspect ratios
+lead to different control-flow paths, thereby directly affecting
+inference time. Consequently, the side-channel derives from
+the fundamental algorithmic design rather than specific model
+weights or implementation artifacts.
+B. Cross-Architecture Validation
+While the previous results established the attack’s efficacy
+on Intel, we now evaluate the influence of cache capacity using
+an AMD-based system.
+We replicated the attack on an AMD Ryzen 9 7950X
+processor, which has a relatively large LLC (Table I). The
+experiments were conducted using a Python-based framework
+that runs pre-compiled llama.cpp binaries on both the
+Intel and AMD systems. For each image in the benchmark,
+the script pins the inference process to a specific CPU core
+using taskset and collects hardware measurements using
+the Linux perf tool. In particular, we record LLC misses
+9
+LLaVA_1.5
+Qwen2_VL
+VLM Architecture
+0
+500
+1000
+1500
+2000
+2500
+3000
+3500
+Inference Time (ms)
++60% Gap
+Static vs. Dynamic: Latency Impact
+Input Aspect Ratio
+Portrait (1:2)
+Square (1:1)
+Landscape (2:1)
+Fig. 7: Cross-Model Comparison. LLaVA v1.5 (static pre-
+processing) shows similar latency across aspect ratios, whereas
+Qwen2-VL (dynamic preprocessing) exhibits a clear step-like
+timing pattern. Square inputs (1 : 1) incur approximately a
+60% latency increase compared to rectangular inputs.
+and execution cycles. This allows us to test whether the
+observed leakage depends on specific hardware properties or
+the algorithmic design.
+We expect the geometric leakage, which appears as timing
+differences due to variable-grid processing, to remain visible
+regardless of cache size, as it is caused by input-dependent
+control flow in the algorithm. In contrast, cache-based signals
+such as LLC misses may vary with cache size, because a larger
+cache can reduce memory contention and thereby affect the
+number of misses. Table III summarizes the results.
+As expected, the cross-architecture experiment reveals two
+different types of leakage: one that remains stable across hard-
+ware platforms, and another that depends on microarchitectural
+characteristics.
+1) Architecture-Independent Leakage (Aspect Ratio):
+The timing-based side-channel remains visible on both
+platforms. Although the AMD processor runs faster
+overall, the relative latency gap between square and
+portrait inputs remains clear (1.61×). This suggests that
+the leakage originates from the input-dependent control
+flow of the preprocessing algorithm rather than from
+hardware-specific behavior.
+2) Hardware-Sensitive Leakage (Semantics): In contrast,
+semantic leakage is more dependent on hardware charac-
+teristics. While clearly observable on the Intel platform,
+the signal is weaker on the AMD system, presumably
+due to its larger 64 MB LLC. The larger cache reduces
+memory contention and dampens the observable cache-
+miss signal.
+C. Robustness to System Load
+Finally, we evaluated the robustness of the semantic signal
+under realistic background system load. During each experi-
+ment, the VLM inference was executed concurrently with a
+synthetic workload generated using stress-ng. The stress
+process was configured to occupy two additional CPU cores
+and introduce sustained CPU and cache pressure (using the
+--cpu and --l3-cache stressors). By measuring LLC con-
+tention under these conditions, we assess whether the seman-
+tic signal remains observable despite continuous background
+cache activity (detailed results are provided in Appendix C of
+the supplementary material).
+IX. DISCUSSION AND DESIGN RECOMMENDATIONS
+Our findings highlight a fundamental trade-off in local
+AI systems between architectural efficiency and side-channel
+resilience. To address practical security engineering concerns,
+we map the identified vulnerabilities to actionable design
+recommendations and evaluate the trade-offs of implementing
+them.
+A. Mitigation Strategies
+Effective mitigation requires addressing the two tiers of our
+threat model (Section IV) separately:
+• Tier 1 (Timing/Geometry): Mitigations must break the
+deterministic link between the input’s aspect ratio and
+the total execution time. This requires application-level
+or framework-level interventions.
+• Tier 2 (Cache/Semantics): Mitigations must hide the
+memory access patterns caused by the structural com-
+plexity of the input. This typically requires OS-level or
+hardware-level controls.
+B. Mitigating Tier 1: Application and Framework Interven-
+tions
+To eliminate geometric leakage, the VLM must perform a
+constant amount of computational work regardless of the input
+shape.
+1) Constant-Work Padding: A straightforward mitigation is
+to enforce constant computational work by padding all inputs
+to the worst-case grid configuration (e.g., forcing a 2 × 2
+grid that yields 5 patches). This approach removes the input-
+dependent control flow that enables the timing side-channel,
+as every input is processed using the same computational path.
+However, this mitigation incurs a substantial performance cost.
+On our reference Intel platform (Table III), processing a por-
+trait image naturally requires 49 seconds, while the worst-case
+square configuration requires 111 seconds. Enforcing constant-
+work padding would therefore introduce an approximate 126%
+increase in inference latency for portrait inputs.
+2) Static Resolution (”Privacy Mode”):
+As a lower-
+overhead
+alternative,
+local
+inference
+frameworks
+(e.g.,
+llama.cpp or PyTorch) could provide an explicit “Privacy
+Mode” flag (e.g., --disable-anyres). In this mode, the
+model would bypass dynamic resolution entirely and revert
+to a static single-patch resizing strategy similar to earlier
+architectures such as LLaVA v1.5. While this reduces high-
+resolution visual fidelity, it avoids the substantial performance
+overhead of constant-work padding. It provides a simple
+baseline defense for privacy-sensitive applications, such as
+medical or document-processing workloads.
+10
+C. Mitigating Tier 2: System-Level Interventions
+Unlike execution-time leakage, semantic cache leakage can-
+not be mitigated directly at the application level. As a result,
+effective defenses must rely on system-level controls.
+1) OS Telemetry Policies: The most immediate defense
+against Tier 2 is restricting access to hardware performance
+counters. Operating system vendors can adopt stricter defaults
+(e.g., setting perf_event_paranoid = 3 on Linux) to
+prevent unprivileged applications from profiling shared caches
+during sensitive workloads.
+2) Telemetry Obfuscation via Noise Injection: If telemetry
+access must remain enabled for debugging, OS schedulers
+could intentionally inject controlled background memory ac-
+tivity during VLM inference to lower the signal-to-noise
+ratio. For example, the scheduler could periodically trigger
+lightweight memory accesses or cache-thrashing routines on
+idle cores during inference. However, this trade-off reduces
+overall system throughput and negatively impacts battery life
+on mobile devices.
+D. The Hardware Lottery
+Finally, our cross-architecture evaluation suggests a form of
+”hardware lottery” [46]. Users on consumer-grade hardware
+with modest LLC capacities (e.g., 30 MB) exhibit observable
+semantic leakage. In contrast, high-end systems with large
+shared caches (e.g., 64 MB) incidentally absorb the working
+set variance, naturally dampening the Tier 2 signal. This
+asymmetry highlights a critical risk for future deployments.
+As VLMs transition to specialized, resource-constrained edge
+hardware, these devices will inherently have significantly
+smaller LLC capacities. Consequently, the dampening effect
+observed on large desktop caches will vanish, making semantic
+side-channel leakages even more prominent. Evaluating mi-
+croarchitectural vulnerability must therefore become a manda-
+tory security benchmark for dedicated Edge AI hardware.
+X. SECURITY IMPLICATIONS AND LIMITATIONS
+While our evaluation identifies a fundamental architectural
+vulnerability, assessing its real-world impact requires con-
+sidering how these systems are deployed in practice and
+recognizing the limitations of our current analysis.
+A. Real-World Risk Scenarios
+The shift towards local VLMs is largely driven by industries
+handling highly sensitive data. The dual-layer side-channel
+exposes these deployments to significant privacy risks:
+• Medical Diagnostics: A local VLM deployed in a clinic
+might process both standard patient records (sparse, por-
+trait documents) and diagnostic imaging (dense, square
+or landscape X-rays). An unprivileged attacker can eas-
+ily distinguish between these tasks using our combined
+attack, violating patient confidentiality without explicitly
+accessing the protected data.
+• Enterprise and Legal Operations: Organizations often
+deploy local AI to review confidential contracts or in-
+tellectual property. The deterministic geometric leakage
+(Tier 1) allows an attacker to reliably distinguish when
+an employee is reviewing standard legal documents ver-
+sus specialized technical documents, potentially revealing
+sensitive patterns of corporate activity.
+B. Limitations and Future Work
+Our experimental methodology was designed to optimally
+isolate and prove the existence of algorithmic side-channels
+in dynamic preprocessing. Building on this foundation, we
+identify several key directions for future research:
+1) Isolating the Algorithmic Signal:
+Our experiments
+demonstrate the presence of the vulnerability under a consis-
+tent experimental setup. Future work could further examine
+how system-level conditions influence the strength of the
+leakage. In particular, studies could repeat the same visual
+workloads while varying common hardware settings, such as
+CPU power-management policies, the use of Simultaneous
+Multithreading (SMT), or the memory layout in multi-socket
+systems (NUMA). Such experiments would help clarify how
+much of the observed signal is driven by the dynamic grid
+mechanism itself versus broader system configuration effects.
+2) Impact of Cache Capacity: Our cross-architecture eval-
+uation demonstrates that LLC capacity influences the semantic
+(Tier 2) leakage. Future work should systematically quantify
+this relationship across a broader spectrum of processors to
+establish the exact cache thresholds at which semantic variance
+becomes unobservable.
+3) Algorithmic Vulnerability in Edge AI Devices: Like all
+cache-based attacks, our semantic signal can be disrupted by
+extreme memory contention. However, our primary contribu-
+tion is exposing the underlying algorithmic vulnerability: the
+VLM’s attention mechanism inherently alters its memory foot-
+print based on visual entropy. Since this algorithmic behavior
+manifests physically depending on the specific hardware archi-
+tecture, evaluating resilience against this leakage vector should
+become a mandatory, device-specific security benchmark for
+all future dedicated Edge AI hardware.
+XI. CONCLUSION
+The primary motivation for deploying Edge AI and lo-
+cal VLMs is to preserve data privacy. However, we have
+shown that the architectural shift toward dynamic high-
+resolution preprocessing introduces a previously overlooked
+multi-dimensional side-channel. By jointly exploiting deter-
+ministic geometric leakage (Tier 1) through execution time and
+probabilistic semantic leakage (Tier 2) through cache behavior,
+an unprivileged attacker can infer not only the shape but also
+high-level contextual properties of visual inputs.
+Our evaluation across architectures and system conditions
+indicates that the geometric component of this leakage stems
+from the algorithmic design of dynamic preprocessing. In
+contrast, semantic leakage is influenced by underlying mi-
+croarchitectural characteristics such as cache capacity.
+More broadly, our results highlight that local execution
+alone does not guarantee privacy on shared hardware. Future
+edge AI systems must therefore treat side-channel resilience
+as a first-class design consideration rather than assuming that
+on-device inference inherently provides privacy.
+11
+ACKNOWLEDGMENT
+To facilitate reproducibility, the experimental measurement
+scripts, feature extraction tools, and a representative sample
+of the dataset have been made publicly available at: https:
+//anonymous.4open.science/r/Shape-and-Substance-Dual-Lay
+er-Side-Channel-Attacks-on-Local-Vision-Language-Model
+s-C6D7.
+REFERENCES
+[1] Z. Zhou, X. Chen, E. Li, L. Zeng, K. Luo, and J. Zhang, “Edge
+intelligence: Paving the last-mile of artificial intelligence with edge
+computing,” Proceedings of the IEEE, vol. 107, no. 8, pp. 1738–1762,
+2019.
+[2] E. Li, L. Zeng, Z. Zhou, and X. Chen, “Edge ai: On-demand accelerating
+deep neural network inference via edge computing,” IEEE transactions
+on wireless communications, vol. 19, no. 1, pp. 447–457, 2019.
+[3] N. Carlini, F. Tramer, E. Wallace, M. Jagielski, A. Herbert-Voss, K. Lee,
+A. Roberts, T. Brown, D. Song, U. Erlingsson et al., “Extracting training
+data from large language models,” in 30th USENIX Security Symposium
+(USENIX Security 21), 2021, pp. 2633–2650.
+[4] R. Shokri, M. Stronati, C. Song, and V. Shmatikov, “Membership
+inference attacks against machine learning models,” in 2017 IEEE
+symposium on security and privacy (SP).
+IEEE, 2017, pp. 3–18.
+[5] T. Ristenpart, E. Tromer, H. Shacham, and S. Savage, “Hey, you, get
+off of my cloud: exploring information leakage in third-party compute
+clouds,” in Proceedings of the 16th ACM Conference on Computer and
+Communications Security (CCS), 2009, pp. 199–212.
+[6] H. Shacham, M. Page, B. Pfaff, E.-J. Goh, N. Modadugu, and D. Boneh,
+“On the effectiveness of address-space randomization,” in Proceedings
+of the 11th ACM conference on Computer and communications security,
+2004, pp. 298–307.
+[7] Q. Ge, Y. Yarom, D. Cock, and G. Heiser, “A survey of microarchitec-
+tural timing attacks and countermeasures on contemporary hardware,”
+Journal of Cryptographic Engineering, vol. 8, no. 1, pp. 1–27, 2018.
+[8] P. Kocher, J. Horn, A. Fogh, D. Genkin, D. Gruss, W. Haas, M. Ham-
+burg, M. Lipp, S. Mangard, T. Prescher et al., “Spectre attacks: Exploit-
+ing speculative execution,” in 2019 IEEE Symposium on Security and
+Privacy (SP).
+IEEE, 2019, pp. 1–19.
+[9] Y. Yarom and K. Falkner, “Flush+ reload: A high resolution, low noise,
+l3 cache side-channel attack,” in 23rd USENIX Security Symposium
+(USENIX Security 14), 2014, pp. 719–732.
+[10] A. Adiletta and B. Sunar, “Spill the beans: Exploiting cpu cache side-
+channels to leak tokens from large language models,” arXiv preprint
+arXiv:2505.00817, 2025.
+[11] H. Naghibijouybari, A. Neupane, Z. Qian, and N. Abu-Ghazaleh,
+“Rendered insecure: Gpu side channel attacks are practical,” in 27th
+USENIX Security Symposium (USENIX Security 18), 2018, pp. 2139–
+2156.
+[12] P. Pessl, D. Gruss, C. Maurice, M. Schwarz, and S. Mangard,
+“{DRAMA}: Exploiting {DRAM} addressing for {Cross-CPU} at-
+tacks,” in 25th USENIX security symposium (USENIX security 16), 2016,
+pp. 565–581.
+[13] H. Liu, C. Li, Y. Li, and Y. J. Lee, “Improved baselines with visual
+instruction tuning,” in Proceedings of the IEEE/CVF conference on
+computer vision and pattern recognition, 2024, pp. 26 296–26 306.
+[14] A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai,
+T. Unterthiner, M. Dehghani, M. Minderer, G. Heigold, S. Gelly et al.,
+“An image is worth 16x16 words: Transformers for image recognition at
+scale,” in International Conference on Learning Representations, 2021.
+[15] R. Schwartz, J. Dodge, N. A. Smith, and O. Etzioni, “Green ai,”
+Communications of the ACM, vol. 63, no. 12, pp. 54–63, 2020.
+[16] F. Li, R. Zhang, H. Zhang, Y. Zhang, B. Li, W. Li, Z. Ma, and C. Li,
+“Llava-next-interleave: Tackling multi-image, video, and 3d in large
+multimodal models,” arXiv preprint arXiv:2407.07895, 2024.
+[17] P. Wang, S. Bai, S. Tan, S. Wang, Z. Fan, J. Bai, K. Chen,
+X. Liu, J. Wang, W. Ge et al., “Qwen2-vl: Enhancing vision-language
+model’s perception of the world at any resolution,” arXiv preprint
+arXiv:2409.12191, 2024.
+[18] A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez,
+Ł. Kaiser, and I. Polosukhin, “Attention is all you need,” in Advances
+in neural information processing systems, 2017, pp. 5998–6008.
+[19] F. Liu, Y. Yarom, Q. Ge, G. Heiser, and R. B. Lee, “Last-level cache
+side-channel attacks are practical,” in 2015 IEEE symposium on security
+and privacy.
+IEEE, 2015, pp. 605–622.
+[20] A. Radford, J. W. Kim, C. Hallacy, A. Ramesh, G. Goh, S. Agarwal,
+G. Sastry, A. Askell, P. Mishkin, J. Clark et al., “Learning transferable
+visual models from natural language supervision,” in International
+conference on machine learning.
+PMLR, 2021, pp. 8748–8763.
+[21] M. Tschannen, A. Gritsenko, X. Wang, M. F. Naeem, I. Alabdul-
+mohsin, N. Parthasarathy, T. Evans, L. Beyer, Y. Xia, B. Mustafa
+et al., “Siglip 2: Multilingual vision-language encoders with improved
+semantic understanding, localization, and dense features,” arXiv preprint
+arXiv:2502.14786, 2025.
+[22] J. Li, D. Li, S. Savarese, and S. Hoi, “Blip-2: Bootstrapping language-
+image pre-training with frozen image encoders and large language
+models,” in International conference on machine learning.
+PMLR,
+2023, pp. 19 730–19 742.
+[23] J.-B. Alayrac, J. Donahue, P. Luc, A. Miech, I. Barr, Y. Hasson, K. Lenc,
+A. Mensch, K. Millican, M. Reynolds et al., “Flamingo: a visual
+language model for few-shot learning,” Advances in neural information
+processing systems, vol. 35, pp. 23 716–23 736, 2022.
+[24] J.
+Achiam
+et
+al.,
+“Gpt-4
+technical
+report,”
+arXiv
+preprint
+arXiv:2303.08774, 2023.
+[25] G. Gerganov and contributors, “llama.cpp,” https://github.com/ggml-o
+rg/llama.cpp, 2024.
+[26] K. He, X. Zhang, S. Ren, and J. Sun, “Deep residual learning for image
+recognition,” in Proceedings of the IEEE conference on computer vision
+and pattern recognition, 2016, pp. 770–778.
+[27] M. Dehghani, B. Mustafa, J. Djolonga, J. Heek, J. Gilmer et al.,
+“Patch n’ pack: Navit, a vision transformer for any aspect ratio and
+resolution,” in Advances in Neural Information Processing Systems
+(NeurIPS), vol. 36, 2024.
+[28] T. Dao, D. Y. Fu, S. Ermon, A. Rudra, and C. R´e, “Flashattention: Fast
+and memory-efficient exact attention with io-awareness,” in Advances
+in Neural Information Processing Systems, vol. 35, 2022, pp. 16 344–
+16 359.
+[29] S. A. Crosby and D. S. Wallach, “Denial of service via algorithmic
+complexity attacks,” in 12th USENIX Security Symposium (USENIX
+Security 03), 2003, pp. 29–44.
+[30] P. C. Kocher, “Timing attacks on implementations of diffie-hellman, rsa,
+dss, and other systems,” in Annual international cryptology conference.
+Springer, 1996, pp. 104–113.
+[31] M. Yan, C. W. Fletcher, and J. Torrellas, “Cache telepathy: Leveraging
+shared resource attacks to learn dnn architectures,” in 29th USENIX
+Security Symposium (USENIX Security 20), 2020, pp. 2003–2020.
+[32] M. Fredrikson, S. Jha, and T. Ristenpart, “Model inversion attacks
+that exploit confidence information and basic countermeasures,” in
+Proceedings of the 22nd ACM SIGSAC Conference on Computer and
+Communications Security (CCS), 2015, pp. 1322–1333.
+[33] Y. Zhang, R. Yasaei, H. Chen, Z. Li, and M. A. Al Faruque, “Stealing
+neural network structure through remote fpga side-channel analysis,”
+IEEE Transactions on Information Forensics and Security, vol. 16, pp.
+4377–4388, 2021.
+[34] Z. Gao, J. Hu, F. Guo, Y. Zhang, Y. Han, S. Liu, H. Li, and Z. Lv,
+“I know what you said: Unveiling hardware cache side-channels in
+local large language model inference,” arXiv preprint arXiv:2505.06738,
+2025.
+[35] X. Zheng, H. Han, S. Shi, Q. Fang, Z. Du, X. Hu, and Q. Guo,
+“Inputsnatch: Stealing input in llm services via timing side-channel
+attacks,” arXiv preprint arXiv:2411.18191, 2024.
+[36] L. Song, Z. Pang, W. Wang, Z. Wang, X. Wang, H. Chen, W. Song,
+Y. Jin, D. Meng, and R. Hou, “The early bird catches the leak: Unveiling
+timing side channels in llm serving systems,” IEEE Transactions on
+Information Forensics and Security, 2025.
+[37] C. Gu, X. L. Li, R. Kuditipudi, P. Liang, and T. Hashimoto,
+“Auditing prompt caching in language model apis,” arXiv preprint
+arXiv:2502.07776, 2025.
+[38] R. Ding, T. Xu, X. Shen, A. A. Ding, and Y. Fei, “Moecho: Exploiting
+side-channel attacks to compromise user privacy in mixture-of-experts
+llms,” in Proceedings of the 2025 ACM SIGSAC Conference on Com-
+puter and Communications Security, 2025, pp. 2159–2173.
+[39] D. Wang, A. Neupane, Z. Qian, and N. Abu-Ghazaleh, “Unveiling your
+keystrokes: A cache-based side-channel attack on graphics libraries,” in
+NDSS, 2019.
+[40] R. Kotcher, Y. Pei, P. Jumde, and C. Jackson, “Cross-origin pixel
+stealing: timing attacks using css filters,” in 20th ACM Conference on
+Computer and Communications Security (CCS), 2013, pp. 1055–1062.
+12
+[41] X. Cai, X. C. Zhang, B. Joshi, and R. Johnson, “Touching from a
+distance: Website fingerprinting attacks and defenses,” in Proceedings of
+the 2012 ACM conference on Computer and communications security,
+2012, pp. 605–616.
+[42] R. Schuster, V. Shmatikov, and E. Tromer, “Beauty and the burst:
+Remote identification of encrypted video streams,” in 26th USENIX
+Security Symposium (USENIX Security 17), 2017, pp. 1357–1374.
+[43] H. Kim, C. Hahn, H. J. Kim, Y. Shin, and J. Hur, “Deep learning-based
+detection for multiple cache side-channel attacks,” IEEE Transactions
+on Information Forensics and Security, vol. 19, pp. 1672–1686, 2023.
+[44] Z. Zhang, A. A. Ding, and Y. Fei, “A guessing entropy-based framework
+for deep learning-assisted side-channel analysis,” IEEE Transactions on
+Information Forensics and Security, vol. 18, pp. 3018–3030, 2023.
+[45] M. T. Ribeiro, S. Singh, and C. Guestrin, “”why should i trust you?”
+explaining the predictions of any classifier,” in Proceedings of the 22nd
+ACM SIGKDD international conference on knowledge discovery and
+data mining, 2016, pp. 1135–1144.
+[46] S. Hooker, “The hardware lottery,” Communications of the ACM, vol. 64,
+no. 12, pp. 58–65, 2021.
+APPENDIX A
+ARTIFACT REPRODUCIBILITY DETAILS
+To facilitate exact reproduction of the reported side-channel
+leakage, we provide the specific configuration parameters used
+in our evaluation.
+a) Victim & Attacker Isolation: Process Pinning for Ex-
+perimental Control. To reduce scheduling-induced variance
+and enable reproducible attribution of observed leakage to
+shared microarchitectural resources, we pinned the victim and
+attacker processes to specific CPU cores using taskset. We
+use core pinning to isolate the microarchitectural signal from
+OS scheduler noise, thereby establishing a precise baseline
+for algorithmic leakage. While an unprivileged attacker cannot
+dictate the victim’s scheduling, they can monitor core utiliza-
+tion and dynamically control their own CPU affinity (e.g., via
+sched_setaffinity) to co-locate with the target process
+actively. Thus, our pinned setup evaluates the vulnerability
+under optimal conditions of shared-cache contention, which a
+realistic attacker actively strives to achieve.
+Specifically, we used the following configuration:
+• Victim (VLM): Pinned to physical core 4 (taskset
+-c 4).
+• Attacker (Profiler): Pinned either to physical core 5
+(to induce contention at the shared LLC) or to the
+same physical core (to evaluate a hyperthreading setting),
+depending on the experiment described in Section IV of
+the main manuscript.
+This setup allows us to isolate leakage arising from shared
+cache resources, either through L1/L2 sharing via simultane-
+ous multi-threading or through contention in the shared L3
+cache, while minimizing interference from OS scheduling.
+b) Software Versions: Our reference implementation is
+based on llama.cpp. To ensure a consistent memory layout
+and stable execution paths across runs, all experiments were
+conducted using a fixed commit (b3456...). We employed
+the Q4_K_M quantization scheme, which corresponds to the
+default configuration for high-performance local inference.
+c) Kernel Configuration: Performance Counter Access
+for Ground Truth Collection. For the purpose of constructing
+a clean and reproducible ground-truth dataset, we temporarily
+configured kernel.perf_event_paranoid = -1 dur-
+ing data collection. This setting was used exclusively to enable
+unrestricted access to performance counters for measurement
+validation.
+Importantly, the attack itself does not rely on elevated
+privileges. As described in Section IV of the main manuscript,
+the specific hardware events exploited in this work (e.g.,
+LLC misses and CPU cycles) are accessible to unprivileged
+user-space processes under the default restrictive configuration
+(perf_event_paranoid ≤2), which is commonly used
+in standard Linux distributions such as Ubuntu and Debian.
+APPENDIX B
+VISUAL DENSITY & SPECTRAL ANALYSIS
+In Section VI of the main manuscript, we argued that
+the observed probabilistic leakage is related to differences in
+spatial frequency and visual structure across image patches.
+This appendix provides visual examples that illustrate these
+low-level properties without relying on the image’s semantic
+meaning.
+Figure S1 illustrates representative samples from the four
+evaluated categories.
+• Low Contention (Left Column): Categories such as
+Documents and Crypto-Noise contain large uniform re-
+gions and relatively little fine texture. As a result, the
+vision encoder processes these inputs with more regular
+memory access patterns, thereby reducing LLC con-
+tention.
+• High Contention (Right Column): Categories such as
+Nature and X-Rays contain dense visual structure and
+rich textures across the image. Processing these inputs
+activates additional parts of the vision encoder and in-
+creases the working set size, thereby leading to higher
+LLC contention.
+APPENDIX C
+ROBUSTNESS UNDER SYSTEM LOAD
+Condition
+Noise (Avg)
+X-Ray (Avg)
+Separation Gap
+Idle State
+16.9
+17.9
+1.0
+System Load
+17.1
+18.1
+1.0
+TABLE S1: Leakage Robustness. Mean LLC misses (×109)
+under idle and background-load conditions. While absolute
+miss counts increase under load, the relative separation re-
+mains stable.
+A common critique of microarchitectural side-channels is
+their sensitivity to background system activity. To evaluate
+robustness under realistic noise, we repeated the content-based
+inference experiment while subjecting the system to controlled
+synthetic load using stress-ng, saturating two additional
+CPU cores.
+Table S1 summarizes the results. As expected, background
+load increases the absolute LLC miss counts for all in-
+puts, raising the overall noise floor. However, the relative
+separation gap (∆) between structurally dense inputs (X-
+Ray) and noise-like inputs (Crypto-Noise) remains stable at
+approximately 1.0 × 109 misses.
+13
+(a) Document
+(b) Nature
+(c) Noise
+(d) X-Ray
+Fig. S1: Visual Density Comparison. Representative samples
+illustrating differences in spatial frequency and structural den-
+sity. High-contention classes (Nature, X-Ray) exhibit dense
+textures across the image plane, while low-contention classes
+(Document, Noise) contain large homogeneous regions with
+limited fine-grained structure.
+This observation indicates that moderate background load
+does not eliminate the cache-based separation between content
+classes. The stability of the separation gap suggests that the vi-
+sion encoder’s memory footprint during the prompt-evaluation
+phase dominates cache behavior over short execution intervals,
+rendering the leakage resilient to typical background activity.

@@ -1,0 +1,1668 @@
+1
+Dual-Graph Multi-Agent Reinforcement Learning
+for Handover Optimization
+M. Salvatori, F. Vannella, S. Macaluso, S. E. Trevlakis, C. Segura Perales,
+J. Suarez-Varela, A.-A. A. Boulogeorgos, and I. Arapakis
+Abstract—HandOver (HO) control in cellular networks is
+governed by a set of HO control parameters that are traditionally
+configured through rule-based heuristics. A key parameter for
+HO optimization is the Cell Individual Offset (CIO), defined for
+each pair of neighboring cells and used to bias HO triggering
+decisions. At network scale, tuning CIOs becomes a tightly
+coupled problem: small changes can redirect mobility flows
+across multiple neighbors, and static rules often degrade under
+non-stationary traffic and mobility. We exploit the pairwise
+structure of CIOs by formulating HO optimization as a De-
+centralized Partially Observable Markov Decision Process (Dec-
+POMDP) on the network’s dual graph. In this representation,
+each agent controls a neighbor-pair CIO and observes Key
+Performance Indicators (KPIs) aggregated over its local dual-
+graph neighborhood, enabling scalable decentralized decisions
+while preserving graph locality. Building on this formulation,
+we propose TD3-D-MA, a discrete Multi-Agent Reinforcement
+Learning (MARL) variant of the TD3 algorithm with a shared-
+parameter Graph Neural Network (GNN) actor operating on the
+dual graph and region-wise double critics for training, improving
+credit assignment in dense deployments. We evaluate TD3-D-
+MA in an ns-3 system-level simulator configured with real-
+world network operator parameters across heterogeneous traffic
+regimes and network topologies. Results show that TD3-D-MA
+improves network throughput over standard HO heuristics and
+centralized RL baselines, and generalizes robustly under topology
+and traffic shifts.
+Index Terms—Handover Optimization, Multi-Agent Reinforce-
+ment Learning, Decentralized Partially Observable Markov De-
+cision Process, Graph Neural Networks.
+I. INTRODUCTION
+The densification of cellular networks and the proliferation
+of heterogeneous deployments significantly increase the com-
+plexity of mobility management [1], [2]. As cells become
+smaller and coverage more irregular, inter-cell interference
+becomes more severe, while HandOver (HO) decisions be-
+come more frequent and more sensitive to channel fluctuations.
+Meanwhile, modern services ranging from enhanced mobile
+broadband to Ultra-Reliable Low-Latency Communications
+(URLLC) impose stringent and often competing requirements
+M. Salvatori, F. Vannella, S. Macaluso, C. Segura Perales, J. Suarez-
+Varela, and I. Arapakis are with Telef´onica Research, Barcelona, 08019,
+Spain (e-mail: {matteo.salvatori, filippo.vannella, sebastian.macaluso, car-
+los.seguraperales, jose.suarez-varela, ioannis.arapakis}@telefonica.com).
+S. E. Trevlakis is with Innocube PC, 55534 Thessaloniki, Greece, (e-mail:
+trevlakis@innocube.org)
+A.-A. A. Boulogeorgos is with the Department of Electrical and Computer
+Engineering, Democritus University of Thrace, Xanthi, 67100, Greece (e-mail:
+al.boulogeorgos@ieee.org).
+This work has been funded by projects 6G-CLARION-2022/0005400 and
+MAP-6G TSI-063000-2021-63, funded by Spanish Ministry of Economic
+Affairs and Digital Transformation, European Union NextGeneration-EU.
+User Equipment
+Base Station                      
+(primal node)
+Edge Agents          
+(dual node)
+Local Critic 
+Distributed 
+GNN actor
+Fig. 1: Dual-graph MARL framework for CIO-based HO.
+CIO agents are placed on dual-graph nodes corresponding
+to inter-cell edges e = {i, j} and tune the HO bias CIOij
+for each neighbor pair. A distributed GNN actor performs
+local message passing to produce edge actions, while CTDE
+training uses region-wise critics defined on overlapping primal
+subnetworks (shaded colored areas).
+on throughput, latency, and reliability. Recent surveys report
+that legacy Long Term Evolution (LTE)-derived mobility pro-
+cedures can struggle in ultra-dense and high-mobility regimes,
+leading to higher radio link failure rates, ping-pong effects,
+reduced throughput, and load imbalance [1], [3]–[6]. These
+effects are exacerbated by fast variations in radio conditions
+and heterogeneous user mobility, which increase the sensitivity
+of HO triggering and parameter settings.
+In Third Generation Partnership Project (3GPP) compliant
+systems, HO behavior is governed by event-based triggers
+(e.g., A3 events) and a set of HO Control Parameters (HCPs),
+including hysteresis, Time-To-Trigger (TTT), and Cell Indi-
+vidual Offsets (CIOs), which control HO decisions between
+neighboring cells. These parameters are traditionally config-
+ured offline or adapted through rule-based Self-Organizing
+Network (SON) functions. Although robust and easy to deploy,
+such mechanisms are inherently static; a configuration that
+performs well for one traffic mix and mobility pattern can
+induce cell-edge starvation, oscillatory HO behavior, or load
+imbalance under another [5], [6]. This motivates Reinforce-
+ment Learning (RL) [7] as a data-driven approach for adaptive
+HO control. A growing body of work formulates HO control
+as an RL problem either by tuning HCPs or by directly
+selecting serving cells based on radio measurements [8]–
+[13]. These studies show that RL controllers can outperform
+static, heuristic, or rule-based HO baselines in terms of, e.g.,
+throughput, load distribution, or mobility robustness.
+arXiv:2603.24634v1  [cs.NI]  25 Mar 2026
+2
+A. Motivation, novelty, and contributions
+Despite this progress, RL-based HO control still faces prac-
+tical limitations that hinder its scalability, learning stability,
+and generalization. At network scale, CIO tuning induces
+a large number of coupled control variables, yielding high-
+dimensional state representations and multi-discrete action
+spaces that challenge centralized learning or scenario-specific
+designs [8], [11]. Moreover, the structure of CIO control is
+often under-exploited: CIOs are typically treated as a central-
+ized action vector or assigned to per-cell agents, even though
+CIOs naturally live on edges of the network graph, where they
+induce local yet coupled effects across adjacent cell pairs [11]–
+[13]. This coupling also creates credit-assignment problems
+[7], motivating distributed critic designs that provide more
+local learning signals in dense deployments [11]. While RL
+methods often show gains in a given scenario, they are seldom
+evaluated under distribution shift (e.g., changes in topology,
+traffic, or mobility). Consequently, their generalization behav-
+ior is not well understood [8], [11]. We address the above gaps
+through the following contributions:
+• We formulate CIO-based HO optimization as a coopera-
+tive Multi-Agent Reinforcement Learning (MARL) prob-
+lem, where each agent controls a single CIO parameter,
+and agents are placed on CIO edges via a dual-graph
+representation of the network. Local observations are built
+from radio cell Key Performance Indicators (KPIs) and
+aggregated through message passing over the dual graph.
+To the best of our knowledge, this is the first work to
+model CIO-based HO control as a MARL problem with
+agents on CIO edges organized via a dual-graph structure.
+• We introduce TD3-D-MA, a discrete multi-agent exten-
+sion of TD3 [14] with Centralized Training and Decen-
+tralized Execution (CTDE). A shared Graph Neural Net-
+work (GNN) actor operates on the dual graph, controlling
+discrete CIO values for each edge agent, while training
+uses multiple region-wise critics defined on overlapping
+N-hop primal subnetworks to improve credit assignment
+in dense deployments (see Fig. 1).
+• We implement an ns-3 [15] network simulator con-
+figured with real-world network operator parameters,
+standard A3-triggered HOs, and an RL interface for
+CIO tuning. In this environment, we benchmark TD3-
+D-MA against centralized RL and SON-like baselines
+under heterogeneous network topologies. We compare
+multiple GNN actor architectures and different critic
+designs (factorized, non-factorized, local hops input), and
+show that the dual-graph GNN+CTDE design improves
+learning stability and generalization across topologies and
+mobility patterns compared to centralized and rule-based
+baselines. Our code is available at this link.
+B. Organization
+The remainder of this paper is organized as follows: Section
+II reviews prior RL-based HO and positions this work. Section
+III formulates the problem, and Section IV presents the pro-
+posed policy and algorithm. Section V reports the experimental
+setting and results, and Section VI concludes the paper.
+II. RELATED WORK
+Mobility and HO management in wireless networks have
+been extensively studied from the learning perspective [1], [3]–
+[6]. Our work lies at the intersection of (1) RL-based HO
+optimization; (2) multi-agent and graph-based RL for RAN
+control; and (3) RL simulation environments for networking.
+Tab. I summarizes representative prior work and highlights
+how this paper differs along (a) control knob, (b) learning
+paradigm, (c) algorithm, and (d) simulator.
+RL-based HO optimization. Most RL-based HO studies
+adopt centralized or single-agent control and optimize either
+HO decisions (cell selection) or a subset of HO parameters (see
+[8] for a comprehensive review). Examples include bandit/RL
+formulations for mobility decisions [9], RL-based adaptation
+of TTT/hysteresis [10], actor-critic tuning of HO margins [16],
+and deep RL for HO decision making in dense HetNets [17].
+Similarly to our approach, a few works employ RL to tune
+CIOs and related offsets/biases, motivated primarily by Mo-
+bility Load Balancing (MLB) [18]. Representative approaches
+include deep RL for CIO-based mobility load management
+[11], joint CIO and power control [19], and RL schemes
+that optimize offset/neighbor-border parameters in ns-3 [12].
+Decentralized variants place learning across cells [13], and
+two-layer schemes combine load prediction with RL-based
+CIO control [20]. Recent MARL formulations further tune
+HO parameters in decentralized settings [21], [22]. These stud-
+ies demonstrated that adaptive policies can outperform static
+configurations, but generally remain either centralized/single-
+agent, focused on a different set of parameters, or evaluated
+in scenario-specific simulators without reusable environments.
+Multi-Agent and Graph-Based RL for HO optimization.
+Surveys of MARL for wireless systems highlight challenges
+such as partial observability, non-stationarity, and scalability,
+motivating decentralized control and (often) CTDE-style train-
+ing [23]. In the mobility management context, decentralized
+and multi-agent learning has been explored for MLB and HO
+parameter tuning, e.g., with one agent per cell and actions
+on HO-related parameters and offsets [13], [20]–[22]. Beyond
+CIO/parameter tuning, HO-focused MARL also appears in
+settings such as dense mmWave networks [24] and joint
+HO+power or HO+trajectory control [25], [26]. Generally,
+existing MARL formulations for HO/mobility typically place
+agents on BS (node) entities and act on node-level deci-
+sions/parameters, without treating CIO edges as first-class
+decision variables. Our contribution differs by using a dual-
+graph where CIOs are dual nodes and decentralized actors
+operate on CIO edges via a shared-parameter GNN under
+CTDE.
+RL network simulation environments. ns-3 is widely
+used for LTE/NR mobility evaluation [15], and ns-3-gym
+exposes ns-3 as Gym-style environments [27]. Other open-
+source wireless RL environments exist [28], and there are
+isolated ns-3-based RL scripts for MRO/HO tuning [29],
+but they generally do not provide a standardized, reusable
+HO environment focused on 3GPP-style CIO control. Our
+environment addresses this gap with a CIO-centric interface,
+multi-topology support, and standardized HO/MLB KPIs.
+3
+TABLE I: Comparison of related work.
+Work
+Task
+RL Type
+Simulator
+Control Knob
+Multi-agent
+HO-focused approaches
+[9]
+HO
+Bandit
+5G Simulator
+Beam/Cell Selection
+✗
+[10]
+HO
+Single-Agent RL
+ns-3
+TTT + Hysteresis
+✗
+[16]
+HO
+Single-Agent RL
+5G Simulator
+HO Margin
+✗
+[17]
+HO
+Single-Agent RL
+HetNet Simulator
+Cell Selection
+✗
+[24]
+HO
+MARL
+mmWave Simulator
+Cell Selection
+✓
+MLB-focused approaches
+[11]
+MLB
+Single-Agent RL
+LTE Simulator
+CIO
+✗
+[12]
+MLB
+Single-Agent RL
+LTE Simulator
+CIO + Hysteresis
+✗
+[20]
+MLB
+MARL
+LTE/5G Simulator
+CIO
+✓
+[13]
+MLB
+MARL
+Custom Simulator
+Local Bias / HO Offset
+✓
+[30]
+MLB
+MARL
+LTE/5G Simulator
+CIO + Bias
+✓
+[21]
+MLB
+MARL
+5G Simulator
+CIO + Bias
+✓
+[22]
+MLB
+Hierarchical MARL
+LTE / ns-3
+HO Parameters
+✓
+Combined Control Tasks
+[25]
+HO+Power
+MARL
+HetNet Simulator
+HO + Power
+✓
+[26]
+HO+Trajectory
+MARL
+UAV/HetNet Simulator
+HO + Trajectory
+✓
+This work
+HO
+CTDE MARL
+ns-3
+Edge CIO
+✓
+III. PROBLEM FORMULATION
+This section formalizes CIO-based HO control as a coop-
+erative MARL problem. We first describe the network model
+and the HO mechanism, then introduce a Decentralized Par-
+tially Observable Markov Decision Process (Dec-POMDP) to
+model decision making under partial information, and finally
+instantiate the Dec-POMDP for the CIO control setting.
+A. Network Model
+Timescales. We distinguish a control timescale and a mea-
+surement timescale. Control decisions are taken at discrete
+epochs indexed by t = 0, 1, 2, . . . , separated by ∆> 0
+seconds. UE measurements used for HO evaluation (e.g.,
+RSRP reports) are processed at discrete measurement instants
+indexed by n = 0, 1, 2, . . . , separated by ∆m ≪∆seconds.
+We assume ∆= Nm∆m, for some integer Nm ∈N, so
+that each control interval contains exactly Nm measurement
+instants. The set of measurement indices belonging to control
+epoch t is I(t) ≜{tNm, tNm + 1, . . . , (t + 1)Nm −1}.
+Cells and network graph. We consider a mobile network
+environment with a fixed set of cells C = {1, . . . , C}. We
+represent HO feasibility between network cells through an
+undirected network graph G = (C, E), where {i, j} ∈E means
+that cells i and j are neighbors, i.e., a UE served by one
+cell may HO to the other. Neighbor relations are established
+according to a distance-based heuristic that reflects the spatial
+proximity of the cells. We denote the neighbor set of cell i
+by N(i) ≜{j ∈C : {i, j} ∈E}.
+Dual network graph. Since CIOs are configured per neigh-
+bor edges, it is convenient to define a graph whose nodes
+correspond to edges rather than cells. To this end, we construct
+a dual graph G⋆= (V⋆, E⋆) from G as follows:
+• Each dual node corresponds to one undirected neighbor
+relation (edge) e = {i, j} ∈E (controlled CIO variable).
+1
+2
+3
+4
+5
+6
+7
+8
+C12
+C23
+C35
+C34
+C56
+C67
+C14
+C78
+(a) Undirected network graph.
+C12
+C23
+C35
+C34
+C14
+C56
+C67
+C78
+2
+3
+3
+3
+5
+6
+7
+1
+4
+(b) Dual network graph.
+Fig. 2: Example of Network graph representations.
+• Two dual nodes e and e′ are adjacent if their underlying
+edges share at least one endpoint cell, i.e., e ∩e′ ̸= ∅.
+The neighborhood of a node e ∈V⋆in G⋆will define
+which CIO variables are considered “local” for decentralized
+observation aggregation. As the dual-node set and the primal
+edge set coincide, i.e., V⋆≜E, we refer to dual nodes simply
+by e ∈E. This dual-graph representation captures the fact that
+CIOs on adjacent links share cells, and hence their effects
+on local KPIs are correlated. This observation motivates a
+decentralized observation model where each agent aggregates
+information over its dual-graph neighborhood. Note that this
+construction formally corresponds to the line graph L(G) [31]
+(see Fig. 2 for an example).
+Radio quantities. Let U(n) be the set of active UEs at
+measurement instant n, and denote by Ui(n) ⊆U(n) the
+subset of UEs served by cell i at instant n. We define
+U(n) ≜|U(n)|, and Ui(n) ≜|Ui(n)|, so that U(n) =
+P
+i∈C Ui(n). Each cell i ∈C operates on a fixed system
+bandwidth B [Hz], partitioned into NPRB PRBs, such that
+B = NPRBBPRB, where BPRB [Hz] is the PRB bandwidth.
+At each measurement instant n, a scheduler assigns PRBs to
+connected UEs based on their channel conditions and traffic
+4
+demand. At measurement instant n we define the following
+radio quantities:
+• lu(n) ∈{0, 1, . . . , NPRB}: number of PRBs for UE u;
+• Li(n) ≜P
+u∈Ui(n) lu(n): total number of PRBs for cell i;
+• ηu(n) [bit/s/Hz]: spectral efficiency attained by UE u;
+• Ru(n) ≜lu(n)ηu(n)BPRB [bit/s]: downlink rate of UE u;
+• Ti(n) ≜P
+u∈Ui(n) Ru(n): sum throughput of cell i;
+• ρi(n) ≜Li(n)/NPRB: PRB utilization in cell i.
+These quantities are defined at the faster measurement
+timescale n, and capture both resource allocation and link
+quality effects at each cell and UE. To interface with the
+controller operating at the slower control timescale t, we
+aggregate the measurement-scale quantities over the corre-
+sponding control interval I(t):
+• ρi(t) =
+1
+Nm
+P
+n∈I(t) ρi(n): control-epoch PRB utilization,
+• Ti(t) =
+1
+Nm
+P
+n∈I(t) Ti(n): control-epoch sum throughput,
+• Ui(t) =
+1
+Nm
+P
+n∈I(t) Ui(n): control-epoch UE count.
+We also define a control-epoch channel quality summary
+mi(t) (e.g., an MCS/CQI histogram) by aggregating UE
+reports over n ∈I(t), which captures the distribution of
+channel qualities experienced within the cell during the control
+interval.
+CIO parameters. CIOs bias the standard HO decision rule
+and indirectly shape HO directionality and frequency, cell load,
+and user-level service metrics, such as throughput and blocking
+probability. While in full generality the offsets are defined on
+ordered serving-target pairs, in this paper we reduce action
+dimensionality by controlling a single scalar edge bias per
+undirected neighbor relation e = {i, j} ∈E, denoted be(t).
+To represent directed offsets, we fix an orientation for each
+e = {i, j} with i < j and define the antisymmetric mapping
+CIOij(t) ≜be(t),
+CIOji(t) ≜−be(t).
+(1)
+This antisymmetric parameterization preserves HO steering
+while reducing action dimensionality. For all n ∈I(t), the CIO
+applied at measurement instant n is CIOij(n) ≜CIOij(t),
+∀n ∈I(t) (and likewise for (j, i)).
+A3 events. HO conditions are evaluated at the measurement
+instants n. Consider a UE u served by cell i and a candidate
+neighbor cell j ∈N(i). Let RSRPu,i(n) and RSRPu,j(n)
+denote the RSRP measurements available at measurement
+instant n from cells i and j, respectively. Under the A3
+condition (neighbor becomes “offset better” than serving), the
+A3 inequality holds at instant n iff
+RSRPu,j(n) −RSRPu,i(n) > CIOij(n) + H,
+(2)
+where H > 0 is the hysteresis margin. A handover from i to j
+is triggered at instant n if (2) holds for at least NTTT ∈N con-
+secutive measurement instants, i.e., if ∀k ∈{0, . . . , NTTT−1}
+it holds that
+RSRPu,j(n−k)−RSRPu,i(n−k) > CIOij(n−k)+H. (3)
+This provides a discrete-time approximation of the continuous-
+time TTT mechanism used in LTE/NR when ∆m is suf-
+ficiently small. Importantly, (3) uses the CIO value active
+at each instant n −k, so the rule remains correct even if
+the TTT window straddles a control update time. If multiple
+neighbors satisfy (3), define the eligible set NTTT(u, i, n) ≜
+{j ∈N(i) : (3) holds for j at n} , and select the HO target as
+j⋆(n) ∈
+arg max
+j∈NTTT(u,i,n)
+
+RSRPu,j(n) + CIOij(n)
+	
+.
+If NTTT(u, i, n) = ∅, no HO is triggered at instant n.
+B. RL Formulation
+In the following, we cast the CIO control problem as
+a cooperative MARL problem using a Dec-POMDP CTDE
+formulation. We first recall the MDP formalism and then
+introduce the Dec-POMDP framework used to describe our
+decision making problem under partial information.
+Global MDP. An MDP is defined by a tuple M =
+(S, A, P, r, γ), where S is the state space, A is the action
+space, P is the transition kernel, r is the reward function,
+and γ ∈(0, 1] is the discount factor. An agent interacts with
+the MDP as follows: at each epoch t, the agent observes a
+state st ∈S, selects an action at ∈A, receives a scalar
+reward rt = r(st, at), and the system transitions to a new
+state as st+1 ∼P(· | st, at). As explained next, in our setting
+decentralization stems from restricting each agent to local
+KPI information on the dual graph G⋆, while the environment
+dynamics depends on network-wide configuration.
+Dec-POMDP. A purely centralized policy can become im-
+practical when (1) the number of controllable variables is large
+(high-dimensional action space); (2) the state aggregates mea-
+surements from many entities (high-dimensional state space);
+and (3) collecting global information at a single decision point
+induces excessive signaling and latency. These challenges
+motivate multi-agent control, where multiple cooperative
+decision-makers each act on a subset of the control variables.
+Formally, we model our multi-agent setting via a Dec-POMDP
+defined by ˜
+M =
+ I, S, {Ae}e∈I, P, r, {Oe}e∈I, Ω, γ
+
+, where
+I is the set of agents; Ae and Oe are the action and obser-
+vation spaces of agent e; A ≜Q
+e∈I Ae and O ≜Q
+e∈I Oe
+are the joint action and observation spaces; P is the transition
+kernel; r : S × A →R is a shared team reward; Ωis the
+observation kernel; and γ ∈(0, 1] is the discount factor.
+For convenience, in the following we identify agents with
+undirected neighbor edges and write I ≡E.
+At epoch t, the environment is in state st ∈S. The agents
+receive local observations ot = (oe
+t)e∈I ∈O drawn from an
+observation distribution Ω(· | st), select actions ae
+t ∼πe(· |
+oe
+t). The joint action at = (ae
+t)e∈I ∈A is applied to the
+environment, and we observe a global reward rt = r(st, at).
+The objective is to learn decentralized policies π = (πe)e∈I
+maximizing the expected discounted return, defined as
+J(π) ≜Eπ
+"T −1
+X
+t=0
+γt r(st, at)
+#
+.
+CTDE. Directly optimizing decentralized policies is chal-
+lenging because each agent observes only partial information
+and the effective environment is non-stationary from the
+perspective of individual agents. In CTDE, we train decen-
+tralized policies using auxiliary information available only
+5
+during training. In particular, we learn one or more critics
+that may condition on additional state-action information (e.g.,
+the global state and joint action, or state-action restrictions
+and auxiliary local returns defined on local sub-networks,
+as explained in Sec. IV), while execution uses only the
+decentralized policies and local observations {πe(· | oe)}e∈I.
+C. Dec-POMDP for CIO Control
+State space. At each decision epoch t, each cell i ∈C
+measures KPIs
+xi(t) =
+
+ρi(t), Ti(t), Ui(t), mi(t)
+
+,
+where ρi(t) is the PRB utilization, Ti(t) is the downlink
+throughput, Ui(t) is the number of connected UEs, and mi(t)
+summarizes the MCS distribution and assesses the relative
+channel qualities of UEs in the cell. We assume these KPIs are
+computed by aggregating measurement-scale quantities over
+the indices I(t), and are made available at each decision epoch.
+The MCS reflects the channel quality experienced by a UE and
+is directly determined by the reported Channel Quality Indica-
+tors (CQIs), which depend on the received SINR. Lower SINR
+values result in lower MCS indices, corresponding to more
+robust modulation and coding. We define the global state as
+the network-wide KPI feature vector st =
+
+x1(t), . . . , xC(t)
+
+.
+This KPI-based representation provides a practical abstraction
+of the network dynamics at the CIO update timescale.
+Action space. CIOs are configured per neighbor edge,
+hence we index one agent per edge, or equivalently, per
+node of the dual graph G⋆introduced in Sec. III-A. In
+particular, I ≜E. Each agent e = {i, j} ∈I controls the
+scalar edge bias be(t) and selects it from the discrete set
+ACIO ≜{−6, −4, −2, 0, 2, 4, 6} dB = Ae, for all e ∈E.
+This discrete set reflects typical bounds and coarse step sizes
+used in practical SON control, balancing configurability with
+tractability in multi-agent action spaces. The joint action space
+is A = Q
+e∈E Ae = A|E|
+CIO, with at =
+ ae
+t
+
+e∈E, and we apply
+be(t) = ae
+t until the next decision epoch.
+Local observations. The agents observe locally exchange-
+able information on the dual graph G⋆= (V⋆, E⋆) with
+V⋆= E. Let dG⋆(·, ·) denote shortest-path distance in G⋆and
+define the M-hop neighborhood of e as N ⋆
+M(e) ≜{e′ ∈
+E : dG⋆(e, e′) ≤M}. For e′ = {i, j}, define the dual-
+node feature ze′(t) ≜[xi(t), xj(t)]. The observation of agent
+e is the attributed rooted subgraph induced by its M-hop
+neighborhood
+oe
+t ≜
+
+G⋆[N ⋆
+M(e)], {ze′(t)}e′∈N ⋆
+M(e)
+
+∈Oe.
+(4)
+Intuitively, this observation encodes local KPI summaries for
+CIO edges within an M-hop neighborhood on the dual graph,
+enabling decentralized agents to condition actions on neighbor
+network dynamics.
+Reward. The reward function rt maps the state-action pair
+at epoch t to a scalar objective computed from the above
+mentioned KPIs. Specifically, we consider the sum downlink
+throughput, i.e., rt ≜P
+i∈C Ti(t), where Ti(t) is the cell sum
+throughput (see Sec. III-A).
+While the Dec-POMDP team reward is the global objective
+rt, under CTDE training we may construct auxiliary subnet-
+work returns {r(j)
+t }J
+j=1 by aggregating the same throughput
+metric over local regions of the primal graph (as defined
+in Sec. IV). These returns are used only to train region-
+wise critics for credit assignment; evaluation remains with the
+global reward rt.
+Remark. We also evaluated alternative reward functions
+including the percentage of non-blocked UEs and average PRB
+deviation (load balance), which showed similar trends in our
+experiments, so we focus on throughput in the main results.
+IV. ALGORITHM
+We present TD3-D-MA, a CTDE multi-agent actor-critic
+method for the Dec-POMDP setting introduced in Section
+III-C. Agents are CIO edges e ∈E acting on the dual
+graph G⋆with local observations oe
+t (see Section III-C).
+The method combines: (1) a discrete TD3-style update using
+differentiable action relaxations; (2) a shared-parameter GNN
+actor for decentralized execution; and (3) region-wise double
+critics trained under CTDE on overlapping N-hop primal
+subnetworks for scalable credit assignment.
+A. Critics scope and subnetwork decomposition
+We train multiple critics operating on overlapping local
+regions. While actions correspond to CIO variables indexed by
+edges of the neighbor graph, critic inputs are built from primal
+network quantities (cell KPIs), and therefore critic regions are
+defined on the primal graph.
+Primal N-hop subnetworks. Let dG(·, ·) denote shortest-
+path distance on the primal G. For a chosen center node
+c(j) ∈C, define the N-hop neighborhood NN
+ c(j)
+≜{i ∈
+C :
+dG(i, c(j)) ≤N}, and the induced primal subnetwork
+G(j) ≜G
+
+NN
+ c(j)
+. In the distributed configuration, we select
+J centers {c(j)}J
+j=1 such that the subnetworks {G(j)}J
+j=1
+jointly cover the deployment (details in Sec. V-E). Note that
+the centralized configuration is recovered as the special case
+J = 1 with NN(c(1)) = C.
+Induced CIO edge sets. Each primal region induces the
+subset of controllable CIO edges fully contained in the region,
+E(j) ≜
+
+e = {i, k} ∈E :
+i ∈NN(c(j)), k ∈NN(c(j))
+	
+,
+which specifies the agents and action components visible to
+critic j. (Equivalently, E(j) is the edge set of the induced
+subgraph G(j).)
+Restriction operator. For any global quantity, we denote
+by (·)(j) its restriction to region j. Concretely, s(j)
+t
+collects
+KPI features only for cells (or sites) in NN
+ c(j)
+. Similarly,
+a(j)
+t
+denotes the sub-vector of the joint CIO configuration that
+corresponds to the CIO variables indexed by the induced edge
+set E(j). Finally, r(j)
+t
+denotes the corresponding subnetwork
+return obtained by aggregating the same throughput metric
+over NN
+ c(j)
+(Sec. III-C).
+B. Discrete TD3 with categorical relaxations (TD3-D)
+Let ACIO = {a(1), . . . , a(L)} be the discrete CIO set with
+L ≜|ACIO|. For each agent e, the actor outputs a vector of
+6
+logits (unnormalized log-scores) ℓe
+θ(oe
+t) ∈RL, and the corre-
+sponding categorical distribution pe
+θ(oe
+t) ≜softmax
+ ℓe
+θ(oe
+t)
+
+.
+Exploration with two mechanisms. During environment
+interaction, each agent uses a two-stage exploration scheme
+with thresholds 0 ≤η1 ≤η2 ≤1. At each decision epoch and
+for each agent e, draw u ∼Unif(0, 1) and set
+ae
+t ≜
+
+
+
+
+
+Unif(ACIO),
+u < η1,
+GSτ
+ ℓe
+θ(oe
+t)
+
+,
+η1 ≤u < η2,
+arg maxℓpe
+θ(oe
+t)[ℓ],
+u ≥η2,
+(5)
+where GSτ(·) denotes Gumbel-Softmax sampling with tem-
+perature τ > 0.
+A discrete action ae
+t ∈ACIO is encoded as a one-hot vector
+ˆae
+t ≜onehot(ae
+t) ∈{0, 1}L, while the relaxed (differentiable)
+action is the probability vector ˜ae
+t ≜pe
+θ(oe
+t). This relaxed
+action ˜ae
+t is used only as a differentiable surrogate for policy
+optimization, while during the environment interaction the
+discrete action ae
+t is always executed.
+Concatenating over edges yields the joint action embeddings
+ˆat ≜[ˆae
+t]e∈E ∈{0, 1}|E|L, ˜aθ(ot) ≜[˜ae
+t]e∈E ∈[0, 1]|E|L.
+(6)
+For each region j, the critic input uses the restriction to edges
+in E(j), denoted by ˆa(j)
+t
+≜ˆat |E(j) and ˜a(j)
+θ (ot) ≜˜aθ(ot)|E(j).
+Action embeddings. For each region j ∈{1, . . . , J} we
+learn two critics Q(j)
+ψ1 , Q(j)
+ψ2 and corresponding target critics
+Q(j)
+¯
+ψ1 , Q(j)
+¯
+ψ2 . We also maintain an actor πθ and a target actor
+with parameters ¯θ. A replay transition is (st, at, rt, st+1, dt),
+where dt ∈{0, 1} is a terminal flag (1 if the episode ends at t,
+0 otherwise). We assume that the local observations {oe
+t}e∈E
+are deterministically derived from the replayed state st via (4)
+and the fixed topology G⋆, so they can be reconstructed from
+replayed states.
+Given this transition, we compute a relaxed next-action from
+the target actor, ˜at+1 ≜˜a¯θ(ot+1), and its restriction ˜a(j)
+t+1 for
+each region. The clipped double-Q TD target is defined as
+y(j) ≜r(j)
+t
++ γ(1 −dt) min
+k∈{1,2} Q(j)
+¯
+ψk
+
+s(j)
+t+1, ˜a(j)
+¯θ (ot+1)
+
+. (7)
+Critics updates. We train critics on the executed one-hot
+embedding ˆa(j)
+t
+via the Huber loss Hδ(x) =
+1
+2x21{|x| ≤
+δ} + δ
+ |x| −1
+2δ
+
+1{|x| > δ}, yielding, for k ∈{1, 2},
+L(ψ(j)
+k ) ≜E
+h
+Hδ
+ Q(j)
+ψk(s(j)
+t , ˆa(j)
+t ) −y(j)i
+, k ∈{1, 2}. (8)
+Note that critics are trained on the executed one-hot actions
+ˆa(j)
+t
+from the replay buffer, while the TD target and actor
+update evaluate the critics on relaxed actions ˜a(j); this contin-
+uous relaxation enables stable gradients in the discrete action
+setting.
+Actor updates. Every dπ critic updates, we update the actor
+by maximizing a continuous surrogate objective obtained by
+evaluating the first critic on the relaxed action. For each region
+j ∈{1, . . . , J}, we define
+J(j)(θ) ≜E
+h
+Q(j)
+ψ1
+ s(j)
+t , ˜a(j)
+θ (ot)
+i
+, θ ←θ + αθ∇θJ(j)(θ),
+(9)
+and apply this update for all regions j (sequentially, or
+equivalently by accumulating gradients across regions), where
+αθ > 0 is the actor learning rate. Target parameters are updated
+by Polyak averaging with τ ∈(0, 1], for k ∈{1, 2},
+¯ψ(j)
+k
+←(1 −τ) ¯ψ(j)
+k
++ τψ(j)
+k ,
+∀j ∈{1, . . . , J},
+(10)
+¯θ ←(1 −τ)¯θ + τθ.
+(11)
+C. CTDE multi-agent extension (TD3-D-MA)
+All actors share the same parameters θ and act based on
+local observations only (M-hops). Specifically, agents sample
+actions independently with πθ(· | oe
+t) = pe
+θ(oe
+t). Exploration
+during data collection uses the two-stage mechanism in (5).
+Training and execution follows CTDE: execution is decen-
+tralized (each agent uses only oe
+t), while critics are available
+only during training. We decompose the primal graph into
+overlapping N-hop subnetworks {G(j)}J
+j=1 and train one
+double critic per region, each conditioning on restricted inputs
+(s(j)
+t , ˆa(j)
+t ) and using r(j)
+t
+(Sec. IV-A). The centralized critic
+corresponds to the special case J = 1 with NN(c(1)) = C.
+D. Function approximation
+GNN actor on G⋆. The shared actor is a message-passing
+GNN on the dual graph G⋆. Dual node e = {i, j} is initialized
+with ze(t) = [xi(t), xj(t)] (Sec. III-C). After M message-
+passing layers, each node has an embedding h(M)
+e
+(t) that is
+mapped by an MLP to logits ℓe
+θ(oe
+t) ∈RL and hence pe
+θ(oe
+t).
+Using M layers implies that the output for node e depends
+only on N ⋆
+M(e), so explicit subgraph extraction is not required.
+Critic networks. Each critic maps a state-action pair to
+a scalar and can be implemented as either (1) an MLP
+over concatenated features, or (2) a permutation-aware GNN
+operating on the corresponding primal subnetwork, followed
+by a readout. Action input is given by ˆa(j)
+t
+(training) or ˜a(j)
+θ
+(actor update), with restricted embeddings. The critic receives
+restricted inputs (s(j)
+t , ˆa(j)
+t ) (or (s(j)
+t , ˜a(j))) for each region j.
+We use a non-factorized critic since CIO effects on KPIs are
+strongly coupled.
+E. Training loop
+We store transitions in a replay buffer D and start gradi-
+ent updates only after a replay pre-fill of Nmin transitions.
+We then alternate between environment interaction and off-
+policy updates from D with delayed actor updates and Polyak
+targets (see (7)-(11)). In the distributed setting, we apply the
+same update rule in parallel on multiple overlapping N-hop
+subnetworks {G(j)}J
+j=1 (each with its own critic parameters;
+replay can be shared with per-region restriction or maintained
+per critic), and apply the actor update (9) for each region j
+(sequentially, or with gradient accumulation).
+V. EXPERIMENTS
+We evaluate the proposed algorithm on (1) a benchmark
+environment; and (2) a realistic urban deployment configured
+using parameters from the Telef´onica network in Manchester
+7
+Algorithm 1 TD3-D-MA (distributed critics)
+1: Initialize shared actor πθ and target actor ¯θ←θ
+2: Select critic regions {(G(j), E(j))}J
+j=1 (Sec. IV-A)
+3: for j = 1, . . . , J do
+4:
+Initialize double critic Q(j)
+ψ1 , Q(j)
+ψ2 and targets Q(j)
+¯
+ψ1 , Q(j)
+¯
+ψ2
+5: end for
+6: Initialize replay buffer D
+7: for each episode do
+8:
+for each decision epoch t do
+9:
+Run actor on G⋆; sample/apply at using (5)
+10:
+Observe (rt, st+1, dt)
+11:
+Store (st, at, rt, st+1, dt) →D
+12:
+if |D| ≥Nmin then
+13:
+Sample mini-batch; build global ˆat and compute
+global ˜a¯θ(ot+1)
+14:
+for j = 1, . . . , J do
+15:
+Restrict
+batch
+to
+region
+j
+to
+obtain
+(s(j)
+t , ˆa(j)
+t , r(j)
+t , s(j)
+t+1)
+16:
+Restrict target action to region j: ˜a(j)
+¯θ (ot+1)
+17:
+Update critics in region j using (7)-(8)
+18:
+end for
+19:
+if update step % dπ = 0 then
+20:
+for j = 1, . . . , J do
+21:
+Update actor via (9) and targets via (11)
+22:
+end for
+23:
+end if
+24:
+end if
+25:
+end for
+26: end for
+City (UK). The goal is to study learning behavior and scal-
+ability as the HO graph becomes denser, where the number
+of controllable CIOs is large and credit assignment becomes
+challenging for centralized training. We first describe the
+network simulator (Sec. V-A) and the baselines (Sec. V-B), the
+evaluation protocol (Sec. V-C) and then present the results for
+the benchmark and the realistic Manchester City experiments
+(Sec. V-D and Sec. V-E, respectively).
+A. Network Simulator and RL interface
+All experiments are conducted using ns-3 [15], an open-
+source discrete-event network simulator. The simulator fol-
+lows a modular architecture that allows the integration of
+specialized modules that closely follow 3GPP specifications
+and provide accurate KPIs and a realistic implementation of
+MAC procedures and 3GPP-compliant HO logic.
+Simulation architecture. Fig. 3 shows the simulator archi-
+tecture, which is composed of two main elements: the ns-3
+etwork simulator and the ns-3-gym [32] middleware, which
+provides the OpenAI Gymnasium interface. The simulator
+acts as follows: given the current CIO configuration and
+UE positions, it simulates propagation, scheduling, and HO
+execution, and returns the next network state and associated
+KPIs. The ns-3 simulator enables the definition of a variety
+of mobility models, which can be adapted to reflect realistic
+urban mobility patterns. By configuring these mobility models,
+we simulate the movement of users within urban areas which
+would influence network dynamics.
+Fig. 3: Simulator architecture.
+RL interface. To interface the simulator with RL algo-
+rithms, we use a Python binding that exposes the ns-3
+simulator as an environment with the state, action, and reward
+interfaces. On the algorithmic RL side, we build on Stable-
+Baselines3 [33] and extend it to support parameter-sharing
+multi-agent RL under CTDE, with decentralized, shared-
+parameter actors and either a single centralized critic or
+multiple region-wise critics defined on overlapping N-hop
+primal subnetworks (Sec. IV). Due to the Stable-Baselines3
+workflow, we use a single replay buffer that stores a pointer
+to the sampled topology and group minibatches by topology
+when computing critic and actor updates.
+B. Baselines
+We compare our method against the following learning-
+based and heuristic baselines:
+(i) Centralized RL baseline (TD3-D-CA): A single-agent,
+centralized controller that optimizes all CIOs jointly using
+global network information as input (single actor and
+single critic).
+(ii) RRM heuristic: A HO is triggered when the target cell’s
+RSRP exceeds the serving cell’s RSRP by at least 3 dB.
+(iii) SON heuristic: A HO is triggered only if the RSRP
+advantage condition (at least 3 dB) holds continuously
+for a fixed TTT of 110 ms.
+(iv) ∆-CIO heuristic: A rule-based CIO tuning method that
+adjusts the CIO by a fixed ∆= 2 dB whenever the load
+difference between a neighboring cell pair exceeds 15%.
+Critic configuration across scenarios. Unless stated other-
+wise, TD3-D-MA uses a centralized critic (the special case
+J
+= 1 in Sec. IV) for the benchmark experiments. For
+the large Manchester scenario, we use the distributed-critic
+configuration (TD3-D-MA-DC), with J > 1 region-wise dou-
+ble critics trained on overlapping N-hop primal subnetworks
+(Sec. IV). All baselines operate at the same control interval
+and use the same HO hysteresis/TTT configuration unless
+specified otherwise. For learning-based baselines, observation
+and action spaces match TD3-D-MA.
+8
+C. Evaluation protocol
+Train/test splits. We consider a set of mobility scenarios
+partitioned into a training subset and a test subset (Sec. V-D).
+During training, the agent experiences only scenarios from
+the training subset. We report performance (1) on the training
+scenarios, and (2) on the held-out test scenarios.
+Training and evaluation. Training is performed with ex-
+ploration enabled (see Sec. IV), while evaluation is per-
+formed with deterministic action selection (greedy action, i.e.,
+arg max over the actor logits) and without parameter updates.
+Results are averaged across multiple random seeds; each
+episode uses a new seed to randomize UE initial positions and
+random-walk trajectories, preventing memorization of mobility
+patterns.
+Normalization. Since scenarios differ in UE counts and
+spatial distributions, raw throughput is not directly comparable
+across scenarios. For each scenario, we normalize the episode
+return using scenario-specific lower and upper references:
+(1) a lower bound given by the best heuristic baseline; and
+(2) an upper reference obtained by training a centralized
+single-agent RL controller specialized to that scenario (oracle
+specialization). The normalized return is ¯r ≜
+R−Rmin
+Rmax−Rmin ,
+where Rmin is the best-heuristic return and Rmax is the oracle
+specialized-RL return for that scenario.
+D. Benchmark environment
+Deployment. We consider an LTE network composed of
+Nc = 8 cells. The network graph and dual graph are shown in
+Fig. 2. In Fig. 2a, each node represents an omnidirectional
+antenna, and edges are labeled with CIO parameters. All
+antennas use identical radio parameters (carrier frequency,
+bandwidth, and transmit power). The HO relations define a
+coupled neighbor graph where only adjacent and selected
+diagonal cells can exchange users. These relations define
+Ne = 8 controllable CIOs and the dual graph used in the
+learning architecture.
+Traffic model. Each UE generates Constant Bit Rate (CBR)
+downlink traffic at 1 Mbps. This ensures that there exists
+at least one cell that can reach or approach saturation in all
+mobility scenarios and the network operates under sustained
+load, making throughput susceptible to HO and load-balancing
+decisions. Across scenarios, both the UE spatial distribution
+and the number of active UEs vary, substantially affecting ab-
+solute throughput; this motivates reporting normalized return
+(Sec. V-C).
+Mobility model. To study generalization, we construct 6
+mobility scenarios , each defined by a UE spatial distribution
+and a set of bounded random-walk regions overlaid on the
+8-cell topology (Fig. 4). Each UE is assigned to one region
+type: red regions cover multi-cell center areas where sev-
+eral neighboring cells provide competing candidates, whereas
+green regions localize UEs near a specific inter-cell boundary
+to stress handover behavior on that neighbor pair. Scenarios
+differ in the number of UEs placed in each region and in the
+chosen regions, yielding distinct mobility and load patterns.
+Matched vs mismatched settings. We evaluate the models
+in two regimes: (1) matched setting in which training and eval-
+uation are both carried out on the train scenarios. This setting
+3
+4
+2
+1
+5
+6
+7
+8
+C34
+C45
+C56
+C67
+C12
+C23
+C14
+C78
+12
+12
+12
+12
+12
+20
+8
+1
+8
+6
+8
+6
+2
+8
+(a) Train 1.
+3
+4
+2
+1
+5
+6
+7
+8
+C34
+C45
+C56
+C67
+C12
+C23
+C14
+C78
+9
+9
+9
+9
+9
+9
+9
+9
+14
+14
+7
+7
+1
+7
+1
+7
+3
+1
+(b) Test 1.
+3
+4
+2
+1
+5
+6
+7
+8
+C34
+C45
+C56
+C67
+C12
+C23
+C14
+C78
+12
+12
+12
+20
+20
+7
+7
+1
+7
+1
+7
+3
+1
+(c) Train 2.
+3
+4
+2
+1
+5
+6
+7
+8
+C34
+C45
+C56
+C67
+C12
+C23
+C14
+C78
+12
+12
+20
+6
+8
+1
+8
+7
+2
+5
+8
+(d) Test 2.
+3
+4
+2
+1
+5
+6
+7
+8
+C34
+C45
+C56
+C67
+C12
+C23
+C14
+C78
+12
+12
+12
+20
+8
+5
+2
+7
+6
+6
+6
+1
+(e) Train 3.
+3
+4
+2
+1
+5
+6
+7
+8
+C34
+C45
+C56
+C67
+C12
+C23
+C14
+C78
+12
+12
+2
+12
+12
+20
+20
+8
+2
+6
+6
+1
+7
+1
+8
+(f) Test 3.
+Fig. 4: Training (left) and testing (right) mobility scenarios on
+the 8-cell benchmark. Blue circles denote cells and blue links
+denote neighbor relations with tunable CIOs. Colored boxes
+indicate UE random-walk regions: red boxes span multi-cell
+center areas influenced by several neighboring cells, while
+green boxes concentrate mobility near a specific inter-cell
+border (handover hotspot).
+measures how well the agent can adapt to stochastic variations
+within a fixed set of mobility patterns; (2) mismatched setting
+where the agent is trained only on the train scenarios and
+evaluated on test scenarios which were not observed during
+training. This setting quantifies the ability of the learned policy
+to generalize to unseen UE distributions and trajectories.
+Impact of neighbors. The number of hops included in the
+actor’s input greatly impacts performance. More information
+provides the actor with a comprehensive understanding of
+the network status, enabling more robust decision-making.
+However, larger neighborhoods require collecting and sharing
+more KPI information, increasing signaling overhead and
+latency in practical implementations. Therefore, it is crucial
+to understand how performance is affected by the number of
+hops. The results of this analysis are shown in Fig. 5 for both
+the matched (left) and mismatched (right) settings.
+(a) Matched setting.
+(b) Mismatched setting.
+Fig. 5: Impact of the number of hops (M) on performance.
+Regardless of the number of hops, the multi-agent approach
+generally performs better than the centralized one. Using 2-
+9
+hops provides enough information to effectively solve the
+problem. Employing 4-hops leads to faster convergence (ap-
+proximately 11, 000 vs. 16, 000 training steps) but requires
+transferring more information across the network.
+Actor architecture ablation. We next study how the GNN
+design impacts performance. We compare a Graph Convolu-
+tional Network (GCN) [34], Graph Attention Network (GAT)
+[35], Transformer [36], and Interaction Network (IN) [37],
+[38]. In all cases, the actor uses the same observation radius
+(2-hop neighbors) and differs only in the message-passing
+architecture. Fig. 6 reports normalized return during training
+for the matched and mismatched settings.
+Fig. 6: Impact of the Actor GNN on model performance. In
+all cases, the actor receives information from 2-hop neighbors.
+From the results, we conclude that (1) GAT, IN and
+Transformer architectures consistently outperform GCN; (2)
+both transformer and IN outperform GAT; (3) IN demonstrates
+greater stability and exhibits lower variance compared to
+transformer. This suggests that, while GCN utilizes graph
+topology without discerning the importance of existing edges,
+GAT, Transformer, and IN employ soft-link-prune mecha-
+nisms. Moreover, these mechanisms allow them to learn graph
+edge weights, distinguishing the contribution of neighboring
+nodes to contextual node updates. The progression from GAT
+to Transformer to IN reflects an increase in the complexity
+of the mechanisms for learning edge weights. In our problem
+setting, where distinguishing the state of neighboring cells is
+critical for performance, this progression explains the observed
+improvement in performance.
+Generalization under topology shifts. Next, we evaluate
+the contribution of the GNN embedding and the distributed
+(dual-graph) actor. We compare three models: (1) centralized-
+MLP-actor: the centralized baseline of Sec. IV with an MLP
+actor; (2) centralized-GNN-actor: a centralized actor where
+the first embedding is replaced by a GNN (IN), but the
+readout remains an MLP; and (3) distributed-GNN-actor: our
+dual-graph GNN actor with parameter sharing. Fig. 7 reports
+performance on training scenarios (left) and test scenarios
+(right). For fairness, all GNN-based actors use the IN back-
+bone identified in Fig. 6.
+Comparing the two centralized actors show that using a
+GNN to enhance node representation improves the over-
+(a) Training scenarios.
+(b) Test scenarios.
+Fig. 7: Generalization capability: centralized-MLP-actor vs.
+centralized-GNN-actor vs. distributed-GNN-actor.
+all model performance. Specifically, in test scenarios, the
+centralized GNN actor demonstrates superior generalization
+compared to the centralized MLP one. From the results we
+can conclude the following: (1) Both the use of GNNs and
+the distributed approach enhance generalization capabilities;
+(2) The generalization capability of the centralized-GNN-actor
+is limited by the readout MLP, which lacks permutation-
+equivariant structure at the readout stage, which can hinder
+generalization across topology variations.
+Critic architecture. In the 8-cell benchmark, the critic is
+implemented as a centralized MLP over concatenated KPI
+features and the joint action embedding. We evaluate the
+impact of the critic architecture on the performance of the
+model. We compare model performance using different critic
+implementations: non-factorized critic, monotonic mixer critic
+(QMIX) [39], and generic mixer critic. All critic variants in
+this ablation use the same (centralized) critic input for the
+benchmark setting; only the critic parameterization differs
+(non-factorized vs. mixing). The results are shown in Fig.
+8. Regardless of the implementation, the factorized critic
+consistently yields inferior performance compared to the non-
+factorized critic. This is primarily due to the high variance
+observed during the learning process.
+Fig. 8: Impact of different type of factorizations for the critic.
+E. Manchester Network scenario
+Deployment. We consider a network area of approximately
+2 km2 around Albert Square in Manchester City, comprising
+10 sites with 3 directional antennas per site (Nc = 30).
+10
+Antenna locations and radio parameters (transmit power, car-
+rier frequency, bandwidth, azimuth, height) are configured
+to match the operator setup from the real-world network
+deployment. Fig. 10a shows the Radio Environment Map
+(REM) for the SINR [dB] in the Manchester City scenario. The
+graph has an average graph degree of approximately 4.3, and a
+number of CIO parameters (local action space dimensionality)
+of 64. In this regime, a centralized Critic that learns from
+a single aggregated return (e.g., network throughput) must
+attribute outcomes to a large set of simultaneous actions, which
+makes credit assignment harder and can slow or destabilize
+learning. This motivates revisiting the Critic design.
+Users and traffic. The scenario includes NUE = 300 UEs,
+and a heterogeneous mix of downlink traffic profiles: (1) full-
+buffer traffic with MBR = 20 Mbit/s (file transfer/cloud
+sync); (2) bursty 3 Mbit/s (video streaming); (3) bursty
+750 Kbit/s (web browsing); (4) bursty 150 Kbit/s with
+guaranteed bit rate (voice calls).
+Experimental configurations. All experiments in this sec-
+tion use the same distributed GNN-based actor described
+in Sec. IV. We evaluate multiple critic configurations while
+keeping the actor, observation space, action space, and training
+hyperparameters fixed, to isolate the effect of credit assign-
+ment in dense graphs. In the distributed-critic variant (TD3-
+D-MA-DC), we instantiate one GNN-based double critic per
+region, where each critic operates on the corresponding primal
+subnetwork G(j) and produces a scalar value via a graph-level
+readout (see Sec. IV).
+27
+25
+26
+22
+23
+24
+13
+14
+15
+9
+8
+7
+5
+6
+4
+Fig. 9: Reward decomposition for CTDE training: global
+return, and local returns over overlapping N-hop subnetworks
+(shaded boxes).
+Fig. 9 illustrates different locality levels used when defining
+local returns in centralized training. These choices influence
+the granularity of the learning signal and help explain the
+performance differences observed in Fig. 12. Note that these
+locality levels modify only the critic’s training target (credit
+assignment) under CTDE, while the underlying environment
+objective remains the same team-level reward. For the dis-
+tributed critic configuration, the Manchester graph is decom-
+posed into J = 4 overlapping sub-networks using N = 2 hops
+at the site level. Each local critic has its own parameters.
+Generalization under topology shifts. To evaluate robust-
+ness to topology changes, we split the Manchester deployment
+into North 1, North 2, and South regions, as shown in Fig. 10a.
+The model is trained on North-1 and North-2 and evaluated
+both on the training regions and on South, which is larger and
+exhibits a different topology. Fig. 11 reports the generalization
+performance. The left panel shows normalized expected return
+to account for differences in scenario size. The right panel
+reports relative improvement over heuristic baselines. Despite
+the increased scale and different topology, the learned policy
+generalizes effectively to the unseen South region.
+(a) REM for sub-networks North-
+1 (yellow), North-2 (blue), and
+South (green).
+27
+25
+26
+22
+23
+24
+19
+20
+21
+28
+29
+30
+13
+14
+15
+16
+17
+18
+10
+11
+12
+9
+8
+7
+5
+6
+4
+1
+2
+3
+(b) Corresponding network graph
+for the Manchester scenario.
+Fig. 10: Manchester scenario: radio environment map and
+corresponding network graph.
+(a) Normalized return on North-
+1, North-2, and South regions.
+(b) Percentage improvement over
+heuristic baselines
+Fig. 11: Generalization results on Manchester.
+Critics comparison. Fig. 12 compares the three critic
+designs on the Manchester scenario. The distributed N-hops
+critic consistently achieves faster convergence and higher final
+performance than both centralized alternatives. Compared to
+the centralized global-return critic, distributed training im-
+proves learning stability without sacrificing performance. On
+the other hand, when compared to the centralized local-
+returns critic (site-level outputs), the distributed M-hops critic
+achieves higher network-level throughput, indicating that sub-
+network level optimization better approximates the global
+objective than purely site-level optimization.
+Fig. 12: Critics comparison results.
+11
+VI. CONCLUSION
+This paper addressed the problem of HO in cellular net-
+works through adaptive tuning of CIOs. Motivated by the
+limitations of rule-based and centralized RL control, we for-
+mulated CIO-based HO optimization as a cooperative MARL
+problem under CTDE. By placing agents on the edges of the
+cell graph and operating on a dual-graph representation, our
+formulation aligns the learning architecture with the true locus
+of control in 3GPP HO procedures. We introduced TD3-D-
+MA, a dual graph-based MARL algorithm that combines a
+shared GNN actor with a set of region-wise critics, enabling
+decentralized execution using only local KPI information
+while leveraging global feedback during training. Extensive
+experiments in a realistic ns-3-based simulator demonstrate
+that the proposed approach consistently outperforms heuris-
+tic and centralized RL baselines. In particular, the dual-
+graph GNN actor exhibits strong generalization across unseen
+network topologies, while maintaining learning stability and
+scalability.
+Interesting directions for future work include (1) extending
+the framework to jointly optimize multiple HCPs; (2) integrat-
+ing NR-specific features such as beam-level mobility rewards;
+(3) exploring distributed critic architectures with federated
+and hierarchical learning designs, which could enable scalable
+training across geographically distributed network segments.
+REFERENCES
+[1] M. Tayyab, X. Gelabert, and R. J¨antti, “A survey on handover manage-
+ment: From LTE to NR,” IEEE Access, 2019.
+[2] 3GPP, “Study on artificial intelligence (ai) and machine learning (ml)
+for nr,” 3GPP, Tech. Rep. 3GPP TR 38.874, 2021, release 17, v17.0.0.
+[3] A. Haghrah, M. Pourmohammad Abdollahi, H. Azarhava, and J. Mu-
+sevi Niya, “A survey on the handover management in 5g-NR cellular
+networks: Aspects, approaches and challenges,” EURASIP J. Wireless
+Commun. Netw., 2023.
+[4] Y. Ullah, M. Roslee, S. M. I. Mitani, S. A. Khan, and M. H. Jusoh, “A
+survey on handover and mobility management in 5g hetNets: Current
+state, challenges, and future directions,” Sensors, 2023.
+[5] M. Thillaigovindan et al., “A comprehensive survey on machine learning
+methods for handover optimization in 5g networks,” Electronics, 2024.
+[6] Y. Ullah, M. Roslee, S. M. Mitani, M. Sheraz, F. Ali, K. Aurangzeb,
+A. F. Osman, and F. Z. Ali, “A survey on AI-enabled mobility and
+handover management in future wireless networks: Key technologies,
+use cases, and challenges,” J. King Saud Univ. Comput. Inf. Sci., 2025.
+[7] R. S. Sutton and A. G. Barto, Reinforcement Learning: An Introduction.
+MIT Press, 2018.
+[8] J. Tanveer, A. Haider, R. Ali, and A. Kim, “An overview of reinforce-
+ment learning algorithms for handover management in 5g ultra-dense
+small cell networks,” Appl. Sci., 2022.
+[9] V. Yajnanarayana, H. Ryd´en, and L. H´evizi, “5G handover using
+reinforcement learning,” arXiv, 2020.
+[10] R. Karmakar, G. Kaddoum, and S. Chattopadhyay, “Mobility manage-
+ment in 5g and beyond: A novel smart handover with adaptive time-to-
+trigger and hysteresis margin,” arXiv, 2022.
+[11] G. Alsuhli, K. Banawan, K. M. Attiah, A. Elezabi, K. G. Seddik,
+A. Gaber, M. M. Zaki, and Y. Gadallah, “Mobility load management
+in cellular networks: A deep reinforcement learning approach,” IEEE
+TMC, 2023.
+[12] K. M. Attiah, G. Alsuhli, K. Banawan, A. Elezabi, and K. G. Sed-
+dik, “Load balancing in cellular networks: A reinforcement learning
+approach,” in IEEE CCNC, 2020.
+[13] H. Chang, H. Chen, J. Zhang, and L. Liu, “Decentralized deep reinforce-
+ment learning meets mobility load balancing,” IEEE/ACM ToN, 2023.
+[14] S. Fujimoto, H. van Hoof, and D. Meger, “Addressing function approx-
+imation error in actor-critic methods,” in ICML, 2018.
+[15] “The ns-3 network simulator,” accessed: 14 November 2025. [Online].
+Available: https://www.nsnam.org/
+[16] C. F. Kwong, C. Shi, Q. Liu, S. Yang, D. Chieng, and P. Kar,
+“Autonomous handover parameter optimisation for 5g cellular networks
+using deep deterministic policy gradient,” ESWA, 2024.
+[17] Y. Song, S.-H. Lim, and S.-W. Jeon, “Handover decision making for
+dense hetnets: A reinforcement learning approach,” IEEE Access, 2023.
+[18] A. Mahmood et al., “Reinforcement learning for communication load
+balancing: Approaches and challenges,” Front. Comput. Sci., 2023.
+[19] G. Alsuhli, H. A. Ismail, K. Alansary, M. Rumman, M. Mohamed,
+and K. G. Seddik, “Deep reinforcement learning-based CIO and energy
+control for LTE mobility load balancing,” in IEEE CCNC, 2021.
+[20] H. Buhurcu and H. C¸ arkacıo˘glu, “Reinforcement learning based mobility
+load balancing in cellular networks: A two-layered approach,” Sig. Image
+Video Process., 2024.
+[21] Y. Shen, S. Chai, B. Li, X. Luo, Q. Shi, and R. Zhang, “Decentral-
+ized handover parameter optimization with multi-agent reinforcement
+learning for load balancing in 5g networks,” arXiv, 2023.
+[22] A. Elgharably, M. Aboelwafa, K. Banawan, and K. G. Seddik, “Hi-
+erarchical multi-agent reinforcement learning framework for cellular
+mobility load management,” in IEEE CCNC, 2025.
+[23] S. Gronauer and K. Diepold, “Multi-agent deep reinforcement learning:
+A survey,” Artif. Intell. Rev., 2022.
+[24] M. Sana, A. De Domenico, and E. C. Strinati, “Multi-agent deep
+reinforcement learning for distributed handover management in dense
+mmwave networks,” in IEEE ICASSP, 2020.
+[25] D. Guo, M. Tao, Z. Chen, K. Liu, B. Li, K. Wu, P. Hu, and Y. Liu,
+“Joint optimization of handover control and power allocation based on
+multi-agent deep reinforcement learning,” IEEE TVT, 2020.
+[26] Y. Deng, S. Zhang, I. A. Meer, and M. Ozger, “Joint trajectory and
+handover management for uavs co-existing with terrestrial users: A
+multi-agent deep reinforcement learning approach,” IEEE TWC, 2021.
+[27] P. Gawłowicz and A. Zubow, “ns3-gym: Extending OpenAI gym for
+networking research,” arXiv, 2018.
+[28] F. Hu, Y. Deng, and A. H. Aghvami, “Scalable multi-agent reinforcement
+learning algorithm for wireless networks,” arXiv, 2021.
+[29] G.
+Alsuhli,
+“Load-management:
+ns-3-based
+implementation
+of
+reinforcement learning for mobility load balancing,” 2021. [Online].
+Available: https://github.com/Ghada-sy/Load-Management
+[30] A. Mohajer, M. Bavaghar, and H. Farrokhi, “Mobility-aware load
+balancing for reliable self-organization networks: Multi-agent deep re-
+inforcement learning,” Reliab. Eng. Syst. Saf., 2020.
+[31] R. J. Wilson, Introduction to graph theory.
+Pearson Education India,
+1979.
+[32] P. Gawłowicz and A. Zubow, “ns-3 meets openai gym: The playground
+for machine learning in networking research,” in MSWIM, 2019.
+[33] A. Raffin, A. Hill, A. Gleave, A. Kanervisto, M. Ernestus, and N. Dor-
+mann, “Stable-baselines3: Reliable reinforcement learning implementa-
+tions,” JMLR, 2021.
+[34] T. N. Kipf and M. Welling, “Semi-supervised classification with graph
+convolutional networks,” in ICLR, 2017.
+[35] P. Veliˇckovi´c, G. Cucurull, A. Casanova, A. Romero, P. Lio, and
+Y. Bengio, “Graph attention networks,” in ICLR, 2018.
+[36] A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez,
+L. Kaiser, and I. Polosukhin, “Attention is All you Need,” in NeurIPS,
+2017.
+[37] P. Battaglia, R. Pascanu, M. Lai, D. Rezende, and K. Kavukcuoglu,
+“Interaction networks for learning about objects, relations and physics,”
+NeurIPS, 2016.
+[38] P. W. Battaglia, J. B. Hamrick, V. Bapst, A. Sanchez-Gonzalez, V. Zam-
+baldi, M. Malinowski, A. Tacchetti, D. Raposo, A. Santoro, R. Faulkner
+et al., “Relational inductive biases, deep learning, and graph networks,”
+arXiv, 2018.
+[39] T. Rashid, M. Samvelyan, C. Schroeder de Witt, G. Farquhar, J. Foerster,
+and S. Whiteson, “Qmix: Monotonic value function factorisation for
+deep multi-agent reinforcement learning,” in ICML, 2018.

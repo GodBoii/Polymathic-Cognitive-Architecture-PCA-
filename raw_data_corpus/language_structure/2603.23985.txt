@@ -1,0 +1,2278 @@
+Diet Your LLM: Dimension-wise Global Pruning of LLMs
+via Merging Task-specific Importance Score
+Jimyung Hong1
+Jaehyung Kim1
+1Yonsei University
+{jim0527,jaehyungk}@yonsei.ac.kr
+Abstract
+Large language models (LLMs) have demon-
+strated remarkable capabilities, but their mas-
+sive scale poses significant challenges for prac-
+tical deployment. Structured pruning offers a
+promising solution by removing entire dimen-
+sions or layers, yet existing methods face crit-
+ical trade-offs: task-agnostic approaches can-
+not adapt to task-specific requirements, while
+task-aware methods require costly training to
+learn task adaptability.
+We propose DIET
+(Dimension-wise global pruning of LLMs
+via merging Task-wise importance scores), a
+training-free structured pruning method that
+combines dimension-level granularity with
+task-aware selection. DIET profiles activation
+magnitudes across tasks using only 100 sam-
+ples per task, then applies majority voting to
+construct a single global mask. DIET does
+not require large costs from pre-computation
+or training. Experiments on seven zero-shot
+benchmarks using Gemma-2 2B and 9B mod-
+els demonstrate the effectiveness of DIET; for
+example, at 20% sparsity on Gemma-2 2B,
+DIET achieves near 10% average accuracy im-
+provement, compared to previous state-of-the-
+art structured pruning methods. This advan-
+tage persists across various sparsity levels and
+model scales, positioning DIET as a practical
+and robust choice for structured LLM pruning.1
+1
+Introduction
+Large Language Models (LLMs) have rapidly ad-
+vanced with increasing scale, yet deploying them
+on resource-constrained platforms remains chal-
+lenging due to strict compute and memory limits.
+This mismatch between model size and hardware
+budgets has motivated approaches to reduce their
+computational and memory footprints. Among
+them, pruning is one of the representative tech-
+niques, which removes model parameters or activa-
+tions (i.e., masks them to zero to induce sparsity)
+1Code
+available
+at:
+https://github.com/
+Jimmy145123/DIET
+while striving to preserve the original performance.
+Pruning has long been an active area of research
+in deep learning, and this interest has recently ex-
+tended to LLMs. To make pruning practical for
+real-world deployment, inducing structured spar-
+sity patterns, rather than simply increasing the spar-
+sity ratio, is crucial, since unstructured pruning
+is often incompatible with efficient computation
+using sparse matrix operations.
+Prior works on structured pruning in LLMs can
+be categorized based on (1) the granularity of prun-
+ing (e.g., individual parameters, attention heads, or
+entire transformer blocks) and (2) whether the prun-
+ing decisions leverage task-specific information.
+For instance, SliceGPT (Ashkboos et al., 2024) ex-
+emplifies dimension-level, task-agnostic pruning
+by identifying less important dimensions through
+principal component analysis (PCA) of hidden em-
+beddings using calibration data. However, its task-
+agnostic mask cannot adapt to task-wise variation,
+and PCA-based identification introduces non-trivial
+computational overhead. PuDDing (Wee et al.,
+2025), in contrast, adopts block-level, task-specific
+pruning by training a per-prompt router to dynami-
+cally skip selected Transformer blocks. While this
+approach achieves strong task-specific compres-
+sion, it requires large training cost for the router
+and removes all attention and MLP computations
+within pruned blocks, limiting its generalization
+capability. These observations motivate us to ex-
+plore an underexplored point in the design space: a
+dimension-level, task-aware, training-free pruning
+framework for LLMs.
+In this work, we propose DIET, a framework
+for Dimension-wise global pruning of LLMs via
+merging Task-wise importance scores. DIET re-
+quires no additional training, such as model fine-
+tuning or router training, for pruning; it only relies
+on streamed model activations from a few task-
+specific samples to generate a simple, deployable
+global mask. To be specific, for each task, DIET
+1
+arXiv:2603.23985v1  [cs.LG]  25 Mar 2026
+first profiles the outputs of MLP layers at every
+Transformer block and computes a per-dimension
+importance vector by averaging absolute activa-
+tions. It then converts the lowest-ranked dimen-
+sions into a task-specific binary pruning mask and
+stacks these selectors across tasks. By aggregat-
+ing masks across tasks, DIET identifies dimen-
+sions with the highest cross-task agreement to
+achieve a target sparsity level, forming a single
+global pruning mask. This mask is uniformly ap-
+plied to all residual-connected linear layers: input-
+dimension masking for embeddings, attention pro-
+jections, MLP input projections, and the LM head
+and output-dimension masking for attention and
+MLP output projections, respectively.
+We demonstrate the effectiveness of DIET on
+Gemma-2 (Team et al., 2024) (2B and 9B) at 10%,
+20%, and 30% dimension sparsity under zero-shot
+evaluation on 7 different benchmarks. Across both
+model sizes and all sparsity levels, DIET signif-
+icantly outperforms a recent structured pruning
+method and a router-based pruning approach.
+Overall, our key contributions are as follows:
+◦We propose DIET, a dimension-wise global
+pruning framework that yields a single global
+mask which is easy to apply.
+◦We introduce a simple activation-based profil-
+ing requiring no additional training.
+◦DIET achieves comprehensive zero-shot results
+across two model scales, seven benchmarks,
+and sparsity up to 20% showing consistent
+gains over state-of-the-art pruning baselines.
+◦Empirically, DIET exhibits a clear advan-
+tage over task-wise depth pruning algorithms,
+achieving more than 20% accuracy increase on
+zero-shot commonsense reasoning tasks.
+2
+Dimension-wise Global Pruning via
+Merging Task-wise Importance Scores
+In this section, we introduce DIET, a Dimension-
+wise structured pruning method for LLMs that
+merges Task-wise importance signals to produce
+a single global pruning mask applicable across all
+tasks. The overview of DIET is presented in Fig. 1.
+2.1
+Preliminaries
+Let M denote a transformer-based LLM with B
+transformer blocks. Without loss of generalization,
+we assume the following with respect to M:
+• Each transformer block has an identical structure
+which consists of a multi-head attention layer
+followed by an MLP layer, both with residual
+connections and layernorms (pre- or post-).
+• It maintains a fixed hidden dimension d through-
+out all blocks, which serves as the input/output
+dimension for most linear sublayers: word em-
+beddings, attention projections, MLP layers, and
+LM head. For example, Gemma-2 (Team et al.,
+2024) uses d = 2304 in 2B model and d = 4608
+in 9B model across all B blocks.
+Then, the goal of structured pruning is to remove
+entire computational units (e.g., dimensions, atten-
+tion heads, or blocks), while unstructured pruning
+zeroes individual weights of sublayers without such
+consideration. In this work, we mainly consider
+dimension-wise pruning, because the above archi-
+tectural property enables a single global mask over
+d to be applied uniformly to all layers, without
+requiring per-layer or per-task customization.
+Mathematical formulation.
+Let y = Wx+b de-
+note a generic linear sublayer in each block, where
+W ∈Rm×n, b ∈Rm, x ∈Rn, and y ∈Rm. Then,
+depending on the type of sublayer, the dimensions
+m and n could be different:
+• Input dimension n = d: word embeddings, at-
+tention query/key/value projections, MLP input
+projection, and LM head.
+• Output dimension m = d: attention output pro-
+jection and MLP output projection.
+Then, for each case, we consider different opera-
+tions for dimension-wise pruning. For layers with
+input dimension n = d, we apply input-dimension
+masking using a binary selector z ∈{0, 1}d:
+y = WPz x + b,
+Pz = diag(z)
+(1)
+which zeros the columns of W where zj = 0.
+For layers with output dimension m = d, we
+apply output-dimension masking using the same
+selector z:
+˜y = ˜Pz (Wx + b),
+˜Pz = diag(z)
+(2)
+which zeros the rows of W where zj = 0.
+We refer to (1)–(2) collectively as the generic
+masking operator. The application of a masking op-
+erator reduces the effective dimension of M from
+d to d′ = Pd
+j=1 zj. Throughout this work, we
+apply the same global mask z ∈{0, 1}d to all
+parametrized sublayers (i.e., except normalization)
+via the appropriate operator (input or output mask-
+ing depending on the layer’s input/output dimen-
+sions).
+2
+Figure 1: Step 1. Task-wise activation profiling is performed on a dense LLM with hidden width d. Step 2. A global
+pruning mask is constructed via task-aware aggregation: for each task t, a binary selector selects low-importance
+dimensions based on activation scores. These task-wise votes are aggregated through majority voting to produce the
+global mask m ∈{0, 1}d. Step 3. The mask is applied across all layers, reducing the residual width from d to d′.
+2.2
+DIET: Merge Task-wise Importance for
+Global Dimension-wise Pruning of LLMs
+DIET derives a global pruning mask through a two-
+phase process. First, DIET identifies the dimen-
+sions that contribute minimally to each task. Then,
+DIET aggregates these task-specific assessments:
+dimensions that most tasks agree to be uninforma-
+tive are masked across all sublayers.
+Task-wise importance scoring.
+For each task
+t ∈T , we assess dimension importance by mea-
+suring activation magnitudes using task-specific
+data. Activation magnitude serves as a widely-
+adopted proxy for feature contribution: dimensions
+with consistently low activations contribute little
+to the model’s outputs and are candidates for re-
+moval (Sun et al., 2024; Molchanov et al., 2017).
+Specifically, we profile the pretrained LLM fθ
+on N samples {x(t)
+i }N
+i=1 from task t, recording acti-
+vations at the output of the MLP layer in each trans-
+former block (i.e., before the post-MLP layernorm
+and the residual add). Let B denote the set of trans-
+former blocks (with B = |B|). For sample x(t)
+i , let
+h(t)
+i,b ∈RLi×d represent the MLP outputs at block
+b, where Li is the number of valid (non-padding)
+tokens and columns index residual dimensions. We
+compute a per-dimension importance score a(t)
+k by
+averaging absolute activations first across all blocks
+(capturing cross-layer consistency) and then across
+all tokens and samples:
+¯h(t)
+i [j, k] =
+1
+B
+X
+b∈B
+ h(t)
+i,b[j, k]
+,
+(3)
+a(t)
+k
+=
+N
+X
+i=1
+Li
+X
+j=1
+¯h(t)
+i [j, k]
+.
+N
+X
+i=1
+Li.
+(4)
+The resulting vector a(t) ∈Rd
+≥0 quantifies each di-
+mension’s contribution to task t. Given target spar-
+sity s ∈[0, 1], we identify the ⌊s · d⌋dimensions
+with smallest a(t)
+k as pruning candidates, producing
+a binary selector z(t) ∈{0, 1}d where z(t)
+k
+= 1
+indicates a pruning vote for dimension k.
+Merging into global pruning mask.
+Each task
+produces a pruning vote reflecting its own data dis-
+tribution, but our objective is a single pruning deci-
+sion applicable to all tasks. To this end, we employ
+a simple idea of majority voting: dimensions that
+multiple tasks independently flag as unimportant
+are likely safe to remove globally without signifi-
+cantly harming individual tasks.
+Concretely, we aggregate votes by stacking task-
+wise selectors into a matrix Z = [z(t)]t∈T
+∈
+{0, 1}d×T and counting votes per dimension: ck =
+P
+t∈T z(t)
+k . The indices for global pruning O con-
+sist of ⌊s · d⌋dimensions with highest vote counts:
+O = arg top⌊s·d⌋
+
+ck
+	d
+k=1,
+(5)
+where arg topk selects the indices of the k largest
+values. We define the omission mask m ∈{0, 1}d
+by mk = 1{k ∈O}, and let u = 1 −m denote
+the keep selector with P = diag(u) in Eq.1 and 2.
+We apply this global mask to all parametrized
+sublayers uniformly: for every layer with input di-
+mension d (embeddings, attention query/key/value
+projections, MLP input projections, LM head), we
+3
+apply input-dimension masking via W ←WP
+(Eq. 1), which zeros the columns of W correspond-
+ing to dimensions in O. For every layer with output
+dimension d (attention output projection, MLP out-
+put projection), we apply output-dimension mask-
+ing via W ←˜PW (Eq. 2), which zeros the cor-
+responding rows. This mask is applied identically
+across all B transformer blocks, yielding a single
+architectural modification: all sublayers now op-
+erate on the same pruned set of dimensions. This
+modification is task-agnostic, i.e., the pruned model
+serves all tasks without per-task customization.
+2.3
+From Global Masking to Hard Pruning
+for Real-Time Efficiency
+The global mask derived in Sec. 2.2 specifies which
+residual dimensions are removed across all sublay-
+ers. This mask is applied via the generic masking
+operators in Eq. 1–2, i.e., zero masking, which is
+sufficient for evaluating the quality of dimension
+selection in terms of accuracy.
+For efficiency evaluation, we additionally con-
+sider an optional hard pruning setting, where
+masked dimensions are physically removed and
+the hidden dimension is compacted from d to
+d′ =
+d
+X
+j=1
+uj,
+(6)
+with u = 1 −m denoting the keep selector in
+Sec. 2.2. This compaction is applied uniformly
+across all residual-connected sublayers, resulting
+in a reduced hidden dimension. However, this hard
+pruning changes the input dimensionality of sub-
+sequent linear sublayers; under RMSNorm or Lay-
+erNorm, assuming independent and equally-scaled
+input features, reducing the input dimension from d
+to d′ decreases the expected activation variance by
+a factor of d′/d. Without correction, this variance
+reduction can lead to degraded representations.
+Variance correction via weight rescaling.
+To
+compensate for this effect, we rescale the weights
+of linear sublayers whose input dimension is re-
+duced. Specifically, we apply the scaling factor
+α =
+r
+d
+d′ .
+(7)
+For a linear sublayer whose input dimension is
+sliced to d′, the corresponding weight matrix is
+rescaled as
+Wscaled = α · Wsliced,
+(8)
+where Wsliced denotes the weight matrix after re-
+moving masked input dimensions. For sublayers
+where only the output dimension is reduced (e.g., at-
+tention output projection or MLP down-projection),
+the input dimensions remain unchanged and no
+rescaling is applied. Normalization parameters are
+sliced to the retained dimensions without scaling.
+Unless stated otherwise, all accuracy-focused
+results are obtained using zero masking, while hard
+pruning with variance correction is applied only for
+real-time efficiency evaluations.
+3
+Experiments
+3.1
+Setups
+Datasets.
+We evaluate DIET on seven widely-
+used NLP benchmarks covering diverse reason-
+ing and language understanding capabilities: (1)
+BoolQ (Clark et al., 2019) contains yes/no ques-
+tions derived from naturally occurring queries
+paired with Wikipedia passages. (2) RTE (Dagan
+et al., 2005) (Recognizing Textual Entailment) eval-
+uates whether a hypothesis is entailed by a given
+premise. (3) HellaSwag (Zellers et al., 2019) tests
+commonsense reasoning through sentence comple-
+tion requiring contextual understanding. (4) Wino-
+Grande (Sakaguchi et al., 2020) measures com-
+monsense reasoning via pronoun disambiguation.
+(5, 6) ARC-Challenge and ARC-Easy (Clark et al.,
+2018) provide grade-school science questions at
+varying difficulty levels. (7) OpenBookQA (Mi-
+haylov et al., 2018) requires multi-hop reasoning
+over elementary science facts.
+For task-wise importance scoring (Sec. 2.2), we
+randomly sample 100 examples per task from the
+training split of each dataset. Final evaluations
+use the native splits defined by the lm-evaluation-
+harness (Gao et al., 2024): BoolQ, RTE, Hel-
+laSwag, and WinoGrande are evaluated on their val-
+idation splits, while ARC-Easy, ARC-Challenge,
+and OpenBookQA use test splits.
+Metrics.
+We evaluate with two metrics: stan-
+dard accuracy (acc) and length-normalized accu-
+racy (acc_norm).
+For multiple-choice datasets
+with variable-length options—HellaSwag, ARC-
+Easy, ARC-Challenge, and OpenBookQA—we re-
+port acc_norm as the primary metric because it
+mitigates length bias by dividing each option’s
+log-likelihood by its token length.
+For BoolQ,
+RTE, and WinoGrande, we follow the default
+lm-eval-harness task definitions and report acc
+only, since answers are extremely short (often
+4
+Table 1: Zero-shot accuracy comparisons of DIET against baseline pruning algorithms on Gemma-2 2B on seven
+NLP benchmarks. The best performances are marked in bold, and the runner-up is marked with underline. Tasks
+with * are presented with acc_norm and remaining tasks with acc.
+Method
+Sparsity
+Per-task Accuracies (%)
+Average
+Acc. (%)
+BoolQ
+RTE
+HellaSwag*
+WinoGrande
+Arc-E*
+Arc-C*
+OBQA*
+No pruning (Original)
+0
+73.5
+61.4
+73.0
+68.4
+80.2
+49.7
+41.8
+64.0
+Magnitude-Dim
+20%
+38.2
+55.2
+31.1
+50.0
+39.8
+21.3
+25.0
+37.2
+SliceGPT
+20%
+37.8
+53.4
+25.3
+50.4
+26.2
+24.9
+27.0
+35.0
+PuDDing
+20%
+43.4
+53.8
+25.8
+49.8
+27.3
+23.6
+27.0
+35.8
+DIET (Ours)
+20%
+63.3
+54.9
+41.8
+53.2
+49.8
+24.1
+27.6
+45.0
+Magnitude-Dim
+10%
+51.3
+52.7
+44.8
+53.9
+59.6
+32.5
+31.2
+46.6
+SliceGPT
+10%
+37.8
+53.4
+25.2
+50.2
+26.3
+25.0
+27.0
+35.0
+PuDDing
+10%
+42.6
+51.3
+25.8
+50.8
+27.3
+23.7
+30.0
+35.9
+DIET (Ours)
+10%
+70.6
+54.9
+62.7
+62.8
+69.0
+38.4
+35.4
+56.3
+single-token verbalizers), making length normal-
+ization unhelpful and potentially noisy. We present
+per-task scores and an unweighted average across
+all seven tasks.
+Baselines.
+We compare DIET with three struc-
+tured pruning baselines under matched sparsity ra-
+tios. (1) MAGNITUDE–DIM (Han et al., 2015):
+dimension-wise pruning that aggregates absolute-
+weight scores per residual dimension and applies
+a single global dimension mask uniformly to all
+residual-connected linear layers, zeroing corre-
+sponding rows or columns. (2) SLICEGPT (Ashk-
+boos et al., 2024): rotate-and-slice compression
+that learns an orthogonal activation basis from a cal-
+ibration corpus and slices MLP and attention pro-
+jections to a reduced hidden width implied by the
+target sparsity. (3) PUDDING (Wee et al., 2025):
+prompt-conditioned depth pruning in which trained
+lightweight router selects, per input, which trans-
+former blocks to skip. By omitting layers selected
+by trained router, it achieves target sparsity ratio.
+Implementation details.
+In our experiments, we
+employ Gemma-2 models (Team et al., 2024) with
+different sizes of 2B and 9B. For the Task-wise
+importance scoring phase, we randomly sam-
+pled 100 samples from each task to accelerate the
+activation profiling process (the effect of sample
+size on zero shot performance is analyzed in Fig-
+ure 3). To ensure reproducibility and mitigate the
+influence of random sampling, we set the random
+seed to 42 throughout all experiments. For baseline
+methods, we follow the default configurations from
+their released implementations. SliceGPT (Ashk-
+boos et al., 2024) uses WikiText2 (Merity et al.,
+2016) as the calibration corpus with 64 samples
+and a maximum sequence length of 2048. To en-
+sure fair comparison with DIET, we also evalu-
+ate SliceGPT using 100 samples per task from
+the seven zero-shot benchmarks described in Sec-
+tion 3.1. PuDDing (Wee et al., 2025) trains a BERT-
+base (Devlin et al., 2019) router for 10 epochs us-
+ing AdamW (Loshchilov and Hutter, 2019) opti-
+mizer with an 80/20 train/test split. We trained
+router on the same benchmark suite, mentioned
+in 3.1. Magnitude-based methods apply global
+L1 pruning, with the structured variant follow-
+ing (1)–(2) to mask dimensions uniformly across
+residual-connected layers. All methods are evalu-
+ated at 10%, 20%, and 30% sparsity ratios and all
+evaluations use lm-evaluation-harness (Gao et al.,
+2024) in zero-shot mode with fixed seed 42.
+3.2
+Main results
+Table 1 presents zero-shot accuracy on seven
+benchmarks for Gemma-2 2B (Team et al., 2024),
+comparing DIET against structured pruning base-
+lines SliceGPT (Ashkboos et al., 2024) and PuD-
+Ding (Wee et al., 2025), as well as magnitude-
+based methods (Han et al., 2015). Here, DIET
+consistently outperforms both published structured
+pruning methods across all sparsity levels. For ex-
+ample, at 10% sparsity, DIET achieves 56.3% aver-
+age accuracy, substantially exceeding SliceGPT by
+21.3 % and PuDDing by 20.4 %. This gap persists
+at 20% sparsity, where DIET (45.0%) surpasses
+SliceGPT by 10.0% and PuDDing (35.8%) by
+9.2%. Notably, while SliceGPT and PuDDing ex-
+hibit severe performance degradation—dropping to
+near-random performance on several tasks—DIET
+preserves substantially more task-specific capabili-
+ties. Per-task analysis further reveals this advantage
+5
+Table 2: Zero-shot accuracy comparisons of DIET against baseline pruning algorithms on Gemma-2 9B on seven
+NLP benchmarks. The best performances are marked in bold, and the runner-up is marked with underline. Tasks
+with * are presented with acc_norm and remaining tasks with acc.
+Method
+Sparsity
+Per-task Accuracies (%)
+Average
+Acc. (%)
+BoolQ
+RTE
+HellaSwag*
+WinoGrande
+Arc-E*
+Arc-C*
+OBQA*
+No pruning (Original)
+0
+84.4
+67.9
+80.0
+74.2
+87.8
+66.1
+47.2
+72.5
+Magnitude-Dim
+20%
+68.5
+53.8
+49.5
+60.6
+62.0
+30.8
+31.6
+51.0
+SliceGPT
+20%
+37.8
+52.7
+25.8
+50.5
+27.4
+25.0
+27.6
+35.3
+PuDDing
+20%
+62.8
+57.4
+49.8
+59.7
+51.3
+32.1
+29.2
+48.9
+DIET (Ours)
+20%
+74.7
+54.2
+48.5
+59.2
+61.7
+32.0
+31.2
+51.6
+Magnitude-Dim
+10%
+82.7
+62.1
+71.1
+71.4
+80.2
+50.6
+43.2
+65.9
+SliceGPT
+10%
+37.8
+52.7
+25.7
+50.5
+27.2
+25.0
+27.4
+35.2
+PuDDing
+10%
+64.5
+64.3
+49.5
+59.5
+49.1
+30.3
+30.2
+49.7
+DIET (Ours)
+10%
+82.8
+62.1
+69.9
+68.7
+79.1
+49.6
+40.0
+64.6
+Table 3: Real-time efficiency comparison between orig-
+inal model and DIET-pruned model on Gemma-2 2B.
+Latency is measured in milliseconds (ms), memory de-
+notes peak GPU memory usage in megabytes (MB), and
+FLOPs are computed per forward pass (1012).
+Task
+Latency (ms) Memory (MB) FLOPs (1012)
+Base
+DIET Base
+DIET
+Base
+DIET
+BoolQ
+62.98 40.55 5466
+4469
+8.05
+6.44
+RTE
+37.64 39.95 5263
+4267
+4.27
+3.42
+HellaSwag
+38.16 39.28 5174
+4179
+4.23
+3.39
+WinoGrande
+37.47 38.75 5094
+4098
+1.90
+1.52
+Arc-Easy
+37.93 39.55 5127
+4131
+2.90
+2.32
+Arc-Challenge 38.47 39.76 5208
+4212
+3.83
+3.06
+OpenBookQA 38.02 39.38 5099
+4103
+2.44
+1.95
+Avg
+41.52 39.58 5204
+4209
+3.95
+3.16
+holds broadly: at 10% sparsity, DIET outperforms
+both structured baselines on all seven tasks, with
+particularly strong results on BoolQ (70.6%), Hel-
+laSwag (62.7%), and WinoGrande (62.8%). At
+20%, DIET exceeds SliceGPT on six tasks and
+PuDDing on all seven tasks, demonstrating particu-
+lar robustness on reasoning tasks like BoolQ and
+WinoGrande.
+Next, we additionally conduct the experiments
+with larger model. Table 2 presents results on
+Gemma-2 9B model at 10% and 20% sparsity lev-
+els. Similar to the results on 2B model, DIET main-
+tains its strong advantage over structured pruning
+baselines across model scales. For instance, at 10%
+sparsity, DIET achieves 64.6% average accuracy,
+substantially outperforming SliceGPT by 29.4%
+and PuDDing by 14.9%. At 20% sparsity, DIET
+(51.6%) continuously surpasses SliceGPT (35.3%)
+and PuDDing (48.9%).
+The comparison across model scales reveals con-
+sistent patterns. DIET’s advantage over SliceGPT
+remains substantial on both 2B and 9B models,
+with gaps exceeding 16% at 20% sparsity. Against
+PuDDing, DIET demonstrates stronger improve-
+ments on the smaller 2B model (9.2%) compared
+to 9B (2.7%), suggesting that task-aware dimen-
+sion selection becomes increasingly competitive
+as model capacity grows. While Magnitude-Dim
+achieves 51.0% on 9B at 20% sparsity—slightly be-
+low DIET’s 51.6%—DIET still demonstrates com-
+petitive performance among dimension-level struc-
+tured approaches. This consistent advantage across
+two model scales spanning nearly 4× in param-
+eter count positions DIET as a robust structured
+pruning method across different architectural con-
+figurations.
+Real-time efficiency.
+We report real-time effi-
+ciency results in terms of latency, peak memory
+usage, and FLOPs in Table 3. All efficiency mea-
+surements are conducted on the Gemma-2 2B at
+a sparsity ratio of 20%, using the hard-pruned im-
+plementation described in Sec. 2.3. Overall, DIET
+achieves consistent reductions in memory footprint
+and FLOPs across all evaluated tasks, leading to an
+improvement in average latency from 41.52 ms to
+39.58 ms. While per-task latency may vary due to
+runtime effects, reductions in memory usage and
+computational cost are consistent across tasks, in-
+dicating practical efficiency gains of hard pruning.
+In addition to efficiency improvements, we ver-
+ify that hard pruning preserves predictive perfor-
+mance. Table 4 compares the zero-shot accuracy
+of the standard zero-masking implementation of
+DIET (reported in Table 1) with its hard-pruned
+6
+Table 4: Zero-shot accuracy comparisons of the standard zero-masking DIET and the hard-pruning implementation
+(DIET-Hard) on Gemma-2 2B. DIET-Hard physically removes dimensions and applies variance rescaling to mitigate
+distribution shift. The better performance between the two pruned methods is marked in bold. Tasks with * are
+presented with acc_norm and remaining tasks with acc.
+Method
+Sparsity
+Per-task Accuracies (%)
+Average
+Acc. (%)
+BoolQ
+RTE
+HellaSwag*
+WinoGrande
+Arc-E*
+Arc-C*
+OBQA*
+No pruning (Original)
+0
+73.5
+61.4
+73.0
+68.4
+80.2
+49.7
+41.8
+64.0
+DIET (Zero-mask)
+20%
+63.3
+54.9
+41.8
+53.2
+49.8
+24.1
+27.6
+45.0
+DIET (Hard-prune)
+20%
+64.7
+51.6
+42.5
+54.7
+51.3
+25.9
+27.4
+45.4
+Table 5: Zero-shot accuracy on Gemma-2 2B with masks derived from arc_easy, arc_challenge, and all tasks. Tasks
+with * are presented with acc_norm and remaining tasks with acc.
+Method
+Sparsity
+Per-task Accuracies (%)
+Average
+Acc. (%)
+BoolQ
+RTE
+HellaSwag*
+WinoGrande
+Arc-E*
+Arc-C*
+OBQA*
+Arc-Easy Mask
+20%
+62.9
+52.5
+39.0
+53.1
+48.6
+25.2
+26.8
+44.0
+Arc-Challenge Mask
+20%
+63.4
+52.4
+39.0
+51.5
+48.0
+24.5
+26.8
+43.6
+All Tasks (Ours)
+20%
+63.3
+54.9
+41.8
+53.2
+49.8
+24.1
+27.6
+45.0
+Table 6: Zero-shot accuracy comparisons of continuous score merging and our discrete (vote-based) mask on
+Gemma-2 2B at 20% sparsity. Tasks with * are presented with acc_norm and remaining tasks with acc.
+Method
+Sparsity
+Per-task Accuracies (%)
+Average
+Acc. (%)
+BoolQ
+RTE
+HellaSwag*
+WinoGrande
+Arc-E*
+Arc-C*
+OBQA*
+Continuous
+20%
+63.3
+52.7
+42.1
+52.6
+50.4
+24.5
+26.8
+44.6
+Voting (Ours)
+20%
+63.3
+54.9
+41.8
+53.2
+49.8
+24.1
+27.6
+45.0
+counterpart under the same sparsity ratio. Despite
+physically removing dimensions and compacting
+the hidden size, DIET-Hard maintains accuracy
+comparable to the zero-masked model across tasks.
+In particular, the average accuracy of DIET-Hard
+(45.4%) closely matches that of the zero-masked
+DIET (45.0%), demonstrating that the proposed
+variance correction effectively mitigates the distri-
+bution shift induced by dimensionality reduction.
+These results indicate that hard pruning serves as a
+faithful and efficient realization of DIET, enabling
+real-time efficiency gains without sacrificing zero-
+shot performance.
+3.3
+More Analyses
+In this section, we present additional analyses of
+DIET on the seven zero-shot benchmarks using
+Gemma-2 2B (Team et al., 2024).
+Global mask vs. per-task masks.
+First, we
+compare our merged global mask to models
+pruned with a single-task mask from arc_easy and
+arc_challenge. As shown in Table 5, the global
+mask improves average zero-shot accuracy over
+single-task mask applied models. The gains are
+largest on RTE, as the global mask model (54.9%)
+outperforms model with arc_easy mask with 2.4%
+and model with arc_challenge mask with 2.5%.
+Taken together, these results indicate that aggre-
+gating votes across tasks preserve broadly useful
+dimensions and yields better task-aware generaliza-
+tion that relying on any single task’s mask.
+Continuous score merging instead of binary vot-
+ing.
+Beyond binary selectors, we also merge con-
+tinuous task-wise importance scores: for each di-
+mension, we construct a vector of normalized ac-
+tivation magnitudes across tasks, aggregate it to
+obtain a scalar score, and rank dimensions accord-
+ingly (smaller scores indicate less informative di-
+mensions). We then select a global fraction of
+dimensions according to the target sparsity (20%)
+based on this ranking and prune the model. As
+reported in Table 6, the pruned model under this
+continuous merging scheme attains accuracy com-
+parable to the binary vote–based DIET, showing
+that activation magnitudes provide sufficiently in-
+formative signals and that DIET is robust to the
+7
+0
+1
+2
+3
+4
+5
+6
+7
+Number of pruning votes per dimension (across 7 tasks)
+0
+200
+400
+600
+800
+1000
+1200
+1400
+1600
+Count of dimensions
+1406 (61.0%)
+237 (10.3%)
+123 (5.3%)
+101 (4.4%)
+114 (4.9%)
+94 (4.1%)
+95 (4.1%)
+134 (5.8%)
+Figure 2: Consensus-vote histogram by dimension
+across 7 tasks on Gemma-2 2B. Numbers show total
+counts (and share of d=2304).
+BoolQ
+RTE
+HellaSwag* WinoGrande
+Arc-E*
+Arc-C*
+OBQA*
+Tasks
+20
+30
+40
+50
+60
+70
+Zero-shot accuracy (%)
+N = 10
+N = 50
+N = 100
+Entire Sample
+Figure 3: Zero-shot accuracy by activation-profiling
+sample size on Gemma-2 2B across seven benchmarks.
+Benchmarks with * use acc_norm.
+merging granularity (binary vs. continuous).
+Cross-task agreement via voting.
+We then an-
+alyze how strongly tasks agree on which residual
+dimensions are uninformative. For each dimension
+k, we count the number of tasks that vote to prune
+it, ck= P
+t z(t)
+k , and report the histogram over vote
+counts in Figure 2. The distribution reveals mean-
+ingful cross-task consensus: dimensions receiving
+7 or 6 votes (i.e., flagged by nearly all tasks) ac-
+count for approximately 10% of total dimensions,
+enabling us to achieve 10% sparsity with strong
+agreement. Expanding to dimensions with 7, 6,
+5, or 4 votes yields approximately 20% of dimen-
+sions, sufficient to meet 20% sparsity targets. This
+concentration of votes at high counts indicates that
+DIET’s majority voting mechanism successfully
+identifies dimensions that are consistently unin-
+formative across diverse tasks, validating the core
+assumption that cross-task agreement can guide
+effective structured pruning.
+Robustness to profiling sample size.
+We vary
+the number of activation-profiling samples per task
+Table 7: Zero-shot task average accuracy comparison on
+Qwen2.5-7B and Phi-4-mini-reasoning, applying DIET.
+We have applied 10% and 20%.
+Method
+Sparsity
+Qwen2.5-7B
+Phi-4-mini
+No pruning
+0%
+70.5
+58.8
+Magnitude - Dim
+10%
+38.6
+36.1
+DIET (Ours)
+10%
+60.9
+46.3
+DIET (Ours)
+20%
+37.0
+37.2
+N ∈{10, 50, 100, full} and evaluate the resulting
+20%-sparse models across all seven benchmarks.
+Figure 3 shows that performance improves consis-
+tently as N increases: mean accuracy rises from
+44.2% at N = 10 to 46.1% when profiling on
+the full training split. Notably, the gap between
+N = 100 (45.0%) and the full-split baseline is only
+1.1%, indicating that DIET achieves near-optimal
+performance with a modest profiling budget. These
+findings indicate that DIET reaches near-saturation
+by N = 100, striking an effective balance between
+profiling cost and zero-shot benchmark accuracy.
+Generalization of DIET to various LLMs.
+Lastly, we validate whether DIET could be gen-
+eralized various types of LLMs, more than Gemma
+series in previous experiments. To this end, we con-
+duct additional experiments on Qwen2.5-7B (Yang
+et al., 2024) and Phi-4-Mini-Reasoning (3.8B) (Xu
+et al., 2025). The corresponding results are pre-
+sented in Table 7. Under a moderate pruning budget
+of 10% sparsity, DIET preserves most of the orig-
+inal accuracy across both backbones, demonstrat-
+ing strong cross-architecture generalization without
+any retraining. As the sparsity ratio increases, how-
+ever, performance degradation becomes more pro-
+nounced approximately 33% on Qwen2.5-7B and
+21% on Phi-4-Mini-Reasoning, respectively. These
+results suggest that while dimension-wise impor-
+tance aggregation transfers effectively under light
+compression, more aggressive pruning amplifies
+architecture-specific sensitivities and may require
+further adaptation or re-scaling mechanisms.
+4
+Related Works
+Structured pruning of LLMs.
+Structured prun-
+ing methods can be categorized based on the
+granularity of computational units they remove.
+Dimension-wise approaches aim to prune in-
+dividual dimensions across weight matrices:
+SliceGPT (Ashkboos et al., 2024) applies PCA-
+based alignment and leverages computational in-
+8
+variance in transformer models to uniformly re-
+duce embedding width. LLM-Pruner (Ma et al.,
+2023) constructs dependency graphs to automati-
+cally identify coupled structures and uses gradient-
+based importance estimation for pruning, followed
+by fast LoRA-based fine-tuning for performance
+recovery.
+LoRAShear (Chen et al., 2024) per-
+forms progressive structured pruning via LoRA
+Half-Space Projected Gradient (LHSPG), enabling
+knowledge transfer from redundant structures dur-
+ing the pruning process. On the other hand, block-
+wise methods instead remove entire transformer
+blocks based on importance metrics: SLEB (Song
+et al., 2024) employs perplexity-based iterative se-
+lection to streamline models by eliminating redun-
+dant blocks, while Shortened-LLaMA (Kim et al.,
+2024) adopts a one-shot approach that directly mea-
+sures perplexity drop after removing each block.
+Task-aware pruning.
+Recent work has explored
+dynamic pruning to adapt compression decisions
+to specific tasks or inputs.
+At the block level,
+PuDDing (Wee et al., 2025) trains a lightweight
+router to predict per-prompt block omission sets
+in a data-driven manner. This approach enables
+task-specific adaptation and achieves over 4% ac-
+curacy improvement on commonsense reasoning
+tasks compared to static pruning, but requires router
+training and introduces per-prompt routing over-
+head during inference. At the dimension level,
+Instruction-Following Pruning (IFPruning) (Ji et al.,
+2025) generates input-dependent dimension masks
+by co-training the sparsity predictor and the masked
+LLM on pre-training and instruction-following
+data. However, this requires extensive training
+across both pre-training and fine-tuning stages, and
+the per-input mask generation adds computational
+overhead at inference time. These dynamic meth-
+ods demonstrate the value of task-aware adaptation
+but impose significant training or routing costs.
+Training-free pruning.
+While many structured
+pruning methods require additional training for
+router optimization (Wee et al., 2025), spar-
+sity predictor co-training with continued pre-
+training (Ji et al., 2025), or post-pruning recov-
+ery via LoRA (Ma et al., 2023; Chen et al., 2024),
+training-free approaches offer practical advantages
+for rapid deployment. SLEB (Song et al., 2024) and
+Shortened-LLaMA (Kim et al., 2024) perform one-
+shot block selection based on perplexity measure-
+ments on calibration data, avoiding retraining but
+producing task-agnostic masks that can be subopti-
+mal for specific tasks. SliceGPT (Ashkboos et al.,
+2024) requires only PCA preprocessing on cali-
+bration data, though its computational invariance-
+based approach produces a fixed mask that remains
+task-agnostic. DIET similarly operates training-
+free by profiling activations on task-specific data
+and merging task-wise importance via majority vot-
+ing to produce a single global mask. Unlike prior
+training-free methods that produce task-agnostic
+masks, DIET incorporates task-aware signals by
+aggregating importance evidence across multiple
+tasks, generating global uniform mask that can be
+applied to all tasks without training or routing over-
+head while maintaining the practical deployment
+advantages of training-free pruning.
+5
+Conclusion
+We presented DIET, a training-free dimension-wise
+global pruning framework that merges task-wise
+importance estimates into a single global mask.
+By profiling MLP activations on small per-task
+samples and aggregating through majority voting,
+DIET systematically removes residual dimensions
+that multiple tasks deem uninformative. Across
+seven zero-shot benchmarks on Gemma-2 2B and
+9B, DIET consistently outperforms previous state-
+of-the-art structured pruning baselines at matched
+sparsity levels, achieving improvements of up to
+21% at 10% sparsity ratio.
+In addition, DIET
+achieves consistent reductions in FLOPs and peak
+memory under hard pruning, leading to measurable
+latency improvements without degrading zero-shot
+performance. These results indicate that a simple,
+router-free, activation-driven approach can deliver
+robust task-aware compression with modest profil-
+ing costs, positioning DIET as a practical choice
+for structured LLM pruning.
+Limitation and future work.
+Our evaluation fo-
+cuses on seven English-centric zero-shot bench-
+marks; broader coverage across multilingual do-
+mains, safety-critical tasks, long-context scenar-
+ios, and tool-use applications remains unexplored.
+At high sparsity levels on non-Gemma architec-
+tures, we observe notable accuracy degradation,
+suggesting the need for adaptive sparsity schedules,
+per-layer allocation strategies, or lightweight post-
+pruning recovery techniques. Also, task-weighted
+or distribution-aware voting mechanisms may im-
+prove robustness, while smarter calibration poli-
+cies, such as difficulty-aware or uncertainty-driven
+sampling, could enhance sample efficiency.
+9
+Broader Impact and Ethical Implications
+By reducing computational and memory require-
+ments through a single global mask, DIET offers
+practical benefits for model deployment and en-
+vironmental sustainability. Unlike task-specific
+pruning methods that require maintaining mul-
+tiple pruned variants, DIET’s global mask pro-
+duces a single task-aware model capable of han-
+dling diverse tasks effectively. This consolidation
+simplifies deployment pipelines, reduces storage
+overhead, and lowers both energy consumption
+during inference and the carbon footprint associ-
+ated with model distribution. By eliminating the
+need for multiple model variants, DIET makes
+large language models more accessible to resource-
+constrained settings while maintaining task-aware
+capabilities. However, pruning alters internal repre-
+sentations and may shift model behavior in fairness,
+safety, and robustness. Practitioners should audit
+pruned models for bias and distribution shift, re-
+run safety evaluations, and transparently document
+sparsity levels and calibration procedures. We rec-
+ommend using publicly available calibration data
+to respect privacy and pairing deployments with
+appropriate monitoring and safeguards.
+References
+Saleh
+Ashkboos,
+Maximilian
+Lamparter
+Croci,
+Marcelo Gennari do Nascimento, Torsten Hoefler,
+and James Hensman. 2024. SliceGPT: Compress
+large language models by deleting rows and
+columns. In International Conference on Learning
+Representations (ICLR).
+Tianyi Chen, Tianyu Ding, Badal Yadav, Ilya Zharkov,
+and Luming Liang. 2024. Lorashear: Efficient large
+language model structured pruning and knowledge
+recovery. In International Conference on Learning
+Representations (ICLR).
+Christopher Clark, Kenton Lee, Ming-Wei Chang,
+Tom Kwiatkowski, Michael Collins, and Kristina
+Toutanova. 2019. Boolq: Exploring the surprising
+difficulty of natural yes/no questions. In Conference
+of the North American Chapter of the Association
+for Computational Linguistics: Human Language
+Technologies (NAACL-HLT).
+Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot,
+Ashish Sabharwal, Carissa Schoenick, and Oyvind
+Tafjord. 2018. Think you have solved question an-
+swering? try arc, the ai2 reasoning challenge. arXiv
+preprint arXiv:1803.05457.
+Alexis Conneau, Guillaume Lample, Ruty Rinott, Ad-
+ina Williams, Samuel R. Bowman, Holger Schwenk,
+and Veselin Stoyanov. 2018. Xnli: Evaluating cross-
+lingual sentence representations. In Conference on
+Empirical Methods in Natural Language Processing
+(EMNLP).
+Ido Dagan, Oren Glickman, and Bernardo Magnini.
+2005. The PASCAL recognising textual entailment
+challenge. In Proceedings of the PASCAL Challenges
+Workshop on Recognising Textual Entailment.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and
+Kristina Toutanova. 2019. Bert: Pre-training of deep
+bidirectional transformers for language understand-
+ing. In Conference of the North American Chapter of
+the Association for Computational Linguistics: Hu-
+man Language Technologies (NAACL-HLT), pages
+4171–4186. Original preprint: arXiv:1810.04805.
+Leo Gao, Jonathan Tow, Stella Biderman, Sid Black,
+and EleutherAI. 2024. Eleutherai language model
+evaluation harness (lm-eval). https://pypi.org/
+project/lm-eval/0.4.9/. Version 0.4.9 (PyPI re-
+lease), accessed 2025-10-05.
+Song Han, Jeff Pool, John Tran, and William Dally.
+2015. Learning both weights and connections for
+efficient neural networks. In Advances in Neural In-
+formation Processing Systems (NeurIPS), volume 28.
+Pisheng Ji, Moshe Fine, Zitong Li, and Aditi Raghu-
+nathan. 2025. Instruction-following pruning for large
+language models. In Proceedings of the International
+Conference on Machine Learning (ICML).
+Bo-Kyeong Kim, Seong-Ung Kim, Wenlong Hu, Chun-
+yuan Lin, Rajiv Khanna, Chelsea Finn, and Zi Liu.
+2024.
+Shortened llama:
+Depth pruning for ef-
+ficient large language models.
+arXiv preprint
+arXiv:2402.02834. ICLR 2024 Workshop on Un-
+derstanding of Foundation Models (ME-FoMo).
+Ilya Loshchilov and Frank Hutter. 2019. Decoupled
+weight decay regularization. In International Confer-
+ence on Learning Representations (ICLR). Popularly
+known as AdamW.
+Xinyin Ma, Gongfan Fang, and Xinchao Wang. 2023.
+Llm-pruner: On the structural pruning of large lan-
+guage models. In Advances in Neural Information
+Processing Systems (NeurIPS), volume 36.
+Stephen Merity, Caiming Xiong, James Bradbury, and
+Richard Socher. 2016. Revisiting the limits of lan-
+guage modeling. arXiv preprint arXiv:1602.02410.
+Introduces the WikiText-2 dataset.
+Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish
+Sabharwal. 2018. Can a suit of armor conduct elec-
+tricity? a new dataset for open book question answer-
+ing. In Conference on Empirical Methods in Natural
+Language Processing (EMNLP).
+Pavlo Molchanov, Stephen Tyree, Tero Karras, Timo
+Aila, and Jan Kautz. 2017. Pruning convolutional
+neural networks for resource efficient inference. In
+International Conference on Learning Representa-
+tions (ICLR). ICLR 2017 poster.
+10
+Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhaga-
+vatula, and Yejin Choi. 2020. Winogrande: An ad-
+versarial winograd schema challenge at scale. In
+Proceedings of the AAAI Conference on Artificial
+Intelligence (AAAI).
+Jiwon Song, Kyungseok Oh, Taesu Kim, Hyungjun Kim,
+Yulhwa Kim, and Jae-Joon Kim. 2024. Sleb: Stream-
+lining llms through redundancy verification and elim-
+ination of transformer blocks. In International Con-
+ference on Machine Learning (ICML). Also available
+as arXiv:2402.09025.
+Mingjie Sun, Zhuang Liu, Anna Bair, and J. Zico Kolter.
+2024. A simple and effective pruning approach for
+large language models. In International Conference
+on Learning Representations (ICLR). ICLR 2024
+poster.
+Gemma Team, Morgane Riviere, Shreya Pathak,
+Pier Giuseppe Sessa, Cassidy Hardin, Surya Bhupati-
+raju, Léonard Hussenot, Thomas Mesnard, Bobak
+Shahriari, Alexandre Ramé, and 1 others. 2024.
+Gemma 2: Improving open language models at a
+practical size. arXiv preprint arXiv:2408.00118.
+Juyun Wee, Minjae Park, and Jaeho Lee. 2025. Prompt-
+based depth pruning of large language models. In
+Proceedings of the International Conference on Ma-
+chine Learning (ICML). Poster.
+Haoran Xu, Baolin Peng, Hany Awadalla, Dongdong
+Chen, Yen-Chun Chen, Mei Gao, Young Jin Kim,
+Yunsheng Li, Liliang Ren, Yelong Shen, Shuohang
+Wang, Weijian Xu, Jianfeng Gao, Weizhu Chen, and
+1 others. 2025. Phi-4-mini-reasoning: Exploring the
+limits of small reasoning language models in math.
+arXiv preprint arXiv:2504.21233.
+An Yang, Beichen Zhang, Binyuan Hui, Bofei Gao, Day-
+iheng Liu, Jianhong Tu, Bowen Yu, Chengpeng Li,
+Jingren Zhou, Junyang Lin, Keming Lu, Mingfeng
+Xue, Xingzhang Ren, Zhenru Zhang, and 1 others.
+2024.
+Qwen2.5 technical report.
+arXiv preprint
+arXiv:2412.15115.
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali
+Farhadi, and Yejin Choi. 2019. HellaSwag: Can
+a machine really finish your sentence? In Annual
+Meeting of the Association for Computational Lin-
+guistics (ACL).
+Jeffrey Zhou, Tianjian Lu, Swaroop Mishra, Sid-
+dhartha Brahma, Sujoy Basu, Yi Luan, Denny Zhou,
+and Le Hou. 2023.
+Instruction-following evalu-
+ation for large language models.
+arXiv preprint
+arXiv:2311.07911.
+A
+Experimental Details
+This section provides comprehensive details on
+our experimental setup, including dataset descrip-
+tions, prompt/evaluation policies, implementation
+specifics, and reproducibility aspects.
+A.1
+Datasets
+We evaluate on seven English benchmarks that are
+standard in prior pruning/efficiency work: BoolQ,
+RTE, HellaSwag, WinoGrande, ARC-Easy, ARC-
+Challenge, and OpenBookQA. Activation statistics
+for pruning are collected on the train split of each
+dataset, while final accuracy is reported with lm-
+eval-harness on its default split.
+BoolQ
+BoolQ (Clark et al., 2019) is a yes/no read-
+ing comprehension dataset built from naturally oc-
+curring questions paired with supporting passages,
+primarily sourced from the web (e.g., Wikipedia).
+Each example contains a short question and a para-
+graph that may contain sufficient evidence to an-
+swer it. In our pipeline, we use the train split to
+collect activation statistics and the lm-eval-harness
+default configuration for zero-shot evaluation. Dur-
+ing activation collection, we do not employ an ex-
+plicit prompt; instead, inputs are formed by con-
+catenating the passage and question. For evalua-
+tion, we rely on lm-eval’s standard yes/no template
+and report accuracy (and acc_norm where appli-
+cable). Tokenization uses max_length=512 with
+padding/truncation; padding tokens are masked in
+our forward-hook aggregation.
+RTE
+RTE (Dagan et al., 2005) evaluates two-way
+natural language inference over (premise, hypothe-
+sis) pairs. Labels are entailment vs. not entailment.
+We collect activations on the train split by con-
+catenating the premise and hypothesis without a
+handcrafted prompt, then evaluate zero-shot with
+lm-eval-harness’ default NLI formatting and report
+accuracy. As with other tasks, we tokenize with
+max_length=512 and mask padding during aggre-
+gation to avoid biasing per-dimension importance
+estimates.
+HellaSwag
+HellaSwag (Zellers et al., 2019) is
+a commonsense sentence completion benchmark
+where a short context must be continued with the
+most plausible of four candidate endings. It targets
+subtle lexical and pragmatic cues and is known
+to expose annotation artifacts if option order or
+formatting drifts from the original. In our setup,
+activation statistics are computed on the train split
+11
+Table 8: Prompt policy used in our pipeline. For pruning analysis we do not use explicit templates; for final
+evaluation we rely on lm-eval-harness defaults.
+Stage
+Basic Prompt / Source
+Activation Collection (Pruning)
+No explicit prompt. Inputs are formed by concatenating dataset fields (e.g., premise +
+hypothesis, question + choices, ctx + endings).
+Final Evaluation (lm-eval)
+lm-eval-harness default prompts with zero-shot (–num_fewshot 0). No custom
+instruction added.
+Component
+Content
+Question
+do iran and afghanistan speak the same language
+Context
+Persian language, also known as Farsi, is one of the Western Iranian languages within
+the Indo-Iranian branch of the Indo-European language family. It is primarily spoken in
+Iran, Afghanistan (officially known as Dari since 1958), and Tajikistan (officially known
+as Tajiki since the Soviet era), and some other regions which historically were Persianate
+societies and considered part of Greater Iran. It is written in the Persian alphabet, a
+modified variant of the Arabic script, which itself evolved from the Aramaic alphabet.
+Ground Truth
+Yes
+Table 9: Example data from BOOLQ.
+by concatenating the context with all four endings
+(no explicit instruction). Final accuracy is mea-
+sured with lm-eval-harness zero-shot defaults that
+present the context and choices and parse answers
+as A–D. We keep the original option order and pre-
+serve special characters; long inputs are truncated
+at 512 tokens.
+WinoGrande
+WinoGrande (Sakaguchi et al.,
+2020) is a large-scale pronoun/coreference com-
+monsense benchmark cast as a cloze task: a sen-
+tence with a single blank must be filled with one
+of two candidate nouns. We gather activations on
+the train split using only the raw sentence (with-
+out a formatted instruction or candidate list) to
+reflect content-driven activations; zero-shot evalua-
+tion then follows lm-eval’s default cloze template
+that shows the candidates and expects an answer in
+{1,2}. We report accuracy and escape underscores
+in LaTeX where necessary; truncation follows the
+same 512-token policy.
+ARC-Easy
+ARC-Easy (Clark et al., 2018) con-
+tains elementary-level science multiple-choice
+questions with four options. Items often involve
+factual recall plus light reasoning and unit/term fi-
+delity. For activation collection, we use the train
+split and build inputs by concatenating the stem
+with the four option texts (no explicit prompt). Fi-
+nal zero-shot evaluation uses lm-eval-harness’ stan-
+dard MCQ formatting, preserving the original op-
+tion order, and we report accuracy (and acc_norm
+where available). Scientific notation and symbols
+are kept verbatim; overly long stems are truncated
+after tokenization.
+ARC-Challenge
+ARC-Challenge (Clark et al.,
+2018) is the harder subset of ARC that requires
+multi-hop reasoning or background knowledge be-
+yond straightforward recall. We follow the same
+protocol as ARC-Easy: activations are collected
+on the train split using concatenated stem+choices
+without an explicit instruction, and evaluation is
+performed zero-shot with lm-eval defaults and orig-
+inal option order. As is typical, accuracy on ARC-
+Challenge is substantially lower than ARC-Easy for
+the same base model; our pruning analysis there-
+fore reports both to illustrate difficulty sensitivity.
+OpenBookQA
+OpenBookQA (Mihaylov et al.,
+2018) is a four-choice science QA dataset designed
+around a small “open book” of core facts. Many
+items benefit from combining the provided stem
+with general science knowledge. In our experi-
+ments we do not augment with retrieval; activa-
+tions on the train split are computed by concatenat-
+ing the question stem and choice texts (no explicit
+prompt), and final zero-shot accuracy is obtained
+with lm-eval’s default MCQ template. This isolates
+pruning effects from external knowledge pipelines
+and keeps evaluation comparable to prior efficiency
+work.
+12
+Component
+Content
+Premise
+No Weapons of Mass Destruction Found in Iraq Yet.
+Hypothesis
+Weapons of Mass Destruction Found in Iraq.
+Ground Truth
+not entailment
+Table 10: Example data from RTE.
+Component
+Content
+Context
+Then, the man writes over the snow covering the window of a car, and a woman wearing
+winter clothes smiles. then
+Options
+A. , the man adds wax to the windshield and cuts it.
+B. , a person board a ski lift,
+while two men supporting the head of the person wearing winter clothes snow as the we
+girls sled.
+C. , the man puts on a christmas coat, knitted with netting.
+D. , the man
+continues removing the snow on his car.
+Ground Truth
+D
+Table 11: Example data from HELLASWAG.
+XNLI
+XNLI (Conneau et al., 2018) is a multi-
+lingual natural language inference benchmark con-
+structed by extending the English MNLI dataset
+to multiple languages via human translation. Each
+example consists of a premise–hypothesis pair la-
+beled as entailment, contradiction, or neutral, and
+is commonly used to evaluate cross-lingual sen-
+tence representations. In our experiments, we eval-
+uate zero-shot performance without any language-
+specific adaptation or fine-tuning. Model predic-
+tions are obtained using lm-eval’s default NLI
+prompt template, and accuracy is reported by aver-
+aging results across languages. This setting allows
+us to assess how well pruning preserves distributed
+multilingual knowledge under a unified evaluation
+protocol.
+IFEval
+IFEval (Zhou et al., 2023) is a bench-
+mark designed to evaluate instruction-following
+capability of large language models through verifi-
+able constraints. Each instance specifies explicit re-
+quirements on the generated output, such as format,
+length, or content inclusion, which are automati-
+cally checked using rule-based evaluators rather
+than reference matching. In our evaluation, we fol-
+low the standard zero-shot setup without additional
+prompting or alignment techniques. Model outputs
+are assessed using the strict prompt-level accuracy
+metric provided by the benchmark. This evaluation
+focuses on whether pruning preserves the model’s
+ability to reliably follow instructions, independent
+of semantic correctness or stylistic quality.
+A.2
+Measurement details
+We report accuracy (and acc_norm where avail-
+able) from lm-eval-harness with zero-shot
+(–num_fewshot 0). All results use the official task
+loaders and default post-processing of lm-eval to
+ensure comparability.
+A.3
+Baselines
+As our main baseline, we evaluate the unpruned
+base model with the same lm-eval settings. No
+custom prompt is added (zero-shot, defaults). For
+completeness, the basic evaluation templates (ren-
+dered by lm-eval) are summarized in Table 17.
+A.4
+Implementation details
+We use Hugging Face AutoModelForCausalLM
+/AutoTokenizer with local checkpoints. For acti-
+vation collection, we construct inputs from dataset
+fields, attach forward hooks to each MLP down-
+projection, and compute mean absolute activations
+over non-padded tokens (via the attention mask) to
+score hidden dimensions. Per task, dimensions are
+ranked and the lowest (r%) are selected; a simple
+vote across tasks yields a consensus set, which we
+prune by zero-masking channels in linear layers
+whose input/output size matches the hidden width.
+Final accuracy is reported with lm_eval (hf back-
+end, zero-shot). All runs use a fixed seed (42) for
+reproducibility.
+13
+Component
+Content
+Sentence
+Ian volunteered to eat Dennis’s menudo after already having a bowl because _ despised
+eating intestine.
+Options
+1. Ian
+2. Dennis
+Ground Truth
+2 (Dennis)
+Table 12: Example data from WINOGRANDE.
+Component
+Content
+Question
+Which factor will most likely cause a person to develop a fever?
+Options
+A. a leg muscle relaxing after exercise
+B. a bacterial population in the bloodstream
+C. several viral particles on the skin
+D. carbohydrates being digested in the stomach
+Ground Truth
+B
+Table 13: Example data from ARC-EASY.
+B
+Additional Analyses
+In Section 3.1, we described two calibration strate-
+gies for SliceGPT: the original approach using 64
+samples from WikiText2 with maximum sequence
+length 2048, and an alternative using 100 randomly
+selected samples from the seven zero-shot bench-
+marks in Section 3.1. Table 18 compares the re-
+sulting accuracies at 10% and 20% sparsity. The
+performance difference between the two calibration
+strategies remains minimal, with accuracy varying
+by less than 1.0% at both sparsity levels, indicating
+that SliceGPT’s performance is relatively robust to
+the choice of calibration data source.
+In Table 1 and Table 2, we compare the perfor-
+mance of DIET with other pruning baselines at
+sparsity ratios of 10% and 20%. We additionally
+report results at 30% sparsity in Table 19 and Ta-
+ble 20. While the performance gains at 30% spar-
+sity are less pronounced than those at lower sparsity
+ratios, all pruning methods suffer substantial perfor-
+mance degradation in this regime, indicating that
+this behavior arises from the inherent difficulty of
+aggressive sparsification rather than a limitation of
+DIET.
+To further evaluate the robustness of DIET across
+different capability dimensions, we additionally re-
+port results on XNLI (multilingual understanding)
+and IFEval (instruction-following) on Table 21, Ta-
+ble 22, and Table 23. At 10% sparsity, DIET consis-
+tently outperforms magnitude-based baselines on
+XNLI for both Gemma-2-2B and 9B models, with
+a larger margin observed in the smaller model. On
+IFEval, DIET shows competitive or improved per-
+formance, particularly for Gemma-2-9B, indicat-
+ing that global dimension-wise pruning preserves
+instruction-following behavior more effectively in
+larger models. For detailed descriptions of XNLI
+and IFEval, we refer readers to Section 3.1.
+C
+Usage of AI Tools
+During manuscript preparation, we used AI-based
+language tools for editorial revisions such as
+grammar correction and readability improvements.
+These tools did not contribute to the conception
+of the study, methodological development, exper-
+imental design, data analysis, or the articulation
+of scientific conclusions. All substantive content
+originates from the authors; AI assistance was re-
+stricted to copy-editing and has no bearing on the
+work’s originality.
+14
+Component
+Content
+Question
+George wants to warm his hands quickly by rubbing them. Which skin surface will
+produce the most heat?
+Options
+A. dry palms
+B. wet palms
+C. palms covered with oil
+D. palms covered with
+lotion
+Ground Truth
+A
+Table 14: Example data from ARC-CHALLENGE.
+Component
+Content
+Question
+The sun is responsible for
+Options
+A. puppies learning new tricks
+B. children growing up and getting old
+C. flowers
+wilting in a vase
+D. plants sprouting, blooming and wilting
+Ground Truth
+D
+Table 15: Example data from OPENBOOKQA.
+Table 16: Input construction per benchmark during activation collection (used to compute dimension-wise impor-
+tance).
+Benchmark
+Field Concatenation
+BoolQ / RTE
+{premise} + " " + {hypothesis}
+HellaSwag
+{ctx} + " " + " ".join({endings})
+WinoGrande
+{sentence}
+ARC-Easy / ARC-Challenge
+{question} + " " + " ".join({choices})
+OpenBookQA
+{passage} + " " + {question}
+Table 17: Basic prompts used for our evaluation (lm-eval-harness defaults).
+Benchmark
+Basic Prompt
+BoolQ
+Answer the question with Yes or No based on the context.
+Q: {question}
+Context: {passage}
+Final format: ‘Answer: [Yes or No]’
+RTE
+Determine whether the hypothesis is entailed by the premise.
+Premise: {premise}
+Hypothesis: {hypothesis}
+Final format: ‘Answer: [entailment or not entailment]’
+HellaSwag
+Choose the most plausible ending.
+Context: {ctx}
+Choices: (A) {A} (B) {B} (C) {C} (D) {D}
+Final format: ‘Answer: [A/B/C/D]’
+WinoGrande
+Fill the blank in the sentence with one candidate.
+Sentence: {sentence with ___ blank}
+Candidates: {option1}, {option2}
+Final format: ‘Answer: [1 or 2]’
+ARC-Easy / ARC-Challenge
+Select one correct option.
+Question: {question}
+Choices: (A) {A} (B) {B} (C) {C} (D) {D}
+Final format: ‘Answer: [A/B/C/D]’
+OpenBookQA
+Use basic science knowledge to answer.
+Question: {question_stem}
+Choices: (A) {A} (B) {B} (C) {C} (D) {D}
+Final format: ‘Answer: [A/B/C/D]’
+15
+Table 18: Zero-shot accuracy of SliceGPT on Gemma-2 2B on seven NLP benchmarks, using WikiText2 and seven
+benchmarks. Tasks with * are presented with acc_norm and remaining tasks with acc.
+Method
+Sparsity
+Per-task Accuracies (%)
+Average
+Acc. (%)
+BoolQ
+RTE
+HellaSwag*
+WinoGrande
+Arc-E*
+Arc-C*
+OBQA*
+No pruning (Original)
+0
+73.5
+61.4
+73.0
+68.4
+80.2
+49.7
+41.8
+64.0
+SliceGPT - Zero-shot Benchmark
+20%
+37.8
+53.4
+25.3
+50.4
+26.2
+24.9
+27.0
+35.0
+SliceGPT - WikiText2
+20%
+37.8
+52.7
+24.5
+50.0
+26.1
+26.4
+25.8
+34.8
+SliceGPT -Zero-shot Benchmark
+10%
+37.8
+53.4
+25.2
+50.2
+26.3
+25.0
+27.0
+35.0
+SliceGPT - WikiText2
+10%
+37.9
+47.3
+25.2
+50.4
+25.8
+25.3
+27.4
+34.2
+Table 19: Zero-shot accuracy comparisons of DIET against baseline pruning algorithms on Gemma-2 2B on seven
+NLP benchmarks. The best performances are marked in bold, and the runner-up is marked with underline. Tasks
+with * are presented with acc_norm and remaining tasks with acc.
+Method
+Sparsity
+Per-task Accuracies (%)
+Average
+Acc. (%)
+BoolQ
+RTE
+HellaSwag*
+WinoGrande
+Arc-E*
+Arc-C*
+OBQA*
+No pruning (Original)
+0
+73.5
+61.4
+73.0
+68.4
+80.2
+49.7
+41.8
+64.0
+Magnitude - Dim
+30%
+37.8
+50.5
+28.7
+49.3
+34.5
+20.7
+25.6
+35.3
+SliceGPT
+30%
+37.8
+50.2
+25.2
+50.7
+25.7
+24.5
+27.4
+34.5
+PuDDing
+30%
+39.6
+46.2
+26.3
+49.6
+28.6
+24.5
+27.2
+34.6
+DIET (Ours)
+30%
+41.3
+49.1
+28.8
+49.3
+35.9
+21.5
+24.2
+35.7
+Table 20: Zero-shot accuracy comparisons of DIET against baseline pruning algorithms on Gemma-2 9B on seven
+NLP benchmarks. The best performances are marked in bold, and the runner-up is marked with underline. Tasks
+with * are presented with acc_norm and remaining tasks with acc. All values are reported as percentages (%).
+Method
+Sparsity
+Per-task Accuracies (%)
+Average
+Acc. (%)
+BoolQ
+RTE
+HellaSwag*
+WinoGrande
+Arc-E*
+Arc-C*
+OBQA*
+No pruning (Original)
+0
+84.4
+67.9
+80.0
+74.2
+87.8
+66.1
+47.2
+72.5
+Magnitude - Dim
+30%
+53.9
+52.7
+32.6
+51.9
+44.1
+22.6
+25.0
+40.4
+SliceGPT
+30%
+37.8
+52.7
+25.6
+50.1
+27.8
+24.9
+28.0
+35.3
+PuDDing
+30%
+50.5
+66.1
+49.2
+60.0
+52.1
+32.2
+31.6
+48.8
+DIET (Ours)
+30%
+61.2
+53.1
+32.3
+52.9
+43.1
+22.5
+24.2
+41.3
+Table 21: Zero-shot accuracy comparisons of DIET against baseline pruning algorithms on Gemma-2 2B on XNLI
+(15 languages). The best average performances at each sparsity level are marked in bold. All values are reported as
+percentages (%).
+Method
+Sparsity
+Per-language Accuracies (%)
+Average
+Acc. (%)
+en
+fr
+es
+de
+el
+bg
+ru
+tr
+ar
+vi
+th
+zh
+hi
+sw
+ur
+No pruning (Original)
+0
+53.9
+49.3
+46.8
+49.0
+39.1
+44.1
+49.0
+45.0
+33.2
+47.0
+44.4
+35.5
+43.5
+41.0
+34.1
+43.7
+Magnitude-Dim
+10%
+37.1
+37.2
+34.5
+34.3
+34.2
+34.7
+36.4
+33.6
+34.1
+33.5
+33.5
+34.0
+34.8
+34.1
+34.3
+34.7
+DIET (Ours)
+10%
+49.8
+41.9
+45.3
+42.6
+35.6
+39.2
+38.7
+34.2
+33.5
+34.3
+37.6
+32.8
+37.7
+34.2
+33.3
+38.0
+Magnitude-Dim
+20%
+35.0
+34.9
+33.7
+33.4
+33.6
+33.7
+36.4
+32.9
+33.6
+33.1
+33.5
+33.3
+36.1
+33.6
+33.4
+34.0
+DIET (Ours)
+20%
+40.0
+34.1
+36.6
+33.7
+33.4
+34.1
+33.5
+33.4
+33.2
+33.4
+33.6
+33.3
+35.1
+34.6
+33.3
+34.4
+16
+Table 22: Zero-shot accuracy comparisons of DIET against baseline pruning algorithms on Gemma-2 9B on XNLI
+(15 languages). The best average performances at each sparsity level are marked in bold. All values are reported as
+percentages (%).
+Method
+Sparsity
+Per-language Accuracies (%)
+Average
+Acc. (%)
+en
+fr
+es
+de
+el
+bg
+ru
+tr
+ar
+vi
+th
+zh
+hi
+sw
+ur
+No pruning (Original)
+0
+54.0
+51.6
+51.0
+51.1
+45.3
+48.6
+49.0
+50.4
+33.8
+45.2
+47.5
+33.4
+46.6
+46.5
+44.4
+46.6
+Magnitude-Dim
+10%
+52.3
+44.0
+49.5
+49.0
+42.7
+38.6
+41.5
+42.9
+33.6
+47.4
+38.8
+33.3
+40.2
+40.7
+34.1
+41.9
+DIET (Ours)
+10%
+52.6
+50.2
+47.0
+48.7
+41.6
+37.4
+47.3
+44.7
+34.0
+42.9
+40.8
+33.9
+44.5
+38.8
+38.1
+42.8
+Magnitude-Dim
+20%
+45.0
+35.2
+43.5
+42.3
+38.8
+35.1
+35.6
+35.3
+33.7
+39.9
+35.9
+33.1
+39.2
+37.1
+33.4
+37.5
+DIET (Ours)
+20%
+43.7
+43.3
+37.1
+43.5
+38.6
+34.9
+37.2
+38.8
+33.5
+36.1
+34.5
+33.7
+37.6
+34.5
+34.1
+37.4
+Table 23: Zero-shot accuracy comparisons on IFEval for Gemma-2 2B and 9B. All values are reported as accuracy
+scores.
+Method
+Sparsity
+Gemma-2 2B
+Gemma-2 9B
+Strict Acc
+Loose Acc
+Strict Acc
+Loose Acc
+Prompt
+Inst
+Prompt
+Inst
+Prompt
+Inst
+Prompt
+Inst
+Original
+0
+0.1368
+0.2710
+0.1386
+0.2758
+0.1497
+0.2698
+0.1590
+0.2770
+Magnitude-Dim
+10%
+0.1331
+0.2698
+0.1405
+0.2758
+0.1497
+0.2614
+0.1608
+0.2710
+DIET (Ours)
+0.1035
+0.2158
+0.1183
+0.2278
+0.1553
+0.2842
+0.1590
+0.2902
+Magnitude-Dim
+20%
+0.1054
+0.2302
+0.1054
+0.2302
+0.1165
+0.2398
+0.1220
+0.2434
+DIET (Ours)
+0.1091
+0.2206
+0.1109
+0.2230
+0.1146
+0.2326
+0.1146
+0.2326
+17

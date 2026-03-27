@@ -1,0 +1,1737 @@
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+Yushi Guan 1 2 Jeanine Ohene-Agyei 1 Daniel Kwan 1 Jean Sebastien Dandurand 1 Yifei Zhang 1
+Nandita Vijaykumar 1 2
+Abstract
+To embed domain-specific or specialized knowl-
+edge into pre-trained foundation models, fine-
+tuning using techniques such as parameter effi-
+cient fine-tuning (e.g. LoRA) is a common prac-
+tice. However, as new LLM architectures and
+pre-trained models emerge, transferring this spe-
+cialized knowledge to newer models becomes an
+important task. In many scenarios, the original
+specialized data may be unavailable due to pri-
+vacy or commercial restrictions, necessitating dis-
+tillation and transfer of this specialized knowl-
+edge from the fine-tuned base model to a different
+pre-trained model. We present TuneShift-KD,
+a novel approach that automatically distills spe-
+cialized knowledge from a fine-tuned model to
+a target model using only a few examples rep-
+resentative of the specialized information. Our
+key insight is that specialized knowledge can be
+identified through perplexity differences between
+base and fine-tuned models: prompts where the
+fine-tuned model responds confidently (low per-
+plexity), but the base model struggles (high per-
+plexity), indicate queries corresponding to the
+specialized knowledge learned by the fine-tuned
+model. TuneShift-KD leverages this insight to
+create a synthetic training dataset to transfer the
+specialized knowledge. Using an iterative process,
+TuneShift-KD generates more prompts similar to
+those that generated responses with specialized
+knowledge. TuneShift-KD does not require train-
+ing discriminators or access to training datasets.
+It is an automated approach that only requires
+the initial fine-tuned and base models and a few
+representative prompts. Our experiments demon-
+strate that models fine-tuned using TuneShift-KD
+achieve higher accuracy than prior approaches,
+enabling ease of deployment and more effective
+transfer of the specialized knowledge.
+1Department of Computer Science, University of Toronto
+2Vector Institute, Toronto, Canada. Correspondence to: Yushi
+Guan <yushi.guan@mail.utoronto.ca>.
+Preprint.
+1. Introduction
+Fine-tuning large language models (LLMs) has become the
+widely adopted approach to introducing specialized knowl-
+edge or capabilities into pre-trained foundation models. This
+technique has proven effective in diverse domains, from
+the integration of specialized legal and healthcare knowl-
+edge (Lai et al., 2023; Clusmann et al., 2023) to the enhance-
+ment of coding, logical reasoning, and mathematical abili-
+ties (et al., 2021; Wei et al., 2022; Lewkowycz et al., 2022).
+Parameter Efficient Fine-Tuning (PEFT) has emerged as
+the dominant methodology, keeping base model weights
+fixed while training only a small set of additional parame-
+ters. Low-Rank Adaptation (LoRA) (Hu et al., 2021) and
+its variants (Dettmers et al., 2023; Zhang et al., 2023; Li
+et al., 2024b) are widely used implementations of this con-
+cept, where trainable low-rank decomposition matrices are
+added to the weight matrices of the frozen base model. This
+approach significantly reduces memory requirements com-
+pared to full-weight fine-tuning, making it economically and
+computationally efficient for adapting foundation models to
+specialized knowledge.
+As LLMs continuously evolve to new architectures, there
+is a need to transfer the specialized knowledge from a fine-
+tuned source model to newer pre-trained (target) models to
+ensure accuracy for domain-specific usage. Conversely, this
+transfer may also target older model architectures for com-
+patibility with older compute hardware. However, in many
+scenarios, the training data used for the initial fine-tuning
+process may no longer be available to directly fine-tune
+the target model. For example, when an LLM is hosted by
+a third-party cloud service provider, fine-tuning data may
+remain undisclosed due to privacy or commercial restric-
+tions (Luo et al., 2024; Yan et al., 2024). Similarly, hardware
+vendors optimizing models for deployment typically lack
+access to proprietary fine-tuning datasets. In these scenarios,
+the ability to transfer specialized knowledge without full
+access to the domain-specific training dataset is a useful but
+challenging endeavor.
+Knowledge distillation (KD) (Hinton et al., 2015) is an
+established technique for transferring knowledge between
+models. In the context of LLMs, KD has primarily been
+used to improve inference efficiency by training smaller
+1
+arXiv:2603.24518v1  [cs.LG]  25 Mar 2026
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+models with larger model outputs, but it has also been used
+to transfer knowledge from one model to another (Xu et al.,
+2024). However, there is little research on how to effectively
+transfer specialized knowledge (the knowledge learned by
+and embedded in fine-tuned models using domain-specific
+datasets) from a source to a target model. Such domain-
+specific fine-tuning can equip models with both factual
+knowledge and enhanced capabilities (e.g., reasoning, align-
+ment), which we collectively refer to as “specialized knowl-
+edge” hereafter.
+Knowledge distillation typically requires access to the train-
+ing data, and identifying fine-tuning knowledge without
+such access has proved difficult. Trans-LoRA (Wang et al.,
+2024a) is the closest work that has targeted this problem
+by training a dedicated discriminator to distinguish fine-
+tuning data from other data. However, this approach re-
+quires modifications to the standard fine-tuning process (in-
+cluding training discriminators on the original fine-tuning
+data) and incurs additional storage costs since a separate
+discriminator must be stored for each fine-tuning dataset.
+LoRA-X (Farhadzadeh et al., 2025) takes a different ap-
+proach by directly copying LoRA weights from the source
+model to a target base model, but this requires that model
+weights are highly similar and can be aligned. Empirically,
+this constraint limits LoRA-X to source and target models
+from the same model family that are highly similar. These
+limitations motivate two desirable properties for specialized
+knowledge transfer methods: i) ability to transfer knowledge
+across different LLM architecture families and ii) compati-
+bility with standard fine-tuning pipelines. Achieving both
+properties simultaneously remains an open challenge.
+During fine-tuning, a model shifts its output probability
+distribution to match the fine-tuning domain’s distribution,
+improving its probability in generating domain-relevant re-
+sponses, and also assigning higher probability to in-domain
+examples than the original base model. Given the same
+in-domain prompt, the fine-tuned model is more likely to
+produce a relevant response than the base model’s response.
+When the fine-tuned model assigns high probability (low per-
+plexity) to its own response while assigning low probability
+(high perplexity) to the base model’s response for the same
+prompt, this creates a perplexity gap. This gap reveals a
+response difference that stems from the fine-tuning process,
+which is the only systematic source of divergence between
+the models. We define this as the perplexity difference
+filtering criterion: PPL(y(f); θF ) < τ ≤PPL(y(b); θF ),
+where θF denotes the fine-tuned model parameters, and y(f)
+and y(b) are the fine-tuned and base model responses re-
+spectively. This criterion identifies examples that capture
+specialized knowledge while discarding both general knowl-
+edge (low perplexity in both responses) and overly difficult
+examples (high perplexity in both responses). Crucially, per-
+plexity is readily available during standard inference and re-
+flects model output distribution changes during fine-tuning
+regardless of the specific fine-tuning task. This property
+applies to virtually all decoder-based LLM architectures,
+making our approach broadly compatible with existing fine-
+tuning pipelines. We provide a more formal discussion in
+Section 3.3.
+Leveraging the perplexity difference filtering criterion, we
+propose TuneShift-KD, an automated mechanism that dis-
+tills specialized knowledge from a source fine-tuned model
+to a target pre-trained model without full access to the spe-
+cialized training data set. TuneShift-KD implements the
+idea by using a few fine-tuning prompts that are represen-
+tative of the specialized knowledge base to generate sim-
+ilar prompts through an instruction-tuned LLM. We use
+the phrase ”Generate 20 more samples like these 5 [the
+5 sample data]” to create more training samples in bulk.
+We discard the bulk-generated responses and keep only the
+prompts. These prompts are then fed to both the fine-tuned
+and base models to collect their respective responses. We
+select prompt-response pairs that demonstrate perplexity
+differences between the fine-tuned and base model outputs.
+These selected examples are iteratively added to our train-
+ing pool and used to generate additional prompts, creating a
+self-expanding collection of relevant training data. Our so-
+lution only requires access to the fine-tuned model, the base
+model weights, and a few representative examples of the
+fine-tuning data. For typical PEFT implementations where
+low-rank adaptors are kept separate from base weights, these
+requirements are readily satisfied. We also demonstrate that
+in the absence of the source base model, another general
+LLM can serve as a substitute.
+We empirically validate TuneShift-KD across diverse fine-
+tuning tasks spanning math reasoning (GSM8K), pro-
+gramming (MBPP), challenging reasoning benchmarks
+(BBH) (Cobbe et al., 2021; Austin et al., 2021; Suzgun et al.,
+2022). TuneShift-KD consistently improves target model
+accuracy across different model architectures and outper-
+forms Trans-LoRA despite using only model responses and
+perplexity difference, without requiring dedicated discrim-
+inators trained on the original fine-tuning data. TuneShift-
+KD remains effective even when the source base model is
+unavailable, allowing a different generic pre-trained model
+to serve as a substitute. This architecture flexibility, com-
+patibility with standard fine-tuning pipeline and minimal
+requirement (only the source fine-tuned model and a generic
+base model for perplexity comparison) make TuneShift-KD
+compatible with practical machine learning model deploy-
+ment scenarios.
+In summary, our contributions are:
+• We identify perplexity differences between fine-tuned
+and base model responses as a signal for specialized
+knowledge, and propose a filtering criterion that re-
+2
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+(b) Instruction-
+tuned LLM
+Add
+Prompt-
+Response
+Synthetic 
+Prompt
+Prompt
+Response
+Discard
+(d)
+PPL(y(f)) low &
+PPL(y(b)) high
+(e) Target
+LLM
+Training Signal
+Source 
+Finetuned 
+LLM
+Source
+Base
+LLM
+5 original 
+finetuning 
+examples
+…
+(a) Synthetic Fine-tuning 
+Dataset
+Response 
+y(f)
+Response 
+y(b)
+Yes
+No
+(c)
+Figure 1. TuneShift-KD Framework for Specialized Knowledge Transfer. This figure illustrates our approach to transferring specialized
+knowledge without requiring full access to original fine-tuning data. (a) The Synthetic Fine-tuning Dataset begins with just 5 seed
+examples from the original fine-tuning data and expands through our iterative process. (b) An instruction-tuned LLM generates similar
+prompts based on the prompt pattern ”Generate 20 more samples like these 5 [the 5 sample data]”. (c) Each synthetic prompt is fed to
+both the Source Base LLM and Source Fine-tuned LLM to obtain paired responses y(b) and y(f). (d) Our key filtering mechanism selects
+prompts where the fine-tuned model shows high confidence (low perplexity PPL(y(f))) while the base model shows low confidence
+(high perplexity PPL(y(b))), indicating the prompt targets specialized knowledge. Qualified prompt-response pairs are added to the
+synthetic dataset, while others are discarded. (e) The curated synthetic dataset is used to perform knowledge distillation, transferring
+specialized capabilities to the Target LLM without requiring original training data.
+quires no discriminators or architectural constraints.
+• We propose TuneShift-KD, an automated method that
+transfers specialized knowledge from a fine-tuned
+source model to a target pre-trained model without
+requiring the fine-tuning datasets, using iterative syn-
+thetic data generation and perplexity-based filtering.
+• We demonstrate TuneShift-KD’s effectiveness across
+diverse tasks and model architectures, outperforming
+Trans-LoRA while maintaining full compatibility with
+existing fine-tuning pipelines and practical deployment
+scenarios.
+2. Related Work
+Our work relates to several important research directions in
+LLMs, including knowledge distillation, synthetic data gen-
+eration, and data filtering with LLMs. Most closely related
+is existing research on transferring specialized knowledge
+from one model to another, which we discuss thoroughly in
+Section 2.2. Due to space limitations, we defer the discus-
+sion of knowledge distillation and synthetic data generation
+in LLMs to Appendix A.1 and Appendix A.2. TuneShift-
+KD uses standard prompt-based synthetic data generation
+and the negative log-likelihood objective during knowledge
+distillation.
+2.1. Data Filtering and Perplexity
+Data filtering is a crucial component of the synthetic data
+generation process. It can be used to improve the qual-
+ity and relevance of the generated data. There are many
+different data filtering methods. One category of these
+methods is classifier-based filtering that trains classifiers
+to filter out toxic or non-factual samples (Kruschwitz &
+Schmidhuber, 2024; Ren et al., 2025). There is a plethora
+of heuristic-based filtering methods that include human-
+designed filtering metrics ranging from simple keywords,
+to template and regex, to higher-level policy-driven checks,
+such as JSON schema validation, token-length bounds, and
+fuzzy-deduplication rules (Belavadi & Others; Mangalam
+et al., 2023; Ziegler et al., 2024). Chain-of-Verification
+utilizes a multi-stage independent response generation for
+cross-checking (Dhuliawala et al., 2023). Crowdsourcing
+or human-in-the-loop filtering has also been applied (Kang
+et al., 2024). The closest to our work is statistical filtering
+that leverages perplexity to perform the filtering, which we
+elaborate on further next.
+3
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+Perplexity has been used as a straightforward metric to mea-
+sure LLM confidence and performance (Brown et al., 2020).
+Perplexity has also been used in the data filtering process.
+For example, Perplexed by Perplexity demonstrates that one
+can train a small LLM to select the data samples at the
+right perplexity level (dataset dependent), improving the
+performance of the final LLM training with reduced compu-
+tational cost. Superfiltering is another technique that uses a
+small model to select samples that exhibit high perplexity
+even given the instruction (prompt), and uses these samples
+to fine-tune a larger model. ScalingFilter (Li et al., 2024a)
+leverages the difference in perplexity between two LLMs
+of different sizes trained on the same data to identify high-
+quality text and yields better zero-shot performance when
+used to filter pretraining data. Iter et al. showed that for
+in-context demonstrations, selecting examples that reduce
+the perplexity of the output is an ideal way to improve infer-
+ence performance with in-context demonstrations (Iter et al.,
+2023). The idea that in-distribution data can have low per-
+plexity has been explored in membership inference attacks.
+For example, (He et al., 2025) and (Puerto et al., 2024) as-
+sume that in-distribution members have low perplexity, and
+use this assumption to infer membership. (Fu et al., 2024)
+is another work that leverages the probabilistic variation
+(similar to perplexity difference in principle) between the
+member and non-member data to infer membership.
+In summary, while leveraging perplexity threshold or per-
+plexity difference has been used in filtering (pre-)training
+data, improving inference performance and inferring mem-
+bership, our work is the first to systematically apply the
+perplexity filter (in the form of perplexity difference filter)
+to enable specialized knowledge distillation, outperforming
+existing methods in this task setting while being fully com-
+patible with existing fine-tuning processes. We discuss the
+theoretical motivation for using the perplexity difference fil-
+ter to identify the specialized knowledge in Section 3.3. We
+note that TuneShift-KD is orthogonal to many other tech-
+niques that perform data filtering without using perplexity,
+and those methods could be used for additional verification
+with human experts (Kang et al., 2024) or external informa-
+tion (Lupidi et al., 2024) as needed.
+2.2. Transfer of specialized knowledge
+Transferring the knowledge contained within the fine-tuned
+component of one model to another has received limited
+attention. Trans-LoRA is the work with a task setting clos-
+est to ours: transferring the specialized knowledge from the
+source model to a new target model via knowledge distilla-
+tion (Wang et al., 2024a). In order to identify fine-tuning rel-
+evant knowledge, Trans-LoRA trains dedicated discrimina-
+tors that can answer the question ”Is the above question from
+NAME dataset?”. Training such a discriminator requires ac-
+cess to the original fine-tuning data and modifications to
+all PEFT processes. The discriminator is an LLM in itself,
+and separate discriminators need to be trained for different
+datasets. During the knowledge distillation, the discrimina-
+tor becomes a data filter, allowing only synthetic data that is
+classified as from the dataset to contribute to the KD process.
+Such discriminators not only require additional computa-
+tion to train and storage to keep, but most importantly, are
+unlikely to be granted by a party that deems the original
+data not suitable for sharing. In contrast, our solution is
+compatible with the standard fine-tuning process and also
+shows improved accuracy compared to Trans-LoRA. In the
+absence of an open-source implementation of Trans-LoRA,
+qualitative comparison with specific data samples is difficult.
+The OpenReview submission for Trans-LoRA (Wang et al.,
+2024b) includes accompanying code. However, it does not
+provide the discriminator-training code or the code used to
+generate synthetic data from the discriminator, making the
+core contribution difficult to reproduce. However, we argue
+that our perplexity difference filtering is a more straight-
+forward method to identify the knowledge that has been
+acquired by the source model during the fine-tuning process.
+We compare against Trans-LoRA and demonstrate that our
+solution leads to higher accuracy for the target model.
+LoRA-X is another work that has a similar objective but with
+a different approach (Farhadzadeh et al., 2025). LoRA-X
+directly transfers the specialized knowledge by copying the
+LoRA weights from the source model to the target model.
+Their solution can perform this operation in a data-free
+manner. However, the alignment of the subspace between
+the source and target models is a key requirement for the
+effectiveness of such direct transfer. Empirically, this re-
+quires the source and target models to be from the same
+model family. For example, LoRA-X demonstrated its ef-
+fectiveness on language tasks by showing little degradation
+in performance by transferring the LoRA component from a
+TinyLlama 3T model to TinyLlama 2.5T model, which are
+highly similar variants from the same model family (Zhang
+et al., 2024). From its main experiments on image diffu-
+sion model LoRA transfer, it is observed that the transfer
+quality severely degrades when the models are not from
+the same family. In that case, fine-tuning the target model
+with original fine-tuning data is required to maintain satis-
+factory performance. A few other works concurrent to us
+also applied a similar approach to LoRA-X for knowledge
+transfer, also noting requirements for either architecture
+family consistency or identical attention mechanisms and
+activation functions (Li et al., 2025; Xia et al., 2025). Com-
+pared to these approaches that attempt direct LoRA weight
+alignment and copying, TuneShift-KD is both more general
+and complementary. It is more general by operating effec-
+tively across different model families without architectural
+similarity requirements. It is complementary by generat-
+ing synthetic data that removes LoRA-X’s dependency on
+4
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+original fine-tuning datasets when working with dissimilar
+models.
+3. Method
+In this section, we describe our method TuneShift-KD in
+detail. Figure 1 provides a comprehensive overview of our
+approach. Our method operates by generating a synthetic
+fine-tuning dataset that effectively captures the specialized
+knowledge embedded in the source model. We begin by
+sampling a minimal seed set of 5 examples from the avail-
+able fine-tuning data (randomly sampled from the training
+portion of the dataset). These examples serve as demonstra-
+tions for an instruction-tuned LLM, which we prompt to
+generate 20 similar synthetic examples per seed using the
+template: ”Generate 20 more samples like these 5 [the 5
+sample data]”. This is an iterative process, in which we use
+the generated synthetic examples to generate more exam-
+ples.
+3.1. Knowledge Distillation
+First, we introduce our notations. Starting with the source
+base model MB with parameter θB, a source fine-tuned
+model MF with parameter θF = θB + ϕF has been fine-
+tuned through a PEFT method on a task-specific dataset D
+of prompt–response pairs, where ϕF is the low-rank adaptor
+weights. Our goal is to transfer the fine-tuned knowledge
+of MF to a target model MT . This can be done through
+knowledge distillation, i.e., fine-tuning parameter θT of the
+target model MT to match the outputs of the source fine-
+tuned model with parameters θF . Specifically, we tune
+with a sequence-level objective of minimizing the negative
+log-likelihood of output sequences from the source model:
+L(y | θT ) = −
+N
+X
+i=1
+log pT
+ yi | y<i, x; θT
+
+(1)
+where y = (y1, . . . , yN) is an output token sequence sam-
+pled from the fine-tuned source model’s conditional distribu-
+tion pF (· | x; θF ) and pT (yi | y<i, x; θT ) is the fine-tuned
+target’s predicted probability of token yi for a given input
+prompt x. In the absence of the original dataset, a critical
+challenge in this distillation process is obtaining a suitable
+set of prompts that effectively capture the specialized knowl-
+edge of the fine-tuned source model. We discuss this further
+in the next section.
+3.2. Perplexity Difference Filtering
+Given the same prompt x, we get the response y(f) ∼pF (· |
+x; θF ) from the fine-tuned source model, and the response
+y(b) ∼pB(· | x; θB) from the base source model. We
+then compute the perplexity of both responses under the
+fine-tuned model:
+PPL(y(f) | x; θF ) = exp
+ −ℓ(y(f) | x; θF )
+
+(2)
+PPL(y(b) | x; θF ) = exp
+ −ℓ(y(b) | x; θF )
+
+(3)
+where
+ℓ(y | x; θF ) = 1
+N
+N
+X
+i=1
+log pF (yi | y<i, x; θF )
+(4)
+is the per-token average log-likelihood computed using the
+fine-tuned model parameters θF . Calculating perplexity con-
+sistently with the fine-tuned model is a deliberate decision,
+as the fine-tuned model is the most authoritative source on
+determining the quality of the response in the absence of the
+original fine-tuning data. Lastly, we select prompt–response
+pairs where PPL(y(f) | x; θF ) < τ ≤PPL(y(b) | x; θF )
+with τ a threshold parameter (set to 1.5 by default in our
+experiments).
+3.3. Perplexity Difference Filtering and Specialized
+Knowledge Identification
+We now provide a theoretical justification for why
+perplexity-difference filtering identifies specialized knowl-
+edge from the fine-tuned model’s perspective. Since the
+source fine-tuned model MF differs from the base model
+MB only through gradient updates on the fine-tuning
+dataset D, any systematic change in output distributions
+should stem from the fine-tuning learning process. In the
+following discussion, we omit the θF and θB references,
+and replace with pF , pB, PPLF for clarity.
+Let pF (· | x) and pB(· | x) denote the next-token con-
+ditional distributions for a prompt x. Given the same x,
+draw two independent responses y(f) ∼pF (· | x) and
+y(b) ∼pB(· | x). The per-token average log-likelihood
+under the fine-tuned model and its perplexity are given by
+ℓF (y | x) = 1
+N
+N
+X
+i=1
+log pF (yi | y<i, x)
+(5)
+PPLF (y) = exp
+ −ℓF (y | x)
+
+(6)
+The log-likelihood margin under the fine-tuned scorer is
+mF (x) = ℓF (y(f) | x) −ℓF (y(b) | x)
+= −log PPLF (y(f)) + log PPLF (y(b))
+(7)
+A positive margin means the fine-tuned model’s sample lies
+in a higher-density region under pF than the base model’s
+sample.
+Taking expectation over the draws y(f) ∼pF and y(b) ∼
+pB yields
+E
+
+mF (x)
+
+= Ey∼pF ℓF (y | x)
+|
+{z
+}
+−H(pF )
+−Ey∼pBℓF (y | x)
+|
+{z
+}
+−H(pB,pF )
+(8)
+5
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+With H(pB, pF ) = H(pB) + KL(pB∥pF ), we have
+E
+
+mF (x)
+
+= (H(pB) −H(pF )) + KL(pB∥pF )
+(9)
+Entropy drop H(pB) −H(pF ): This captures sharpening.
+Fine-tuning often concentrates probability mass on fine-
+tuning–relevant examples, reducing entropy relative to the
+base model. When this term is positive, fine-tuned samples
+carry higher per-token log-likelihood under pF , reflecting
+the updated concentration learned during fine-tuning. If
+prompts are irrelevant to the fine-tuned behavior, this term
+will be small.
+Distributional shift KL(pB∥pF ): This measures how much
+the base distribution disagrees with the fine-tuned one.
+Larger values indicate that the base tends to produce se-
+quences that pF scores with lower probability, signaling a
+mismatch in where the two models place probability mass.
+When prompts are not relevant to the fine-tuning task, the
+distributional shift should be small.
+Together, these terms show that the expected margin
+E[mF (x)] increases only when prompts x lead to response
+behaviors actually altered by fine-tuning. For prompts irrele-
+vant to D, the entropy drop vanishes and the KL divergence
+term is small on average, so the expected margin is near zero.
+For prompts tied to D, both sharpening and shift contribute,
+making the expected margin positive.
+For the main experiments in this paper, we use a small, fixed
+threshold τ:
+PPLF (y(f)) < τ ≤PPLF (y(b))
+=⇒mF (x) > 0 and mF (x) > log
+
+τ
+PPLF (y(f))
+ (10)
+This combines fine-tuned–model preference (the fine-tuned
+sample beats the base) with an absolute quality gate (the
+fine-tuned sample lies in a high-density region under pF ). A
+small τ (e.g., 1.5) keeps examples where the fine-tuned
+model is confident in its own response while the base
+model’s response is less probable under pF . In Table 9,
+we also evaluate alternative filters (tighter absolute thresh-
+olds and a ratio-based rule) and observe only small differ-
+ences relative to τ = 1.5, showing that the robustness of
+our perplexity-difference filter is not tied to the specific
+thresholding mechanics.
+3.4. Iterative Data Generation
+Our synthetic data generation process begins with a seed
+set of 5 examples randomly sampled from the available
+fine-tuning data. Using these examples as demonstrations,
+we prompt an instruction-tuned LLM (GPT-4o) to generate
+synthetic examples with the prompt template: ”Generate 20
+more samples like these 5 [the 5 sample data]”. We discard
+the generated responses and keep only the prompts, ensuring
+we do not leverage GPT-4o’s responses in our knowledge
+transfer. These prompts are then fed to both the source fine-
+tuned and base models to generate their respective responses.
+We determine whether to keep each prompt-response pair
+based on the perplexity threshold defined in Section 3.2.
+Our choice of instruction-tuned LLM differs from that used
+in Trans-LoRA, which we discuss further in this section.
+The filtered prompt-response pairs serve dual purposes: they
+constitute our synthetic training dataset for knowledge dis-
+tillation to the target model, and they expand our synthetic
+data generation pool for subsequent iterations. In each it-
+eration, we randomly sample 5 examples from the current
+pool. This iterative process continues until our synthetic
+dataset matches the size of the original fine-tuning dataset.
+All sequences in this synthetic dataset are then used to train
+the target model.
+In contrast to Trans-LoRA, which uses the target pre-trained
+model itself for synthetic prompt generation, we found this
+approach produced insufficient diversity in the prompts. De-
+spite using the same models and attempting to replicate
+their reported simple prompting strategy (e.g., ”Here are
+10 examples”), we observed very limited variation in gen-
+erated samples across multiple iterations. We demonstrate
+the limited diversity visually in Figure 2. Our efforts to im-
+prove diversity through temperature adjustments and more
+sophisticated prompting techniques yielded minimal im-
+provements that were insufficient to match their reported ac-
+curacy. We note that our use of GPT-4o is limited strictly to
+prompt generation—we neither use its responses nor lever-
+age it for filtering. The bulk generation approach serves to
+reduce API costs.
+Furthermore, we provide additional experiments in Ap-
+pendix C using the more capable Qwen2.5 (Qwen, 2024)
+families as the source and target models.
+In those ex-
+periments, the Qwen2.5 models themselves serve as the
+instruction-tuned LLM, generating the synthetic prompts,
+showing that TuneShift-KD does not rely on external
+instruction-tuned LLMs.
+4. Evaluation
+4.1. Experiment Setup
+We evaluate our method on three popular benchmarks:
+BigBench-Hard (BBH) (Suzgun et al., 2022), Mostly Basic
+Python Problems (MBPP) (Austin et al., 2021), and Grade
+School Math 8K (GSM8K) (Cobbe et al., 2021). BBH is a
+suite of 23 challenging tasks from the broader BIG-Bench
+evaluation, selected for their difficulty and where prior lan-
+guage models failed to outperform average human raters.
+MBPP comprises 974 crowd-sourced Python programming
+problems designed to test code synthesis capabilities on
+basic programming constructs and standard library usage.
+6
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+Table 1. GSM8K benchmark results
+Trans-LoRA
+Ours
+Source
+Target
+Source
+LoRA
+Target
+(no LoRA)
+Target
+LoRA
+Source
+LoRA
+Target
+(no LoRA)
+Target
+LoRA
+Llama2-7B
+Llama2-13B
+19.64%
+28.86%
+30.70%
+(↑1.84%)
+19.48%
+27.89%
+30.12%
+(↑2.23%)
+Gemma-2B
+Gemma-7B
+14.94%
+40.64%
+44.58%
+(↑3.94%)
+15.20%
+40.0%
+44.80%
+(↑4.80%)
+Table 2. MBPP benchmark results (standard evaluation)
+Trans-LoRA
+Ours
+Source
+Target
+Source
+LoRA
+Target
+(no LoRA)
+Target
+LoRA
+Source
+LoRA
+Target
+(no LoRA)
+Target
+LoRA
+Llama2-7B
+Llama2-13B
+27.2%
+37.1%
+39.7%
+(↑2.6%)
+28.2%
+36.9%
+40.2%
+(↑3.3%)
+Gemma-2B
+Gemma-7B
+41.1%
+37.9%
+50.0%
+(↑12.1%)
+40.9%
+37.8%
+51.3%
+(↑13.5%)
+Table 3. BBH benchmark results
+Trans-LoRA
+Ours
+Source
+Target
+Source
+LoRA
+Target
+(no LoRA)
+Target
+LoRA
+Source
+LoRA
+Target
+(no LoRA)
+Target
+LoRA
+Llama2-7B
+Llama2-13B
+43.32%
+37.85%
+43.41%
+(↑5.56%)
+42.02%
+38.04%
+44.92%
+(↑6.88%)
+Gemma-2B
+Gemma-7B
+31.84%
+37.75%
+43.61%
+(↑5.86%)
+31.01%
+38.15%
+45.09%
+(↑6.94%)
+GSM8K consists of 8,500 linguistically diverse grade school
+math word problems that require multi-step arithmetic rea-
+soning to solve. For a fair comparison with Trans-LoRA, we
+evaluate BBH and GSM8K using the Language Model Eval-
+uation Harness (Gao et al., 2024) and evaluate MBPP using
+Evalplus (Liu et al., 2023). Consistent with Trans-LoRA,
+we demonstrate our method on the Llama-2 (Touvron et al.,
+2023) and Gemma (Gemma Team, 2024) model families
+(7B/13B for Llama-2 and 2B/7B for Gemma). We also re-
+port additional results on specialized medical (MedMCQA)
+and legal (LexGLUE) datasets in Appendix E.
+4.2. Results
+We compare our target model’s performance before and
+after our knowledge distillation process with Trans-LoRA
+across different datasets in Tables 1, 2, and 3. We note that
+we use the same models and datasets as Trans-LoRA. How-
+ever, due to inherent noise in the token sampling process
+and lack of open-source implementations for Trans-LoRA,
+we are not able to perfectly reproduce the same accuracy
+as Trans-LoRA’s results that should be independent of the
+synthetic data generation process, e.g. the ”Source LoRA”
+and ”Target (no LoRA)” columns. However, our results are
+within a small margin of Trans-LoRA’s for those.
+We note that the key metric to focus on the target model’s
+accuracy improvement as a result of the LoRA knowledge
+distillation process (column ”Target LoRA ↑”). Across all
+three datasets (GSM8K, MBPP and BBH), our solution
+shows greater accuracy improvement compared to Trans-
+LoRA in the target model after the knowledge distillation.
+We note that such accuracy improvement is achieved while
+our solution is directly applicable to the standard fine-tuning
+pipeline, without the need to have access to the original
+fine-tuning dataset to train auxiliary modules (such as the
+discriminator).
+Example-based qualitative comparisons to reveal why our
+method has improved accuracy are difficult as Trans-LoRA
+does not have an open-source implementation. However, we
+hypothesize the following reasons for our higher accuracy
+improvement:
+TuneShift-KD’s data filtering process is beyond simple
+discrimination Trans-LoRA employs a binary discrimina-
+tor that classifies examples as either from the fine-tuning
+data or not. While our perplexity difference filter serves a
+similar purpose, it operates with greater nuance: it selects
+examples where the fine-tuned model responds with high
+confidence (low perplexity) while the base model struggles
+7
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+Table 4. Generic pre-trained model as base substitutes
+Dataset
+Source Base
+Source LoRA
+Target
+Target
+(no LoRA)
+Target
+LoRA
+Our Acc
+Increase
+GSM8K
+Gemma-2B
+Llama2-7B
+Gemma-7B
+40.0%
+43.82%
+↑3.82%
+MBPP
+Llama2-7B
+Gemma-2B
+Gemma-7B
+37.8%
+51.2%
+↑13.4%
+Table 5. Comparison of filtering rules: default filtering vs. alternative filtering rules
+Dataset
+Source
+Target
+Target
+(no LoRA)
+Low-High Filter
+(TuneShift-KD)
+No Filter
+Acc
+Low-Low
+Filter Acc
+High-High
+Filter Acc
+GSM8K
+Gemma-2B
+Gemma-7B
+40.0%
+44.8%
+36.7%
+40.2%
+35.4%
+GSM8K
+Llama2-7B
+Llama2-13B
+27.9%
+30.1%
+27.8%
+28.4%
+26.9%
+MBPP
+Gemma-2B
+Gemma-7B
+37.8%
+51.2%
+35.8%
+39.5%
+34.4%
+MBPP
+Llama2-7B
+Llama2-13B
+36.9%
+40.2%
+29.4%
+37.4%
+30.2%
+(high perplexity), directly targeting specialized knowledge
+that the fine-tuned model has acquired. Our approach auto-
+matically eliminates two categories of less useful examples:
+those where both models demonstrate high confidence (in-
+dicating knowledge already presented in pre-training) and
+those where both models show uncertainty (suggesting ex-
+amples too difficult for the fine-tuned model to learn). This
+strategic filtering focuses specifically on knowledge that
+the fine-tuned model has successfully internalized, remov-
+ing the fine-tuned model’s responses that would contribute
+minimally to a target model’s learning process.
+Trans-LoRA’s discriminator faces inherent objective
+conflicts Trans-LoRA adopts a GAN-inspired approach
+but with a critical deviation: rather than utilizing the gen-
+erator, it preserves the discriminator after training. This
+discriminator is explicitly trained to distinguish between
+authentic fine-tuning data (”real”) and synthetically gener-
+ated examples (”fake”). Yet during inference, the system
+must use this same discriminator to evaluate synthetic ex-
+amples—the very category it was optimized to identify as
+inauthentic. This training-inference objective contradiction
+likely constrains the synthetic data generator to converge
+on an artificially narrow subset of examples that can cir-
+cumvent the discriminator’s filters. Given that GANs are
+inherently susceptible to mode collapse (Arjovsky et al.,
+2017), and considering our observation that the target model
+already demonstrates limited prompt generation diversity,
+Trans-LoRA’s methodology appears inclined to produce a
+restricted range of synthetic training examples.
+4.3. Results when source base model is unavailable
+We report results when the source base model is unavailable
+in Table 4. In this setting, a generic pre-trained model (not
+fine-tuned on the specialized knowledge) can serve as a
+substitute base for our perplexity comparison. On GSM8K,
+using Llama2-7B in place of the Gemma-2B base yields a
+3.82% target accuracy increase, compared to 4.80% when
+the true base is available (Table 1). On MBPP, the accuracy
+drop is smaller at 0.1% (Table 2). Overall, while having
+access to the true base helps, it is not strictly required for
+TuneShift-KD.
+4.4. Ablation with different filtering criteria
+In Table 5, we compare our default perplexity difference
+filtering against alternative rules, keeping all thresholds at
+1.5. No Filter runs the same data generation and knowledge
+distillation pipeline as TuneShift-KD, but without prompt
+filtering. Low-Low Filter selects prompts where both the
+source base and fine-tuned models exhibit low perplexity,
+and High-High Filter selects prompts where both models
+exhibit high perplexity. Across datasets and model architec-
+tures, TuneShift-KD’s low-high perplexity difference filter-
+ing achieves the highest target accuracy. Low-Low yields
+only modest improvements over the not fine-tuned baseline
+(Target no LoRA), while No Filter degrades performance;
+High-High further reduces accuracy. These results show that
+TuneShift-KD’s filtering rule helps identify beneficial train-
+ing examples while avoiding harmful ones. In Appendix D,
+we further ablate the perplexity filter threshold selection rule
+and show that TuneShift-KD is robust to these choices.
+5. Conclusion
+We presented TuneShift-KD, a method for transferring spe-
+cialized knowledge between language models without re-
+quiring access to original fine-tuning data. By leveraging
+perplexity differences between fine-tuned and base models,
+our approach identifies and filters synthetic examples that
+effectively capture specialized knowledge. Experiments
+across GSM8K, MBPP, and BBH tasks demonstrate im-
+provements over existing methods, with our solution’s pri-
+mary advantage being its broad applicability and compat-
+ibility with standard fine-tuning pipelines. TuneShift-KD
+addresses practical scenarios where original training data
+8
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+is unavailable due to privacy concerns or commercial re-
+strictions, enabling efficient knowledge transfer between
+different model architectures.
+References
+Amazon
+Web
+Services.
+A
+secure
+approach
+to
+generative
+ai
+with
+aws.
+https://aws.
+amazon.com/blogs/machine-learning/
+a-secure-approach-to-generative-ai-with-aws/,
+2024. Accessed: 2025-09-24.
+Arjovsky, M., Chintala, S., and Bottou, L. Wasserstein gan.
+ArXiv, abs/1701.07875, 2017.
+Austin, J., Odena, A., Nye, M., Bosma, M., Michalewski,
+H., Dohan, D., Jiang, E., Cai, C. J., Terry, M., Le, Q. V.,
+and Sutton, C. Program synthesis with large language
+models. ArXiv, abs/2108.07732, 2021.
+Belavadi, V. and Others. Routenator: A router-based multi-
+modal architecture for generating synthetic training data
+for function calling llms.
+Brown, T. et al. Language models are few-shot learners.
+Advances in Neural Information Processing Systems, 33,
+2020.
+Chen, H., Quan, X., Chen, H., Yan, M., and Zhang, J.
+Knowledge distillation for closed-source language mod-
+els. ArXiv, abs/2401.07013, 2024.
+Clusmann, J., Kolbinger, F. R., Muti, H. S., Carrero,
+Z. I., Eckardt, J.-N., Laleh, N. G., L¨offler, C. M. L.,
+Schwarzkopf, S.-C., Unger, M., Veldhuizen, G. P., Wag-
+ner, S. J., and Kather, J. N. The future landscape of large
+language models in medicine. Communications Medicine,
+3, 2023.
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,
+Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,
+R., Hesse, C., and Schulman, J. Training verifiers to solve
+math word problems. ArXiv, abs/2110.14168, 2021.
+DeepSeek-AI.
+Deepseek-v3 technical report.
+ArXiv,
+abs/2412.19437, 2024.
+Dettmers, T., Pagnoni, A., Holtzman, A., and Zettlemoyer,
+L. Qlora: Efficient finetuning of quantized llms. ArXiv,
+abs/2305.14314, 2023.
+Dhuliawala, S., Komeili, M., Xu, J., Raileanu, R., Li, X.,
+Celikyilmaz, A., and Weston, J. Chain-of-verification
+reduces hallucination in large language models. ArXiv,
+abs/2309.11495, 2023.
+Du, H., Liu, S., Zheng, L., Cao, Y., Nakamura, A., and Chen,
+L. Privacy in fine-tuning large language models: Attacks,
+defenses, and future directions. ArXiv, abs/2412.16504,
+2024.
+et al., I. C. A benchmark dataset for legal language under-
+standing in english. 2022.
+et al., M. C. Evaluating large language models trained on
+code. ArXiv, abs/2107.03374, 2021.
+Farhadzadeh, F., Das, D., Borse, S., and Porikli, F. M. Lora-
+x: Bridging foundation models with training-free cross-
+model adaptation. ArXiv, abs/2501.16559, 2025.
+Fu, W., Wang, H., Gao, C., Liu, G., Li, Y., and Jiang, T.
+Practical membership inference attacks against fine-tuned
+large language models via self-prompt calibration, 2024.
+Furlanello, T., Lipton, Z. C., Tschannen, M., Itti, L., and
+Anandkumar, A. Born again neural networks. In Interna-
+tional Conference on Machine Learning, 2018.
+Gao, L., Tow, J., Abbasi, B., Biderman, S., Black, S., DiPofi,
+A., Foster, C., Golding, L., Hsu, J., Le Noac’h, A., Li,
+H., McDonell, K., Muennighoff, N., Ociepa, C., Phang,
+J., Reynolds, L., Schoelkopf, H., Skowron, A., Sutawika,
+L., Tang, E., Thite, A., Wang, B., Wang, K., and Zou, A.
+The language model evaluation harness, 07 2024. URL
+https://zenodo.org/records/12608602.
+Gemma Team, G. D. Gemma: Open models based on
+gemini research and technology. ArXiv, abs/2403.08295,
+2024.
+Gu, Y., Li, J., Huang, S., Zou, X., Li, Z., and Hu, X. Captur-
+ing nuanced preferences: Preference-aligned distillation
+for small language models. ArXiv, abs/2502.14272, 2025.
+He, Y., Li, B., Liu, L., Ba, Z., Dong, W., Li, Y., Qin, Z.,
+Ren, K., and Chen, C. Towards label-only membership in-
+ference attack against pre-trained large language models.
+ArXiv, abs/2502.18943, 2025.
+Hinton, G. E., Vinyals, O., and Dean, J. Distilling the
+knowledge in a neural network. ArXiv, abs/1503.02531,
+2015.
+Hu, J. E., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang,
+S., and Chen, W. Lora: Low-rank adaptation of large
+language models. ArXiv, abs/2106.09685, 2021.
+Iter, D., Pryzant, R., Xu, R., Wang, S., Liu, Y., Xu, Y., and
+Zhu, C. In-context demonstration selection with cross
+entropy difference. In Conference on Empirical Methods
+in Natural Language Processing, 2023.
+Jiao, X., Yin, Y., Shang, L., Jiang, X., Chen, X., Li, L.,
+Wang, F., and Liu, Q. Tinybert: Distilling bert for natural
+language understanding. In Findings, 2019.
+9
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+Kang, H. J., Harel-Canada, F., Gulzar, M. A., Peng, V., and
+Kim, M. Human-in-the-loop synthetic text data inspec-
+tion with provenance tracking. ArXiv, abs/2404.18881,
+2024.
+Kim, T., Oh, J., Kim, N., Cho, S., and Yun, S.-Y. Comparing
+kullback-leibler divergence and mean squared error loss
+in knowledge distillation. ArXiv, abs/2105.08919, 2021.
+Kim, Y. and Rush, A. M. Sequence-level knowledge distil-
+lation. In Su, J., Duh, K., and Carreras, X. (eds.), Pro-
+ceedings of the 2016 Conference on Empirical Methods
+in Natural Language Processing, pp. 1317–1327, Austin,
+Texas, November 2016. Association for Computational
+Linguistics. doi: 10.18653/v1/D16-1139.
+Kruschwitz, U. and Schmidhuber, M. Llm-based synthetic
+datasets: Applications and limitations in toxicity detec-
+tion. In Workshop on Trolling, Aggression and Cyberbul-
+lying, 2024.
+Lai, J., Gan, W., Wu, J., Qi, Z., and Yu, P. S. Large language
+models in law: A survey. ArXiv, abs/2312.03718, 2023.
+Lewkowycz, A., Andreassen, A., Dohan, D., Dyer, E.,
+Michalewski, H., Ramasesh, V. V., Slone, A., Anil, C.,
+Schlag, I., Gutman-Solo, T., Wu, Y., Neyshabur, B., Gur-
+Ari, G., and Misra, V. Solving quantitative reasoning
+problems with language models. ArXiv, abs/2206.14858,
+2022.
+Li, L. H., Hessel, J., Yu, Y., Ren, X., Chang, K.-W., and
+Choi, Y. Symbolic chain-of-thought distillation: Small
+models can also “think” step-by-step. In Annual Meeting
+of the Association for Computational Linguistics, 2023.
+Li, R., Wei, Y., Zhang, M., Yu, N., Hu, H., and Peng, H.
+Scalingfilter: Assessing data quality through inverse uti-
+lization of scaling laws. ArXiv, abs/2408.08310, 2024a.
+Li, Y., Han, S., and Ji, S.
+Vb-lora: Extreme param-
+eter efficient fine-tuning with vector banks.
+ArXiv,
+abs/2405.15179, 2024b.
+Li, Y., Meng, F., Zhang, M., Zhu, S., Wang, S., and Xu, M.
+Lorasuite: Efficient lora adaptation across large language
+model upgrades. ArXiv, abs/2505.13515, 2025.
+Liu, H., Wang, Y., Liu, H., Sun, F., and Yao, A. Small
+scale data-free knowledge distillation. 2024 IEEE/CVF
+Conference on Computer Vision and Pattern Recognition
+(CVPR), pp. 6008–6016, 2024.
+Liu, J., Xia, C., Wang, Y., and Zhang, L. Is your code
+generated by chatgpt really correct? rigorous evaluation
+of large language models for code generation. ArXiv,
+abs/2305.01210, 2023.
+Liu, P., Yuan, W., Fu, J., Jiang, Z., Hayashi, H., and Neubig,
+G. Pre-train, prompt, and predict: A systematic survey of
+prompting methods in natural language processing. ACM
+Computing Surveys, 55:1 – 35, 2021a.
+Liu, Y., Zhang, W., Wang, J., and Wang, J. Data-free knowl-
+edge transfer: A survey. ArXiv, abs/2112.15278, 2021b.
+Luo, W., Keung, J. W., Yang, B., Ye, H., Goues, C. L.,
+Bissyand´e, T. F., Tian, H., and Le, X. B. D. When fine-
+tuning llms meets data privacy: An empirical study of
+federated learning in llm-based program repair. ACM
+Transactions on Software Engineering and Methodology,
+2024.
+Lupidi, A. M., Gemmell, C., Cancedda, N., Dwivedi-Yu,
+J., Weston, J. E., Foerster, J., Raileanu, R., and Lomeli,
+M. Source2synth: Synthetic data generation and curation
+grounded in real data sources. ArXiv, abs/2409.08239,
+2024.
+Mangalam, K., Akshulakov, R., and Malik, J. Egoschema: A
+diagnostic benchmark for very long-form video language
+understanding. ArXiv, abs/2308.09126, 2023.
+Microsoft
+Azure.
+Azure
+openai
+service
+pricing.
+https://azure.microsoft.com/en-us/
+pricing/details/cognitive-services/
+openai-service/, 2025. Accessed: 2025-09-24.
+Pal, A., Umapathi, L. K., and Sankarasubbu, M. Medmcqa
+: A large-scale multi-subject multi-choice dataset for
+medical domain question answering. In ACM Conference
+on Health, Inference, and Learning, 2022.
+Pang, C., Jiang, X., Pavinkurve, N. P., Kalluri, K. S., Minto,
+E., Patterson, J., Zhang, L., Hripcsak, G., Elhadad, N.,
+and Natarajan, K. Cehr-gpt: Generating electronic health
+records with chronological patient timelines.
+ArXiv,
+abs/2402.04400, 2024.
+Park, W., Kim, D., Lu, Y., and Cho, M. Relational knowl-
+edge distillation. 2019 IEEE/CVF Conference on Com-
+puter Vision and Pattern Recognition (CVPR), pp. 3962–
+3971, 2019.
+Puerto, H., Gubri, M., Yun, S., and Oh, S. J. Scaling up
+membership inference: When and how attacks succeed
+on large language models. ArXiv, abs/2411.00154, 2024.
+Qwen. Qwen2.5 technical report. ArXiv, abs/2412.15115,
+2024.
+Ren, J., Du, Z., Wen, Z., Jia, Q., Dai, S., Wu, C., and Dong,
+Z. Few-shot llm synthetic data with distribution matching.
+ArXiv, abs/2502.08661, 2025.
+10
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+Romero, A., Ballas, N., Kahou, S. E., Chassang, A., Gatta,
+C., and Bengio, Y. Fitnets: Hints for thin deep nets.
+CoRR, abs/1412.6550, 2014.
+Sanh, V., Debut, L., Chaumond, J., and Wolf, T. Distilbert,
+a distilled version of bert: smaller, faster, cheaper and
+lighter. ArXiv, abs/1910.01108, 2019.
+Sch¨afer, M., Nadi, S., Eghbali, A., and Tip, F. An empirical
+evaluation of using large language models for automated
+unit test generation. IEEE Transactions on Software En-
+gineering, 50:85–105, 2023.
+Schmidt, M., Bartezzaghi, A., and Vu, N. T. Prompting-
+based synthetic data generation for few-shot question
+answering. 2024.
+Sennrich, R., Haddow, B., and Birch, A. Improving neural
+machine translation models with monolingual data. ArXiv,
+abs/1511.06709, 2015.
+Song, K., Tan, X., Qin, T., Lu, J., and Liu, T.-Y. Mpnet:
+Masked and permuted pre-training for language under-
+standing. ArXiv, abs/2004.09297, 2020.
+Suzgun, M., Scales, N., Scharli, N., Gehrmann, S., Tay, Y.,
+Chung, H. W., Chowdhery, A., Le, Q. V., Chi, E. H., Zhou,
+D., and Wei, J. Challenging big-bench tasks and whether
+chain-of-thought can solve them. In Annual Meeting of
+the Association for Computational Linguistics, 2022.
+Timiryasov, I. and Tastet, J.-L. Baby llama: knowledge
+distillation from an ensemble of teachers trained on
+a small dataset with no performance penalty.
+ArXiv,
+abs/2308.02019, 2023.
+Touvron, H., Martin, L., Stone, K. R., Albert, P., Almahairi,
+A., Babaei, Y., lay Bashlykov, N., Batra, S., Bhargava, P.,
+Bhosale, S., Bikel, D. M., Blecher, L., tian Cant´on Ferrer,
+C., Chen, M., Cucurull, G., Esiobu, D., Fernandes, J.,
+Fu, J., Fu, W., Fuller, B., Gao, C., Goswami, V., Goyal,
+N., Hartshorn, A. S., Hosseini, S., Hou, R., Inan, H.,
+Kardas, M., Kerkez, V., Khabsa, M., Kloumann, I. M.,
+Korenev, A., Koura, P. S., Lachaux, M.-A., Lavril, T.,
+Lee, J., Liskovich, D., Lu, Y., Mao, Y., Martinet, X.,
+Mihaylov, T., Mishra, P., Molybog, I., Nie, Y., Poulton,
+A., Reizenstein, J., Rungta, R., Saladi, K., Schelten, A.,
+Silva, R., Smith, E. M., Subramanian, R., Tan, X., Tang,
+B., Taylor, R., Williams, A., Kuan, J. X., Xu, P., Yan,
+Z., Zarov, I., Zhang, Y., Fan, A., Kambadur, M. H. M.,
+Narang, S., Rodriguez, A., Stojnic, R., Edunov, S., and
+Scialom, T. Llama 2: Open foundation and fine-tuned
+chat models. ArXiv, abs/2307.09288, 2023.
+Wang, H., Fu, R., Li, C., Zhang, X., Zhou, J., Bai, X., Yan,
+Y., and Zhao, Q. Reminding the incremental language
+model via data-free self-distillation. Applied Intelligence,
+53:9298–9320, 2021.
+Wang, R., Ghosh, S., Cox, D., Antognini, D., Oliva, A.,
+Feris, R., and Karlinsky, L. Trans-lora: Towards data-free
+transferable parameter efficient finetuning. ArXiv, 2024a.
+Wang, R., Ghosh, S., Cox, D. D., Antognini, D., Oliva,
+A., Feris, R., and Karlinsky, L.
+Trans-lora: towards
+data-free transferable parameter efficient finetuning. In
+NeurIPS 2024. OpenReview.net, 2024b. URL https:
+//openreview.net/forum?id=c3Pakdyi3t.
+Wang, W., Wei, F., Dong, L., Bao, H., Yang, N., and Zhou,
+M.
+Minilm: Deep self-attention distillation for task-
+agnostic compression of pre-trained transformers. ArXiv,
+abs/2002.10957, 2020.
+Wei, J., Wang, X., Schuurmans, D., Bosma, M., Chi, E. H.,
+Xia, F., Le, Q., and Zhou, D. Chain of thought prompt-
+ing elicits reasoning in large language models. ArXiv,
+abs/2201.11903, 2022.
+Wen, Y., Li, Z., Du, W., and Mou, L. f-divergence mini-
+mization for sequence-level knowledge distillation. ArXiv,
+abs/2307.15190, 2023.
+Xia, F., Liao, M., Fang, Y., Li, D., Xie, Y., Li, W., Li,
+Y., Xia, D., and Huang, J. Cross-lora: A data-free lora
+transfer framework across heterogeneous llms. ArXiv,
+abs/2508.05232, 2025.
+Xu, X., Li, M., Tao, C., Shen, T., Cheng, R., Li, J., Xu, C.,
+Tao, D., and Zhou, T. A survey on knowledge distillation
+of large language models. ArXiv, abs/2402.13116, 2024.
+Yan, B., Li, K., Xu, M., Dong, Y., Zhang, Y., Ren, Z., and
+Cheng, X. On protecting the data privacy of large lan-
+guage models (llms): A survey. ArXiv, abs/2403.05156,
+2024.
+Yu, D., Naik, S., Backurs, A., Gopi, S., Inan, H. A., Kamath,
+G., Kulkarni, J., Lee, Y. T., Manoel, A., Wutschitz, L.,
+Yekhanin, S., and Zhang, H. Differentially private fine-
+tuning of language models. ArXiv, abs/2110.06500, 2021.
+Zhang, P., Zeng, G., Wang, T., and Lu, W.
+Tinyl-
+lama: An open-source small language model. ArXiv,
+abs/2401.02385, 2024.
+Zhang, Q., Chen, M., Bukharin, A., Karampatziakis, N.,
+He, P., Cheng, Y., Chen, W., and Zhao, T.
+Adalora:
+Adaptive budget allocation for parameter-efficient fine-
+tuning. 2023.
+Zhang, Y., Xiang, T., Hospedales, T. M., and Lu, H. Deep
+mutual learning. 2018 IEEE/CVF Conference on Com-
+puter Vision and Pattern Recognition, pp. 4320–4328,
+2017.
+11
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+Zhong, Q., Ding, L., Shen, L., Liu, J., Du, B., and Tao,
+D. Revisiting knowledge distillation for autoregressive
+language models. In Annual Meeting of the Association
+for Computational Linguistics, 2024.
+Ziegler, I., K¨oksal, A., Elliott, D., and Schutze, H. Craft
+your dataset: Task-specific synthetic dataset genera-
+tion through corpus retrieval and augmentation. ArXiv,
+abs/2409.02098, 2024.
+12
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+We present additional related work, results and ablations to the main experiments in the appendix. Section A reviews related
+work on knowledge distillation in LLMs and synthetic data generation with LLMs. Section B provides additional results for
+different datasets using the same experimental setting as in the main paper. Section C presents the results of TuneShift-KD
+when applied to the Qwen2.5 architecture. Section D explores different perplexity filter thresholds and filtering mechanisms.
+Section G visualizes prompt diversity comparisons between our approach and related works. Section H shows example
+prompts and responses generated by the fine-tuned and base models. We discuss ethics and privacy concerns in Section I,
+and experimental settings and reproducibility in Section J.
+A. Additional Related Work
+A.1. Knowledge Distillation for LLMs
+Knowledge distillation (KD) (Hinton et al., 2015) has been an important technique for distilling knowledge from a large
+source model to a smaller target model. For classification and regression tasks, KD techniques include logit-based distillation,
+feature-based distillation (Romero et al., 2014), and response-based distillation (Park et al., 2019). These KD techniques
+are widely used in transferring the knowledge from a large source model to a smaller target model for improved inference
+efficiency, but can generally work regardless of the model sizes (Furlanello et al., 2018; Zhang et al., 2017). Encoder-only
+language models that focus on contextual embedding (classification) tasks use similar KD techniques, examples include
+DistilBERT, TinyBERT, and MiniLM (Sanh et al., 2019; Jiao et al., 2019; Wang et al., 2020). However, decoder-only
+generative language models require different treatment of KD techniques.
+Knowledge distillation for decoder-only autoregressive language models usually operates with a sequence-level objec-
+tive (Kim & Rush, 2016; Zhong et al., 2024). The target model’s objective typically involves either minimizing the negative
+log-likelihood of source model-sampled output sequences or minimizing the KL divergence between its token logits and
+the source model’s (Wen et al., 2023; Kim et al., 2021). Researchers have also explored generalized divergence objectives,
+such as f-divergence (Wen et al., 2023). Important applications include compressing larger source models to smaller target
+models for inference efficiency (Timiryasov & Tastet, 2023), and transferring capabilities from stronger proprietary models
+to open source models (Chen et al., 2024). Some works have also focused on skill-specific distillations, like chain-of-thought
+distillation for enhanced reasoning (Li et al., 2023) or alignment distillation for human value preference alignment (Gu et al.,
+2025). Self-distillation is another application that supports continual learning and regularization by iteratively refining the
+same model (Wang et al., 2021).
+While our work and existing KD works both seek to transfer knowledge from one model to another, we focus on transferring
+the specialized knowledge in the absence of the full fine-tuning data, for which standard KD techniques are not readily
+applicable.
+A.2. Synthetic Data Generation with LLMs
+Large Language Models (LLM) readily serve as effective tools for synthetic data generation due to their ability to generate
+coherent, contextually relevant text. A simple approach involves utilizing few-shot in-context learning, after which LLMs
+can generate task-aligned examples that broadly reflect the structure and style of the target data (Brown et al., 2020).
+Prompt-based generation techniques leverage simple or complex prompts to guide LLMs in producing diverse, task-specific
+synthetic examples with minimal examples (Liu et al., 2021a). This approach has been shown to produce high-quality
+synthetic question–answer pairs that improve downstream model performance on tasks such as domain-specific QA (Schmidt
+et al., 2024). Synthetic data generation in general benefits a wide range of language-related tasks. For example, in neural
+machine translation, back-translation generates synthetic parallel data that, when combined with authentic parallel data, leads
+to consistent improvements in translation quality on standard WMT benchmarks (Sennrich et al., 2015). For programming
+tasks, LLMs generate synthetic code snippets and unit tests that facilitate large-scale code modeling and analysis (Sch¨afer
+et al., 2023). In privacy-sensitive domains such as healthcare, synthetic data with differential privacy protections maintains
+utility while safeguarding individual record confidentiality (Pang et al., 2024).
+Our method follows the established simple prompt-and-few-shot framework, using LLMs to generate question variants
+based on a small set of examples from the fine-tuning dataset. This approach could potentially benefit scenarios where
+original data is unavailable due to privacy constraints, though in the current work we demonstrate its efficacy using various
+standard fine-tuning datasets.
+13
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+Table 6. MMLU benchmark results
+Trans-LoRA
+Ours
+Source
+Target
+Source
+LoRA
+Target
+(no LoRA)
+Target
+LoRA
+Acc
+Increase
+Source
+LoRA
+Target
+(no LoRA)
+Target
+LoRA
+Acc
+Increase
+Llama2-7B
+Llama2-13B
+45.89%
+53.72%
+55.09%
+1.37%
+47.19%
+53.13%
+53.62%
+0.49%
+Gemma-2B
+Gemma-7B
+42.34%
+60.45%
+61.23%
+0.78%
+41.39%
+61.62%
+62.38%
+0.76%
+Table 7. MBPP benchmark results (strict evaluation)
+Trans-LoRA
+Ours
+Source
+Target
+Source
+LoRA
+Target
+(no LoRA)
+Target
+LoRA
+Acc
+Increase
+Source
+LoRA
+Target
+(no LoRA)
+Target
+LoRA
+Acc
+Increase
+Llama2-7B
+Llama2-13B
+25.0%
+31.7%
+34.4%
+2.7%
+25.7%
+31.6%
+33.9%
+2.3%
+Gemma-2B
+Gemma-7B
+33.9%
+32.1%
+40.6%
+8.5%
+32.4%
+40.7%
+46.8%
+6.1%
+B. Results for Additional Datasets
+In this section, we present additional results for different datasets using the same experiment setting as in the main paper.
+MMLU
+In Table 6, we present additional results for the MMLU dataset. In general, we found that the accuracy increase
+from fine-tuning is very small, consistent with observations from Trans-LoRA. For example, during our testing, the Llama2-
+13B model’s accuracy after fine-tuning increases by only 0.49% (from 53.13% to 53.62%). For the Gemma-7B model, the
+increase is similarly small at 0.76%. We believe this occurs because the MMLU dataset is highly fact-based, and the training
+split provides little transferable knowledge to the evaluation split. Therefore, whether the target model successfully distills
+knowledge from the source fine-tuned model has minimal impact on the target model’s accuracy increase. The target model
+likely relies on knowledge obtained during pre-training rather than from distillation.
+Strict MBPP+
+In Table 7, we present additional results for the strict version of the MBPP dataset, referred to as
+”MBPP+” (Austin et al., 2021). To the best of our knowledge, this corresponds to the same strict MBPP+ dataset used by
+Trans-LoRA. However, we observe substantial discrepancies between our accuracy and Trans-LoRA’s reported results. Most
+notably, Trans-LoRA reports 32.1% accuracy for their ”Target (no LoRA)” baseline, while we achieve 40.7% accuracy for
+our ”Target (no LoRA)” baseline using the Gemma-7B model. This 8.6 percentage point difference represents a significant
+gap in the evaluation of the same pre-trained model without any fine-tuning.
+We believe these discrepancies likely stem from differences in evaluation settings. Unfortunately, due to the lack of an
+open-source implementation of Trans-LoRA, we could not fully resolve these differences. Nevertheless, we note two
+important observations. First, when comparing accuracy improvements rather than absolute values, our gains are comparable
+to those reported by Trans-LoRA. Combined with our superior performance on other datasets where results are more
+reproducible, we believe our solution achieves higher accuracy overall, and the specific discrepancy in this strict MBPP+
+setting is due to implementation-related factors. Second, in Appendix G, we provide t-SNE visualizations of MBPP prompts
+generated using Llama2 (following Trans-LoRA’s reported setting) versus GPT-4o (our setting). These visualizations
+demonstrate that our prompts exhibit significantly greater diversity. The limited diversity in Trans-LoRA’s prompts likely
+restricts knowledge extraction from the fine-tuned model, making it unlikely that Trans-LoRA’s approach can achieve
+comparable target accuracy improvements.
+C. Results for Additional Architectures for TuneShift-KD
+Table 8. TuneShift-KD results using Qwen models as source and target
+Dataset
+Source
+Target
+Source
+LoRA
+Target
+(no LoRA)
+Target
+LoRA
+Acc
+Increase
+GSM8K
+Qwen2.5-7B Instruct
+Qwen2.5-14B Instruct
+69.4%
+43.9%
+79.6%
+35.7%
+MBPP
+Qwen2.5-7B Instruct
+Qwen2.5-14B Instruct
+52.8%
+42.0%
+60.1%
+18.1%
+14
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+Table 9. GSM8K performance under different perplexity filtering configurations. (a) Symmetric threshold filtering with both models
+using threshold 1.3. (b) Asymmetric threshold filtering with fine-tuned model perplexity < 1.2 and base model perplexity > 1.6. (c)
+Ratio-based filtering where examples are retained if 1.5 × fine-tuned perplexity ≤base perplexity.
+Filter Setting
+Source Model
+Target Model
+Target
+(no LoRA)
+Target
+LoRA Acc.
+Acc. Change
+(vs. default)
+(a) Threshold = 1.3
+Llama2-7B
+Llama2-13B
+27.89%
+30.02%
+–0.10%
+(b) Fine-tuned < 1.2, Base > 1.6
+Llama2-7B
+Llama2-13B
+27.89%
+30.10%
+–0.02%
+(c) Ratio-based: 1.5× fine-tuned ≤base
+Llama2-7B
+Llama2-13B
+27.89%
+30.25%
++0.13%
+Figure 2. t-SNE visualization of MBPP prompt embeddings generated by Llama2-13B versus GPT-4o. Embeddings computed using the
+MPNet encoder model demonstrate the superior diversity of GPT-4o generated prompts.
+We provide additional evaluations with the Qwen2.5 architectures in Table 8. The Qwen target model achieved significant
+accuracy improvements (35.7% on GSM8K and 18.1% on MBPP) through knowledge transfer using TuneShift-KD. Unlike
+the Llama and Gemma experiments where we used GPT-4o for prompt generation, we used the source Qwen2.5 model itself
+as the instruction-tuned LLM for synthetic prompt generation. This demonstrates that TuneShift-KD can operate without
+external prompt generation models when the source model has sufficient prompt generation capabilities. The limitations of
+prompt generation diversity in Llama and Gemma models were discussed in Section 3.4 and visualized further in Figure 2.
+D. Results for Different Perplexity Filter Threshold Rules
+We evaluate TuneShift-KD under several perplexity filter threshold rules in Table 9. Our default rule is symmetric
+thresholding at 1.5, retaining examples where the fine-tuned model perplexity is < 1.5 and the base model perplexity is
+> 1.5.
+Rule (a) lowers the symmetric threshold to 1.3 and yields only a 0.10% accuracy decrease relative to the default. Rule (b)
+uses asymmetric thresholds (fine-tuned < 1.2, base > 1.6), requiring a wider perplexity gap and avoiding borderline cases
+(e.g., 1.49 vs. 1.51), but achieves nearly identical performance (–0.02%). Rule (c) uses a ratio-based rule, retaining examples
+where the base model perplexity is at least 1.5× the fine-tuned model perplexity; this slightly improves accuracy by 0.13%.
+15
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+Table 10. TuneShift-KD results on specialized medical (MedMCQA) and legal (LexGLUE) domain knowledge transfer.
+Dataset
+Source
+LoRA
+Target
+Target
+(no LoRA)
+Our Target
+LoRA
+Acc
+Increase
+Medical
+Llama2-7B
+Llama2-13B
+33.8%
+35.8%
+2.0%
+Medical
+Gemma-2B
+Gemma-7B
+43.0%
+45.1%
+2.1%
+Legal
+Llama2-7B
+Llama2-13B
+25.2%
+40.8%
+15.6%
+Legal
+Gemma-2B
+Gemma-7B
+44.4%
+48.4%
+4.0%
+Table 11. Statistical significance analysis across random seeds on GSM8K and MBPP.
+Dataset
+Source
+LoRA
+Target
+Target LoRA
+(Original)
+Target LoRA
+(New 1)
+Target LoRA
+(New 2)
+Average
+with Error Bar
+GSM8K
+Llama2-7B
+Llama2-13B
+30.1%
+30.0%
+29.9%
+30.1% ± 0.058%
+GSM8K
+Gemma-2B
+Gemma-7B
+44.8%
+44.6%
+45.1%
+44.8% ± 0.15%
+MBPP
+Llama2-7B
+Llama2-13B
+40.2%
+40.3%
+40.0%
+40.2% ± 0.088%
+MBPP
+Gemma-2B
+Gemma-7B
+51.2%
+50.9%
+51.2%
+51.1% ± 0.10%
+Taken together with the main-paper ablation in Table 5 (which varies the filtering criteria at a fixed threshold), these results
+show that TuneShift-KD is robust both to the specific filtering criterion and to the threshold selection rule, as long as a
+reasonable perplexity gap is enforced.
+E. Results for Specialized Domain Knowledge
+We provide additional experimental results for medical (MedMCQA) (Pal et al., 2022) and legal (LexGLUE) (et al., 2022)
+domains in Table 10, to evaluate our method’s performance on very specialized domain knowledge transfer.
+F. Results for Statistical Significance
+We provide statistical significance analysis in Table 11. We conducted additional runs with different random seeds on the
+GSM8K and MBPP datasets. Results show minimal variance across runs, demonstrating that our method consistently and
+reliably improves target model accuracy.
+G. Visualization of Prompt Diversity
+We demonstrate the difference in prompt diversity between our method and Trans-LoRA’s approach. We use the MPNet (Song
+et al., 2020) model to generate embeddings for examples produced by Llama2-13B (following Trans-LoRA’s reported
+setting) and GPT-4o (our setting). MPNet was also used in Trans-LoRA’s paper for embedding analysis. We then visualize
+the t-SNE plots of the embeddings generated from both model outputs.
+As shown in Figure 2, GPT-4o generates significantly more diverse prompts than Llama2-13B. The Llama2-13B prompts
+cluster into a few small, tightly-grouped regions, with highly similar prompts within each cluster. In contrast, GPT-4o
+prompts exhibit much broader distribution across the embedding space. This limited diversity in Llama2-13B’s outputs
+likely impedes the target model’s ability to learn from a varied set of examples that would optimally extract knowledge from
+the fine-tuned source model.
+In Figures 3 and 4, we show the perplexity distributions of prompts generated by the fine-tuned (teacher) and base Llama2-7B
+models. We observe that the teacher model’s perplexity is much smaller compared to the base model for both datasets. For
+the MBPP examples, we found that although many of the teacher’s generated examples have perplexity above 1.5, they
+should not be retained as they do not provide correct task demonstrations. In other words, we found the 1.5 threshold to be a
+reasonable setting that excludes examples where the teacher model lacks confidence across multiple datasets.
+16
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+Figure 3. Perplexity distribution of GSM8K examples generated by fine-tuned (Teacher) and base Llama2-7B models. Perplexities beyond
+the rightmost bin are omitted for clarity.
+Figure 4. Perplexity distribution of MBPP examples generated by fine-tuned (Teacher) and base Llama2-7B models. Perplexities beyond
+the rightmost bin are omitted for clarity.
+H. Generated Examples
+In this section, we show example prompts and responses generated by the fine-tuned and base models. In our experiments,
+we observe that many of our generated samples are correctly retained through our filtering process—that is, prompts that
+lead to technically correct fine-tuned responses and incorrect base responses are kept. Here, we focus on demonstrating a
+wide range of examples, including potential edge cases, to illustrate both examples that are technically correct and could be
+retained, as well as those that are technically incorrect and could be filtered out. We note that the final target model accuracy
+depends on many factors, including data quality, correctness, and diversity, as well as other considerations such as the target
+model’s training dynamics. In general, correctness alone is insufficient for determining data inclusion or exclusion. We
+comment on the responses’ correctness for demonstration purposes only.
+I. Ethics and Privacy
+TuneShift-KD operates within the practical constraint where fine-tuned model weights are accessible but original training
+data is not. This is a common scenario in real-world ML deployments where service providers receive models for deployment
+without accessing proprietary datasets, often due to privacy reasons. For example, cloud providers hosting LoRA adapters
+motivated Trans-LoRA’s data-free approach (Wang et al., 2024a). Secure cloud architectures like AWS Nitro treat model
+weights and training data as separate assets with different access controls (Amazon Web Services, 2024). Additionally, the
+growing ”Data-Free Knowledge Distillation” literature specifically targets scenarios where datasets are withheld for privacy
+or IP reasons (Liu et al., 2024; 2021b).
+17
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+{
+"prompt": "Question: Noah bought 5 bundles of balloons, and each bundle had 9
+balloons. 7 balloons popped. How many balloons does he still have?\nAnswer:",
+,→
+"fine-tuned response": "Noah has 5 x 9 = <<5*9=45>>45 balloons.\n7 balloons popped,
+so he has 45 - 7 = <<45-7=38>>38 balloons left.",
+,→
+"base response": "Noah has 8 balloons left."
+}
+Figure 5. GSM8K example generated by fine-tuned and base Llama2-7B, with 1.19 fine-tuned perplexity and 4.22 base perplexity. The
+fine-tuned response is technically correct, and the base response is incorrect. The example was kept through the perplexity filter process.
+{
+"prompt": "Question: Layla baked 5 trays of muffins. Each tray had 8 chocolate
+muffins and 4 blueberry muffins. She gave away 10 muffins. How many does she
+have left?\nAnswer:",
+,→
+,→
+"fine-tuned response": "Layla baked 5 x 8 = <<5*8=40>>40 muffins.\nShe gave away 10 +
+40 = <<10+40=50>>50 muffins.\nSo she has 40 - 50 = <<40-50=10>>10 muffins
+left.",
+,→
+,→
+"base response": "Layla has 40 muffins left."
+}
+Figure 6. GSM8K example generated by fine-tuned and base Llama2-7B, with 1.16 fine-tuned perplexity and 3.05 base perplexity. Both
+fine-tuned and base responses are technically incorrect. The example was kept through the perplexity filter process.
+Privacy properties of TuneShift-KD: TuneShift-KD is not itself a privacy-preserving method. Our approach accesses
+information through standard model queries and therefore cannot extract knowledge beyond what the source model already
+exposes. If a deployed model does not generate sensitive information through normal querying, TuneShift-KD introduces
+no additional privacy risks. For models trained with differential privacy, querying does not weaken existing guarantees
+or consume additional privacy budget (Yu et al., 2021; Du et al., 2024). However, if the source model leaks sensitive
+information through standard prompting, TuneShift-KD may incorporate such information into synthetic training data. Thus,
+source model providers should ensure their models do not contain or produce sensitive information through prompting.
+Ensuring this is an orthogonal problem to TuneShift-KD usage.
+In summary, TuneShift-KD operates within existing privacy boundaries established by source models without introducing
+novel privacy risks beyond standard model querying. We recommend implementing proper safeguards at the source model
+level; however, TuneShift-KD users should also be aware of potential privacy risks if the source model was not properly
+safeguarded.
+J. Reproducibility
+J.1. Experimental Settings
+We trained six models (Llama2-7B Chat, Llama2-13B Chat, Gemma-2B, Gemma-7B, Qwen2.5-7B Instruct, Qwen2.5-14B
+Instruct) on two AMD Instinct MI210 GPUs using low-rank adaptation (LoRA). LoRA adapters with rank r = 8, scaling
+factor α = 16, and dropout rate p = 0.05 were inserted into the query and value projection layers of each multi-head
+attention block. All models were trained for 20 epochs using the AdamW optimizer with a peak learning rate of 2 × 10−5
+and linear decay. Fine-tuning was performed in 16-bit floating-point precision (FP16). These settings apply to both source
+model fine-tuning and target model knowledge distillation. We include the source code in the supplementary material and
+will open-source it upon publication.
+J.2. Computational Cost and Scalability
+Our method’s computational overhead remains practical compared to standard fine-tuning. For GSM8K with the Llama
+family, fine-tuning takes approximately 30 minutes, while data generation and perplexity filtering require 2 hours and 1
+18
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+{
+"prompt": "Question: Carter baked 48 muffins. He put them into boxes with 6 muffins
+each. Then he ate 2 muffins. How many full boxes remain?\nAnswer:",
+,→
+"fine-tuned response": "Carter baked 48 / 6 = <<48/6=8>>8 boxes of muffins.\nHe ate 2 /
+6 = <<2/6=1>>1 muffin per box.\nSo, 8 - 1 = <<8-1=7>>7 full boxes remain.",
+,→
+"base response": "After Carter baked 48 muffins and put them into boxes with 6 muffins
+each, he had 8 boxes. If he ate 2 muffins, he has 7 full boxes remaining."
+,→
+}
+Figure 7. GSM8K example generated by fine-tuned and base Llama2-7B, with 1.32 fine-tuned perplexity and 1.93 base perplexity. Both
+responses are technically correct, though they employ different solution methods, resulting in different perplexities. The example was
+kept through the perplexity filter process.
+{
+"prompt": "Write a function to generate a list of n Fibonacci numbers.",
+"fine-tuned response": "def fibonacci(n):\n
+if n == 0:\n
+return 0\n
+if n
+== 1:\n
+return 1\n
+return fibonacci(n-1) + fibonacci(n-2)",
+,→
+"base response": "def generate_fibonacci(n):\n
+a, b = 0, 1\n
+result = []\n
+for _ in range(n):\n
+result.append(a)\n
+a, b = b, a + b\n
+return
+result"
+,→
+,→
+}
+Figure 8. MBPP example generated by fine-tuned and base Gemma-2B, with 1.28 fine-tuned perplexity and 1.45 base perplexity. The
+fine-tuned response is correct, and the base response is incorrect. The example was kept through the perplexity filter process.
+hour, respectively, on two AMD Instinct MI210 GPUs. This pattern holds across datasets and models, with TuneShift-KD
+requiring roughly 6× the time of direct fine-tuning. Based on typical GPU rental costs of approximately $2.00 per hour for
+equivalent hardware (DeepSeek-AI, 2024), the total cost for GSM8K knowledge transfer is approximately $14.00.
+Following Trans-LoRA’s experimental setting, we use 250 final synthetic examples for target model training, with approxi-
+mately 80% filtered out during perplexity screening (this ratio varies by model and dataset but remains relatively stable).
+We generate prompts in batches of 20. Given an average prompt length of 50 words in GSM8K, this requires fewer than
+100,000 tokens, costing under $1 in GPT-4o API calls (Microsoft Azure, 2025). Our generation and filtering pipeline is
+inherently parallelizable, allowing speedup with additional GPUs for larger datasets. Given our near data-free setting, this
+computational cost represents a reasonable trade-off for enabling knowledge transfer without original data access.
+19
+TuneShift-KD: Knowledge Distillation and Transfer for Fine-tuned Models
+{
+"prompt": "Write a function to interleave two strings of the same length.",
+"fine-tuned response": "def interleave(s1, s2):\n
+return ''.join(i for i in (s1 +
+s2))",
+,→
+"base response": "def interleave_strings(a, b):\n
+return ''.join(x + y for x, y in
+zip(a, b))"
+,→
+}
+Figure 9. MBPP example generated by fine-tuned and base Gemma-2B, with 1.67 fine-tuned perplexity and 1.68 base perplexity. Both
+responses are technically correct and very similar, resulting in almost identical perplexities. The example was removed through the
+perplexity filter process.
+{
+"prompt": "Write a function to reverse a list without using built-in reverse().",
+"fine-tuned response": "def reverseList(myList):\nreturn myList[::-1]",
+"base response": "def reverse_list(lst):\n
+return lst[::-1]"
+}
+Figure 10. MBPP example generated by fine-tuned and base Gemma-2B, with 2.01 fine-tuned perplexity and 1.66 base perplexity. The
+fine-tuned response has an incorrect indentation, resulting in a rare case where the teacher’s solution is incorrect but the base solution is
+correct. The example was removed through the perplexity filter process.
+20

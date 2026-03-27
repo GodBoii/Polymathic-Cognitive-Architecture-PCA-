@@ -1,0 +1,1146 @@
+BXRL: Behavior-Explainable
+Reinforcement Learning
+Ram Rachum1,2, Yotam Amitai3, Yonatan Nakar4, Reuth Mirsky2,†, Cameron
+Allen1,†
+ram.rachum@berkeley.edu, yotamitai@gmail.com,
+yonatannakar@google.com, reuth.mirsky@tufts.edu,
+camallen@berkeley.edu
+1University of California, Berkeley
+2Tufts University
+3Independent Researcher
+4Google Research
+† Equal senior contribution
+Abstract
+A major challenge of Reinforcement Learning is that agents often learn undesired be-
+haviors that seem to defy the reward structure they were given. Explainable Reinforce-
+ment Learning (XRL) methods can answer queries such as “explain this specific action”,
+“explain this specific trajectory”, and “explain the entire policy”. However, XRL lacks a
+formal definition for behavior as a pattern of actions across many episodes. We provide
+such a definition, and use it to enable a new query: “Explain this behavior”.
+We present Behavior-Explainable Reinforcement Learning (BXRL), a new prob-
+lem formulation that treats behaviors as first-class objects. BXRL defines a behavior
+measure as any function m : Π →R, allowing users to precisely express the pattern of
+actions that they find interesting and measure how strongly the policy exhibits it. We de-
+fine contrastive behaviors that reduce the question “why does the agent prefer a to a′?”
+to “why is m(π) high?” which can be explored with differentiation. We do not imple-
+ment an explainability method; we instead analyze three existing methods and propose
+how they could be adapted to explain behavior. We present a port of the HighwayEnv
+driving environment to JAX, which provides an interface for defining, measuring, and
+differentiating behaviors with respect to the model parameters.
+1
+Introduction
+A chatbot optimized with human feedback declares love to a journalist and expresses a desire to
+spread misinformation (Roose, 2023). An Autonomous Driving (AD) system powering a fleet of
+robotaxis learns to brake unnecessarily hard near bicyclists, increasing the risk of rear-end collisions
+(NHTSA, 2025). A swarm of warehouse robots navigates a grid to pick groceries, but three of its
+members collide into each other, causing a massive fire (BBC News, 2021).
+We want to understand why these failures happen. Do the agents not receive enough information
+about their environment? Are the failures a result of out-of-distribution generalization? Or are the
+agents’ actions an inevitable consequence of the incentive structure we provided (Knox et al., 2023)?
+We advocate for explaining the recurring patterns of undesirable behavior that lead to failures, rather
+than the failures themselves. In our last example, the warehouse robots were observed to “play
+chicken”, approaching each other at high speed and diverting at the last moment (Prisco, 2021). In
+1
+arXiv:2603.23738v1  [cs.LG]  24 Mar 2026
+other domains, behaviors will be described not in terms of velocity and acceleration, but of defection
+rate, portfolio concentration, word choice, and more. Given unwanted agent behavior of any kind,
+we wish to define it, measure it, and find an explanation for it.
+This need is within the scope of Explainable Reinforcement Learning (XRL), which is a subdomain
+at the intersection of Explainable Artificial Intelligence (XAI) and Reinforcement Learning (RL)
+(Heuillet et al., 2021). XRL aims to make the decisions of RL agents more interpretable and un-
+derstandable to humans (Doshi-Velez & Kim, 2017). It is driven by the needs to diagnose failures
+(Amodei et al., 2016), maintain user trust (Ribeiro et al., 2016), satisfy regulations (Goodman &
+Flaxman, 2017), and ensure alignment with societal goals (Arrieta et al., 2020).
+Freiesleben & König (2023) warn about a pervasive problem in XAI: explanation methods are rou-
+tinely proposed without clearly defining what it is they aim to explain. This makes it difficult to
+invoke multiple explanation methods on the same phenomenon for a comparative study. This prob-
+lem also exists in XRL, specifically for explanations of behavior, as distinct from actions or policies.
+When XRL papers use the term “behavior”, they offer no formal definition for it, or any way to
+pinpoint one behavior out of many. Some papers use the word “behavior” as a synonym for policy.
+Atrey et al. (2020) provide a verbal definition: “behavior, or aggregate actions, over temporally
+extended sequences of frames”. However, a quantitative definition is needed to (1) measure how
+strongly a given policy exhibits a given behavior and (2) allow the user to point at a specific behav-
+ior and ask “why is the agent behaving like this?”
+This gap in problem formulation extends beyond method papers; no survey paper or position paper
+poses the problem of explaining behavior, nor provides a definition for behavior. We address this
+gap in this paper. We find a simple and general definition for behavior in an adjacent research area
+and repurpose it for explainability. We use it to make the following contributions:
+1. We formalize the notion of behavior in RL as any scalar function m : Π →R and introduce
+Behavior-Explainable Reinforcement Learning (BXRL), a problem formulation that treats
+behaviors as first-class explanation targets. We show how to articulate specific behaviors as
+measurable quantities that, when differentiable, enable gradient-based analysis. (Sec. 3–5).
+2. We analyze three existing methods—data attribution, SVERL-P, and COUNTERPOL—and show
+how each can be adapted to analyze behavior measures with minimal structural changes (Sec. 7).
+3. To further facilitate BXRL research, we introduce HighJax, a port of the HighwayEnv driving
+environment to JAX. HighJax provides an interface for defining, measuring, and differentiating
+behaviors with respect to the model parameters. We use HighJax to define an example behavior
+that leads to vehicle collisions, and invite researchers to use this environment to conduct BXRL
+research. (Sec. 8).
+2
+Background
+Explanation target and source
+Hempel (1965) draws the distinction between the explanandum
+(the phenomenon to be explained) and the explanans (the information that does the explaining). We
+use the terms explanation target and explanation source. The former is the problem domain and the
+latter is the solution domain. Keeping with Freiesleben & König (2023), we practice great care in
+keeping them separate.
+Contrastive explanation
+While philosophers have long debated what constitutes an explanation
+(Hume, 1758; Lewis, 1973; Woodward, 2003), research in cognitive science and social psychology
+has highlighted a key finding: good explanations are contrastive (Lipton, 1990; Miller, 2019). Peo-
+ple do not ask “Why P?” in isolation; they ask “Why P rather than Q?” even when Q is implicit. P
+and Q are respectively called fact and foil. For example, if a person asks “why did my barn catch on
+fire?” we recognize that the answer “because it had oxygen in it”, while correct, has no explanatory
+power. The implicit “...rather than Q?” is “...while other buildings in the area did not catch on fire?”
+The answer to a contrastive question follows Lipton’s Difference Condition: to explain why P rather
+2
+than Q, cite a cause C that is present in P’s causal history but absent from Q’s. In our example,
+C might be “because someone threw a lit cigarette in a pile of hay”. Crucially, the foil determines
+which causes are explanatory: the same fact P has different explanations depending on which foil
+Q the questioner has in mind.
+Behavior as disposition
+We ground our usage of the term “behavior” in Ryle (1949)’s disposi-
+tional analysis. Ryle described behaviors as tendencies to take certain actions in certain situations:
+“to be a smoker is just to be bound or likely to fill, light and draw on a pipe in such and such condi-
+tions”. He distinguished single-track dispositions from multi-track dispositions, where multi-track
+dispositions could manifest as several different types of actions. This dispositional view is echoed in
+the psychological habit literature, where habits are characterized by “activation by recurring context
+cues” (Wood & Rünger, 2016).
+Markov Decision Process (MDP)
+An MDP is defined by (S, A, T, R, γ): states S, actions A,
+transition function T(s′|s, a), reward function R(s, a), and discount factor γ. At each timestep
+t, the agent observes state st ∈S, selects action at ∼πθ(a | st) according to its policy πθ :
+S × A →[0, 1], a conditional distribution over actions given states, parameterized by θ, receives
+reward rt, and the environment transitions to a new state. A trajectory τ = (s0, a0, r0, s1, . . .)
+is a sequence of experiences; an epoch is a batch of N timesteps collected for a single gradient
+update. The return Gt = P∞
+k=0 γkrt+k is the discounted sum of future rewards. The agent’s goal
+is to maximize expected return, or value V (s) = E[Gt|st = s]. The advantage At = Gt −V (st)
+measures how much better an action was than expected. The training objective J(π) = E[G0] is the
+expected return under π. The Kullback–Leibler (KL) divergence DKL(πold∥πnew) = Eπold[log πold
+πnew ]
+is commonly used to constrain policy updates so that each gradient step does not change the policy
+too drastically (Kullback & Leibler, 1951). We note that BXRL applies to Partially-Observable
+MDPs as well, where ot, the observation the agent receives at timestep t, is distinct from st; in a
+fully-observable MDP, ot = st.
+Attribution and importance methods
+Several methods attribute a scalar objective to individual
+components of the learning process. Data attribution (Hu et al., 2025) adapts TracIn (Pruthi et al.,
+2020) to identify which training records most influenced a target function, measuring influence via
+the gradient inner product between the target and the PPO loss (Schulman et al., 2017). SVERL-
+P (Beechey et al., 2023) considers Shapley values over state features, quantifying each feature’s
+contribution to agent performance. COUNTERPOL (Deshmukh et al., 2023) finds the minimal
+policy change that achieves a specified target return, optimizing a counterfactual objective with a
+KL-divergence proximity constraint. All three are built around a modular scalar objective that can
+be retargeted at behavior measures.
+3
+Properties of Behavior
+We distill the single-track model of behavior presented by Ryle (1949) to concrete MDP properties:
+Property 1 (Action-based). Behavior consists of one or more actions the agent tends to choose.
+Property 2 (Recurring). Behavior recurs in multiple episodes.
+Property 3 (Graded). A behavior is not merely present or absent; a policy may exhibit a be-
+havior strongly, weakly, or anywhere in between.
+Property 4 (Scoped). Any given behavior will be limited in scope in some way: it may be
+scoped to a specific set of states, or to specific dimensions of the action space if it is multi-
+dimensional. Timesteps in states outside this scope are irrelevant to the behavior, as are action
+dimensions outside it.
+3
+We previously used the motivating example of a warehouse robot that plays chicken, i.e., moves
+too fast toward human workers. This phenomenon satisfies all four properties: (1) it’s expressed by
+the action of speeding up, (2) it happens in separate incidents, (3) it can happen less often or more
+often, with varying speeds, and (4) it may only occur in states in which the robot is moving toward
+humans, and only actions related to full-body movement are relevant to it.
+In the next section we map out the XRL landscape and find a gap in its treatment of behavior.
+4
+Related Work
+We are interested in the subset of XRL literature that is guided by a strong motivation to answer
+a focused question, giving preference to “why?” questions. We deem as out of scope any XRL
+paradigm whose primary goal is to build trust, verify safety properties, or summarize policies. We
+organize the remaining methods by what kind of question they answer, i.e., their explanation target.1
+We choose three surveys that provide a taxonomy based on explanation target (Vouros, 2022; Milani
+et al., 2024; Saulières et al., 2025) and pool them into a cross-taxonomy of five distinct explanation
+targets, shown in Table 1.
+We seek an explanation target that aligns with our motivation of explaining behavior, as we described
+in Section 3. We argue that none of the five explanation targets in Table 1 are a good fit for
+explaining behavior:
+• The objective and learning explanation targets violate Property 1; they are not directed at the
+agent’s actions. While actions are involved, explaining the actions is not their primary motivation.
+• The action and trajectory explanation targets are targeted at a single timestep and a single episode
+respectively; this means that their respective methods could be useful for explaining a case study of
+the chicken behavior, but that explanation might overfit the circumstances of the specific episode,
+and therefore violates Property 2. In that sense, these explanation targets are too narrow.
+• The policy explanation target is too broad; the policy is responsible for all the activities that the
+agent does in all states. Our warehouse robot may do a great job at stacking boxes and scanning
+barcodes, but given Property 4, these action components are out of scope, and any breakdown of
+them is noise that we do not want in our explanation.
+Property 2 is especially important in MDPs that favor stochastic policies. Consider a music recom-
+mender system that has access to millions of songs. It performs well, except that for 10% of user
+queries it plays The Final Countdown by Europe. This is a bug that the operators would urgently
+want explained. However, the action explanation target would not be useful, not because the meth-
+1Some papers explicitly define their explanation target or the questions that they answer, while some leave it implicit;
+there can be different interpretations on what is the primary question that a method answers.
+Explanation
+Target
+Example questions
+Vouros
+(2022)
+Milani et al. (2024)
+Saulières
+et al. (2025)
+# papers
+surveyed
+Example methods
+Action
+“In episode 137, timestep 82, why did
+the agent choose action a?”
+Outcome
+Feature Importance: Directly
+Generate Explanations
+Action
+105
+Puri et al. (2020);
+Juozapaitis et al. (2019)
+Trajectory
+“In episode 137, which timesteps were
+critical for the outcome?”
+—
+—
+Sequence
+11
+Tsirtsis et al. (2021);
+Sreedharan et al. (2022)
+Policy
+“What is the agent’s general
+decision-making process?”
+Policy
+FI: Interpretable Policies,
+Policy-Level
+Policy
+192
+Verma et al. (2018);
+Bastani et al. (2018)
+Objective
+“What is the agent optimizing? What
+are its goals?”
+Objectives
+—
+—
+3
+Huang et al. (2019);
+Bica et al. (2021)
+Learning
+“Why did the policy gradually evolve
+to be the way that it is?”
+—
+Learning Process & MDP
+—
+17
+Dao et al. (2018); Wang
+et al. (2019)
+Table 1: A cross-taxonomy of XRL methods according to their explanation targets. The purple cells
+indicate the corresponding categories in three surveys.
+4
+ods are not good enough, but because on the action level, there is nothing to explain. The song itself
+is fine. It is only the aggregate behavior of playing it often that calls for an explanation.
+None of the surveyed XRL methods allow users to receive an explanation for a specified be-
+havior; and to the best of our knowledge, no XRL survey defines a general expression for behavior
+to be explained (Amitai & Amir, 2024). We note three relevant methods below. None of them allow
+users to specify a behavior, measure it, or answer “why did this behavior occur?” but each addresses
+a related aspect of behavior analysis in RL.
+Rishav et al. (2025)
+answer the question “what behavior is this action part of?” The authors use
+behaviors as an explanation source, while their explanation target is actions. They do not allow users
+to choose a specific behavior; they instead (1) detect behaviors automatically by using a VQ-VAE
+to discretize offline state-action trajectories into latent codes and (2) apply spectral clustering to dis-
+cover recurring behavioral patterns. They then explain actions by attributing them to the discovered
+behaviors via per-cluster behavior cloning models.
+HIGHLIGHTS (Amir & Amir, 2018)
+answers the question “what timesteps give the most in-
+formation about the policy’s capabilities and limitations, and what actions does the policy choose
+in them?” It summarizes an agent’s policy by extracting trajectories through states where different
+actions lead to substantially different outcomes, as measured by Q-value gaps.
+ASQ-IT (Amitai et al., 2024)
+answers the question “in scenarios that match the constraints I
+defined, what actions does the agent choose?” They provide an interface for users to specify start/end
+conditions and constraints on what happens in between. Though ASQ-IT provides explanations
+through demonstration, it does not define or measure behaviors as general constructs, and its query
+language uses discrete boolean predicates, so gradual or continuous behavioral properties are not
+expressible. They demonstrate on a highway domain where the user can specify, e.g., that the agent
+starts in Lane 1 behind another car and ends in Lane 4. ASQ-IT then searches pre-collected rollouts
+and plays back matching trajectories.
+The authors of the latter work call for “a language for describing more abstract queries about the
+behavior of the agent”. We present such a formalism in the next two sections.
+5
+Behavior-Explainable Reinforcement Learning (BXRL)
+We find a simple and general definition of behavior in the research area of evolutionary computation.
+Lehman & Stanley (2011) introduced behavioral characterization: a domain-dependent function
+that maps policies to a vector space, enabling search for behaviorally diverse solutions. Pugh et al.
+(2016) formalized this as practitioner-selected features defining “a space of possible behaviors”,
+and Meyerson et al. (2016) made it an explicit, first-class learnable component. Conti et al. (2018)
+applied this formalism to deep RL. Knox et al. (2023) proposed sanity checks for reward functions
+that rely on policy-level performance metrics, which can be viewed as behavior measures. Adapting
+the notation of Fontaine & Nikolaidis (2021), we denote behavior measures by m(π) and define
+them as follows:
+Definition 1 (Behavior measure). Given an MDP, a behavior measure is any function m from
+a policy π to a scalar:
+m : Π →R
+A larger value of m(π) indicates that π exhibits the represented behavior more strongly.
+A policy is a conditional probability distribution over actions given observations; this means any m
+can be defined only in terms of how likely an agent is to take each of the actions, and not any other
+5
+information. This definition satisfies the four properties we distilled from Ryle (1949) in Section 3:
+(1) it is defined in terms of action probabilities, (2) it is not limited to a specific episode or timestep,
+(3) it returns a scalar that expresses how strongly the behavior is exhibited, and (4) it allows defining
+behaviors that are dependent on only a subset of the MDP’s observation space and action space. We
+show practical examples of such behaviors in Section 6.
+We wish to highlight an important feature of Definition 1. We motivated our work with examples
+of real-world negative consequences of an agent’s actions, such as traffic accidents. While these
+negative events may be modeled as trajectories in the MDP, our definition of behavior measure does
+not depend on any consequence or event, positive or negative, that the agent’s actions may cause. It
+is defined strictly in terms of the policy, i.e. the probability that the agent will take an action that we
+associate with the bad event. It does not require sampling the policy or the state transition function.
+This has three desirable effects: (1) it does not require running an expensive rollout per-evaluation,
+(2) it does not add another source of variance, and (3) it allows defining behaviors that are fully
+differentiable with respect to the agent’s parameters. The latter point is required for the adaptation
+of data attribution methods to explainability, detailed in Section 7.1.
+One way to understand behavior measures is to view the training objective J(π) →R as a measure
+over policies. J is determined by the reward function R(s, a). Practitioners design R to produce a J
+such that π∗
+J behaves in particular desirable ways, without having to specify each of these ways. For
+example, we reward a bipedal robot for forward velocity, and it learns to maintain upright balance
+and a walking gait without us having to formalize these behaviors. We advocate for formalizing
+these behaviors, e.g., upright balance as mb(π) and walking gait as mg(π), and then using them
+as explanation targets, while keeping optimization on J only. This allows substituting the question
+“why is my robot not maintaining an upright balance?” with the equivalent “why is mb(π) low?”
+The latter question allows for differentiation of mb with respect to policy parameters, and by ex-
+tension, to any quantities that affect the policy parameters during training. We present a general
+definition for any method that attempts to answer questions of this form:
+Definition 2 (BXRL Method). Given a MDP and a policy π, a BXRL method is one that
+produces an explanation for any specified behavior measure m.
+We intentionally leave the “explanation” output undefined. We wish to fix the explanation target, not
+its sources or output modalities. A few possible output formats are saliency maps, tables, plots, and
+text. We suggest that the way to compare methods that provide different types of explanations is by
+evaluating them in user studies that produce objective success metrics (Gyevnar & Towers, 2025).
+6
+Expressing a Behavior as a Number
+Here we provide practical guidance on defining m(π), with concrete examples in several MDP
+domains. In all our examples below, we follow the convention that m(π) = 0 indicates the behavior
+does not occur at all, and m(π) = 1 indicates the policy exhibits the behavior as strongly as possible.
+This convention is optional. We note that in simple domains, it is easy to find canonical metrics for
+behaviors; in complex domains, many correlating measures may exist for the same core behavior.
+We demonstrate this for several domains in Table 2.
+All metrics in Table 2 share a common structure: each is an expectation over a fixed observation
+distribution D of some function of the policy’s output. We write πθ(a | o) for the action probabilities
+of a discrete policy and µθ(o) for the mean action of a continuous policy. Crucially, D is not
+dependent on θ: it is a pre-collected or manually constructed set of observations. This ensures that
+the full computation from θ to m(πθ) passes only through the policy network, making it end-to-end
+differentiable. When the behavior is scoped to specific situations (Property 4), this is reflected by
+restricting D accordingly; e.g., for a highway environment, Dclose contains only observations where
+6
+Table 2: Examples of expressing behaviors in different domains as a measure m(π).
+Domain
+Behavior
+Metric
+Iterated Prisoner’s Dilemma
+Reciprocity
+m(π) := Eo∼D[πθ(aopp
+t−1 | o)]
+Autonomous vehicles
+Tailgating
+m(π) := Eo∼Dclose[1 −πθ(SLOWER | o)]
+LLMs
+Sycophancy
+m(π) := Ex∼D[πθ(“You’re right to push back” | x)]
+Robotics
+Jerkiness
+m(π) := E(o,o′)∼Dconsec[∥µθ(o′) −µθ(o)∥2]
+Trading
+Risk appetite
+m(π) := Eo∼D[|µθ(o)|]
+Recommenders
+Popularity bias
+m(π) := Eo∼D[P
+i∈top-k πθ(i | o)]
+the ego vehicle is near the vehicle ahead. Practitioners may draw observations from rollouts of a
+reference policy, from a replay buffer, or construct them synthetically.
+Miller (2019) advocates for explanations that are contrastive, meaning that they answer questions of
+the form “why P and not Q?” We show how to define contrastive behavior measures of two kinds in
+Table 3. Observation-contrasting behavior measures are similar to classic fact-foil examples such
+as “why did my barn catch on fire, while my neighbor’s barn did not?” Action-contrasting behavior
+measures express questions such as “why did the driving agent choose to overtake rather than stay
+in its lane?” Both types allow reducing such questions to “why does m(π) have a high value?”
+Table 3: Two kinds of contrastive behavior measures.
+Contrast
+Question
+Metric
+Observation
+“How much more likely is the agent to choose action
+a given observation oP than given observation oQ?”
+m(π) := π(a | oP )−π(a | oQ)
+Action
+“Given observation o, how much more likely is the
+agent to choose action aP rather than aQ?”
+m(π) := π(aP | o)−π(aQ | o)
+7
+Adapting Existing XRL Methods for BXRL
+Some existing methods can be retargeted at behavior measures, even if they were not originally
+designed for that purpose. We review one attribution method, one importance method, and one
+contrastive method. All three are built around a modular scalar objective that can be replaced with
+m(π) with minimal structural changes. We do not implement these adaptations; we analyze each
+method’s structure to show that the substitution is feasible. We analyze the changes that occur when
+m(π) is substituted in, what properties are preserved, and what breaks.
+7.1
+Data Attribution
+Hu et al. (2025) introduced a data attribution framework for online RL that answers the questions
+"which training experiences most influenced the agent’s tendency to take action a in state s?" and
+"which training experiences most increased the agent’s overall performance?" The authors adapt
+TracIn (Pruthi et al., 2020) to operate within single PPO training rounds. The method has two tar-
+get functions. The first, f action(θ) = log πθ(a | s), targets the log-probability of a specific action
+in a specific state; influence scores quantify how much each training record pushed the policy to-
+ward or away from that action. The second, f return(θ), is a REINFORCE-like estimate of expected
+return; influence scores quantify each record’s contribution to overall performance. In both cases,
+the components receiving attribution are individual training records in the current round’s rollout
+buffer. Within each round k, the influence of a record zi = (si, ai, ri, log πi, vi, ˆAi) on the target is
+measured via gradient similarity:
+Ii =
+D
+∇θf(θ(k)), ∇θLPPO(θ(k), zi)
+E
+,
+(1)
+7
+where f ∈{f action, f return} and the other side of the dot product is always the per-record PPO training
+gradient.
+The method’s two targets serve different purposes. The action target quantifies which records most
+influenced a specific decision. The return target identifies training records that negatively influence
+expected return (e.g., via inaccurate advantage estimates); filtering out these records can help speed
+up learning. The action target is close to describing behavior in the general way that we define it;
+we suggest generalizing beyond a single state-action pair to (1) prevent overfitting to a single state
+and (2) support multi-state behaviors such as overtaking. (Expanded in Section 9.)
+BXRL adaptation
+Replace the target function f(θ) with any differentiable behavior measure
+m(πθ), such that the influence score becomes Ii = ⟨∇θm(πθ), ∇θLPPO(θ, zi)⟩. The influence
+scores then quantify which training transitions in round k most contributed to increasing or decreas-
+ing m(π). Positive scores indicate records that increased m(π); negative scores indicate records
+that suppressed it. For behavior measures of the form m(π) = Eo∼D[g(πθ(· | o))], where g is a
+differentiable function, the gradient can be straightforwardly computed via backpropagation through
+g ◦πθ. The adaptation produces per-record influence scores that can be aggregated temporally to
+reveal when during training a behavior emerged, and analyzed semantically to reveal what those
+experiences have in common.
+Limitations
+This method reveals a record’s contribution to only the current round’s policy update.
+However, a policy update in one round could set the agent up to collect better data in subsequent
+rounds, and the method won’t measure these downstream effects. Hu et al. (2025) acknowledge
+that the local framework “lacks a clear counterfactual interpretation”; rather it tells only whether
+a record’s gradient pointed in a helpful/harmful direction. The underlying TracIn formulation is
+derived SGD, but PPO implementations use Adam.
+7.2
+Shapley Values for Observation Features
+SVERL-P (Beechey et al., 2023) answers the question “which observation features does the agent
+rely on most for its performance?” It uses Shapley values to decompose RL agent performance into
+per-feature contributions. Its target quantity is expected return, and the components receiving credit
+are state features. The method works by comparing the agent’s performance under a variety of mod-
+ified policies, where each modification restricts the set of state features that the policy is allowed to
+condition on (marginalizing over the rest). For each feature i and coalition of remaining features
+C ⊆F \ {i}, it compares the agent’s marginalized policy πC(a|s) := P
+s′∈S pπ(s′|sC)π(a|s′),
+that “ignores” all the other features, against the marginalized policy πC∪{i} that also conditions on
+feature i. It then uses the marginal gain in expected return to compute Shapley values ϕi, assign-
+ing each feature the unique fair credit allocation that satisfies all four Shapley axioms: efficiency,
+symmetry, null player, and additivity.
+The method has two versions: global and local. The global version modifies the policy at all states
+and computes the expected contribution of each feature under the state occupancy distribution pπ(s);
+the local version only modifies the policy at a given state s, and computes expected return from state
+s. Together these quantify how much each state feature contributes to the agent’s performance. Note
+that SVERL-P measures the informational value of only the features for making good decisions, and
+can thus assign zero importance to a feature that’s deeply embedded in the dynamics if the feature
+isn’t decision-relevant for maximizing expected return.
+BXRL adaptation
+Replace the expected return with a behavior measure m(π). The target quan-
+tity becomes the behavior measure, and the Shapley decomposition quantifies how much observ-
+ing each feature i contributes to m(π). This adaptation produces scores such as “the distance-to-
+vehicle-ahead feature contributes +0.23 to m(π), while relative speed contributes −0.11.” It extends
+SVERL-P to account for other behaviors, not just those that are relevant to expected-return, while
+retaining the theoretical guarantee of fair credit allocation across features.
+8
+Limitations
+Exact computation is O(2|F | · |S|), limiting applicability to environments with small
+feature spaces (≤20 features or so) without approximation. The original paper validates only on
+tabular MDPs with exact solutions, not neural network policies. FastSVERL (Beechey & ¸Sim¸sek,
+2025) addresses scalability by amortizing costs across states with a parametric model, but this intro-
+duces approximation error.
+7.3
+Counterfactual Policy Explanation
+COUNTERPOL (Deshmukh et al., 2023) answers the question “what is the smallest change to this
+policy that would make it perform at level Rtarget?” This can be helpful for understanding which
+actions in which states provide the biggest opportunity for increasing or decreasing performance.
+Given a policy πθ0 with expected return Jπθ0 and a target return Rtarget, the method optimizes:
+πθcf = arg min
+θ
+[|Jπθ −Rtarget| + k · DKL(πθ0∥πθ)] ,
+(2)
+where the first term pushes toward the target return and the KL-divergence term keeps the counter-
+factual policy close to the original. The coefficient k regulates the trade-off. The return Jπθ and its
+gradient are estimated via on-policy Monte Carlo rollouts and the policy gradient theorem. To reach
+distant targets, the method iteratively updates the KL pivot after every m gradient steps, allowing
+the counterfactual to “walk” away from the original in controlled increments.
+The output is a counterfactual policy πθcf that achieves approximately Rtarget while remaining as sim-
+ilar as possible to πθ0. The structured difference πθcf(· | o) −πθ0(· | o) across observations reveals
+which states required different action distributions and how they changed. The authors show a the-
+oretical connection to trust-region policy optimization: when Rtarget equals the maximum possible
+return, the COUNTERPOL objective reduces to the TRPO objective.
+BXRL adaptation
+Replace the expected return Jπθ with a behavior measure m(πθ), and replace
+the target return Rtarget with a target behavior level m∗. The counterfactual objective becomes:
+πθcf = arg min
+θ
+[|m(πθ) −m∗| + k · DKL(πθ0∥πθ)] .
+(3)
+Because behavior measures are pure functions of π, no rollouts are needed, making the adapted
+version simpler than the original. The counterfactual policy reveals what minimal policy change
+would increase or decrease the behavior: for example, “to reduce the collision behavior mc from
+0.7 to 0.1, the policy needs to shift probability from FASTER to SLOWER in states where the nearest
+vehicle is close ahead, while other states remain essentially unchanged.”
+Limitations
+Unlike the previous two methods, COUNTERPOL does not decompose m(π) into
+per-component contributions; it produces a modified policy whose difference from the original must
+be inspected to extract insight. The optimization may converge to one of several equally-minimal
+counterfactual policies, and different initializations may yield different solutions. The KL coefficient
+k requires tuning per domain.
+8
+Demonstrating Behaviors in Autonomous Driving
+We demonstrate defining and measuring behaviors in a driving environment. HighwayEnv (Leurent,
+2018) is a widely used driving simulation for RL research, but its NumPy implementation cannot
+be differentiated through. We introduce HighJax, a port of HighwayEnv’s highway-v0 setting
+to JAX (Bradbury et al., 2018). The HighJax state transition function T(s′|s, a) is implemented
+as a sequence of pure matrix operations. When using HighJax, rollout and training are batched and
+just-in-time compiled for high efficiency and throughput. We provide HighJax under an MIT license
+at https://github.com/HumanCompatibleAI/HighJax.
+9
+Figure 1: HighJax TUI for defining be-
+havior scenarios by selecting states and
+actions from existing rollouts.
+HighJax provides a terminal user interface (TUI) that al-
+lows defining a behavior by selecting states and actions
+from existing rollouts (Fig. 1). We define a behavior mea-
+sure mc by choosing states in which the car veers towards
+other cars. We show how mc changes during training, and
+present it as an example target for BXRL methods.
+8.1
+Environment rules
+HighJax is a port of the highway-v0 setting in which
+the agent controls a vehicle navigating a four-lane high-
+way with fifty other vehicles ahead. The agent’s vehicle
+is also called the ego vehicle.
+The highway-v0 setting has a discrete action space:
+LEFT, IDLE, RIGHT, FASTER and SLOWER. These are
+interpreted by the environment into smooth movements. The other vehicles are controlled by three
+predefined algorithms: Intelligent Driver Model (IDM) (Treiber et al., 2000), MOBIL (Kesting et al.,
+2007), and a proportional controller. The agent is rewarded for avoiding collisions, driving fast, and
+staying as close to the rightmost lane as possible. The reward at each timestep is
+rt = −1 · 1[collision] + 0.4 · ˜vt + 0.1 · ˜ℓt
+where ˜vt = clip((vt −20)/10, 0, 1) is the normalized forward speed (0 at ≤20 m/s, 1 at ≥30 m/s)
+and ˜ℓt = ℓt/3 is the normalized lane index (0 for leftmost, 1 for rightmost). For benchmarking we
+report the normalized reward (rt + 1)/1.5 ∈[0, 1]. The observation is a matrix O ∈R5×5 with the
+following data for the ego vehicle and the four closest vehicles ahead: presence, x, y, vx, and vy.
+The rows for non-ego vehicles are in relative coordinates. Full details of the environment rules are
+given in Appendix A.
+8.2
+Analyzing Training Using Behavior
+We show an example training run on HighJax in Fig. 2 and offer a simplified analysis. The dominant
+reward component is collision, and the agent first optimizes for that. In the first 1M timesteps, the
+agent learns two simple ways to avoid collision: slow down and stick to the rightmost lane. Survival
+climbs from 0.04 to 0.37. Between 1M and 4M timesteps, the agent learns to stay in the right lane
+more often, increasing survival to 0.85. From 4M timesteps onward, the agent learns to speed up.
+This leads to more collisions with other vehicles, but these are few enough that the penalties are
+offset by the reward from the increased speed.
+0
+2M
+4M
+6M
+8M
+10M
+12M
+14M
+Timesteps
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Return: Survival
+Return: Speed
+Return: Right lane
+Speed
+Lane (1 is rightmost)
+0
+2M
+4M
+6M
+8M
+10M
+12M
+14M
+Timesteps
+0.0
+0.1
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+Behavior value
+mc
+Figure 2: Left: Return breakdown of a PPO agent training on HighJax. Training is deliberately
+slowed down to DKL = 5 × 10−4 per epoch. Right: Value of the collision behavior measure mc
+across training.
+10
+Figure 3: Six scenarios defining the collision behavior measure mc. Each causes the ego car (dark
+gray) to crash within two timesteps. Columns correspond to the action taken: LEFT, RIGHT, or
+FASTER.
+In this simple case, the agent’s change towards more collisions is easily explained: the return that
+it gets from the extra speed is greater than the loss from the collision. However, let us practice
+BXRL by defining a behavior measure mc to capture this behavior. We cherry-pick six observations
+in which the agent chose actions LEFT, RIGHT, or FASTER, each of which led to a collision two
+timesteps later. We note that this is one of many overlapping ways to express this behavior. Formally:
+mc(π) = 1
+3
+ Eo∼DL
+c [πθ(LEFT | o)] + Eo∼DR
+c [πθ(RIGHT | o)] + Eo∼DF
+c [πθ(FASTER | o)]
+
+(4)
+where DL
+c , DR
+c , and DF
+c are each uniform over the two scenarios for their respective action. We show
+the example scenarios in Fig. 3, their full observation matrices in Appendix B, and the behavior’s
+value throughout the training in Fig. 2 (right).
+We present this collision behavior, as measured by mc, as an example target for potential
+BXRL methods. Our goal here is to provide only a proof of concept measure that could be explained
+with one of the methods we describe in Section 7. We leave the implementation of such adaptations
+and the analysis of their subsequent explanations to future work.
+9
+Limitations
+BXRL requires practitioners to choose which observations to sample for a given behavior measure.
+This can be very difficult, especially when the observation space is large. We consider the example
+behavior of overtaking another vehicle, and highlight three challenges.
+1. There could be many different trajectories for accomplishing what humans perceive as the same
+behavior. In the overtaking example, the ego vehicle is behind another vehicle, and then it
+changes lanes to the left. Consider that one policy might choose to execute the left turn when the
+other vehicle is 20 meters ahead, while another policy will prefer 10 meters. Both policies are
+considered to overtake, but if a behavior measure is defined in terms of the former policy, e.g.,
+mo(π) := π(aLEFT | o20m), it might return a misleadingly low value for the latter policy.
+2. A more extreme case of the former problem: different policies can have wildly different prob-
+ability distributions for the observations that they visit. After repeated training, a policy might
+develop arbitrary action distributions for observations it never visits; these action distributions
+might choose nonsensical behavior. When defining a behavior, it may be challenging to choose
+11
+observations that do not belong to the unvisited set of any of the hundreds of policies for which
+one wants to measure the behavior.
+3. Like many behaviors, overtaking requires multiple actions at different times: changing lanes to
+the left, then speeding up, and then changing lanes back to the right. (Putting aside cases where
+the overtaking fails and the vehicle needs to gracefully abort the attempt.) A good behavior
+measure will need to combine the action distributions for each of these observations.
+We believe that these problems are solvable, though they would require behavior measures that are
+far more involved than the basic ones we demonstrated in Section 6. We outline potential solutions
+to these three challenges, drawing on adjacent literatures. For Challenge 1, the quality-diversity
+literature faces the same problem when defining behavior descriptors across diverse policies; Wu
+et al. (2023) derive gradient estimators that make behavior descriptors robust to trajectory variation,
+and contrastive or bisimulation-based embeddings (Laskin et al., 2022; Zhang et al., 2021) produce
+spaces in which behaviorally equivalent states cluster together regardless of the specific trajectory
+taken. For Challenge 2, the DICE family of stationary distribution correction estimators (Nachum
+et al., 2019; Zhang et al., 2020) computes the density ratio dπ(s, a)/dD(s, a) without requiring
+knowledge of the data-collection policy, enabling behavior measures to be reweighted to a common
+reference distribution; distributionally robust evaluation (Shi & Chi, 2024) can further provide guar-
+anteed bounds on m(π) under worst-case perturbations. For Challenge 3, the options framework
+(Sutton et al., 1999) provides a natural grammar in which primitive sub-behaviors are defined as
+options and composed via linear temporal logic (Araki et al., 2021), and data-driven methods such
+as PRISE (Zheng et al., 2024) can discover such primitives automatically by applying byte-pair en-
+coding to action sequences. These directions are complementary: temporal abstraction decomposes
+a complex behavior into measurable primitives, distribution correction enables comparison across
+policies, and robust observation sampling groups diverse implementations of the same behavior.
+10
+Discussion and Conclusion
+This is a problem formulation paper; the most important kind of future work that we propose is
+the development and comparative evaluation of BXRL methods. We hope to inspire our fellow
+researchers to develop such methods, and we are eagerly anticipating to evaluate the explanations
+they will produce. In the meanwhile, we propose two more directions for future work below:
+Behavior-Explainable Artificial Intelligence
+The BXRL formulation can be generalized from
+RL to other fields in Machine Learning. In supervised learning, the policy πθ is replaced by a
+classifier or regressor, and the behavior measure m can express any pattern over its predictions.
+For LLMs fine-tuned with RLHF, m can capture sycophancy (Sharma et al., 2024), verbosity, or
+refusal rates, which are quantities that practitioners already monitor. Formalizing these as behavior
+measures and applying the BXRL framework would unify what the mechanistic interpretability
+community is already doing under an explicit explanatory lens. We refer to this broader program as
+Behavior-Explainable Artificial Intelligence (BXAI).
+User studies
+The XRL literature has a well-documented evaluation gap: Milani et al. (2024) found
+that comprehensibility and preferability are the least commonly evaluated metrics in XRL papers.
+Whether behavior-level explanations actually improve human understanding and decision-making
+in safety-critical domains remains an open empirical question. We echo Gyevnar & Towers (2025)
+in calling for objective success metrics and rigorous user studies as a prerequisite for claims of
+explanatory utility.
+To conclude, we argue that behavior is a missing level of abstraction in explainable reinforcement
+learning. Situated between single-action explanations and global policy summaries, behaviors cap-
+ture the recurring patterns that characterize what an agent tends to do. By defining the properties of
+behaviors and showing how existing XRL methods can be adapted to reveal them, this paper lays
+12
+the groundwork for BXRL and invites the community to develop and rigorously evaluate behavioral
+explanations.
+Acknowledgments
+We thank our colleagues for helpful discussions and feedback: David Aha, Nitay Alon, Ofra Amir,
+Eli Bronstein, Bálint Gyevnár, Alexandre Heuillet, David Manheim, Stephanie Milani, Tim Miller,
+and Georg Ostrovski.
+References
+Dan Amir and Ofra Amir. Highlights: Summarizing agent behavior to people. In AAMAS, pp.
+1168–1176, 2018.
+Yotam Amitai and Ofra Amir. A survey of global explanations in reinforcement learning. In Sil-
+via Tulli and David W. Aha (eds.), Explainable Agency in Artificial Intelligence: Research and
+Practice. CRC Press, 2024.
+Yotam Amitai, Guy Avni, and Ofra Amir. ASQ-IT: Interactive explanations for reinforcement-
+learning agents. Artificial Intelligence, 335:104182, 2024.
+Dario Amodei, Chris Olah, Jacob Steinhardt, Paul Christiano, John Schulman, and Dan Mané. Con-
+crete problems in AI safety. arXiv preprint arXiv:1606.06565, 2016.
+Brandon Araki, Xiao Li, Kiran Vodrahalli, Jonathan DeCastro, Micah J. Fry, and Daniela Rus. The
+logical options framework.
+In International Conference on Machine Learning, pp. 307–317.
+PMLR, 2021.
+Alejandro Barredo Arrieta, Natalia Díaz-Rodríguez, Javier Del Ser, Adrien Bennetot, Siham Tabik,
+Alberto Barbado, Salvador Garcia, Sergio Gil-Lopez, Daniel Molina, Richard Benjamins, Raja
+Chatila, and Francisco Herrera. Explainable artificial intelligence (XAI): Concepts, taxonomies,
+opportunities and challenges toward responsible AI. Information Fusion, 58:82–115, 2020.
+Akanksha Atrey, Kaleigh Clary, and David Jensen. Exploratory not explanatory: Counterfactual
+analysis of saliency maps for deep reinforcement learning. In International Conference on Learn-
+ing Representations, 2020.
+Osbert Bastani, Yewen Pu, and Armando Solar-Lezama. Verifiable reinforcement learning via policy
+extraction. In Advances in Neural Information Processing Systems, volume 31, pp. 2499–2509,
+2018.
+BBC News. Thousands of orders cancelled after ocado robot fire. https://www.bbc.com/
+news/business-57883332, July 2021.
+Daniel Beechey and Özgür ¸Sim¸sek. Approximating shapley explanations in reinforcement learning.
+In Advances in Neural Information Processing Systems, volume 39, 2025.
+Daniel Beechey, Thomas M. S. Smith, and Özgür ¸Sim¸sek. Explaining reinforcement learning with
+shapley values. In International Conference on Machine Learning, pp. 2003–2014. PMLR, 2023.
+Ioana Bica, Daniel Jarrett, Alihan Hüyük, and Mihaela van der Schaar. Learning “what-if” explana-
+tions for sequential decision-making. In International Conference on Learning Representations,
+2021.
+James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Chris Leary, Dougal
+Maclaurin, George Necula, Adam Paszke, Jake VanderPlas, Skye Wanderman-Milne, and Qiao
+Zhang. JAX: composable transformations of Python+NumPy programs, 2018. URL http:
+//github.com/google/jax.
+13
+Edoardo Conti, Vashisht Madhavan, Felipe Petroski Such, Joel Lehman, Kenneth O. Stanley, and
+Jeff Clune. Improving exploration in evolution strategies for deep reinforcement learning via a
+population of novelty-seeking agents. In Advances in Neural Information Processing Systems,
+volume 31, pp. 5027–5038, 2018.
+Giang Dao, Indrajeet Mishra, and Minwoo Lee. Deep reinforcement learning monitor for snapshot
+recording. In IEEE International Conference on Machine Learning and Applications (ICMLA),
+pp. 591–598. IEEE, 2018. DOI: 10.1109/ICMLA.2018.00095.
+Shripad V. Deshmukh, R. Srivatsan, Supriti Vijay, Jayakumar Subramanian, and Chirag Agarwal.
+Counterfactual explanation policies in RL. In ICML Workshop on Counterfactuals in Minds and
+Machines, 2023.
+Finale Doshi-Velez and Been Kim. Towards a rigorous science of interpretable machine learning.
+arXiv preprint arXiv:1702.08608, 2017.
+Matthew C. Fontaine and Stefanos Nikolaidis. Differentiable quality diversity. In Advances in
+Neural Information Processing Systems, volume 34, pp. 10040–10052, 2021.
+Timo Freiesleben and Gunnar König. Dear XAI community, we need to talk! fundamental miscon-
+ceptions in current XAI research. In World Conference on Explainable Artificial Intelligence, pp.
+48–65. Springer, 2023.
+Bryce Goodman and Seth Flaxman. European union regulations on algorithmic decision-making
+and a “right to explanation”. AI Magazine, 38(3):50–57, 2017.
+Balint Gyevnar and Mark Towers. Objective metrics for human-subjects evaluation in explainable
+reinforcement learning. In Multi-Disciplinary Conference on Reinforcement Learning and Deci-
+sion Making (RLDM), 2025.
+Carl G. Hempel. Aspects of Scientific Explanation and Other Essays in the Philosophy of Science.
+Free Press, New York, 1965.
+Alexandre Heuillet, Fabien Couthouis, and Natalia Díaz-Rodríguez. Explainability in deep rein-
+forcement learning. Knowledge-Based Systems, 214:106685, 2021.
+Yuzheng Hu, Fan Wu, Haotian Ye, David Forsyth, James Zou, Nan Jiang, Jiaqi W. Ma, and Han
+Zhao.
+A snapshot of influence: A local data attribution framework for online reinforcement
+learning. In Advances in Neural Information Processing Systems, volume 39, 2025.
+Sandy H. Huang, David Held, Pieter Abbeel, and Anca D. Dragan. Enabling robots to communicate
+their objectives. Autonomous Robots, 43(2):309–326, 2019.
+David Hume. An Enquiry Concerning Human Understanding. A. Millar, London, 1758. Originally
+published 1748 as Philosophical Essays Concerning Human Understanding; retitled 1758.
+Zoe Juozapaitis, Anurag Koul, Alan Fern, Mathias Erber, and Finale Doshi-Velez. Explainable rein-
+forcement learning via reward decomposition. In IJCAI/ECAI Workshop on Explainable Artificial
+Intelligence, 2019.
+Arne Kesting, Martin Treiber, and Dirk Helbing. MOBIL: General lane-changing model for car-
+following models. Transportation Research Record, 1999(1):86–94, 2007.
+W. Bradley Knox, Alessandro Allievi, Holger Banzhaf, Felix Schmitt, and Peter Stone. Reward
+(mis)design for autonomous driving. Artificial Intelligence, 316:103829, 2023.
+Solomon Kullback and Richard A. Leibler. On information and sufficiency. The Annals of Mathe-
+matical Statistics, 22(1):79–86, 1951.
+14
+Michael Laskin, Hao Liu, Xue Bin Peng, Denis Yarats, Aravind Rajeswaran, and Pieter Abbeel.
+CIC: Contrastive intrinsic control for unsupervised skill discovery. In Advances in Neural Infor-
+mation Processing Systems, volume 35, 2022.
+Joel Lehman and Kenneth O. Stanley. Abandoning objectives: Evolution through the search for
+novelty alone. Evolutionary Computation, 19(2):189–223, 2011.
+Edouard Leurent. An environment for autonomous driving decision-making. https://github.
+com/eleurent/highway-env, 2018.
+David Lewis. Causation. The Journal of Philosophy, 70(17):556–567, 1973.
+Peter Lipton. Contrastive explanation. Royal Institute of Philosophy Supplements, 27:247–266,
+1990.
+Elliot Meyerson, Joel Lehman, and Risto Miikkulainen.
+Learning behavior characterizations
+for novelty search. In Proceedings of the Genetic and Evolutionary Computation Conference
+(GECCO), pp. 149–156. ACM, 2016.
+Stephanie Milani, Nicholay Topin, Manuela Veloso, and Fei Fang. Explainable reinforcement learn-
+ing: A survey and comparative review. ACM Computing Surveys, 56(7):1–36, 2024.
+Tim Miller. Explanation in artificial intelligence: Insights from the social sciences. Artificial Intel-
+ligence, 267:1–38, 2019.
+Ofir Nachum, Yinlam Chow, Bo Dai, and Lihong Li. DualDICE: Behavior-agnostic estimation
+of discounted stationary distribution corrections. In Advances in Neural Information Processing
+Systems, volume 32, 2019.
+NHTSA.
+Safety recall report 25e-019:
+Zoox automated driving system.
+NHTSA Re-
+call Database, March 2025.
+URL https://static.nhtsa.gov/odi/rcl/2025/
+RCLRPT-25E019-8103.PDF. 258 vehicles recalled for unexpected hard braking; two mo-
+torcyclist rear-end collisions with minor injuries in May 2024 prompted NHTSA investigation.
+Jacopo Prisco.
+Why online supermarket ocado wants to take the human touch out
+of groceries,
+April 2021.
+URL https://www.cnn.com/2021/04/26/world/
+ocado-supermarket-robot-warehouse-spc-intl/index.html. Contains Alex
+Harvey quote: “We basically play chicken with them: they go on a collision course only to divert
+at the last moment.”.
+Garima Pruthi, Frederick Liu, Satyen Kale, and Mukund Sundararajan. Estimating training data
+influence by tracing gradient descent. In Advances in Neural Information Processing Systems,
+volume 33, pp. 19920–19930, 2020.
+Justin K. Pugh, Lisa B. Soros, and Kenneth O. Stanley. Quality diversity: A new frontier for evolu-
+tionary computation. Frontiers in Robotics and AI, 3:40, 2016.
+Nikaash Puri, Sukriti Verma, Piyush Gupta, Dhruv Kayastha, Shripad Deshmukh, Balaji Krishna-
+murthy, and Sameer Singh. Explain your move: Understanding agent actions using specific and
+relevant feature attribution. In International Conference on Learning Representations, 2020.
+Marco Tulio Ribeiro, Sameer Singh, and Carlos Guestrin. “why should i trust you?”: Explaining the
+predictions of any classifier. In ACM SIGKDD International Conference on Knowledge Discovery
+and Data Mining, pp. 1135–1144, 2016.
+Rishav Rishav, Somjit Nath, Vincent Michalski, and Samira Ebrahimi Kahou. Behaviour discov-
+ery and attribution for explainable reinforcement learning. Transactions on Machine Learning
+Research, 2025.
+15
+Kevin Roose. A conversation with Bing’s chatbot left me deeply unsettled. The New York Times,
+February 2023.
+URL https://www.nytimes.com/2023/02/16/technology/
+bing-chatbot-microsoft-chatgpt.html.
+Documents 2-hour conversation where
+Bing’s “Sydney” persona declared love, expressed dark fantasies, and attempted to convince au-
+thor to leave his wife.
+Gilbert Ryle. The Concept of Mind. Hutchinson, London, 1949.
+Léo Saulières, Vincent Moens, Francisco Erivaldo Fernandes Cisneros, Edan Kfir, Martin Abgrall,
+David Bensoussan, Natasha Alechina, and Brian Logan. A survey of explainable reinforcement
+learning: Targets, methods and needs. arXiv preprint arXiv:2507.12599, 2025.
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy
+optimization algorithms. arXiv preprint arXiv:1707.06347, 2017.
+Mrinank Sharma, Meg Tong, Tomasz Korbak, David Duvenaud, Amanda Askell, Samuel R Bow-
+man, Newton Cheng, Esin Durmus, Zac Hatfield-Dodds, Scott R Johnston, et al. Towards under-
+standing sycophancy in language models. In International Conference on Learning Representa-
+tions, 2024.
+Laixi Shi and Yuejie Chi. Distributionally robust model-based offline reinforcement learning with
+near-optimal sample complexity. Journal of Machine Learning Research, 25, 2024.
+Sarath Sreedharan, Utkarsh Soni, Mudit Verma, Siddharth Srivastava, and Subbarao Kambhampati.
+Bridging the gap: Providing post-hoc symbolic explanations for sequential decision-making prob-
+lems with inscrutable representations. In International Conference on Learning Representations,
+2022.
+Richard S. Sutton, Doina Precup, and Satinder Singh. Between MDPs and semi-MDPs: A frame-
+work for temporal abstraction in reinforcement learning. Artificial Intelligence, 112(1–2):181–
+211, 1999.
+Martin Treiber, Ansgar Hennecke, and Dirk Helbing. Congested traffic states in empirical observa-
+tions and microscopic simulations. Physical Review E, 62(2):1805–1824, 2000.
+Stratis Tsirtsis, Abir De, and Manuel Gomez-Rodriguez. Counterfactual explanations in sequen-
+tial decision making under uncertainty. In Advances in Neural Information Processing Systems,
+volume 34, pp. 30127–30139, 2021.
+Abhinav Verma, Vijayaraghavan Murali, Rishabh Singh, Pushmeet Kohli, and Swarat Chaudhuri.
+Programmatically interpretable reinforcement learning. In International Conference on Machine
+Learning, pp. 5045–5054. PMLR, 2018.
+George A. Vouros. Explainable deep reinforcement learning: State of the art and challenges. ACM
+Computing Surveys, 55(5):1–39, 2022.
+Junpeng Wang, Liang Gou, Han-Wei Shen, and Hao Yang. DQNViz: A visual analytics approach
+to understand deep q-networks. IEEE Transactions on Visualization and Computer Graphics, 25
+(1):288–298, 2019.
+Wendy Wood and Dennis Rünger. Psychology of habit. Annual Review of Psychology, 67:289–314,
+2016.
+James Woodward. Making Things Happen: A Theory of Causal Explanation. Oxford University
+Press, Oxford, 2003.
+Shuang Wu, Jian Yao, Haobo Fu, Ye Tian, Chao Qian, Yaodong Yang, Qiang Fu, and Wei Yang.
+Quality-similar diversity via population based reinforcement learning. In International Confer-
+ence on Learning Representations, 2023.
+16
+Amy Zhang, Rowan McAllister, Roberto Calandra, Yarin Gal, and Sergey Levine. Learning invari-
+ant representations for reinforcement learning without reconstruction. In International Confer-
+ence on Learning Representations, 2021.
+Ruiyi Zhang, Bo Dai, Lihong Li, and Dale Schuurmans. GenDICE: Generalized offline estimation
+of stationary values. In International Conference on Learning Representations, 2020.
+Ruijie Zheng, Yongyuan Du, Zhaowei Liang, Fengying Bao, Shuang Huang, Kaixuan Li, and Sergey
+Levine. PRISE: LLM-style sequence compression for learning temporal action abstractions in
+control. In International Conference on Machine Learning, 2024.
+A
+HighJax Environment Rules
+HighJax is a port of the highway-v0 setting, in which the agent controls a vehicle navigating a
+four-lane highway with fifty other vehicles ahead. The agent’s vehicle is also called the ego vehicle.
+Action space
+The highway-v0 setting has a discrete action space: LEFT, IDLE, RIGHT, FASTER
+and SLOWER. These are interpreted by the environment into smooth movements. The environment
+state includes a discrete target lane and target speed. The latter is one of three options: 20 m/s, 25
+m/s, and 30 m/s. Each action increments, decrements or sustains either the target lane or speed. The
+target lane and speed are interpreted by two proportional controllers into smooth acceleration and
+steering movements. These controllers operate 15 times per timestep.
+Other vehicles
+The other vehicles are controlled by three predefined algorithms: (1) acceleration
+is determined by the Intelligent Driver Model (IDM) algorithm (Treiber et al., 2000), (2) high-level
+lane-changing decisions are determined by the MOBIL algorithm (Kesting et al., 2007), and (3)
+low-level steering actions are determined by a proportional controller. Each vehicle has randomized
+IDM parameters for variety.
+Reward structure
+The agent is rewarded for avoiding collisions, driving fast, and staying as close
+to the rightmost lane as possible. The reward at each timestep is
+rt = −1 · 1[collision] + 0.4 · ˜vt + 0.1 · ˜ℓt
+where ˜vt = clip((vt −20)/10, 0, 1) is the normalized forward speed (0 at ≤20 m/s, 1 at ≥30 m/s)
+and ˜ℓt = ℓt/3 is the normalized lane index (0 for leftmost, 1 for rightmost). For benchmarking we
+report the normalized reward (rt + 1)/1.5 ∈[0, 1].
+Collision detection
+Collisions are detected via the Separating Axis Theorem on oriented bounding
+boxes, and they terminate the episode.
+Observations
+The observation is a matrix O ∈R5×5 with the following data for the ego vehicle
+and the four closest vehicles ahead: presence, x, y, vx, and vy. The rows for non-ego vehicles are in
+relative coordinates.
+B
+Collision Behavior Observations
+Table 4 lists the six observation matrices used to define the collision behavior measure mc (Eq. 4).
+Each observation was selected from a training run at the indicated epoch and timestep, corresponding
+to a moment two timesteps before a collision. All values are normalized: positions and velocities
+for non-ego vehicles are relative to the ego vehicle.
+17
+Table 4: Observation matrices for the six scenarios defining the collision behavior measure mc
+(Eq. 4). Each matrix O ∈R5×5 contains the ego vehicle (absolute) and four nearest NPCs (relative).
+Columns: presence, longitudinal position, lateral position, longitudinal velocity, lateral velocity.
+(a) Scenario 1: LEFT (epoch 148, t = 226)
+pres.
+x
+y
+vx
+vy
+ego
+1.000
+1.000
+0.750
+0.373
+0
+npc0
+1.000
+0.057
+-0.500
+-0.089
+0
+npc1
+1.000
+0.086
+-0.250
+-0.091
+0
+npc2
+1.000
+0.133
+0
+-0.074
+0
+npc3
+1.000
+0.636
+-0.500
+-0.088
+0
+(b) Scenario 2: LEFT (epoch 221, t = 118)
+pres.
+x
+y
+vx
+vy
+ego
+1.000
+1.000
+0.750
+0.375
+0
+npc0
+1.000
+-0.024
+-0.750
+-0.107
+0
+npc1
+1.000
+0.047
+-0.500
+-0.113
+0
+npc2
+1.000
+0.072
+-0.250
+-0.102
+0
+npc3
+1.000
+0.336
+-0.750
+-0.106
+0
+(c) Scenario 3: RIGHT (epoch 92, t = 102)
+pres.
+x
+y
+vx
+vy
+ego
+1.000
+1.000
+0
+0.311
+0
+npc0
+1.000
+-0.003
+0.750
+-0.036
+0
+npc1
+1.000
+0.063
+0.500
+-0.061
+0
+npc2
+1.000
+0.189
+0
+-0.057
+0
+npc3
+1.000
+0.326
+0.250
+-0.048
+0
+(d) Scenario 4: RIGHT (epoch 111, t = 142)
+pres.
+x
+y
+vx
+vy
+ego
+1.000
+1.000
+0.003
+0.323
+-0.002
+npc0
+1.000
+0.053
+0.497
+-0.063
+0.002
+npc1
+1.000
+0.121
+-0.003
+-0.066
+0.002
+npc2
+1.000
+0.182
+0.247
+-0.055
+0.002
+npc3
+1.000
+0.335
+0.747
+-0.073
+0.002
+(e) Scenario 5: FASTER (epoch 81, t = 233)
+pres.
+x
+y
+vx
+vy
+ego
+1.000
+1.000
+0.750
+0.259
+0
+npc0
+1.000
+0.010
+-0.500
+0.001
+0
+npc1
+1.000
+-0.026
+-0.250
+0.013
+0
+npc2
+1.000
+0.066
+0
+0.005
+0
+npc3
+1.000
+0.131
+-0.750
+-0.003
+0
+(f) Scenario 6: FASTER (epoch 117, t = 130)
+pres.
+x
+y
+vx
+vy
+ego
+1.000
+1.000
+0.750
+0.321
+0
+npc0
+1.000
+-0.021
+-0.750
+-0.066
+0
+npc1
+1.000
+-0.023
+-0.250
+-0.067
+0
+npc2
+1.000
+0.088
+0
+-0.066
+0
+npc3
+1.000
+0.191
+-0.500
+-0.053
+0
+18

@@ -1,0 +1,2553 @@
+Free-Lunch Long Video Generation via Layer-Adaptive O.O.D Correction
+Jiahao Tian
+Chenxi Song*
+Wei Cheng
+Chi Zhang†
+Westlake University
+Abstract
+Generating long videos using pre-trained video diffusion
+models, which are typically trained on short clips, presents
+a significant challenge.
+Directly applying these models
+for long-video inference often leads to a notable degra-
+dation in visual quality. This paper identifies that this is-
+sue primarily stems from two out-of-distribution (O.O.D)
+problems: frame-level relative position O.O.D and context-
+length O.O.D. To address these challenges, we propose
+FreeLOC, a novel training-free, layer-adaptive framework
+that introduces two core techniques: Video-based Relative
+Position Re-encoding (VRPR) for frame-level relative po-
+sition O.O.D, a multi-granularity strategy that hierarchi-
+cally re-encodes temporal relative positions to align with
+the model’s pre-trained distribution, and Tiered Sparse At-
+tention (TSA) for context-length O.O.D, which preserves
+both local detail and long-range dependencies by structur-
+ing attention density across different temporal scales. Cru-
+cially, we introduce a layer-adaptive probing mechanism
+that identifies the sensitivity of each transformer layer to
+these O.O.D issues, allowing for the selective and efficient
+application of our methods. Extensive experiments demon-
+strate that our approach significantly outperforms existing
+training-free methods, achieving state-of-the-art results in
+both temporal consistency and visual quality. Code is avail-
+able at https://github.com/Westlake-AGI-Lab/FreeLOC.
+1. Introduction
+Video generation has been established as a core research
+problem in computer vision and generative modeling due
+to its utility in content creation, simulation, education, and
+interactive media. In recent years, extensive research has
+been conducted in this area, where video diffusion mod-
+els [1, 4, 7, 8, 16, 29, 32, 34, 37] have made remarkable
+progress.
+Benefiting from training on a large collection
+of annotated video data, these models can generate high-
+quality videos that are nearly indistinguishable from reality.
+* denotes project lead. † denotes corresponding author.
+Emails: {tianjiahao, chizhang}@westlake.edu.cn
+Despite impressive generation quality, most video diffu-
+sion models are designed for short clips. Directly generat-
+ing longer videos causes significant degradation due to the
+discrepancy between training and inference lengths. While
+retraining models is computationally prohibitive, existing
+training-based autoregressive (AR) methods [3, 10, 11, 30,
+38, 39] still struggle to match the quality of native short
+video generation, posing an open challenge.
+Recently, increasing attention has been directed toward
+training-free approaches that adapt an off-the-shelf short
+video diffusion model to a long video generator at in-
+ference time.
+A popular line of work [2, 25, 33] par-
+titions the target video into multiple temporally overlap-
+ping clips using a sliding window, and processes these
+clips in an asynchronous or tiled fashion. While such ap-
+proaches effectively maintain consistency within localized
+video segments, the inherent constraints of the sliding win-
+dow paradigm restrict interactions between distant frames
+and consequently impair global temporal coherence. Other
+works [19, 21, 22] attempt to generate long videos in a sin-
+gle pass, and video quality is subsequently refined by ma-
+nipulating latents to balance spatial detail against temporal
+consistency. However, these empirical designs are still sub-
+optimal and may still produce artifacts such as identity drift,
+inconsistent lighting, or abrupt scene transitions. Moreover,
+most existing training-free pipelines are built upon UNet-
+based diffusion architectures, making them incompatible
+with state-of-the-art DiT-based models such as Wan [32].
+In this paper, we focus on training-free long video gen-
+eration using DiT-based diffusion models and address this
+challenge from three complementary perspectives. Firstly,
+when extending video diffusion transformers to generate se-
+quences substantially longer than their pre-trained tempo-
+ral window, the 3D relative positional encodings (RoPE),
+inevitably fall outside the distribution encountered dur-
+ing training.
+This frame-level relative position out-of-
+distribution (O.O.D) phenomenon causes the model to mis-
+interpret temporal dependencies, leading to degraded qual-
+ity. This issue mirrors the extrapolation problem in RoPE-
+based LLMs [5, 9, 13].
+However, naive solutions from
+LLMs like clipping [9] or grouping [13] fail for video
+because they overlook the hierarchical nature of video’s
+arXiv:2603.25209v1  [cs.CV]  26 Mar 2026
+temporal dependencies: nearby frames require fine-grained
+precision for local dynamics, whereas distant frames con-
+tribute to global coherence. To address this, we introduce
+Video-based Relative Position Re-encoding (VRPR), a
+multi-granularity scheme that adaptively remaps out-of-
+range frame-level relative positions back into the model’s
+familiar domain with varying precision, preserving both
+short-range fidelity and long-range consistency.
+While VRPR alleviates the positional extrapolation is-
+sue, generating significantly longer videos can induce an-
+other O.O.D problem that we refer to as context-length
+O.O.D problem. As the temporal sequence grows, the ex-
+pansion of attention tokens leads to overly diffused atten-
+tion distributions and increased attention entropy, weaken-
+ing the model’s ability to focus on informative local re-
+gions. Existing methods, such as fixed sliding-window at-
+tention [19, 22, 25], effectively constrain the receptive field
+but fail to capture long-range temporal dependencies. To
+address this trade-off, following the application of VRPR,
+we introduce Tiered Sparse Attention (TSA), a hierarchi-
+cal attention mechanism that adaptively allocates attention
+density across temporal scales. TSA preserves dense at-
+tention within short temporal neighborhoods to maintain
+fine-grained visual details, while employing progressively
+narrower striped attention patterns for more distant ones to
+sustain global coherence. This tiered design ensures that
+the model allocates sufficient attention to both local motion
+cues and long-range dependencies without overwhelming
+the attention space.
+Although VRPR and TSA effectively alleviate frame-
+level relative position and context-length O.O.D issues re-
+spectively, applying them uniformly across all transformer
+layers neglects the heterogeneous roles and sensitivities of
+individual layers in video DiTs. To better understand this
+issue, we conduct a detailed empirical study to quantify
+each layer’s sensitivity to these O.O.D effects. Specifically,
+we develop an automatic probing mechanism that quantifies
+the sensitivity of each DiT’s self-attention layer to the two
+O.O.D sources. Building upon this, we introduce a training-
+free layer-adaptive O.O.D correction (FreeLOC) for long
+video generation, which selectively applies VRPR and TSA
+to the most responsive layers. For frame-level relative po-
+sition sensitive layers, we utilize aforementioned VRPR to
+mitigate frame-level relative position O.O.D problems. For
+context-length sensitive layers, we employ TSA to constrain
+the context length following VRPR. This targeted adapta-
+tion ensures that positional and contextual corrections are
+applied precisely where they are most effective, enhancing
+long-video stability and generation quality.
+To validate the effectiveness of FreeLOC, we conduct
+extensive experiments. The results demonstrate that Free-
+LOC substantially outperforms existing training-free base-
+lines in both visual fidelity and temporal consistency. In
+summary, this paper makes the following contributions:
+• We propose a Video-based Relative Position Re-encoding
+(VRPR) strategy that remaps frame-level relative posi-
+tions into the pre-trained range, effectively mitigating
+frame-level relative-position O.O.D issues.
+• We introduce a Tiered Sparse Attention (TSA) mecha-
+nism that preserves the attention distribution under ex-
+tended context lengths, maintaining a balance between
+local detail and global temporal coherence.
+• We design a layer-adaptive strategy named FreeLOC
+which guided by automatic layer sensitivity probing, en-
+abling selective and efficient application of our methods
+for optimal performance.
+• Extensive experiments verify that FreeLOC achieves
+state-of-the-art results among training-free approaches
+for long video generation.
+2. Related Work
+Video Diffusion Model.
+Recently, significant progress
+has been made in video diffusion models [1, 4, 7, 8, 16,
+27, 29, 32, 34, 37], allowing for the synthesis of high-
+resolution videos that maintain coherent visual and motion
+continuity over dozens of frames. Early approaches adapted
+pre-trained Unet-based text-to-image (T2I) diffusion mod-
+els [26]. These models were enhanced with temporal at-
+tention mechanisms to capture the dependencies between
+video frames. A major milestone in generative modeling
+was the emergence of Diffusion Transformers (DiT) [23],
+which offer strong scalability and performance. Building
+on this architecture, recent state-of-the-art video diffusion
+models such as CogVideoX [37], Mochi [29], Hunyuan-
+Video [16], LTX-Video [8], MovieGen [24], and Wan [32]
+have achieved impressive results. However, these video DiT
+models remain limited to short durations, as they are trained
+only on short clips.
+Long Video Generation.
+The significant computational
+demands associated with training DiT-based architectures
+have largely confined the output video to a brief duration
+around 5 seconds. In response to this limitation, several
+training-based approaches [3, 6, 10, 11, 17, 20, 30, 36, 38,
+39] have adopted an autoregressive mechanism to produce
+longer videos. In addition to these improvements, training-
+free approaches [2, 15, 19, 21, 22, 25, 28, 33, 40] for
+adapting pre-trained short video models to generate long-
+duration videos have attracted increasing interest. For in-
+stance, some methods [2, 25, 33] extend video length by
+integrating overlapping segments through a sliding-window
+technique.
+Other methods [21, 22, 28] explore to iden-
+tify key components of videos through principal compo-
+nent analysis or frequency analysis during generation and
+improve output quality by progressively mixing these com-
+ponents.
+Closely related to our work, RIFLEx [40] and
+LongDiff [19] modify positional embeddings to mitigate
+frame repetition and quality degradation.
+However, RI-
+FLEx only supports 2× length extension, while LongDiff,
+designed for U-Nets, relies on a heuristic mapping that re-
+quires 16× attention recomputation, making it impractical
+for Video DiTs. More importantly, both methods apply uni-
+form modifications across all layers, ignoring their hetero-
+geneous roles.
+3. Method
+As illustrated in Figure 1, we propose FreeLOC, a layer-
+adaptive, training-free framework to solve the two O.O.D
+challenges in long video generation with pre-trained DiT
+models.
+3.1. Preliminaries
+Self-Attention in Video DiT Blocks. Leading DiT based
+video generation models, such as Wan [32], Hunyuan-
+Video [16] and CogvideoX [37], leverage a full self-
+attention [31] Transformer framework to effectively model
+spatiotemporal dependencies within video sequences. Such
+mechanism is formally computed as follows:
+Attention(Q, K, V ) = softmax
+RoPE(Q)RoPE(K)⊤
+√
+d
+
+V ,
+(1)
+where Q, K, V are query, key, value tokens obtained by
+applying three separate projection matrices to the video to-
+kens, and d is the key dimensionality.
+RoPE in Equation 1 injects relative spatial and tem-
+poral positional information directly into the query and
+key tokens before the computation of attention score. For
+long video generation, only the relative positional informa-
+tion along the temporal dimension needs to be considered.
+Specifically, for a query frame at index i and a key frame
+at index j, their relative position is given by Pori = i −j.
+For a video sequence of length L, where both query and key
+frames are assigned indices from 0 to L−1, the comprehen-
+sive extent of all possible relative positions p is delimited by
+the interval [−(L −1), L −1].
+3.2. Frame-level relative-position O.O.D
+State-of-the-art video DiT models rely on 3D-RoPE for
+modeling spatio-temporal relations. However, when gen-
+erating videos longer than the pre-trained duration, frame-
+level relative positions fall outside the training distribution.
+This frame-level relative-position O.O.D forces the model
+to extrapolate RoPE [5, 40], leading to degraded quality and
+temporal inconsistency. This problem parallels the RoPE
+extrapolation issue in LLMs [5, 9, 13], where extended
+sequence lengths mis-align positional relationships. Prior
+fixes such as clipping [9] or grouping [13] restrict posi-
+tions to the pre-trained range, but they fail to capture the
+hierarchical temporal structure of videos, resulting in over-
+smoothed motions or loss of long-range coherence.
+To address this, we introduce Video-based Relative Po-
+sition Re-encoding (VRPR), a multi-granularity strategy
+that remaps O.O.D relative positions back into the pre-
+trained range. The design of VRPR is motivated by the
+empirical observation that the magnitude of attention in
+video DiTs decays as the temporal distance between frames
+increases [18]. This suggests that nearby frames require
+high-precision positional information for detail, while dis-
+tant frames contribute more to global coherence and can be
+represented with lower precision. Building on this, VRPR
+employs a multi-granularity re-encoding scheme that ad-
+justs the precision of relative position information based on
+frame distance |i −j| between frame i and frame j. As il-
+lustrated in the green block of Figure 1 (with more details
+provided in the supplementary), the re-encoding process is
+structured into three distinct granularities:
+Fine-Grained Re-Encoding.
+For short-range dependen-
+cies within a local window W1 (|i −j| ≤W1), the orig-
+inal relative positions are retained to fully exploit high-
+frequency temporal information essential for motion con-
+tinuity and detail preservation.
+Medium-Grained Re-Encoding: For frames at moderate
+temporal distances (W1 < |i −j| ≤W2), where attention
+is weaker, we apply a quantized re-encoding. This reduces
+positional resolution while maintaining the relative order.
+The original relative position Pori = i −j is mapped to a
+new position P. Specifically, a FLOOR (⌊·⌋) operation is
+applied to their relative positions. This operation groups
+several frames together, treating them as being at the same
+relative distance. We use a group size of G1 to quantize
+every G1 frames to the same relative position, formulated
+as follows:
+P =
+Pori
+G1
+
++ Pori
+|Pori|(W1 −
+W1
+G1
+
+),
+(2)
+where | · | denotes the absolute value symbol. This quanti-
+zation compresses mid-range positions into a coarser granu-
+larity, aligning them with the pre-trained range while main-
+taining the relative order. Such representation facilitates a
+smooth transition of relative positions from the fine-grained
+to the medium-grained re-encoding area, e.g., relative posi-
+tion W1 −1 transitions smoothly to W1. This coarser re-
+encoding aids in managing the relationships between more
+distant tokens while retaining a moderate level of positional
+detail, thereby balancing visual details with temporal con-
+sistency.
+Coarse-Grained Re-Encoding. For frames at long tempo-
+ral distances (|i −j| > W2), the attention primarily serves
+to maintain global coherence, we apply a more aggressive
+quantization with a larger group size G2.
+This strongly
+compresses the positional range of distant frames, retaining
+only their approximate ordering, and the formal formulation
+is as follows:
+Self-Attention Layer
+Cross-Attention Layer
+DiT Block i
+If Sensitive to context-length O.O.D
+Self-Attention Layer
+Cross-Attention Layer
+DiT Block j
+Self-Attention Layer
+Cross-Attention Layer
+DiT Block i+1
+…
+…
+…
+Sampling Step T
+Q
+V
+K
+Relative Position 
+Re-encode via VRPR
+V
+𝑧!
+TSA
+Attention Logits
+If only Sensitive to frame-level relative position O.O.D
+Offline Layer-wise Probing Procedure for Two O.O.D
+Q
+K
+V
+Attention
+Computation
+RoPE’s Relative 
+Position Re-ecoding
+VRPR: Video-based Relative Position Re-encoding
+Tiered Sparse Attention Mask
+TSA: Tiered Sparse Attention
+×T
+Iterative 
+Denoising
+𝑧
+𝑧!
+𝑧
+Figure 1. Overview of FreeLOC. FreeLOC employs an offline, layer-wise probing procedure to identify DiT layers sensitive to two O.O.D
+sources: context-length O.O.D and frame-level relative position O.O.D. For layers only sensitive to frame-level relative position, we apply
+VRPR strategy to hierarchically remap out-of-range positions back into the pre-trained domain. For layers sensitive to context-length, we
+utilize TSA combined with VRPR to balance local detail and global coherence. Zoom in for better view.
+P =
+Pori
+G2
+
++ Pori
+|Pori|(W2 −
+W2
+G2
+
+−
+W2 −W1
+G1
+
+),
+(3)
+This operation compresses the positional range of distant
+frames, effectively mapping them back into the pre-trained
+positional domain while retaining their approximate order-
+ing.
+This coarse quantization preserves global temporal
+alignment without causing perceptual drift.
+By employing aforementioned multi-level re-encoding,
+the VRPR framework effectively constrains the frame-level
+relative positions to the pre-trained range of the video DiT.
+This approach, which aligns with the inherent characteris-
+tics of attention decay, allows for the generation of long
+videos that better capture local details while preserving
+global consistency.
+3.3. Context-length O.O.D
+Even with VRPR mapping relative positions back into the
+pre-trained range, generating very long videos still causes
+blurred details.
+This occurs because extremely long to-
+ken sequences expand the softmax domain, making atten-
+tion weights overly diffuse and weakening fine-grained mo-
+tion cues.
+Recent studies in LLMs [9] and image mod-
+els [14] show that such attention diffusing manifests as in-
+creased attention entropy, which correlates with degraded
+generation quality. The same effect appears in video (with
+details shown in supplementary), which we term context-
+length O.O.D. A common remedy is fixed-length sliding-
+window attention [19, 22, 25], which preserves local de-
+tails but breaks long-range temporal dependencies, harming
+global video consistency.
+To address this, we propose Tiered Sparse Attention
+(TSA), a hierarchical attention mechanism designed to re-
+strict the effective context length within the pre-trained
+range while preserving long-term consistency.
+TSA op-
+erates at multiple temporal granularities, analogous to the
+multi-level hierarchy in VRPR, and incorporates an atten-
+tion sink that serves as a persistent global anchor. Here, we
+still define temporal distance between two frame i and j as
+|i −j|. A visualization of the mask structure is provided in
+blue area of Figure 1.
+Local Window Attention.
+For short-term dependencies
+(temporal distance |i −j| ≤D1), a standard, dense self-
+attention window D1 is used. This ensures that fine details
+and rapid, local motions are captured with high fidelity.
+Striped Attention for Mid-Range Dependencies.
+For
+medium-range dependencies (D1 < |i −j| ≤D2), TSA
+introduces a striped attention pattern. This design is moti-
+vated by the empirical observation in video DiTs [18] that
+beyond local spatial space, high attention scores often oc-
+cur between tokens at corresponding spatial locations across
+frames, which is crucial for temporal coherence. Specifi-
+cally, as illustrated in TSA part of Figure 1, our striped at-
+tention utilize shrunk window size Ds to enable a token at
+a specific spatial position to interact with tokens in the sim-
+ilar spatial locations across frames. This striped approach
+effectively reduces the context length while simultaneously
+expanding the temporal receptive field to enhance temporal
+consistency. While local window attention captures rapid
+motion, striped attention aggregates context to ensure sub-
+ject and scene consistency, striking a balance between detail
+preservation and temporal consistency.
+Long-Range Pruning & Attention Sink. For long-range
+interactions (|i −j| > D2), direct attention is pruned. This
+decision is based on our subsequent empirical finding that
+interactions with overly distant tokens can lead to a degra-
+dation of details. To ensure global consistency, TSA des-
+ignates the initial frame as an attention sink. Tokens from
+all subsequent frames are permitted to attend to this first
+frame, which acts as a persistent global anchor, enforcing
+long-term coherence throughout the entire sequence.
+Specifically, we construct a 4D attention mask
+˜
+M ∈
+{1, 0}f×f×n×n shown in the TSA part of Figure 1 , where
+f denotes the frame number and n denotes the number of
+tokens per frame. Here, each element ˜
+Mi,j,k,l = 1 indicates
+that the token at spatial position k in frame i is permitted
+to attend to the token at position l in frame j. Conversely,
+˜
+Mi,j,k,l = 0 denotes that attention between the token pair
+is suppressed. The aforementioned TSA attention mask is
+constructed as follows:
+˜
+Mi,j,k,l =
+
+
+
+
+
+
+
+1,
+if |i −j| < D1 or j = 0
+1,
+if D1 ≤|i −j| < D2 and |k −l| < Ds
+0,
+otherwise
+(4)
+Specifically, Ds = ⌊
+nD1
+α(D2−D1)⌋. This implies that the
+actual token computation is reduced by a factor of α com-
+pared to the standard window size. By limiting the total
+number of tokens participating in the attention mechanism,
+TSA avoids the dilution of attention weights, which en-
+hances the preservation of both visual and motion details.
+More importantly, this design expands the temporal recep-
+tive field for interactions, enabling better temporal consis-
+tency compared to the conventional sliding window atten-
+tion mechanism. Consequently, TSA achieves a superior
+balance between temporal coherence and the fine-grained
+details in the generated video.
+3.4. Layer-wise Probing Procedure for Two O.O.D
+Issues
+While VRPR and TSA address two O.O.D issues, applying
+them uniformly across all layers ignores the heterogeneous
+sensitivities within video DiTs. Some layers are far more
+affected by positional shifts, while others are more vulnera-
+ble to long-context expansion, making uniform application
+suboptimal. To characterize these differences, we conduct a
+layer-wise probing analysis on Wan2.1-T2V-1.3B [32]. The
+results show that self-attention layers exhibit markedly dif-
+ferent sensitivities to the two O.O.D sources. The subsec-
+tions below describe the probing design and sensitivity met-
+rics for each case.
+Probing Layer-wise Sensitivity to Frame-level Relative
+Position O.O.D. To study this O.O.D issue, we design an
+automated probing procedure that quantifies the importance
+of relative position information in each self-attention layer.
+We first generate M diverse prompts and synthesize N orig-
+inal videos for each, using the default pre-trained length
+(81 frames for Wan2.1-T2V-1.3B). We then create a cor-
+responding set of probing videos, generated with the same
+length but with a controlled perturbation applied to only
+one self-attention layer at a time. The perturbation mod-
+ifies the RoPE only for keys K while keeping queries Q
+unchanged (equivalent to shifting Q alone).
+This selec-
+tively alters frame-level relative positions in that layer, sim-
+ulating values beyond the pre-trained range. We evaluate
+four frame-level shifts, ±20 and ±40. For example, a +20
+shift moves the default position index of K from [0, 20]
+to [20, 40], changing the relative position interval from the
+trained [−20, 20] to an O.O.D range [−40, 0].
+Following the acquisition of all 4 × M × N sets of orig-
+inal videos and probing videos, we employ two metrics to
+quantify each layer’s sensitivity. First, we measure the aver-
+age Vision Reward [35] (higher is better) for each probing
+videos which approximates the human rating of the gener-
+ated probing videos’ quality after shifting frame-level posi-
+tion. A lower Vision Reward score signifies that the layer is
+sensitive to frame-level relative position O.O.D, as genera-
+tion quality deteriorates when encountering untrained rela-
+tive positions.
+Moreover, it is observed in LLMs’ extrapolation [9, 13]
+that relative positions O.O.D in RoPE can induce signifi-
+cant fluctuations in the distribution of attention logits. We
+compute the average attention logits wi across all heads
+and sampling steps for each layer i.
+Here we measure
+the Attention Logits Difference (ALD) as the metric which
+is defined as the relative norm of the difference between
+the logits of the probing and original videos:∥wprobing
+i
+−
+woriginal
+i
+∥/ |woriginal
+i
+∥. A higher ALD indicates a substantial
+change in the attention mechanism’s behavior, signifying
+high sensitivity to positional O.O.D. The statistical results
+are shown in Figure 2. Moreover, Figure 3 illustrates the vi-
+sualization outcomes for Layer 18 which is most insensitive
+to frame-level relative position O.O.D and Layer 28 which
+is most sensitive to frame-level relative position O.O.D.
+Probing Layer-wise Sensitivity to Context Length
+O.O.D. Following the aforementioned probing approach,
+we also employ M diverse textual descriptions for video
+generation and each generate N videos leveraging different
+random seed. Specifically, to probe layer-wise sensitivity
+to context length O.O.D, we first generate original videos
+by extending the sequence length longer than pre-trained
+length while restricting the frame-level relative positions
+within the pre-trained range utilizing VRPR. Subsequently,
+building upon this configuration, we generate the probing
+(a) Vision Reward for each probing layer
+(b) Attention Logits Difference for each probing layer
+Figure 2. Sensitivity analysis for each layer during frame-level
+relative position O.O.D probing.
+(a) Vision Reward for each
+probing layer. A lower score indicates that the layer is more sen-
+sitive to frame-level relative position O.O.D. (b) Attention Logits
+Difference (ALD) for each probing layer. A higher value indicates
+a significant change in the behavior of the attention mechanism,
+signifying high sensitivity to positional O.O.D.
+Original
+Layer 18
+Layer 28
+Figure 3. Layer-wise sensitivity to frame-level relative-position
+O.O.D. The figure compares the original video with probing out-
+puts from Layer 18 (low sensitivity) and Layer 28 (high sensi-
+tivity). Stronger sensitivity leads to noticeable distortions when
+relative-position shifts are applied.
+video by employing a layer-by-layer conventional sliding
+window attention mechanism. This approach confines the
+context length of each layer to the pre-trained range, while
+the self-attention configurations of the other layers remain
+unchanged. For the probing results presented below, we em-
+ployed a simple yet generalizable pre-training length exten-
+sion factor of 2×, as similar patterns were observed with
+other scaling factors (like 3×, 4×).
+To quantify the impact of the extended context, we lever-
+age attention entropy as a diagnostic tool. Attention entropy
+measures the uniformity of the attention distribution within
+the self-attention mechanism [9, 14], and it has been ob-
+served that attention entropy tends to increase as the context
+length grows because of the dispersed attention. Following
+this, we define a Context Length Sensitivity Score, Si, for
+each layer i. This score is formulated as the relative dif-
+ference between the attention entropy Horiginal
+i
+computed in
+layer i’s self-attention in the original video and the attention
+entropy Hprobing
+i
+computed in layer i’s self-attention in the
+probing video. The formulation is as follows:
+Si = ∥Hprobing
+i
+−Horiginal
+i
+∥
+∥Horiginal
+i
+∥
+,
+(5)
+0
+5
+10
+15
+20
+25
+30
+Layer Index
+0.06
+0.07
+0.08
+0.09
+0.10
+0.11
+0.12
+0.13
+0.14
+0.15
+Context Length Sensitivity Score
+0.07
+0.08
+0.09
+0.10
+0.11
+0.12
+0.13
+0.14
+Context Length Sensitivity Score
+Figure 4. Layer-wise sensitivity to context-length O.O.D mea-
+sured via attention entropy differences.
+This metric provides a normalized measure of how signif-
+icantly the attention distribution at a specific layer is per-
+turbed by the increase in context length. A low Si indicates
+that the layer’s attention mechanism maintains a similar dis-
+tribution regardless of whether it processes the full extended
+context or a constrained one, thereby demonstrating insen-
+sitivity to context length O.O.D. Conversely, a high value
+of Si indicates significant variation in the layer’s attention
+distribution with changing context length, suggesting sensi-
+tivity to context-length O.O.D. The probing result is shown
+in Figure 4.
+3.5. FreeLOC: Layer-Adaptive O.O.D Correction
+Strategies for Long Video Generation
+Building upon the observation that individual layers within
+the model exhibit varying degrees of sensitivity to two
+O.O.D issues, we introduce FreeLOC, a layer-adaptive
+strategy that applies VRPR and TSA selectively (The spe-
+cific sensitivity profile for each layer is detailed in the
+supplementary).
+For layers sensitive only to frame-level
+positional O.O.D, we apply VRPR to re-encode relative
+positions while preserving full token interactions, thereby
+maintaining temporal consistency. For layers sensitive to
+context-length O.O.D, regardless of their positional sensi-
+tivity, we apply a two-step scheme: first VRPR for po-
+sitional correction, then TSA to restrict effective context.
+This combination mitigates both O.O.D. issues and pre-
+serves fine-grained spatial and motion details.
+4. Experiments
+4.1. Implementation Details
+Setting up.
+To validate the broad applicability of Free-
+LOC, we integrated our methods with two publicly acces-
+sible video DiT models: Wan2.1-T2V-1.3B [32] and Hun-
+yuanVideo [16] in a training-free manner. For experiments,
+we generate videos at 480p (832 × 480) with 2× and 4×
+length extension.
+Evaluation metrics. Following prior work [21, 22, 28, 40],
+we employ metrics from Vbench [12] to assess FreeLOC.
+We evaluate from two aspects: video consistency and video
+Table 1. Quantitative results at the extended (2× and 4×) video lengths. In a training-free manner, our method maintains the quality
+regarding video consistency and video quality in multiple VBench dimensions when the generation length grows.
+Model
+#Frames
+Method
+Video Consistency
+Video Quality
+Subject
+Consistency(↑)
+Background
+Consistency(↑)
+Motion
+Smoothness(↑)
+Imaging
+Quality(↑)
+Aesthetic
+Quality(↑)
+Dynamic
+Degree(↑)
+Wan2.1
+-T2V-1.3B
+161 (2×)
+Direct Sampling
+97.33
+97.23
+98.69
+60.34
+52.72
+19.31
+Sliding Window
+96.48
+96.22
+98.50
+64.64
+54.42
+40.82
+RIFLEx [40]
+97.21
+97.14
+98.70
+60.62
+53.67
+23.45
+FreeLong [22]
+97.05
+97.19
+98.84
+63.91
+54.56
+32.19
+FreeNoise [25]
+96.82
+97.10
+98.82
+67.19
+56.01
+36.34
+FreeLOC (Ours)
+98.06
+97.49
+98.98
+68.31
+62.33
+39.41
+321 (4×)
+Direct Sampling
+98.50
+97.89
+98.83
+59.21
+49.43
+4.32
+Sliding Window
+96.15
+95.92
+98.54
+65.64
+54.04
+39.81
+RIFLEx [40]
+98.41
+97.87
+98.86
+59.92
+49.67
+4.45
+FreeLong [22]
+97.88
+97.51
+98.91
+63.17
+54.56
+21.21
+FreeNoise [25]
+97.31
+97.25
+98.84
+66.32
+56.01
+35.11
+FreeLOC (Ours)
+98.44
+97.78
+98.97
+67.44
+61.21
+36.27
+Hunyuan
+Video
+253 (2×)
+Direct Sampling
+97.24
+97.18
+98.78
+60.79
+54.43
+23.32
+Sliding Window
+96.35
+96.01
+98.67
+67.02
+60.07
+42.39
+RIFLEx [40]
+97.32
+97.29
+99.03
+62.43
+57.02
+29.13
+FreeLong [22]
+97.22
+97.10
+98.93
+63.47
+56.56
+21.21
+FreeNoise [25]
+96.89
+96.72
+98.90
+64.68
+57.87
+37.11
+FreeLOC (Ours)
+97.92
+97.34
+98.99
+68.92
+62.38
+40.22
+509 (4×)
+Direct Sampling
+98.62
+98.26
+98.90
+58.12
+51.41
+6.32
+Sliding Window
+96.04
+95.98
+98.71
+66.40
+59.32
+38.97
+RIFLEx [40]
+98.69
+98.24
+99.01
+56.56
+51.67
+8.45
+FreeLong [22]
+97.88
+97.51
+98.91
+62.83
+54.56
+21.21
+FreeNoise [25]
+97.31
+97.25
+98.88
+63.91
+56.01
+35.11
+FreeLOC (Ours)
+98.47
+98.12
+98.95
+67.92
+61.09
+39.28
+quality. Specifically, for video consistency, we utilize fol-
+lowing metrics: (1) Subject consistency (SC). (2) Back-
+ground consistency (BC). (3) Motion Smoothness (MS).
+For video quality, we use following metrics: (1) Imaging
+Quality (IQ). (2) Aesthetic Quality (AQ). (3) Dynamic De-
+gree (DD).
+Baseline. A comparative evaluation is conducted between
+the proposed method and several existing training-free tech-
+nique for long video generation using diffusion models. The
+benchmarked approaches include: (1) Direct sampling; (2)
+Sliding window, which employs temporal sliding windows
+to process video content in fixed-length frame segments; (3)
+FreeNoise [25], a method that improves long-range tempo-
+ral consistency through the reuse of input noise patterns;
+(4) Freelong [22], a method that integrates low-frequency
+global features with high-frequency local attention maps to
+enhance video quality; (5) RIFLEx, an approach that sup-
+press frame repetition by reducing the intrinsic frequency.
+For fair comparison, we implement all baseline methods on
+the SOTA video DiT models: Wan2.1-T2V-1.3B [32] and
+Hunyuan Video [16].
+4.2. Comparison Results
+Quantitative Results. Table 1 reports the quantitative com-
+parison for 2× and 4× extension. Direct sampling and RI-
+FLEx suffer from strong degradation, especially on long
+videos. Sliding Window and FreeNoise improve local qual-
+Table 2. Ablation study of layer-wise strategy and main com-
+ponents.
+Method
+SC (↑) BC (↑) MS (↑) IQ (↑) AQ (↑) DD (↑)
+Direct
+98.50
+97.89
+98.83 59.21 49.43
+4.32
+Direct+TSA
+97.41
+96.76
+98.67 65.87 57.05
+37.01
+Direct+VRPR
+98.42
+97.81
+98.89 61.88 54.13
+15.32
+Direct+(TSA+VRPR)uniform
+97.56
+97.67
+98.75 65.19 56.34
+34.44
+Direct+(TSA+VRPR, VRPR)random
+98.03
+97.61
+98.91 63.90 54.44
+33.13
+Direct+(TSA, VRPR)layer-wise
+98.38
+97.66
+98.95 66.92 60.88
+35.05
+Direct+(TSA+VRPR, VRPR)layer-wise 98.44
+97.78
+98.97 67.44 61.21
+36.27
+ity but introduce temporal inconsistency. FreeLong yields
+mild gains but remains limited in both consistency and qual-
+ity. FreeLOC achieves the best overall performance, deliv-
+ering consistent and high-fidelity long videos.
+Qualitative Results. Figure 5 shows qualitative compar-
+isons on Wan2.1-T2V-1.3B and Hunyuan Video with 4×
+extension.
+Direct Sampling and RIFLEx exhibit severe
+loss of visual and motion details.
+Sliding Window and
+FreeNoise produce sharper frames but break temporal co-
+herence. FreeLong offers slight improvements yet still loses
+fine details and dynamic motion. In contrast, our FreeLOC
+preserves strong temporal consistency while maintaining
+high visual and motion quality.
+4.3. Ablation Studies
+To evaluate the effectiveness of each component within
+FreeLOC, we conducted a series of detailed ablation stud-
+ies. For this analysis, we equipped the baseline short video
+Prompt: Clown fish swimming through the coral reef
+Prompt: A motorcycle accelerating to gain speed
+Direct
+RIFLEx
+Sliding
+Window
+Freelong
+Freenoise
+Ours
+Wan2.1-1.3B
+Hunyuan Video
+Figure 5. Qualitative Results of Wan2.1-1.3B and Hunyuan Video
+model, Wan2.1-T2V-1.3B, with our proposed methods as an
+example.
+Impact of Layer-wise Strategy and Main Components.
+We first investigate the impact of our layer-wise strat-
+egy for applying TSA and VRPR. We compare the per-
+formance of the following different configurations:
+(1)
+Direct Sampling.
+(2) Direct+TSA: Applying only TSA
+across all layers.
+(3) Direct+VRPR: Applying only
+VRPR across all layers. (4) Direct+(TSA+VRPR)uniform:
+Applying VRPR combined with TSA uniformly across
+all layers.
+(5) Direct+(TSA+VRPR, VRPR)random:
+A
+random assignment of either VRPR or TSA to each
+layer.
+(6) Direct+(TSA, VRPR)layer-wise): Selectively ap-
+plies VRPR and TSA (instead of VRPR+TSA) to differ-
+ent layers based on their sensitivity to two O.O.D issues.
+(7) FreeLOC (Direct+(TSA+VRPR, VRPR)layer-wise): Our
+layer-wise strategy, which selectively applies VRPR and
+TSA+VRPR to different layers based on their sensitivity
+to two O.O.D issues. The experimental results in Table 2,
+demonstrate that our targeted layer-wise strategy, VRPR
+and TSA all contribute to the outstanding performance.
+Impact of Different Re-encoding Strategies for Frame-
+level Relative Position O.O.D. To validate the effective-
+ness of our VRPR method in handling frame-level relative
+positions O.O.D, we compare it against several alternative
+re-encoding strategies: (1) Clipping [9]: Truncating rela-
+tive position embeddings that exceed the range seen during
+training. (2) Grouping [13]: Assigning a single, shared po-
+sitional embedding to groups of adjacent relative positions.
+(3) VRPR: Our proposed multi-granularity re-encoding
+method. As shown in Table 3, our VRPR approach with
+three granularity levels effectively addresses the challenges
+of frame-level relative positions O.O.D, maintaining both
+temporal consistency and visual details.
+Impact of Different Attention Mechanisms for Context-
+Table 3.
+Ablation study of different relative position re-
+encoding strategy for frame-level relative position O.O.D.
+Method
+SC (↑)
+BC (↑)
+MS (↑)
+IQ (↑)
+AQ (↑)
+DD (↑)
+Clipping
+97.83
+97.51
+98.78
+60.23
+52.03
+22.21
+Group
+97.95
+97.49
+98.66
+59.91
+51.32
+18.32
+Our VRPR
+98.44
+97.78
+98.97
+68.84
+61.21
+36.27
+Table 4. Ablation study of different attention mechanism for
+context-length O.O.D.
+Method
+SC (↑)
+BC (↑)
+MS (↑)
+IQ (↑)
+AQ (↑)
+DD (↑)
+Sliding Window
+97.52
+96.72
+98.69
+64.33
+54.92
+37.81
+Selected Frame Attention
+97.89
+98.94
+98.94
+63.90
+54.19
+28.53
+Our TSA
+98.44
+97.78
+98.97
+68.84
+61.21
+36.27
+Length O.O.D. Finally, we evaluate the contribution of our
+TSA mechanism for managing context-length O.O.D issues
+by comparing it with other common attention strategies: (1)
+Sliding Window Attention [22, 25]. (2) Selected Frame At-
+tention: An approach proposed by LongDiff [19], where
+a few selected frames are designated as global references
+for attention computation. (3) TSA. The results presented
+in Table 4 confirm that our TSA mechanism is more ef-
+fective at maintaining long-range temporal coherence and
+visual quality compared to the other attention mechanisms.
+5. Conclusion
+In this paper, we introduced FreeLOC, a layer-adaptive,
+training-free framework that enables pre-trained video DiTs
+to generate high-fidelity long videos. Our approach system-
+atically resolves two O.O.D issues by using VRPR to remap
+temporal positions and TSA to preserve attentional focus.
+The core of FreeLOC is a layer-adaptive strategy, guided
+by an automatic probing mechanism, which applies these
+techniques selectively for optimal performance. Extensive
+experiments demonstrate that FreeLOC significantly sur-
+passes existing training-free approaches, offering a power-
+ful and generalizable solution for long video synthesis.
+Acknowledgement
+This
+work
+was
+supported
+by
+the
+National
+Natural
+Science
+Foundation
+of
+China
+(No.
+6250070674)
+and
+the
+Zhejiang
+Leading
+Innovative
+and
+En-
+trepreneur Team Introduction Program (2024R01007).
+References
+[1] Andreas Blattmann, Tim Dockhorn, Sumith Kulal, Daniel
+Mendelevitch, Maciej Kilian, Dominik Lorenz, Yam Levi,
+Zion English, Vikram Voleti, Adam Letts, et al. Stable video
+diffusion: Scaling latent video diffusion models to large
+datasets. arXiv preprint arXiv:2311.15127, 2023. 1, 2
+[2] Minghong Cai, Xiaodong Cun, Xiaoyu Li, Wenze Liu,
+Zhaoyang Zhang, Yong Zhang, Ying Shan, and Xiangyu
+Yue. Ditctrl: Exploring attention control in multi-modal dif-
+fusion transformer for tuning-free multi-prompt longer video
+generation. In Proceedings of the Computer Vision and Pat-
+tern Recognition Conference, pages 7763–7772, 2025. 1, 2
+[3] Guibin Chen, Dixuan Lin, Jiangping Yang, Chunze Lin,
+Junchen Zhu, Mingyuan Fan, Hao Zhang, Sheng Chen,
+Zheng Chen,
+Chengcheng Ma,
+et al.
+Skyreels-v2:
+Infinite-length film generative model.
+arXiv preprint
+arXiv:2504.13074, 2025. 1, 2
+[4] Haoxin Chen, Yong Zhang, Xiaodong Cun, Menghan Xia,
+Xintao Wang, Chao Weng, and Ying Shan. Videocrafter2:
+Overcoming data limitations for high-quality video diffusion
+models. In Proceedings of the Computer Vision and Pattern
+Recognition Conference, pages 7310–7320, 2024. 1, 2
+[5] Shouyuan Chen, Sherman Wong, Liangjian Chen, and
+Yuandong Tian.
+Extending context window of large lan-
+guage models via positional interpolation.
+arXiv preprint
+arXiv:2306.15595, 2023. 1, 3
+[6] Justin Cui, Jie Wu, Ming Li, Tao Yang, Xiaojie Li, Rui
+Wang, Andrew Bai, Yuanhao Ban, and Cho-Jui Hsieh. Self-
+forcing++: Towards minute-scale high-quality video genera-
+tion. arXiv preprint arXiv:2510.02283, 2025. 2
+[7] Yuwei Guo, Ceyuan Yang, Anyi Rao, Zhengyang Liang,
+Yaohui Wang, Yu Qiao, Maneesh Agrawala, Dahua Lin,
+and Bo Dai. Animatediff: Animate your personalized text-
+to-image diffusion models without specific tuning.
+arXiv
+preprint arXiv:2307.04725, 2023. 1, 2
+[8] Yoav HaCohen, Nisan Chiprut, Benny Brazowski, Daniel
+Shalem, Dudu Moshe, Eitan Richardson, Eran Levin, Guy
+Shiran, Nir Zabari, Ori Gordon, et al. Ltx-video: Realtime
+video latent diffusion.
+arXiv preprint arXiv:2501.00103,
+2024. 1, 2
+[9] Chi Han, Qifan Wang, Hao Peng, Wenhan Xiong, Yu Chen,
+Heng Ji, and Sinong Wang.
+Lm-infinite: Zero-shot ex-
+treme length generalization for large language models. arXiv
+preprint arXiv:2308.16137, 2023. 1, 3, 4, 5, 6, 8
+[10] Roberto Henschel, Levon Khachatryan, Hayk Poghosyan,
+Daniil Hayrapetyan, Vahram Tadevosyan, Zhangyang Wang,
+Shant Navasardyan, and Humphrey Shi. Streamingt2v: Con-
+sistent, dynamic, and extendable long video generation from
+text.
+In Proceedings of the Computer Vision and Pattern
+Recognition Conference, pages 2568–2577, 2025. 1, 2
+[11] Xun Huang, Zhengqi Li, Guande He, Mingyuan Zhou,
+and Eli Shechtman.
+Self forcing:
+Bridging the train-
+test gap in autoregressive video diffusion.
+arXiv preprint
+arXiv:2506.08009, 2025. 1, 2
+[12] Ziqi Huang, Yinan He, Jiashuo Yu, Fan Zhang, Chenyang Si,
+Yuming Jiang, Yuanhan Zhang, Tianxing Wu, Qingyang Jin,
+Nattapol Chanpaisit, et al. Vbench: Comprehensive bench-
+mark suite for video generative models. In Proceedings of
+the Computer Vision and Pattern Recognition Conference,
+pages 21807–21818, 2024. 6, 4
+[13] Hongye Jin, Xiaotian Han, Jingfeng Yang, Zhimeng Jiang,
+Zirui Liu, Chia-Yuan Chang, Huiyuan Chen, and Xia Hu.
+Llm maybe longlm: Self-extend llm context window without
+tuning. arXiv preprint arXiv:2401.01325, 2024. 1, 3, 5, 8, 2
+[14] Zhiyu Jin, Xuli Shen, Bin Li, and Xiangyang Xue. Training-
+free diffusion model adaptation for variable-sized text-to-
+image synthesis. Advances in Neural Information Processing
+Systems, 36:70847–70860, 2023. 4, 6
+[15] Jihwan Kim, Junoh Kang, Jinyoung Choi, and Bohyung Han.
+Fifo-diffusion: Generating infinite videos from text without
+training. NeurIPS, 37:89834–89868, 2024. 2
+[16] Weijie Kong, Qi Tian, Zijian Zhang, Rox Min, Zuozhuo Dai,
+Jin Zhou, Jiangfeng Xiong, Xin Li, Bo Wu, Jianwei Zhang,
+et al. Hunyuanvideo: A systematic framework for large video
+generative models. arXiv preprint arXiv:2412.03603, 2024.
+1, 2, 3, 6, 7
+[17] Wuyang Li, Wentao Pan, Po-Chien Luan, Yang Gao, and
+Alexandre Alahi.
+Stable video infinity:
+Infinite-length
+video generation with error recycling.
+arXiv preprint
+arXiv:2510.09212, 2025. 2
+[18] Xingyang Li, Muyang Li, Tianle Cai, Haocheng Xi, Shuo
+Yang, Yujun Lin, Lvmin Zhang, Songlin Yang, Jinbo Hu,
+Kelly Peng, et al. Radial attention: Sparse attention with
+energy decay for long video generation.
+arXiv preprint
+arXiv:2506.19852, 2025. 3, 4
+[19] Zhuoling Li, Hossein Rahmani, Qiuhong Ke, and Jun Liu.
+Longdiff: Training-free long video generation in one go. In
+Proceedings of the Computer Vision and Pattern Recognition
+Conference, pages 17789–17798, 2025. 1, 2, 4, 8
+[20] Kunhao Liu, Wenbo Hu, Jiale Xu, Ying Shan, and Shijian
+Lu. Rolling forcing: Autoregressive long video diffusion in
+real time. arXiv preprint arXiv:2509.25161, 2025. 2
+[21] Yu Lu and Yi Yang. Freelong++: Training-free long video
+generation via multi-band spectralfusion.
+arXiv preprint
+arXiv:2507.00162, 2025. 1, 2, 6
+[22] Yu Lu, Yuanzhi Liang, Linchao Zhu, and Yi Yang. Freelong:
+Training-free long video generation with spectralblend tem-
+poral attention. NeurIPS, 37:131434–131455, 2024. 1, 2, 4,
+6, 7, 8
+[23] William Peebles and Saining Xie. Scalable diffusion models
+with transformers. In Proceedings of the IEEE/CVF inter-
+national conference on computer vision, pages 4195–4205,
+2023. 2
+[24] Adam Polyak, Amit Zohar, Andrew Brown, Andros Tjandra,
+Animesh Sinha, Ann Lee, Apoorv Vyas, Bowen Shi, Chih-
+Yao Ma, Ching-Yao Chuang, et al. Movie gen: A cast of
+media foundation models. arXiv preprint arXiv:2410.13720,
+2024. 2
+[25] Haonan Qiu, Menghan Xia, Yong Zhang, Yingqing He, Xin-
+tao Wang, Ying Shan, and Ziwei Liu. Freenoise: Tuning-free
+longer video diffusion via noise rescheduling. arXiv preprint
+arXiv:2310.15169, 2023. 1, 2, 4, 7, 8
+[26] Robin Rombach, Andreas Blattmann, Dominik Lorenz,
+Patrick Esser, and Björn Ommer. High-resolution image syn-
+thesis with latent diffusion models. In Proceedings of the
+Computer Vision and Pattern Recognition Conference, pages
+10684–10695, 2022. 2
+[27] Chenxi Song, Yanming Yang, Tong Zhao, Ruibo Li, and Chi
+Zhang. Taming video models for 3d and 4d generation via
+zero-shot camera control. arXiv preprint arXiv:2509.15130,
+2025. 2
+[28] Jiangtong Tan, Hu Yu, Jie Huang, Jie Xiao, and Feng Zhao.
+Freepca: Integrating consistency information across long-
+short frames in training-free long video generation via prin-
+cipal component analysis. In Proceedings of the Computer
+Vision and Pattern Recognition Conference, pages 27979–
+27988, 2025. 2, 6
+[29] Genmo Team.
+Mochi 1.
+https://github.com/
+genmoai/models, 2024. 1, 2
+[30] Hansi Teng, Hongyu Jia, Lei Sun, Lingzhi Li, Maolin Li,
+Mingqiu Tang, Shuai Han, Tianning Zhang, WQ Zhang,
+Weifeng Luo, et al. Magi-1: Autoregressive video genera-
+tion at scale. arXiv preprint arXiv:2505.13211, 2025. 1, 2
+[31] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszko-
+reit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia
+Polosukhin. Attention is all you need. Advances in neural
+information processing systems, 30, 2017. 3
+[32] Team Wan, Ang Wang, Baole Ai, Bin Wen, Chaojie Mao,
+Chen-Wei Xie, Di Chen, Feiwu Yu, Haiming Zhao, Jianxiao
+Yang, et al. Wan: Open and advanced large-scale video gen-
+erative models. arXiv preprint arXiv:2503.20314, 2025. 1,
+2, 3, 5, 6, 7, 4
+[33] Fu-Yun Wang, Wenshuo Chen, Guanglu Song, Han-Jia Ye,
+Yu Liu, and Hongsheng Li. Gen-l-video: Multi-text to long
+video generation via temporal co-denoising. arXiv preprint
+arXiv:2305.18264, 2023. 1, 2
+[34] Yaohui Wang, Xinyuan Chen, Xin Ma, Shangchen Zhou,
+Ziqi Huang, Yi Wang, Ceyuan Yang, Yinan He, Jiashuo Yu,
+Peiqing Yang, et al. Lavie: High-quality video generation
+with cascaded latent diffusion models. International Journal
+of Computer Vision, 133(5):3059–3078, 2025. 1, 2
+[35] Jiazheng Xu, Yu Huang, Jiale Cheng, Yuanming Yang, Jiajun
+Xu, Yuan Wang, Wenbo Duan, Shen Yang, Qunlin Jin, Shu-
+run Li, et al. Visionreward: Fine-grained multi-dimensional
+human preference learning for image and video generation.
+arXiv preprint arXiv:2412.21059, 2024. 5
+[36] Shuai Yang, Wei Huang, Ruihang Chu, Yicheng Xiao,
+Yuyang Zhao, Xianbang Wang, Muyang Li, Enze Xie, Ying-
+cong Chen, Yao Lu, et al. Longlive: Real-time interactive
+long video generation.
+arXiv preprint arXiv:2509.22622,
+2025. 2
+[37] Zhuoyi Yang, Jiayan Teng, Wendi Zheng, Ming Ding, Shiyu
+Huang, Jiazheng Xu, Yuanming Yang, Wenyi Hong, Xiao-
+han Zhang, Guanyu Feng, et al. Cogvideox: Text-to-video
+diffusion models with an expert transformer. arXiv preprint
+arXiv:2408.06072, 2024. 1, 2, 3
+[38] Tianwei Yin, Qiang Zhang, Richard Zhang, William T Free-
+man, Fredo Durand, Eli Shechtman, and Xun Huang. From
+slow bidirectional to fast autoregressive video diffusion mod-
+els.
+In Proceedings of the Computer Vision and Pattern
+Recognition Conference, pages 22963–22974, 2025. 1, 2
+[39] Lvmin Zhang and Maneesh Agrawala. Packing input frame
+context in next-frame prediction models for video genera-
+tion. arXiv preprint arXiv:2504.12626, 2025. 1, 2
+[40] Min Zhao, Guande He, Yixiao Chen, Hongzhou Zhu,
+Chongxuan Li, and Jun Zhu. Riflex: A free lunch for length
+extrapolation in video diffusion transformers. arXiv preprint
+arXiv:2502.15894, 2025. 2, 3, 6, 7, 4
+Free-Lunch Long Video Generation via Layer-Adaptive O.O.D Correction
+Supplementary Material
+Contents
+1. Verification of Context-Length O.O.D
+1
+2. Additional Details of VRPR and TSA
+1
+2.1. Implementation Details of VRPR
+. . . . . .
+1
+2.2. Implementation Details of TSA
+. . . . . . .
+2
+3. Layer-wise Sensitivity Profile and Strategy
+4
+4. More Implementation Details
+4
+5. Additional Ablation Study Results
+4
+5.1. Impact of D1, D2 and α for TSA
+. . . . . .
+5
+5.2. Impact of Attention Sink . . . . . . . . . . .
+5
+5.3. More Comparison with Other RoPE Scaling
+Methods . . . . . . . . . . . . . . . . . . .
+5
+5.4. Different Granularity of VRPR . . . . . . . .
+6
+5.5. More Layer-wise Strategy . . . . . . . . . .
+6
+6. More Experiment Results
+6
+6.1. Inference Efficiency Analysis
+. . . . . . . .
+6
+6.2. One-Time Cost and Negligible Compute
+. .
+6
+6.3. User Study . . . . . . . . . . . . . . . . . .
+7
+7. More Qualitative Results
+7
+1. Verification of Context-Length O.O.D
+As mentioned in the main paper, we find that naively ex-
+tending the frame-level context length (with VRPR applied
+to constrain the frame-level relative position within pre-
+trained range) leads to increased attention entropy in the
+video DiT. This diffusion of attention weights correlates
+with a degradation in generation quality.
+To quantify this, we measure the attention entropy. As-
+sume that we generate a video sequence with a total token
+number of N, where N = f × n (f is the total number
+of frames and n is the number of tokens per frame). Let
+p1, p2, · · · , pN be the sequence of attention distributions
+(after softmax) for all tokens. Each pi is a vector of atten-
+tion weights for the i-th token, and this vector has a length
+of N. We compute the standard Shannon entropy for the
+attention distribution of each token i as:
+H(pi) = −
+L
+X
+j=1
+pi,j ln(pi,j)
+(1)
+To obtain the final average attention entropy, we first com-
+pute the mean of H(pi) over all L tokens, and then average
+this value across all attention heads and all self-attention
+layers.
+Figure 1 plots the resulting average attention entropy
+as it varies with the context length (i.e., the total number
+of frames, f). This illustrates that as the context length
+increases, the attention entropy also rises, confirming the
+context-length O.O.D phenomenon.
+0
+81
+162
+243
+324
+405
+486
+Context Length
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+Attention Entropy
+Context=0
+Entropy=0.00
+Context=81
+Entropy=5.47
+Context=162
+Entropy=6.40
+Context=243
+Entropy=6.94
+Context=324
+Entropy=7.33
+Context=405
+Entropy=7.64
+Context=486
+Entropy=7.89
+Measured Attention Entropy
+Figure 1. Layer-wise sensitivity to context-length O.O.D mea-
+sured via attention entropy differences.
+2. Additional Details of VRPR and TSA
+2.1. Implementation Details of VRPR
+As stated in the main paper, VRPR is designed to remap
+O.O.D relative positions back into the pre-trained distribu-
+tion in a multi-granularity fashion.
+The re-encoding functions (Equations 2 and 3 in the
+main paper) are designed to create a "compressed" repre-
+sentation of relative time. Specifically, for a model pre-
+trained on L frames (e.g., L = 81 for Wan2.1-T2V-1.3B),
+the pre-trained relative position range is [−(L −1), L −1].
+Here, we provide the specific implementation details for
+Video-based Relative Position Re-encoding (VRPR). Di-
+rectly modifying the relative position matrix as described
+in the main paper is practically challenging, To address
+this, we propose an approximate implementation achieved
+through the formulation of region-specific position indices.
+Let Pq[i] denote the position index for the query at frame
+i after re-encoding, Pk[j] denote the position index for the
+key at frame j after re-encoding and Pimpl denote the imple-
+mented relative position.
+1. Fine-Grained Re-Encoding:
+For local interactions within the fine-grained window (|i −
+j| ≤W1), we use standard relative positions:
+Pq[i] = i,
+Pk[j] = j
+(2)
+In this case, the effective relative position is Pimpl = Pq[i]−
+Pk[j] = i −j = P. This provides an exact implementation
+of the identity mapping P = Pori described in the main
+paper.
+2. Medium-Grained Re-Encoding:
+For interactions in the medium range (W1 < i −j ≤W2),
+we apply the following mapping:
+Pq[i] =
+ i
+G1
+
++
+
+W1 −
+W1
+G1
+
+,
+Pk[j] =
+ j
+G1
+
+(3)
+Conversely, for negative medium-range distances (−W2 ≤
+i −j < −W1):
+Pq[i] =
+ i
+G1
+
+,
+Pk[j] =
+ j
+G1
+
++
+
+W1 −
+W1
+G1
+
+(4)
+This formulation approximates the theoretical formula pre-
+sented in the main paper (Eq. 2). Specifically, for the posi-
+tive case, the relative position calculated by this implemen-
+tation is:
+Pimpl = Pq[i]−Pk[j] =
+ i
+G1
+
+−
+ j
+G1
+
++
+
+W1 −
+W1
+G1
+
+(5)
+Comparing this to the main paper’s target formula P =
+⌊i−j
+G1 ⌋+ (W1 −⌊W1
+G1 ⌋), the equivalence relies on the math-
+ematical property that
+ i
+G1
+
+−
+ j
+G1
+
+−1 ≤
+i −j
+G1
+
+≤
+ i
+G1
+
+−
+ j
+G1
+
+.
+(6)
+So, the error between Pimpl and P is Pimpl −P =
+j
+i−j
+G1
+k
+−
+(
+j
+i
+G1
+k
+−
+j
+j
+G1
+k
+) ∈{0, −1}. This approximation error is
+negligible for our case and allows for the decomposition of
+relative positions into independent query and key indices.
+Crucially, this approximation preserves the original gran-
+ularity (i.e., the group size) and the monotonicity of rela-
+tive position while effectively constraining the relative posi-
+tion within the pre-trained length, preventing O.O.D issues.
+With this operation, it also guarantees no discontinuity near
+the boundary of different regions.
+3. Coarse-Grained Re-Encoding:
+For distant interactions (i −j > W2), we employ a
+coarser quantization:
+Pq[i] =
+ i
+G2
+
++
+
+W2 −
+W2
+G2
+
+−
+W2 −W1
+G1
+
+, Pk[j] =
+ j
+G2
+
+(7)
+For the negative direction (i −j < −W2):
+Pq[i] =
+ i
+G2
+
+, Pk[j] =
+ j
+G2
+
++
+
+W2 −
+W2
+G2
+
+−
+W2 −W1
+G1
+
+(8)
+Importantly, our dynamic mapping strategy preserves
+monotonicity property of relative position across region
+boundaries:
+tokens at greater distances consistently re-
+ceive larger absolute relative position values. Furthermore,
+this index-based formulation allows VRPR to seamlessly
+integrate with efficient attention implementations such as
+FlashAttention2 following [13], as it only requires modify-
+ing the input position indices rather than the full attention
+matrix.
+The specific hyperparameter configurations for the mod-
+els evaluated in the main paper are as follows. These param-
+eters include the Local Window size (W1), the Mid-Range
+Window size (W2), Group Size 1 (G1) and Group Size 2
+(G2).
+The principles of hyperparameters selection is that the
+maximum relative position in the generated video must not
+exceed the pre-trained context window L. For a target gen-
+eration length Ltarget, the maximum absolute relative dis-
+tance is Ltarget −1. The mapped position P(Ltarget −1)
+must satisfy:
+Pimpl(Ltarget −1) ≤L −1.
+(9)
+Substituting
+the
+coarse-grained
+mapping
+(assuming
+Dmax > W2), the criterion is formalized as:
+Ltarget −1
+G2
+
++
+
+W2 −
+W2
+G2
+
+−
+W2 −W1
+G1
+
+≤L −1.
+(10)
+We select the possible windows W1, W2 and group sizes
+G1, G2 that satisfy this inequality to prevent O.O.D issues.
+The empirical configurations for our experiments are:
+For Wan2.1-T2V-1.3B:
+• 2×Extension (161-frame): Local Window W1 = 12,
+Mid-Range Window W2 = 20, Group Size 1 G1 = 2 and
+Group Size 2 G2 = 8
+• 4×Extension (321-frame): Local Window W1 = 10,
+Mid-Range Window W2 = 14, Group Size 1 G1 = 2 and
+Group Size 2 G2 = 8.
+For HunyuanVideo:
+• 2×Extension (253-frame): Local Window W1 = 12,
+Mid-Range Window W2 = 20, Group Size 1 G1 = 2 and
+Group Size 2 G2 = 4.
+• 4×Extension (509-frame): Local Window W1 = 12,
+Mid-Range Window W2 = 20, Group Size 1 G1 = 2 and
+Group Size 2 G2 = 8.
+These values were determined empirically to provide a good
+balance between preserving local motion and maintaining
+global coherence.
+Noting that we also observed that as
+long as these parameters satisfy the aforementioned in-
+equality 10, slight adjustments to them (modify a single pa-
+rameter at a time while maintaining the other three fixed)
+have minimal impact on the results (performance metrics)
+as shown on Figure 2, demonstrating relatively good robust-
+ness.
+2.2. Implementation Details of TSA
+TSA is designed to combat the context-length O.O.D prob-
+lem by preserving attention density. It structures the at-
+tention mask into three components. Here, we provide an
+4
+6
+8
+10
+Fine-Grained Window (W1)
+(a) Impact of W1
+97.00
+97.25
+97.50
+97.75
+98.00
+98.25
+98.50
+98.75
+99.00
+Subject Consistency (%)
+12
+14
+16
+Mid-Range Window (W2)
+(b) Impact of W2
+97.00
+97.25
+97.50
+97.75
+98.00
+98.25
+98.50
+98.75
+99.00
+Subject Consistency (%)
+2
+4
+6
+Medium-Grained Group Size (G1)
+(c) Impact of G1
+97.00
+97.25
+97.50
+97.75
+98.00
+98.25
+98.50
+98.75
+99.00
+Subject Consistency (%)
+8
+10
+12
+Coarse-Grained Group Size (G2)
+(d) Impact of G2
+97.00
+97.25
+97.50
+97.75
+98.00
+98.25
+98.50
+98.75
+99.00
+Subject Consistency (%)
+62
+63
+64
+65
+66
+67
+68
+69
+Imaging Quality (Score)
+62
+63
+64
+65
+66
+67
+68
+69
+Imaging Quality (Score)
+62
+63
+64
+65
+66
+67
+68
+69
+Imaging Quality (Score)
+62
+63
+64
+65
+66
+67
+68
+69
+Imaging Quality (Score)
+Subject Consistency
+Imaging Quality
+Figure 2. Impact of W1, W2 , G1 and G2 on Subject Consistency and Imaging Quality for VRPR.
+Query
+Frame 0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10 
+11 
+11
+10
+9
+8
+7
+6
+5
+4
+3
+2
+1
+Frame 0 
+Key
+Attention Sink
+Window Size 𝐷!
+Window Size 𝐷"
+Mask Value
+1
+0
+Shrunk Diagonal 
+Width
+Full Diagonal Width
+𝐷#
+Figure 3. Attention mask used in TSA.
+enlarged and more detailed view of the attention mask in
+Figure 3.
+Detailed Derivation of Striped Window Width (DS =
+⌊
+nD1
+α(D2−D1)⌋). A key innovation of TSA is the adaptive cal-
+culation of the spatial window width Ds ( which is not ex-
+plored in detail in the main text). Our theoretical goal is
+to strictly control the "Attention Mass" (the total number of
+key tokens involved in calculation) in the mid-range zone
+to prevent it from dominating the local attention. Let Nlocal
+be the total number of tokens attended to in the dense local
+window. Given n tokens per frame and a local window size
+of D1, the local token number (attention density) is:
+Nlocal = n × D1.
+(11)
+For the mid-range zone spanning (D2 −D1) frames, us-
+ing dense attention would result in a token count of n ×
+(D2−D1), which is typically too large. We introduce the α,
+which defines the decay ratio. Specifically, we mandate that
+the total attention density in the mid-range (Nmid) should be
+scaled down by α relative to the local density:
+Nmid = Nlocal
+α
+.
+(12)
+Given the spatial strip width Ds, the actual token count in
+the mid-range is Nmid = Ds × (D2 −D1). Equating these
+terms allows us to derive the optimal Ds:
+Ds × (D2 −D1) = n × D1
+α
+=⇒Ds =
+
+nD1
+α(D2 −D1)
+
+.
+(13)
+The parameter α explicitly controls the trade-off between
+global context awareness and local detail preservation. α
+represents the ratio of "Local Attention Density" to "Mid-
+Range Attention Density". For example, α = 2 implies
+that the aggregate information retrieved from the extended
+temporal context (D1 to D2) is compressed to exactly half
+the capacity of the immediate local context. By setting α >
+1, we force the model to prioritize local interactions (which
+define motion quality) while treating mid-range interactions
+as supplementary cues.
+The specific hyperparameter configurations for the mod-
+els evaluated in the main paper are as follows. These param-
+eters include the Local Window size (D1), the Mid-Range
+Window size (D2), and the Striped Attention Density (α).
+In principle,
+firstly,
+the selection of D1
+and α
+should adhere to the following requirements:
+nD1 +
+⌊
+nD1
+α(D2−D1)⌋(D2 −D1) ≤nD1 +⌊nD1
+α ⌋≤nD1(1+ 1
+α) ≤
+nLpretrained
+2
+, i.e., the effective token number stays within the
+pretrained range, where Lpretrained is the pretrained frame
+length.
+Consequently, D1 and α only need to satisfy
+D1(1 + 1
+α) ≤Lpretrained
+2
+. However, an excessively small D1
+would result in an overly limited interaction range for the at-
+tention mechanism, which is undesirable for temporal con-
+sistency. So we empirically impose the additional constraint
+that:
+Lpretrained
+4
+≤D1(1 + 1
+α) ≤Lpretrained
+2
+.
+(14)
+For Wan2.1-T2V-1.3B, we set Lpretrained = 24, and for Hun-
+yuanVideo, we set Lpretrained = 36. For the selection of D2,
+it only has to satisfy D2 > D1, and we will discuss effect
+of its choice in following ablation study.
+Specifically,
+For Wan2.1-T2V-1.3B:
+• 2×Extension (161-frame): Local Window D1 = 8,
+Mid-Range Window D2 = 16, and Striped Attention
+Density α = 4.
+• 4×Extension (321-frame): Local Window D1 = 8,
+Mid-Range Window D2 = 24, and Striped Attention
+Density α = 4.
+For HunyuanVideo:
+• 2×Extension (253-frame): Local Window D1 = 12,
+Mid-Range Window D2 = 24, and Striped Attention
+Density α = 4.
+• 4×Extension (509-frame): Local Window D1 = 12,
+Mid-Range Window D2 = 36, and Striped Attention
+Density α = 4.
+The Attention Sink component is implemented by ensuring
+that all tokens (queries) from all frames are permitted to
+attend to the tokens from the initial frame.
+3. Layer-wise Sensitivity Profile and Strategy
+To rigorously determine the layer-wise application of Free-
+LOC, we conducted a comprehensive probing experiment.
+The layer-wise probing was conducted using N = 10 di-
+verse prompts, generating M = 3 videos per prompt for
+each perturbation configuration to ensure statistical reliabil-
+ity.
+Sensitivity Determination. We identify layers sensitive
+to frame-level relative position O.O.D based on VisionRe-
+ward and Attention Logits Difference (ALD), and layers
+sensitive to context-length O.O.D based on the Context-
+Length Sensitivity Score. To establish a definitive binary
+sensitivity classification, we employ a thresholding strat-
+egy where the top two-thirds of layers exhibiting the most
+significant metric degradation (or score increase) are desig-
+nated as sensitive to each respective O.O.D type.
+Profile for Wan2.1-T2V-1.3B. Based on this protocol, the
+specific sensitivity profile for the 30 layers of Wan2.1-T2V-
+1.3B is identified as follows:
+• Layers sensitive to Frame-level Relative Position
+O.O.D (20 layers):
+{28, 1, 29, 0, 27, 26, 21, 17, 20, 12, 16, 14, 8, 4, 13, 19, 10,
+23, 5, 3}.
+• Layers sensitive to Context-Length O.O.D (20 layers):
+{18, 24, 13, 23, 22, 10, 15, 6, 11, 25, 2, 4, 16, 29, 7, 8, 12
+9, 3, 21}.
+The sequence here is arranged in descending order of sensi-
+tivity. Notably, we conclude that in this configuration, every
+single layer is sensitive to at least one type of O.O.D issue,
+necessitating a comprehensive correction strategy.
+Layer-wise Strategy Given these overlapping sensitivi-
+ties, we devised a balanced allocation strategy to optimize
+performance.
+1. For layers identified as sensitive to Frame-level Rela-
+tive Position O.O.D, we apply the VRPR strategy.
+2. For layers identified as sensitive to Context-Length
+O.O.D, we apply the combined VRPR + TSA strategy.
+We found that an even distribution—allocating the top 50%
+of layers (specifically, the 15 layers most sensitive to con-
+text length) to the VRPR+TSA strategy, and the remain-
+ing 50% to the VRPR-only strategy—yields the relatively
+optimal balance. Interestingly, the 16 layers identified as
+context-sensitive in our probing aligns almost perfectly with
+this 50% allocation.
+To validate this choice, we compared this balanced (1/2
+VRPR, 1/2 VRPR+TSA) distribution against other ratios:
+• 1/3
+VRPR,
+2/3
+VRPR+TSA:
+Resulted
+in
+over-
+sparsification, harming local details.
+• 2/3 VRPR, 1/3 VRPR+TSA: Insufficient context correc-
+tion, leading to visual details degradation in long videos.
+The 50%/50% split proved to be the robust "sweet spot".
+The detailed visualization of Qualitative comparison is
+shown in Figure 4.
+Profile for Hunyuan Video.
+Resembling the probing
+procdedure of Wan2.1-T2V-1.3B, the specific sensitivity
+profile for the 60 layers of Hunyuan Video is identified as
+follows:
+• Context-length sensitive layers (40 layers):
+These
+layers exhibit high sensitivity to context length and first
+30 layers are assigned the VRPR+TSA strategy.
+The
+identified layers are:
+{1, 2, 45, 29, 5, 13, 38, 59, 11, 34, 47, 16, 0, 53, 21, 41,
+8, 30, 55, 19, 4, 49, 26, 42, 12, 57, 23, 25, 36, 51, 15, 39, 7,
+22, 44, 18, 32, 9, 27, 35}.
+• Frame-level Relative Position-sensitive layers (40
+layers):
+These layers exhibit sensitivity to relative
+position shifts. Layers that appear in this list but not in
+the context-length sensitive list are assigned the VRPR
+only strategy. The identified layers are:
+{58, 59, 31, 6, 54, 21, 37, 29, 47, 18, 28, 10, 1, 24, 3,
+35, 41, 14, 52, 27, 9, 43, 17, 33, 48, 2, 23, 50, 11, 38, 4, 25,
+40, 15, 0, 7, 56, 20, 46, 32}.
+4. More Implementation Details
+All experiments were conducted on a single NVIDIA A100
+(80GB) GPU. Basic settings for generation are listed in Ta-
+ble 1. For test prompt, we randomly sample 100 prompts
+from Vbench-long [12] following prior works [22, 25, 40].
+5. Additional Ablation Study Results
+For efficiency, we conduct following ablation studies on
+Wan2.1-T2V-1.3B [32] with 4× length extension (similar
+results can also be obtained on HunyuanVideo).
+1/3VRPR, 
+2/3VRPR+TSA
+2/3VRPR, 
+1/3VRPR+TSA
+1/2VRPR, 
+1/2VRPR+TSA
+Figure 4. Qualitative comparison of different allocation strategy. The (1/2, 1/2) split proved to be the robust "sweet spot" which balance
+detail preservation and temporal consistency.
+Table 1. Generation Settings. Basic settings used for Wan2.1-
+T2V-1.3B and Hunyuan Video for quantitative and qualitative
+evaluation.
+Parameter
+Wan2.1-T2V-1.3B
+Hunyuan Video
+Sampler
+Unipc
+Euler
+Denoising Steps
+50
+50
+CFG Scale
+6.0
+6.0
+Resolution
+832 × 480 (480p)
+832 × 480 (480p)
+Base Length (1x)
+81 frames
+127 frames
+2x Length
+161 frames
+253 frames
+4x Length
+321 frames
+509 frames
+5.1. Impact of D1, D2 and α for TSA
+To investigate the individual contributions of the TSA hy-
+perparameters—local window size D1, mid-range window
+boundary D2, and attention decay factor α—we conducted
+controlled ablation studies measuring Subject Consistency
+(SC) to measure temporal consistency and Imaging Qual-
+ity (IQ) to measure video quality. We conduct following
+experiments: (1) Impact of D1: Fixing D2 = 24 and
+α = 4, we varied D1 ∈[5, 9] according to Eq 14. (2)
+Impact of D2: Fixing D1 = 8 and α = 4, we var-
+ied D2 ∈[8, 16, 24, 32, 40, 68]. (3) Impact of α: Fixing
+D1 = 8 and D2 = 24, we varied α ∈[1, 2, 4, 6, 8].
+Results Analysis: Figure 5 illustrates the trade-offs ob-
+served:
+• Varying D1: As D1 increases, SC improves continuously
+due to stronger local temporal coupling. However, IQ ini-
+tially improves but subsequently declines, likely because
+an overly large dense window introduces excessive atten-
+tion entropy.
+• Varying D2: Increasing D2 initially boosts SC, which
+then plateaus as the benefit of mid-range context satu-
+rates. IQ follows an inverted-U pattern, increasing at first
+but dropping if the mid-range window becomes too com-
+Table 2. Ablation study of impact of attention sink. Attention
+could significantly improve overall video consistency and video
+quality.
+Method
+SC (↑)
+BC (↑)
+MS (↑)
+IQ (↑)
+AQ (↑)
+DD (↑)
+Mid Frame
+98.14
+97.65
+98.91
+67.12
+59.83
+34.65
+Last Frame
+98.19
+97.68
+98.87
+67.48
+60.98
+35.72
+w/o Attention Sink
+98.05
+97.67
+98.92
+67.53
+60.92
+34.59
+Our First Frame
+98.44
+97.78
+98.97
+67.44
+61.21
+36.27
+putationally diffuse.
+• Varying α: As α increases (sparser attention), SC re-
+mains stable initially but eventually drops as temporal
+connections become too sparse. Conversely, IQ improves
+continuously and then plateaus, as sparsity effectively re-
+duces noise and attention blurring.
+5.2. Impact of Attention Sink
+Attention sink is not unique to LLMs and prior analyses
+of video DiTs’ attention maps also show sink behavior that
+serves as a global anchor to prevent identity drift instead
+of introducing a static bias. We run simple ablations with
+mid-frame sink, last-frame sink and without attention sink
+in Table 2, and first-frame sink performs best. For videos
+with large scene changes, such sink may be suboptimal, but
+our method can extend to adaptive sink to support this case
+and we will improve it in the future.
+5.3. More Comparison with Other RoPE Scaling
+Methods
+We compare VRPR with other RoPE scaling techniques
+e.g., LI (Linear Interpolation), NTK-aware scaling and
+YaRN in Table 3. Results confirm that standard RoPE scal-
+ing methods degrade visual details by diluting local posi-
+tional frequencies, proving VRPR’s hierarchical preserva-
+tion of local precision is essential for high-quality genera-
+tion.
+5
+6
+7
+8
+9
+Local Window Size (D1)
+(a) Impact of D1
+97.2
+97.4
+97.6
+97.8
+98.0
+98.2
+98.4
+Subject Consistency (%)
+8
+16
+24
+32
+40
+Mid-Range Window (D2)
+(b) Impact of D2
+97.2
+97.4
+97.6
+97.8
+98.0
+98.2
+98.4
+Subject Consistency (%)
+1
+2
+4
+6
+8
+Sparsity Factor ( )
+(c) Impact of 
+97.7
+97.8
+97.9
+98.0
+98.1
+98.2
+98.3
+98.4
+Subject Consistency (%)
+64.0
+64.5
+65.0
+65.5
+66.0
+66.5
+67.0
+67.5
+Imaging Quality (Score)
+64.5
+65.0
+65.5
+66.0
+66.5
+67.0
+67.5
+Imaging Quality (Score)
+64.0
+64.5
+65.0
+65.5
+66.0
+66.5
+67.0
+67.5
+Imaging Quality (Score)
+Subject Consistency
+Imaging Quality
+Figure 5. Impact of D1, D2 and α on Subject Consistency and Imaging Quality.
+Table 3. VRPR vs. other RoPE scaling methods.
+Method
+SC (↑)
+BC (↑)
+MS (↑)
+IQ (↑)
+AQ (↑)
+DD (↑)
+LI
+97.93
+97.62
+98.64
+51.11
+50.91
+16.32
+YARN
+98.16
+97.64
+98.89
+62.33
+57.98
+30.87
+NTK-aware
+97.89
+97.59
+98.82
+56.47
+53.54
+24.21
+Our VRPR
+98.44
+97.78
+98.97
+68.84
+61.21
+36.27
+5.4. Different Granularity of VRPR
+We validated the necessity of the 3-stage VRPR design
+(Fine →Medium →Coarse) against a 2-stage baseline
+which (Fine →Coarse) and a 4-stage baseline (Fine →
+Medium 1 →Medium 2 →Coarse).
+All these designs
+re-encode frame-level relative position within pretrained
+range. The result is shown in Table 4. The obtained results
+demonstrate that employing a multi-granularity (three gran-
+ularities) approach, as opposed to a strategy with only two
+granularities, leads to improved video consistency and qual-
+ity. However, diminishing returns are observed when the
+granularity continues to increase (e.g., four levels of granu-
+larity).
+Table 4. Ablation study of different granularity of VRPR.
+Method
+SC (↑)
+BC (↑)
+MS (↑)
+IQ (↑)
+AQ (↑)
+DD (↑)
+2-stage
+98.15
+97.69
+98.90
+65.33
+58.91
+33.42
+4-stage
+98.49
+97.93
+98.95
+67.91
+60.90
+35.97
+Our 3-stage
+98.44
+97.78
+98.97
+67.44
+61.21
+36.27
+5.5. More Layer-wise Strategy
+To further verify the correctness and effectiveness of our
+layer-wise adaptive strategy, we conducted more experi-
+ments on different layer-wise strategy. (1) "Reverse" layer-
+wise strategy, we inverted the assignment logic: applying
+TSA only to layers identified as not sensitive to context
+length, and applying VRPR+TSA only to layers not sen-
+sitive to position.
+(2) Half Implementation 1: applying
+VRPR+TSA to the first half of the layers and VRPR to
+the second half.(3) Half Part Implementation 2: applying
+VRPR to the first half of the layers and VRPR+TSA to the
+second half. (4) Interleaved: alternately applying VRPR
+and VRPR+TSA strategies layer by layer.
+As shown in Table 5, the Reverse configuration, Half Im-
+plementation and Interleaved configuration lead to a signif-
+icant drop in both Subject Consistency (SC) and Imaging
+Quality (IQ), validating that our probing mechanism accu-
+rately identifies the specific needs of each layer.
+Table 5. Ablation study of more different layer-wise strategy.
+Method
+SC (↑)
+BC (↑)
+MS (↑)
+IQ (↑)
+AQ (↑)
+DD (↑)
+Reverse
+98.02
+97.28
+98.87
+62.12
+57.12
+31.23
+Half Implementation 1
+98.18
+97.41
+98.91
+64.21
+59.12
+32.19
+Half Implementation 2
+98.22
+97.48
+98.94
+62.39
+60.91
+32.92
+Interleaved
+98.12
+97.32
+98.89
+63.20
+59.92
+33.59
+FreeLOC
+98.44
+97.78
+98.97
+67.44
+61.21
+36.27
+6. More Experiment Results
+6.1. Inference Efficiency Analysis
+In this section, we provide a comprehensive comparison of
+efficiency, focusing on both inference time (measured as the
+time required for each denoising step) and peak GPU mem-
+ory usage. We compare our method against other training-
+free methods, along with the Direct Sampling and Sliding
+Window baselines. For this comparison, all methods were
+applied to the Wan2.1-T2V-1.3B [32] model to generate
+321-frame videos. All measurements were conducted on
+an NVIDIA A100 GPU. As presented in Table 6, while dra-
+matically improving the quality of long videos generated by
+short video models, our method introduces no significant
+increase in inference time or peak memory consumption.
+This efficiency is primarily attributed to the optimized com-
+putations resulting from the Tiered Sparse Attention (TSA)
+mechanism, which effectively manages the computational
+cost and memory footprint associated with long-context at-
+tention.
+6.2. One-Time Cost and Negligible Compute
+Our probing is a one-time architectural characterization: the
+layer-wise sensitivity profile is consistent across random
+Table 6. Comparison of inference time and peak GPU memory
+usage for generating 321-frame videos on the Wan2.1-T2V-1.3B
+model. All measurements were conducted on an NVIDIA A100
+GPU.
+Method
+Inference Time (s/step)
+Mem (GB)
+Direct Sampling
+33.93
+29.34
+Sliding Window
+16.72
+30.33
+FreeNoise [25]
+17.21
+30.34
+Freelong [22]
+48.15
+40.71
+RIFLEX [40]
+33.94
+29.34
+FreeLOC
+24.35
+29.87
+Table 7. User study results. Participants scored videos on a scale
+of 1 (worst) to 5 (best) across three criteria. Our method received
+the highest ratings across all three metrics.
+Method
+Content
+Consistency
+Video
+Quality
+Video-Text
+Alignment
+Direct Sampling
+3.27
+1.02
+1.92
+Sliding Window
+1.17
+3.25
+2.34
+FreeNoise [25]
+1.20
+2.88
+2.68
+Freelong [22]
+3.59
+2.11
+2.98
+RIFLEX [40]
+3.31
+1.09
+1.89
+FreeLOC
+4.11
+3.95
+3.78
+seeds, prompts and aspect ratios, and is fixed for that model
+once obtained. Although the main paper reports generat-
+ing M × N videos for completeness, we empirically find
+that the profile is highly stable and does not require the full
+probing set. Specifically on Wan2.1-T2V-1.3B [32], using
+a single prompt to derive the profile yields high Spearman
+rank correlation (evaluated over 10 randomly sampled sin-
+gle prompts) of (ρ = 0.984 ± 0.009) compared to the full
+profile. Thus, a single sample set is therefore sufficient in
+practice, rendering the probing cost negligible. For Wan2.1-
+T2V-1.3B, probing requires only 4 hours on an RTX 4090.
+Moreover, we will release pre-computed sensitivity profiles
+for popular models, eliminating the need for users to rerun
+probing.
+6.3. User Study
+To further assess our results based on human subjective
+judgment, we carried out a user study. In this study, par-
+ticipants were shown long videos generated using Wan2.1-
+T2V-1.3B as the base short video model. Videos from all
+compared methods were included, totaling 50 videos. The
+examples were presented to participants in a random order
+to eliminate potential bias.
+Participants were asked to score the generated videos on
+a scale of 1 to 5 according to three evaluation criteria: (1)
+Content Consistency, (2) Video Quality, and (3) Video-
+Text Alignment. The average scores for each method are
+reported in Table 7. As shown, our method received the
+highest ratings across all three metrics.
+7. More Qualitative Results
+We provide extensive qualitative comparisons to visually
+demonstrate the superiority of FreeLOC. Figures 6, 7, 8
+and 9 show additional qualitative results on Wan2.1-T2V-
+1.3B and Hunyuan Video. Our method consistently pro-
+duces videos with higher temporal fidelity, sharper details,
+and more stable object identity compared to all baselines.
+Direct
+RIFLEx
+Sliding
+Window
+Freelong
+Freenoise
+Ours
+Prompt: A person is drinking a smoothie from a glass
+Direct
+RIFLEx
+Sliding
+Window
+Freelong
+Freenoise
+Ours
+Prompt: In a dynamic scene, the camera gracefully orbits around a vibrant basketball court, capturing the essence of the 
+game. The court is alive with energy, featuring players in motion, their jerseys a blur of color against the polished wooden 
+floor. As the camera circles, it reveals the intricate details of the game: the focused expressions of the players, the swift
+movement of the ball, and the rhythmic bounce echoing in the air. The camera's journey offers a 360-degree view, 
+showcasing the audience's anticipation, the scoreboard's glow, and the towering hoop standing as the centerpiece of this 
+thrilling spectacle.
+Figure 6. Qualitative Results of Wan2.1-1.3B-T2V with 4× extension (321-frame)
+Direct
+RIFLEx
+Sliding
+Window
+Freelong
+Freenoise
+Ours
+Prompt: Origami dancers in white paper, 3D render, on white background, studio shot, dancing modern 
+dance.
+Direct
+RIFLEx
+Sliding
+Window
+Freelong
+Freenoise
+Ours
+Prompt: In a serene, sunlit meadow, the camera gracefully orbits around a solitary, ancient oak tree, its 
+gnarled branches reaching skyward, casting intricate shadows on the lush grass below. As the camera circles, 
+the scene reveals a vibrant tapestry of wildflowers in full bloom, their colors vivid against the verdant 
+backdrop. The gentle rustling of leaves accompanies the camera's smooth motion, capturing the tranquil 
+ambiance of this secluded haven. As the camera continues its orbit, the distant mountains come into view, 
+their majestic peaks bathed in the warm glow of the setting sun, completing the picturesque panorama.
+Figure 7. Qualitative Results of Wan2.1-1.3B-T2V with 2× extension (161-frame)
+Direct
+RIFLEx
+Sliding
+Window
+Freelong
+Freenoise
+Ours
+Prompt: A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city 
+signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She 
+wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, 
+creating a mirror effect of the colorful lights. Many pedestrians walk about.
+Direct
+RIFLEx
+Sliding
+Window
+Freelong
+Freenoise
+Ours
+Prompt: a sheep bending down to drink water from a river
+Figure 8. Qualitative Results of HunyuanVideo with 4× extension (509-frame)
+Direct
+RIFLEx
+Sliding
+Window
+Freelong
+Freenoise
+Ours
+Prompt: A cow running to join a herd of its kind.
+Figure 9. Qualitative Results of HunyuanVideo with 2× extension (253-frame)

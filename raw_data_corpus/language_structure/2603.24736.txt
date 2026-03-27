@@ -1,0 +1,998 @@
+AutoSAM: an Agentic Framework for Automating Input File
+Generation for the SAM Code with Multi-Modal
+Retrieval-Augmented Generation
+Zaid Abulawia,b,∗, Zavier Nduma,b, Eric Cervib, Rui Hub, Yang Liua
+aDepartment of Nuclear Engineering, Texas A&M University.
+bNuclear Science and Engineering Division, Argonne National Laboratory
+Abstract
+In the design and safety analysis of advanced reactor systems, constructing input files
+for system-level thermal-hydraulics codes such as the System Analysis Module (SAM) code
+remains a labor-intensive bottleneck. Analysts must manually extract and reconcile de-
+sign data from heterogeneous engineering documents, then transcribe it into solver-specific
+syntax. In this paper, we present AutoSAM, an agentic framework that automates input
+file generation for SAM. The framework couples a large language model-based agent with
+retrieval-augmented generation over the solver’s user guide and theory manual and spe-
+cialized tools for analyzing PDFs, images, spreadsheets, and text files. AutoSAM ingests
+unstructured engineering documents such as system diagrams, design reports, and data
+tables, extracts simulation-relevant parameters into a human-auditable intermediate rep-
+resentation, and synthesizes validated, solver-compatible input decks. AutoSAM achieves
+multi-modal retrieval through a pipeline that integrates scientific-text extraction, vision-
+based figure interpretation, semantic embedding, and query answering, enabling the agent
+to reason jointly over textual and visual content.
+We evaluate the framework on four case studies of progressively increasing complexity:
+a single-pipe steady-state model, a solid-fuel channel with temperature reactivity feedback,
+the Advanced Burner Test Reactor core, and the Molten Salt Reactor Experiment primary
+loop. Across all cases, the agent produces runnable SAM models whose results are con-
+sistent with expected thermal-hydraulic behavior, while explicitly identifying missing data
+and labeling assumed values. The framework achieves 100% utilization of structured in-
+puts, approximately 88% extraction from PDF text, and 100% completeness in vision-based
+geometric extraction. These results demonstrate a practical path toward prompt-driven
+reactor modeling, in which analysts provide system descriptions and supporting documen-
+tation while the agent translates that intent into transparent, executable, and reproducible
+∗Corresponding author.
+Email address: zaidabulawi@tamu.edu (Zaid Abulawi)
+Preprint submitted to Elsevier
+March 27, 2026
+arXiv:2603.24736v1  [cs.AI]  25 Mar 2026
+SAM simulations.
+Keywords:
+System Analysis Module (SAM); Large Language Model Agent;
+Retrieval-Augmented Generation; Multi-Modal Document Processing; Advanced Reactor
+Modeling
+1. Introduction
+System-level thermal-hydraulics codes are foundational tools in nuclear reactor safety
+analysis, design evaluation, and regulatory licensing. Codes such as RELAP [1], TRACE [2],
+CATHARE [3], and the System Analysis Module (SAM) [4] solve one-dimensional conser-
+vation equations for mass, momentum, and energy across networks of interconnected com-
+ponents—pipes, heat exchangers, pumps, plena, and reactor core channels. These codes
+are used to predict system-wide transient behavior under both normal and off-normal con-
+ditions [5]. The fidelity of these simulations depends not only on the numerical methods
+and closure models employed by the solver, but on the correctness and completeness of the
+input file, which encodes geometry, material properties, boundary and initial conditions,
+operating states, and solver settings. Input-file errors can propagate into non-conservative
+safety margins [6], making input preparation an important activity in reactor analysis
+workflows.
+Despite the maturity of modern system codes, constructing valid input files remains one
+of the most labor-intensive and error-prone stages of the modeling and simulation workflow.
+The process typically requires analysts to extract design parameters from heterogeneous
+engineering documentation. This includes piping and instrumentation diagrams, design ba-
+sis documents, material property databases, and legacy reports—and manually transcribe
+them into solver-specific syntax. This data collection and transcription process is iterative:
+analysts must reconcile information scattered across text, tables, figures, and spreadsheets,
+resolve inconsistencies, fill gaps with engineering judgment, and verify that the assembled
+input file satisfies the solver’s structural and physical constraints. For complex systems
+such as advanced reactor primary loops, this process can consume days to weeks of analyst
+effort for a single model [7, 8].
+The challenge is particularly significant for advanced reactor concepts currently un-
+der development, including sodium-cooled fast reactors (SFRs) [9, 10], molten salt reac-
+tors (MSRs) [11, 12], fluoride-salt-cooled high-temperature reactors (FHRs) [13, 14], and
+high-temperature gas-cooled reactors (HTGRs) [15, 16].
+These designs frequently lack
+the standardized component descriptions and established modeling templates available for
+conventional light-water reactors. Analysts must therefore construct models largely from
+heterogeneous sources that may be incomplete, preliminary, or distributed across multiple
+sources and formats [17].
+SAM, developed at Argonne National Laboratory, is a modern system-level simula-
+tion code specifically designed to support the thermal-hydraulic analysis of advanced non-
+2
+light-water reactor concepts [4]. SAM solves the one-dimensional, area-averaged conser-
+vation equations and provides models for single-phase and two-phase flow, conjugate heat
+transfer, and reactor kinetics feedback. The code is actively used in regulatory licensing
+activities by the U.S. Nuclear Regulatory Commission and supports safety analysis for
+multiple advanced reactor designs. A SAM input file is organized into distinct parameter
+blocks—including global parameters, equation of state, components, material properties,
+functions, executioner, preconditioning, outputs, and postprocessors—each requiring pre-
+cise specification of parameters drawn from engineering design data.
+The data required to populate these input blocks are often distributed across het-
+erogeneous sources such as text documents, spreadsheets, PDF reports, tables, and im-
+ages.
+Extracting simulation-relevant information from these multi-modal documents is
+typically performed manually, making data collection a time-intensive step that directly
+affects model fidelity and input file viability. Prior efforts to automate this process have
+relied on standardized templates, Optical Character Recognition (OCR) [18], or rule-based
+key-value extraction. However, these approaches struggle when simulation specifications
+are fragmented across diverse documents or when essential information, such as boundary
+conditions, load directions, or coordinate systems, is encoded visually in figures and dia-
+grams. Classical information extraction pipelines may recover isolated facts but frequently
+fail to map document-level descriptions to solver-specific semantics. Similarly, solver pre-
+processors and graphical user interfaces [19] can generate input decks once parameters
+are explicitly defined, but they do not address the upstream challenge of acquiring those
+parameters from multi-modal engineering documentation. These limitations motivate the
+development of a pipeline that jointly interprets multi-modal documents, compiles the ex-
+tracted information into a structured, solver-specific representation, and enforces validity
+through systematic verification.
+Large language models (LLMs) offer a promising foundation for building such a pipeline,
+given their demonstrated capabilities in code generation, reasoning, and information syn-
+thesis across diverse fields such as material science [20, 21], biology [22, 23], health-
+care [24, 25], finance [26, 27], environmental modeling [28, 29], and engineering appli-
+cations [30, 31]. In nuclear engineering, recent studies have begun exploring LLM-enabled
+automation and intelligent system integration. Ndum et al. [32] developed an LLM-agent
+framework to automate Monte Carlo simulation workflows. Liu et al. [33] proposed an
+LLM-based system for automating data-driven modeling and analysis in engineering ap-
+plications. Ndum et al. [34] introduced an LLM-assisted digital twin for monitoring and
+control of advanced reactors. Lim et al. [35] presented an AI-driven thermal-fluid testbed
+integrating digital twin technologies and LLM interfaces for advanced SMR systems.
+However, when applied to specialized domains, LLMs exhibit significant limitations.
+In fields such as mechanical engineering and materials science, much of the relevant data
+resides in private databases, secure networks, or within technical figures and tables not
+readily parsed by language models [36]. In pharmaceuticals, a large portion of domain-
+specific knowledge exists within private companies as proprietary or commercially sensitive
+3
+information [37]. In the nuclear domain, closed-source simulation codes such as SAM are
+not represented in public training corpora. The absence of such domain-specific data leads
+to errors or hallucinations when LLMs are prompted outside their knowledge base [38].
+Several strategies have been developed to bridge this gap. Tailored system instruc-
+tions can guide an LLM to follow specific reasoning patterns and maintain consistency
+in domain-specific responses [39]. However, current models that support very large con-
+text windows, exceeding one hundred thousand tokens, face trade-offs when incorporating
+long instructions, including increased computational cost, slower inference, and reduced
+effectiveness in capturing long-range dependencies [40, 41]. Retrieval-augmented genera-
+tion (RAG) provides a complementary approach by granting the model access to external
+knowledge repositories, retrieving relevant content through similarity search rather than
+relying solely on the model’s training data [42]. Combining system instructions with RAG
+can transform a general-purpose LLM into a domain-specific assistant. Beyond knowledge
+augmentation, equipping LLM-powered agents with specialized tools and libraries enables
+them to perform complex, multi-step technical workflows that extend well beyond text
+generation alone.
+Of particular relevance to nuclear engineering modeling and simulation input file gener-
+ation, the AutoFLUKA framework [32] demonstrated that a single LLM agent can generate
+executable Monte Carlo input files for the FLUKA radiation transport code, establishing
+precedent for AI-assisted simulation input generation in the nuclear domain. However, ex-
+isting approaches have generally focused on single-source, text-based inputs and have not
+addressed the multi-modal document processing challenge inherent in system-code model-
+ing, where critical information is distributed across PDFs, engineering drawings, images,
+spreadsheets, and narrative reports. Because SAM is closed-source and licensed, its input
+syntax, parameter definitions, and modeling conventions are not well represented in the
+training data of current LLMs, further limiting the direct applicability of general-purpose
+AI assistants to SAM-related tasks.
+In this work, we present AutoSAM, a multi-modal, retrieval-augmented LLM agent
+framework designed to automate the generation of SAM input files directly from het-
+erogeneous engineering documentation.
+The framework employs a ReAct-based single
+agent architecture that combines three complementary specialization strategies: (1) expert-
+engineered system instructions encoding SAM’s input file structure and modeling conven-
+tions, (2) retrieval-augmented generation over embedded representations of SAM’s user
+guide and theory manual, and (3) a suite of seven specialized tools for parsing PDFs,
+images, spreadsheets, and text files, as well as for creating and validating SAM input
+decks. The agent ingests unstructured engineering artifacts, extracts simulation-relevant
+parameters into a human-auditable intermediate structured representation, and synthe-
+sizes validated, solver-compatible input files. The intermediate representation serves as a
+deliberate human-in-the-loop checkpoint, allowing domain experts to review, correct, and
+augment the extracted data before final input generation—a design choice aligned with the
+quality assurance expectations of nuclear safety analysis.
+4
+We demonstrate and evaluate the framework through four case studies of progressively
+increasing complexity: (i) a single-pipe steady-state model that validates baseline compo-
+nent modeling, (ii) a solid-fuel channel with temperature-driven reactivity feedback that
+tests multi-physics coupling, (iii) the reactor core of the Advanced Burner Test Reactor
+(ABTR) that requires multi-modal document processing for a parallel-channel configu-
+ration, and (iv) the primary loop of the Molten Salt Reactor Experiment (MSRE) that
+challenges the agent to reconstruct full-loop topology and connectivity from heterogeneous
+sources.
+The remainder of this paper is organized as follows. Section 2 presents our methodology,
+detailing the personalization of the ReAct agent through system instructions, RAG, and the
+integration of specialized tools. Section 3 discusses the customized tool we developed for
+AutoSAM to retrive and process multi-modal knowledge. Section 4 provides the test cases
+and the results. Section 5 discusses personalization of the methodology, model limitations,
+and safety considerations. Finally, Section 6 concludes with an assessment of the strengths
+and limitations of the current work.
+2. Methodology
+The limited performance of current LLMs on physics and engineering solvers can pri-
+marily be attributed to the scarcity of data describing solver theory, usage, and input
+syntax. In some cases, the closed-source nature of the code further restricts the availability
+of training data. This limitation reflects a lack of exposure to relevant domain-specific
+information rather than an inherent inadequacy in LLM capabilities. To develop an in-
+telligent agent capable of assisting users in generating input files for such solvers, the
+agent must be specialized and equipped with foundational knowledge of the target code.
+In the present work, this domain knowledge is introduced through three complementary
+strategies: (1) tailored system instructions, (2) retrieval-augmented generation (RAG),
+which grants the model access to external, context-specific documents during inference,
+and (3) specialized tools aligned with the target domain. The framework is implemented
+using LangChain, which provides the orchestration needed to integrate the LLM, retrieval
+pipeline, and domain-specific tools into an agentic workflow.
+Figure 1 illustrates this three-pillar specialization approach.
+5
+Figure 1: Specialized LLM-agents through tools, RAG, and system instructions.
+The following subsections first describe the SAM system code and its input file struc-
+ture, which define the domain that the agent must support. We then present how domain-
+specific knowledge is delivered through system instructions and RAG, the document pro-
+cessing workflow that governs how engineering documents are converted into solver-ready
+inputs, and the three categories of tools that enable the agent to execute this workflow.
+2.1. System Analysis Module code
+SAM is a system-level simulation code developed by Argonne National Laboratory to
+support the design and safety evaluation of advanced non-light water reactor systems. SAM
+provides a framework capable of modeling the complex thermal-hydraulic behavior of these
+reactors under both normal and off-normal conditions. Despite its focus on one-dimensional
+(1-D) simulations, SAM incorporates models for heat transfer, fluid dynamics, and system
+interactions. A SAM input file defines the configuration and behavior of a system-level
+simulation through a collection of parameter blocks, each with a distinct purpose in the
+modeling process, as shown in Figure2.
+6
+Figure 2: SAM system code input file structure.
+The Global Parameters block initializes the system with values such as the initial tem-
+perature and pressure. The equation of state block specifies the thermodynamic properties
+of the coolant, which govern fluid behavior. The components block is used to define the
+physical system of pipes, heat exchangers, pumps, etc. It also provides the boundary con-
+ditions and defines the connection between different components. The Materials Properties
+block defines solid material characteristics, including thermal conductivity, specific heat,
+and density for components. The Functions block allows the user to define mathematical
+expressions that could be used throughout the model. The simulation’s numerical con-
+figuration is specified in the Executioner block, which sets the mode of operation (e.g.,
+transient or steady), time discretization, and convergence criteria. The Preconditioning
+block provides additional solver control.The outputs block defines how the data are ex-
+ported, whether to screen, excel files or other options. The Postprocessors block allows
+users to extract derived quantities, or compute location-specific metrics like temperature
+or pressure. The limited performance of current LLMs on the SAM system code can pri-
+marily be attributed to the closed-source nature of the code, which restricts the availability
+of training data.
+2.2. Specific Domain Knowledge through System Instructions and RAG
+Domain-specific knowledge is incorporated into the agent through two complementary
+approaches: system instructions and RAG. First, foundational knowledge is delivered via
+system instructions—a persistent context that is always visible to the model regardless
+7
+of the user’s prompt. These instructions are carefully engineered and curated from the
+solver user guide and theory manual. Due to limitations imposed by the model’s context
+window, only the most essential and foundational information is included. The system
+instructions define the agent’s role and personalize its behavior, specifying the types of tasks
+it should support, such as writing input files, assisting in data collection, validating the
+input file, and troubleshooting errors and warnings to correct input files. The instructions
+also outline the relevant domains the agent should focus on, including fluid flow, heat
+transfer, thermodynamics, and reactor physics. In addition, basic information about the
+input file structure is provided, including required blocks and parameters. The instruction
+set is expandable based on the agent’s observed performance and includes few shots of the
+solver input files. Second, supplementary knowledge is made accessible through RAG. The
+solver’s user guide and theory manual are embedded into a vector store, enabling the agent
+to retrieve relevant information through similarity search based on the user’s prompt.
+2.3. Documents processing workflow
+The automated input generation workflow begins with the ingestion of unstructured
+user-provided documents such as images, and PDF files that contain model description,
+geometry and topology specifications, materials properties, and other simulation related
+parameters. The structured documents processed using specialized tools, including a PDF
+Analysis Tool for extracting text, tables, equations, and PDF images, an Image Analysis
+Tool for interpreting schematics, designs, and layouts. The extracted information is then
+structured and passed into an LLM. The agent produces an intermediate structured YAML
+file that captures all necessary simulation data in a modular, human-readable format. This
+intermediate file is not yet the solver syntax input file, but it provides a flexible, organized
+representation of the simulation setup.
+The intermediate file serves a crucial role as a human-in-the-loop checkpoint between
+raw document data and the final solver input file.
+It allows domain experts to verify,
+edit, and augment the model before code generation, which is vital for correcting possi-
+ble misinterpretations or making nuanced decisions that an LLM alone might miss. The
+intermediate structured file is then combined with other user-provided structured docu-
+ments such as Excel, JSON, and YAML files. Then the agent transforms the data in the
+structured documents into a solver-compatible input file by the Input Creator Tool, and an
+Input File Validation Tool is used to ensure completeness and consistency. The document
+processing workflow is illustrated in Figure 3.
+3. Tools for AutoSAM
+For the agent to support the workflow, and the data collection through documents pro-
+cessing, tools are needed. Some of these tools are essential to perform the data collection,
+while others are performance-enhancing. There are seven tools in total, divided into two
+content parsing tools, two instruction passing tools, two retrieval tools, and a Python code
+8
+Figure 3: A streamline of the agents tools for multi-modal documents processing using a user dynamic
+prompt.
+execution tool. The tools are summarized in Figure 4. In this setup the agent could invoke
+a tool or multiple tools in a single call based on the user prompt and documents provided.
+After the tools are executed, a tool return is sent to the agent, where further actions and
+a response could be generated.
+9
+Figure 4: A summary of the tools’ capabilities: content parsing, instruction passing, retrieval, and Python
+code execution tool.
+3.1. Content parsing tools
+Content parsing tools return the entire file content to the agent due to the nature of such
+files. For example, Excel files may contain tabulated design data where all the information
+is required to generate an input file, making direct parsing the best option. Similarly, a
+user may provide an incomplete input text file whose full content must be parsed before
+the agent can complete it.
+Figure 5: Depiction of the text and Excel files content parsing tool.
+The Excel file reader tool is designed to automatically read, summarize, and provide
+insights from tabular data files. This summary includes the list of column names, the file
+data, descriptive statistics, and structural metadata. The Text file reader tool is designed
+to read and return the contents of various structured and unstructured text-based files.
+10
+Figure 5 depict the content parsing tools.
+3.2. Retrieval tools
+The retrieval tools are meant to create embeddings of PDF files and images, and then
+perform retrieval based on a user query. The PDF analysis tool is a multi-stage pipeline de-
+signed to extract the contents, perform semantic embedding, and retrieve scientific knowl-
+edge from PDF documents. It leverages vision-language models to extract all the PDF doc-
+ument information including text, equations, tables, and figures. The tool performs four
+main operations: (1) structured text extraction using Meta AI’s Nougat model (Neural Op-
+tical Understanding for Academic Text), (2) figures’ caption and description generation via
+vision LLMs, (3) vector embedding of the extracted content, and (4) retrieval-augmented
+query answering.
+Figure 6: A depiction PDF analysis tool embedding and retrieval logic.
+In the first stage, PDF documents are processed using the Nougat model, a vision-
+to-text system trained specifically on scientific papers. Unlike conventional OCR, Nougat
+operates directly on full-page images, reconstructing the original layout—including para-
+graphs, section headers, tables, and even complex LaTeX-style mathematical expressions.
+The extracted text is then semantically chunked and encoded as a dictionary with metadata
+11
+such as the PDF file name, page number, and page-level content. This representation al-
+lows the system to reference specific documents and pages when responding to user queries.
+Nougat model isn’t able to extract information from images inside the PDF document, thus
+further handling is needed.
+After text extraction, each page is rasterized into a high-resolution PNG image. These
+images are analyzed by a vision-language model using a structured prompt instructing it
+to detect and describe all visual figures on the page, including diagrams, plots, schematics,
+and other scientific illustrations. The resulting figure descriptions are stored in a centralized
+knowledge index, enriching the document with visual semantic information.
+figure metadata is added to the extracted data from the Nougat model, then the tool
+computes vector embeddings for all text and figure chunks.
+These embeddings, which
+support similarity-based retrieval, are stored for downstream use. In the final stage, a user
+query is embedded and matched against the stored vectors. The top-retrieved results are
+provided to the agent, which generates a human-readable answer and cites the most relevant
+source pages. The output is returned as a Markdown-formatted response that includes
+both the explanation and its references.
+This workflow supports integrated text-based
+and figure-based retrieval, enabling the system to reason over both visual and linguistic
+content in scientific PDF documents.
+Figure 6 provides a visual overview of the PDF
+analysis pipeline.
+In addition to retrieving from a dynamic directory with user-provided documents, the
+PDF retrieval tool is able to retrieve data from a static directory. This setup combines
+long-term shared knowledge with user-specific content, where the static directory provides
+information on writing and constructing an input file, and a dynamic directory provides
+input data required to build the model.
+– Static Directory: A permanent folder containing a prebuilt vector store of shared
+domain knowledge, typically created from core documents such as theory manuals
+and user guides.
+– Dynamic Directory: A user-provided working directory containing its own vector
+store, built from newly added or task-specific documents.
+The Image analysis tool enables automated understanding and retrieval of images using
+vision-language models and vector embeddings. It is designed to scan a folder of images,
+describe each new image using a user-controlled prompt with an LLM, embed the image
+descriptions semantically, and answer user queries through similarity-based retrieval. This
+makes it ideal for knowledge-driven systems that require understanding visual represen-
+tations such as plots, schematics, or experiment screenshots. Figure 7 illustrates the full
+workflow of the image analysis tool. For each new image not already processed, the tool
+sends the image and user-defined prompt to a selected vision-language model, extracts a
+detailed natural language description of the image, records the description and title into
+a structured file, and embeds the description using a vector embedding model. If a user
+12
+query is provided, the tool semantically retrieves the most relevant image descriptions from
+the vector store using similarity matching.
+Figure 7: A depiction of the image analysis tool embedding and retrieval logic.
+3.3. Instruction passing tools
+Instructions passing tools return a set of instruction for the agent to complete a certain
+task. These instructions are expandable based on the agent’s performance.
+(a)
+(b)
+Figure 8: Depiction of the instructions parsing tools: (a) input file creator tool and (b) input file validator
+tool.
+The input file creator tool is similar to a text file reader tool, but it has a set of
+expandable instructions that the developer could expand based on the experience with the
+agent. The tool is used to automate the generation of the solver’s input file by parsing
+an intermediate file that was generated by the agent after processing different documents.
+The tool passes the intermediate file structured content to the agent. The core output
+of this tool is a detailed LLM prompt that instructs the AI to generate a complete and
+13
+valid input file.
+This prompt includes explicit instructions to infer and synthesize all
+missing blocks, functions, boundary conditions, and solver parameters using engineering
+best practices. The prompt mandates that a proper title, brief problem description, and
+internal comments be included in the final file. The resulting file is intended to be fully
+executable without human intervention.
+The SAM input file validator tool is designed to verify the completeness and structural
+integrity of an input file. It performs both deterministic physics verification, deterministic
+syntax check, and provides additional instructions to the agent for verifying an input
+file.
+The tool begins by reading the file contents and checking for the presence of all
+required input blocks. Each block is verified, and missing entries are reported to the agent.
+The physics check could include units verification, geometry connectivity, functions and
+values check, and initial and boundary conditions. The tool also provides general semantic
+instructions other than the deterministic ones.
+4. Results
+To demonstrate the capabilities of the proposed agent, four test cases of increasing
+complexity are considered. All cases were previously unseen by the agent and are selected
+to systematically evaluate its ability to construct executable system-code input files under
+progressively more demanding modeling conditions. The test suite includes: (i) a single
+pipe model, (ii) a solid-fuel system with temperature reactivity feedback, (iii) the reactor
+core of the Advanced Burner Test Reactor (ABTR), and (iv) the primary loop of the
+Molten Salt Reactor Experiment (MSRE).
+The first two cases rely exclusively on structured input data provided in spreadsheet
+(Excel) format. These cases are designed to assess the agent’s baseline capability to gen-
+erate valid input files when all required information is explicitly available. The single-pipe
+case evaluates the agent’s ability to model a fundamental physical component governed by
+one-dimensional conservation equations, while the second case introduces additional cou-
+pled physics and examines the agent’s ability to incorporate and represent physics feedback
+mechanisms.
+The third and fourth cases move beyond structured inputs and represent realistic en-
+gineering applications with substantially higher complexity. These cases require the agent
+to extract, interpret, and reconcile information from multi-modal sources, including PDF
+documents, images, and spreadsheets. They are used to assess the agent’s ability to con-
+struct coherent, system-level models for real reactor configurations, where information
+is distributed across heterogeneous documents and modeling decisions involve increased
+structural and physical complexity.
+4.1. Test case 1: Pipe model using structured document
+This test case evaluates whether the agent can correctly translate a fully specified,
+structured dataset into an executable system-code input file for a single pipe. The objective
+14
+is to verify that the agent can build the appropriate code objects for a one-dimensional
+flow component and populate them consistently from tabular inputs. Second, it serves as
+a baseline physics check, since the governing behavior is dominated by the fundamental
+one-dimensional conservation equations of mass, momentum, and energy that form the
+core of system thermal–hydraulic solvers.
+The problem is a steady-state simulation of a one-meter, vertical sodium pipe with
+an adiabatic outer wall. The boundary conditions consist of a prescribed inlet velocity
+and inlet temperature, together with a fixed outlet pressure, resulting in a single-phase
+forced-convection flow.
+From a modeling perspective, this requires the agent to define
+the pipe geometry and flow orientation,specify thermophysical properties (e.g., sodium as
+the working fluid), select the spatial and time numerical discretizations, apply compatible
+inlet/outlet boundary conditions that yield a well-posed steady-state solution, and assign
+numerical discretizations, solver settings and initial conditions.
+This case is intentionally designed so that the expected solution is physically easily
+interpretable. Because the outer wall is adiabatic and no volumetric heating is applied, the
+control-volume energy balance implies that the fluid experiences no net heat addition or
+removal along the pipe. Under these conditions, the steady-state solution should converge
+to an axially uniform temperature field: the bulk fluid temperature remains constant along
+the pipe and the wall temperature remains equal to the fluid temperature everywhere.
+Therefore, the bulk outlet temperature should equal the prescribed inlet temperature, and
+the average wall temperature should match the inlet temperature as well.
+In the results, these expectations provide straightforward validation criteria for both
+the generated input file and the resulting simulation: a constant axial temperature profile,
+agreement between inlet and outlet bulk temperatures, consistency between fluid and wall
+temperatures, the pressure decreases monotonically in the flow direction due to frictional
+losses.
+15
+Figure 9: Test case 1: (a) structured document input to the LLM agent, (b) agent-generated simulation
+model, and (c) corresponding simulation results.
+Figure 9 shows the workflow where structured engineering data are provided directly
+to the LLM-based agent. In panel (a), the inputs are already organized in spreadsheet
+(pipe dimensions, boundary conditions, and fluid properties), so the agent does not need
+to interpret diagrams or narrative text. Using these structured values, the agent automat-
+ically constructs the simulation input file in panel (b), translating the provided geometry,
+material/fluid properties, and boundary conditions into a complete, runnable model spec-
+ification.
+Panel (c) presents the corresponding simulation outputs. The agent produced a physi-
+cally consistent model, applied boundary conditions correctly, and preserved conservation
+behavior. The panels demonstrate that when clean structured data are supplied, the agent
+can reliably synthesize a valid input model and produce results consistent with engineering
+expectations.
+4.2. Test case 2: Solid-fuel temperature reactivity feedback using structured documents
+This test case extends the baseline one-dimensional flow modeling capability demon-
+strated in Test Case 1 by introducing additional coupled physics in the form of temperature-
+driven reactivity feedback. The objective is to evaluate whether the LLM-based agent can
+correctly incorporate physics models that depend on the interaction between fluid flow,
+solid heat transfer, and system feedback mechanisms, rather than modeling fluid conser-
+vation equations alone.
+The modeled system consists of a single heated flow channel with concentric solid regions
+representing nuclear fuel and surrounding cladding. In addition to the one-dimensional
+16
+fluid-flow equations governing the coolant channel, the model includes heat conduction
+within the solid regions and a temperature-dependent reactivity feedback model. Internal
+volumetric power generation is set to zero, such that changes in solid temperature arise
+solely from externally imposed boundary conditions rather than internal heat sources. This
+design isolates the feedback mechanism and simplifies physical interpretation of the results.
+A transient inlet boundary condition is applied to drive the system response. Specif-
+ically, the inlet coolant temperature is increased linearly from 628.15 K to 728.15 K over
+a 10 s interval. This temperature ramp propagates through the coolant channel and into
+the solid regions via convective heat transfer, producing a corresponding increase in fuel
+temperature.
+A negative temperature-feedback coefficient is prescribed, representing a
+stabilizing feedback mechanism in which increasing fuel temperature reduces system reac-
+tivity.
+From a physical standpoint, the expected system behavior is straightforward and well
+defined. As the inlet temperature increases monotonically, the coolant temperature through-
+out the channel rises, leading to a gradual increase in the fuel temperature. Because the
+feedback coefficient is negative, the associated reactivity feedback should decrease smoothly
+and monotonically over time. Once the inlet-temperature ramp terminates, both the fuel
+temperature and the reactivity feedback are expected to asymptotically approach steady
+values.
+Figure 10 summarizes the workflow and results for this test case. Panel (a) shows the
+structured input data provided to the agent, including tables defining the channel geometry,
+material properties, transient inlet-temperature boundary condition, and the temperature-
+feedback model parameters. Panel (b) illustrates the agent-generated simulation input file,
+which includes a time-dependent inlet-temperature function, the coupled fluid–solid chan-
+nel definition, and the configuration of the reactivity feedback model. Panel (c) presents the
+resulting transient responses: the fuel temperature follows the imposed inlet-temperature
+ramp and levels off after the ramp concludes, while the reactivity feedback becomes pro-
+gressively more negative over time, consistent with the specified feedback coefficient and
+the monotonic temperature increase.
+These results demonstrate that the agent can correctly integrate additional physics
+models into the generated input deck, define transient boundary conditions, and produce
+simulations that exhibit physically consistent coupled behavior. Compared to Test Case
+1, this case verifies the agent’s ability to move beyond single-physics component modeling
+and accurately represent simplified multiphysics interactions driven by structured input
+data.
+17
+Figure 10: Test case 3: (a) unstructured document input to the LLM agent, (b) agent-generated structured
+data, (c) agent-generated model/solver’s input file, and (d) corresponding simulation results.
+4.3. Test case 3: Advanced Burner Test Reactor (ABTR) core model
+This test case transitions from structured, fully specified inputs (Test Cases 1–2) to a
+more realistic engineering scenario where key modeling information is distributed across
+unstructured and multi-modal sources. The goal is to evaluate whether the LLM-based
+agent can interpret a system layout from an image, extract operating conditions and ma-
+terial/physics details from a PDF, reconcile these heterogeneous inputs into a consistent
+structured representation, and generate an executable transient model that preserves the
+intended topology and physical behavior.
+The Advanced Burner Test Reactor (ABTR) is a conceptual sodium-cooled fast reactor
+developed as a test and demonstration platform for advanced fuel cycles and fast-spectrum
+reactor technologies [43].
+In ABTR-type designs, liquid sodium serves as the primary
+coolant and flows through multiple parallel fuel subassemblies in the reactor core, where
+heat generated in the fuel is transferred to the coolant before being transported to down-
+stream components.
+The modeled system represents a simplified liquid-metal coolant flow path through an
+ABTR core configuration. Liquid sodium enters an upstream pipe and passes through a
+junction that splits the flow into five parallel vertical channels, representing multiple core
+subchannels. Downstream, the five channels recombine through a second junction into a
+single outlet pipe that discharges to a fixed-pressure boundary. At the inlet, velocity and
+temperature are prescribed (3.25 m/s and 628 K, respectively), while the outlet pressure
+is fixed at 0.1 MPa to close the hydraulic boundary conditions.
+This configuration is
+representative of a common reactor-core flow pattern: distribution through parallel heated
+18
+channels followed by mixing and discharge.
+Thermal energy is added through the heated channel region, with a total heat input
+of 250 MW distributed among the five channels. Each channel includes a simplified solid
+region surrounding the coolant (e.g., fuel and cladding), enabling a basic representation
+of conjugate heat transfer: heat is deposited in the solid, conducted through surrounding
+layers, and transferred to the coolant via convection. As a result, the coolant temperature
+increases along the channel axial direction, and the outlet temperature depends on both
+the power distribution and the channel flow split.
+The expected system response provides multiple physics-based validation checks. First,
+an uneven flow distribution among the five parallel channels is anticipated because junction
+geometry and branch-specific hydraulic resistances are not identical, leading to different
+pressure drops across each branch. Second, pressure should decrease along the flow direc-
+tion due to frictional losses in the pipes/channels and additional form losses at the splitting
+and merging junctions. Third, coolant temperatures should rise through the heated chan-
+nels.
+Figure 11 illustrates the end-to-end workflow for this case.
+In panel (a), the agent
+ingests unstructured multi-modal inputs: an image that encodes the system topology
+(components and connectivity) and a PDF containing case information such as bound-
+ary conditions, material properties, and operating parameters. In panel (b), the agent
+converts these sources into a structured intermediate representation (e.g., a component-
+and-connection table with extracted parameter values) that can be reviewed and edited by
+a user if necessary. Using this structured representation, the agent then generates the final
+system-code input/model. When required details are missing or ambiguous in the source
+documents, the agent explicitly identifies the gaps and records any substituted values as
+assumptions to preserve transparency and traceability. Finally, panel (d) presents repre-
+sentative simulation outputs (e.g., temperature, velocity, and pressure fields), which exhibit
+trends consistent with the expected thermal–hydraulic behavior of a parallel-channel heated
+core segment.
+19
+Figure 11: Test case 3: (a) structured document input to the LLM agent, (b) agent-generated simulation
+model, and (c) corresponding simulation results.
+20
+4.4. Test case 4: Molten Salt Reactor Experiment (MSRE) primary loop model
+Figure 12: Test case 4: (a) multi-modal document inputs to the LLM agent, (b) agent-generated simulation
+model/input file, and (c) corresponding simulation results.
+This test case evaluates the agent’s ability to build a system-level circulating-loop model
+representative of real engineering practice, where the topology spans multiple components
+(core, plenums, pump, heat exchanger, and connecting piping) and required information
+is distributed across heterogeneous sources. The modeled system is based on the primary
+loop of the Molten Salt Reactor Experiment (MSRE) [44], a closed-loop molten-salt system
+in which a heated section adds thermal energy to the primary salt and a heat exchanger
+transfers that energy to a secondary coolant circuit while a pump maintains circulation. Be-
+yond demonstrating correct component-level modeling, this case specifically tests whether
+21
+the agent can reconstruct connectivity from an unstructured layout, reconcile parameters
+extracted from PDFs and images with user-provided structured data, and synthesize an
+executable input deck that produces physically consistent loop-wide trends.
+The primary loop flows through an inlet plenum, a heated core segment, an upper
+plenum, connecting pipes, a pump, and the primary side of a heat exchanger, before re-
+turning through additional piping and a downcomer to close the loop.
+The secondary
+(coolant-salt) side of the heat exchanger is represented using inlet/outlet boundary condi-
+tions, which emulate an external cooling circuit without explicitly modeling the full sec-
+ondary loop. A volumetric heat source is applied in the core region, raising the primary-salt
+temperature as it passes through the heated section. Heat is then removed in the heat ex-
+changer as energy is transferred to the secondary side, producing a temperature decrease
+in the primary loop across the exchanger and a corresponding temperature increase in the
+secondary coolant from its inlet to outlet.
+The expected behavior provides intuitive validation criteria commonly used for cir-
+culating thermal-hydraulic loops. First, the hottest temperatures should occur near the
+core outlet, where heat addition is completed. Second, a measurable temperature drop
+should occur across the heat exchanger on the primary side, with the magnitude governed
+by the imposed secondary boundary conditions and exchanger specifications. Third, the
+secondary side should exhibit a temperature rise from inlet to outlet consistent with net
+heat gain. Finally, after transient effects diminish, the system should settle into a self-
+consistent loop temperature profile (hot leg leaving the core and cooling leg after the heat
+exchanger/return path), indicating that mass and energy balances are satisfied around the
+loop.
+Figure 12 summarizes the end-to-end workflow for this case. In panel (a), the agent
+ingests multi-modal inputs: an image encoding the loop layout and connectivity (core,
+plenums, pipes, pump, and heat exchanger) and a PDF providing case descriptions, mate-
+rial definitions, and operating/boundary conditions. In panel (b), the agent extracts these
+details and converts them into an intermediate structured representation (e.g., a component
+list, connectivity graph, and parameter tables) that can be reviewed and supplemented.
+In this case, additional user-provided structured data (such as component dimensions and
+pump specifications) are incorporated to resolve parameters that are missing or ambigu-
+ous in the unstructured sources.
+Using the combined dataset, the agent synthesizes a
+complete simulation input model, explicitly flagging any remaining gaps as assumptions
+when required for executability and traceability. Panel (e) shows representative simula-
+tion results: temperatures increase through the heated core region and decrease across the
+heat exchanger on the primary side, while the secondary side warms across the exchanger.
+These trends are consistent with expectations for a pumped heated loop with heat removal,
+demonstrating that the generated model is executable and produces physically reasonable
+loop-level behavior.
+22
+4.5. Results analysis
+Figure 13 provides a quantitative summary of how information is consumed, extracted,
+and propagated through the agent’s multi-modal data pipeline across the four test cases.
+The purpose of this analysis is to contextualize the results presented in Sections 4.1–4.4
+by examining how different data sources contribute to the final models. Importantly, this
+analysis is intended to characterize information flow and coverage within the pipeline rather
+than to serve as a formal quality or performance assessment of the agent.
+Panel (a) focuses on structured data usage for Test Cases 1 and 2, where all required
+inputs are provided in spreadsheet form. The bars compare the number of parameters
+supplied to the agent with the number ultimately used in the generated simulation inputs.
+In both cases, all provided parameters (30 for Test Case 1 and 49 for Test Case 2) are fully
+consumed, resulting in a 100% usage rate. This confirms that no structured information
+is dropped or ignored during ingestion and translation, and that the agent preserves all
+explicitly supplied data when generating input files.
+Panel (b) examines PDF-based textual retrieval performance for Test Cases 3 and 4 by
+comparing the number of expected data items against those successfully extracted by the
+agent. Across both cases, the agent retrieves the majority of the required textual informa-
+tion (45 out of 51 total items), corresponding to an overall extraction rate of approximately
+88%. While these omissions do not prevent model execution, they highlight where human
+review or supplemental structured inputs may be beneficial in complex, document-driven
+scenarios.
+Panel (c) reports performance for image-based information extraction in Test Cases 3
+and 4.
+All required image-derived attributes (37 out of 37) are successfully recovered,
+yielding a completeness rate of 100%. The bars further decompose the extracted attributes
+into three categories: explicitly stated positional information, inferred positional attributes,
+and inferred or deduced length-related attributes. This breakdown illustrates that complete
+recovery often requires reasoning beyond direct visual cues, particularly when dimensions
+or relative placements must be inferred from layout diagrams rather than explicitly labeled.
+The results demonstrate that the agent can not only parse visual structure, but also infer
+missing geometric relationships needed for model construction.
+23
+Figure 13: Performance of the agent’s data pipeline across structured inputs, PDF text retrieval, and
+vision-based image extraction. (a) All structured parameters passed to the agent are utilized, yielding a
+usage rate of 100%. (b) PDF textual retrieval recovers 45 of 51 expected items. (c) Vision-based extraction
+achieves 100% completeness, breaking extracted image attributes into explicitly stated position, inferred
+position, and inferred/deduced length components.
+Figure 14 illustrates how the agent converts the Test Case 4 2-D X–Y schematic into a
+1-D, solver-ready geometric and topological specification suitable for solver. The schematic
+(left) depicts the primary loop as a sequence of straight connected segments labeled inlet
+plenum, core, upper plenum, pipe 1–5, pump, and heat exchanger. Key node coordinates are
+annotated at corners and endpoints, providing a minimal but sufficient geometric details
+for reconstructing component start/end locations and connectivity.
+The agent’s extracted interpretation is demonstrated on the right. First, it establishes
+a coordinate convention for replication in the solver. It then enumerates labeled nodes from
+the figure (e.g., node identifiers and their coordinates) and uses these nodes to define each
+1-D component segment by a start point, an orientation vector aligned with the segment
+direction, and a length computed from the annotated coordinates. This component-by-
+component decomposition is critical for system-code model construction because SAM
+requires explicit geometric definitions for each 1-D element.
+In addition to geometry, the agent explicitly reconstructs topology. Because SAM gen-
+erally requires connection elements (e.g., junctions/branches) to link 1-D components, the
+agent lists the required junction definitions and maps component ports (inlet/outlet) to
+shared nodes. Finally, a concise flow/topology summary line provides an end-to-end traver-
+sal of the loop (from inlet plenum through the core, pump, and heat exchanger and back
+through the downcomer), serving as a high-level consistency check that the reconstructed
+graph matches the intended physical flow path. Overall, the figure highlights the agent’s
+ability to extract actionable geometric and connectivity information from a schematic,
+producing intermediate structured definitions that are both human-verifiable and directly
+24
+usable for automated input-deck generation.
+Figure 14: Agent-assisted extraction of 1-D SAM component geometry and connectivity from a 2-D loop
+schematic (Test Case 4). The agent identifies labeled nodes and coordinates, defines each component by
+start point, orientation, and length, specifies required junction/branch connectivity, and summarizes the
+loop flow path for consistency checking.
+5. Discussions
+5.1. Generalization of the methodology
+The proposed methodology functions as a generalized framework applicable across var-
+ious physics solvers and simulation codes. While the core architecture remains consistent,
+specific domain adaptation is necessary to address unique solver requirements, such as
+input file syntax, physics constraints, and parameter definitions. This process requires a
+modular update of system instructions and the embedding of relevant documentation.
+Crucially, the agentic tools are categorized by their dependence on the solver:
+25
+• Solver-Specific Tools: Tools like the Input File Creator require adaptation to
+match the target solver’s syntax. For example, in the SAM implementation, this
+involved adding deterministic calculations and checks to the input file validator.
+• Solver-Agnostic Tools: General-purpose utilities, such as the Excel file reader,
+text file reader, Python execution tool, and RAG implementation remain unchanged
+regardless of the simulation environment.
+5.2. Privacy concerns
+Incorporating LLMs into scientific workflows raises important privacy and data protec-
+tion concerns, particularly when dealing with sensitive domains such as nuclear engineering.
+One critical distinction is between using publicly hosted chatbots (e.g., via web interfaces)
+versus interacting with LLMs through private APIs or locally hosted models. Online chat-
+bots typically route user data through external servers, where prompts and uploaded doc-
+uments may be logged, used for model improvement, or subject to data retention policies
+outside the user’s control. This is particularly concerning when working with proprietary
+models, internal workflows, or classified datasets. By contrast, using LLMs through secured
+APIs or deploying them on local infrastructure allows users to retain full control over their
+data. For instance, documents such as reactor design specifications, experimental results,
+or safety analyses can be processed without risk of data leakage. When RAG is employed,
+vector databases and embedding models can be hosted on secure servers, ensuring that the
+retrieval pipeline does not expose sensitive content externally.
+5.3. Safety concerns
+Beyond privacy, the safe use of LLM-powered agents in nuclear applications requires
+careful consideration. SAM is a system-level thermal-hydraulics code developed and used
+in regulatory licensing activities by the U.S. Nuclear Regulatory Commission (NRC). Given
+the critical nature of the simulations it supports, introducing automation via LLMs must
+not compromise the integrity or reliability of the input files. To address these safety con-
+cerns, we introduce a layered safety mechanism. First, the agent does not directly write
+the final SAM input file upon extracting data. Instead, it generates an intermediate struc-
+tured file containing all the extracted parameters and source references. This intermediate
+file allows human users to verify, edit, and approve the content before the SAM input file
+is finalized. Second, the modular prompt design ensures transparency and traceability in
+tool invocation, making it easier for users to follow the logic of the agent’s actions. While
+the agent significantly streamlines the workflow, ultimate responsibility for correctness and
+safety remains with the user. Manual review is essential, particularly in high-stakes en-
+vironments like nuclear licensing. By combining automation with human oversight, the
+system balances efficiency and safety, minimizing the risk of unverified input generation
+while still benefiting from AI-driven acceleration.
+26
+5.4. Model limitations
+Despite their impressive capabilities, LLMs are not without limitations—especially
+when applied to scientific and safety-critical domains.
+One of the primary concerns is
+the potential for hallucinations, where the model generates information that is plausible-
+sounding but factually incorrect. To mitigate these risks, the agent described in this work
+employs a hybrid strategy that combines tool chaining, rule-based validation, and human
+oversight.
+Tool chaining ensures that domain-specific calculations are delegated to de-
+terministic tools rather than relying only on the LLM’s internal reasoning. Rule-based
+validation steps are integrated into the workflow to detect physically implausible values
+or missing parameters. Most importantly, a human-in-the-loop review is enforced by gen-
+erating an intermediate file before finalizing the SAM input file.
+This gives users the
+opportunity to audit the output and correct any inconsistencies.
+Despite these limitations, the agent demonstrated strong potential in supporting domain-
+specific problem-solving. In the ABTR test case, the model successfully diagnosed and
+addressed a user concern related to high system pressure. It traced the issue to an incor-
+rect form loss value, recommended a correction, and updated the input accordingly. This
+case illustrates the LLM’s potential to reason through physical problems when equipped
+with the right tools and context. However, the success also highlights the importance of
+maintaining a collaborative approach where AI augments expert knowledge rather than
+replacing it. In this work, code execution, error reporting to the agent, and data analy-
+sis were performed manually by the user. Subsequent efforts have focused on automating
+these workflow tasks, including code execution and data analysis. Furthermore, an error-
+resolution tool and an accompanying error database have been developed to support the
+agent’s operations.
+5.5. Impact
+The primary impact of this work is the demonstration that multi-modal, tool-augmented
+LLM agents can directly reduce the ”model setup bottleneck” that dominates many engi-
+neering simulation workflows where model construction depends on data spread across het-
+erogeneous documents. By converting mixed source materials (PDFs, images, spreadsheets,
+and text) into a human-auditable intermediate structured representation, the framework
+enables systematic synthesis of solver-ready input decks. This supports a broader paradigm
+in which “modeling becomes prompting,” i.e., users communicate intent and provide sup-
+porting documentation, and the agent translates that intent into transparent, executable
+simulation models. A second, longer-term impact is how this approach could reshape the
+future of modeling and simulation practice.
+Instead of treating input decks as one-off
+artifacts created by hand, models become regenerable products of a document-grounded
+pipeline: as designs evolve and documentation changes, the model can be rebuilt system-
+atically with traceable provenance to source material and explicit assumption labeling.
+For experienced analysts, the AutoSAM functions as a productivity assistant. It can
+(i) automate model assembly, (ii) reduce time spent searching manuals and transcribing
+27
+requirements by enabling retrieval over both text and figures, and (iii) surface gaps early
+by explicitly identifying missing parameters and flagging assumptions, allowing experts to
+focus on model fidelity, scenario definition, and interpretation. Critically, the intermediate
+structured file preserves expert control by serving as a deliberate checkpoint for review and
+correction before final input generation.
+6. Conclusions
+In this paper, we presented AutoSAM, a multi-modal, retrieval-augmented LLM agent
+framework for automating the generation of input files for the SAM system thermal-
+hydraulics code.
+The central contribution is a unified workflow that enables a single
+ReAct-based agent to ingest heterogeneous engineering documentation, including reactor
+design reports, system diagrams, material property tables, and spreadsheets, and produce
+validated, solver-compatible SAM input decks through an auditable, two-stage process.
+By combining SAM-specific system instructions, retrieval-augmented generation over the
+code’s user guide and theory manual, and seven specialized tools for document parsing, in-
+put creation, and input validation, the framework addresses the well-recognized bottleneck
+of manual input-file preparation that currently constrains reactor modeling productivity.
+Four case studies demonstrated the framework’s capabilities across a range of modeling
+complexity representative of practical SAM applications. The single-pipe case confirmed
+that the agent correctly constructs basic one-dimensional flow components and applies
+boundary conditions that yield physically consistent steady-state solutions. The tempera-
+ture reactivity feedback case verified the agent’s ability to incorporate coupled multi-physics
+models, including solid heat conduction and point kinetics, into the generated input deck.
+The ABTR core case demonstrated multi-modal document processing: the agent extracted
+system topology from an engineering diagram, reconciled operating parameters from a PDF
+design document, and synthesized a five-channel parallel-flow model with conjugate heat
+transfer, explicitly identifying and labeling parameters that were assumed due to missing
+source data. The MSRE primary loop case extended these capabilities to a full circulat-
+ing system with multiple component types, testing the agent’s ability to reconstruct loop
+connectivity and produce simulations exhibiting the expected hot-leg/cold-leg temperature
+distribution.
+Quantitative analysis of the data pipeline revealed that all structured parameters pro-
+vided via spreadsheets were utilized without loss (100% usage rate), PDF-based text extrac-
+tion achieved approximately 88% recall of expected data items, and vision-based geometric
+extraction from engineering diagrams achieved 100% completeness across 37 extracted at-
+tributes. These metrics provide an initial characterization of the pipeline’s information
+fidelity, though systematic benchmarking against human analyst performance remains an
+important direction for future work.
+The results demonstrate a practical path toward what we term prompt-driven reactor
+modeling: a paradigm in which analysts provide system descriptions and supporting docu-
+28
+mentation, and an intelligent agent translates that intent into transparent, executable, and
+reproducible SAM simulations. The intermediate structured representation ensures that
+human expertise remains central to the process by providing an explicit review checkpoint
+consistent with the quality assurance practices expected in nuclear safety analysis. For
+experienced analysts, the framework functions as a productivity tool that automates data
+extraction and input assembly while preserving expert control over modeling decisions.
+Despite these advances, several limitations of the current framework should be noted.
+First, we have demonstrated the approach exclusively with SAM. While the architecture
+is designed to be solver-agnostic through modular system instructions and tool definitions,
+adaptation to other system codes (e.g., RELAP5, TRACE) requires re-engineering of the
+solver-specific components; Additionally, context window limitations may constrain the
+framework’s applicability to very large system models with hundreds of components. Multi-
+agent decompositions (e.g., planner–builder–verifier roles) may improve robustness and
+scalability for large systems and multi-physics coupling [45].
+Several directions for future work follow naturally from this study. An ongoing effort
+is extending the framework to full workflow automation, including simulation execution,
+iterative runtime error resolution, automated post-processing, and results reporting, would
+close the loop between model creation and model use. Other key research directions in-
+clude multi-agent architectures for decomposing large system models, formal verification
+and validation protocols suitable for regulatory acceptance, extension to additional system
+codes and multi-physics platforms, and systematic evaluation of input-file quality against
+human-generated reference models. As advanced reactor designs progress toward licensing,
+AI-assisted modeling frameworks such as AutoSAM have the potential to accelerate safety
+analysis workflows while maintaining the rigor and traceability that nuclear regulation
+demands.
+Acknowledgment
+The submitted manuscript has been co-created by UChicago Argonne, LLC, Operator
+of Argonne National Laboratory (“Argonne”). Argonne, a U.S. Department of Energy
+Office of Science laboratory, is operated under Contract No. DE-AC02-06CH11357. The
+U.S. Government retains for itself, and others acting on its behalf, a paid-up nonexclusive,
+irrevocable worldwide license in said article to reproduce, prepare derivative works, dis-
+tribute copies to the public, and perform publicly and display publicly, by or on behalf of
+the Government.
+Authors Zaid Abulawi, Zavier Ndum Ndum, and Yang Liu are partially supported
+by the U.S. Department of Energy Office of Nuclear Energy Distinguished Early Career
+Program under contract number DE-NE0009468.
+29
+Declaration of generative AI and AI-assisted technologies in the manuscript
+preparation process
+During the preparation of this work, the authors used generative AI tools to assist with
+language refinement, editing, and manuscript organization. In addition, the study itself
+involves the development and evaluation of an AI-based framework for automated input
+file generation. All AI-assisted outputs used in manuscript preparation were reviewed and
+edited by the authors as needed, and the authors take full responsibility for the content of
+the published article.
+References
+[1] G. Mesina, A history of relap computer codes, Nuclear Science and Engineering 182 (1)
+(2016) v–ix.
+[2] S. Bajorek, M. Bernard, C. Gingrich, C. Hoxie, A. Ireland, J. Kelly, J. Mahaffy,
+C. Murray, J. Spore, J. Staudenmeier, et al., Development, validation and assessment
+of the trace thermal-hydraulics system code, in: Proceedings of the 16th International
+Topical Meeting on Nuclear Reactor Thermal Hydraulics, Chicago, IL, USA, Vol. 14,
+2015, pp. 1–14.
+[3] P. Emonot, A. Souyri, J. Gandrille, F. Barr´e, Cathare-3: A new system code for
+thermal-hydraulics in the context of the neptune project, Nuclear Engineering and
+Design 241 (11) (2011) 4476–4481.
+[4] R. Hu, L. Zou, D. O’Grady, T. Mui, Z. J. Ooi, G. Hu, E. Cervi, G. Yang, D. Andrs,
+A. Lindsay, et al., Sam: A modern system code for advanced non-lwr safety analysis,
+Nuclear Technology 211 (9) (2025) 1883–1902.
+[5] K. Moshkbar-Bakhshayesh, M. B. Ghofrani, Transient identification in nuclear power
+plants: A review, Progress in Nuclear Energy 67 (2013) 23–32.
+[6] F. S. D’Auria, H. Glaeser, S. Lee, J. Mi´ak, M. Modro, R. Schultz, et al., Best Esti-
+mate Safety Analysis for Nuclear Power Plants: Uncertainty Evaluation. IAEA Safety
+Report Series, Vol. 52, IAEA, 2008.
+[7] S. K. Gupta, C. J. Paredis, R. Sinha, P. F. Brown, Intelligent assembly modeling and
+simulation, Assembly Automation 21 (3) (2001) 215–235.
+[8] D. N. Macklin, N. A. Ruggero, M. W. Covert, The future of whole-cell modeling,
+Current opinion in biotechnology 28 (2014) 111–115.
+[9] J. Eoh, C.-G. Park, J.-Y. Lim, J.-H. Kim, H.-Y. Ye, J. Chang, Design and safety fea-
+tures of salus-100: A long fuel-cycled sodium-cooled fast reactor, Nuclear Engineering
+and Design 420 (2024) 112996.
+30
+[10] K. Takano, S. Ohki, T. Ozawa, H. Yamano, S. Kubo, M. Ogura, Y. Yamada,
+K. Koyama, K. Kurita, L. Costes, et al., Core and safety design for france–japan
+common concept on sodium-cooled fast reactor, EPJ N-Nuclear Sciences & Technolo-
+gies 8 (2022) 35.
+[11] S. S¸ahin, H. M. S¸ahin, G. Tun¸c, H. S¸ahiner, Design studies for a 50 mwth molten salt
+fast reactor, Progress in Nuclear Energy 166 (2023) 104964.
+[12] J. Serp, M. Allibert, O. Beneˇs, S. Delpech, O. Feynberg, V. Ghetta, D. Heuer, D. Hol-
+comb, V. Ignatiev, J. L. Kloosterman, et al., The molten salt reactor (msr) in gener-
+ation iv: overview and perspectives, Progress in Nuclear Energy 77 (2014) 308–319.
+[13] R. O. Scarlat, M. R. Laufer, E. D. Blandford, N. Zweibaum, D. L. Krumwiede, A. T.
+Cisneros, C. Andreades, C. W. Forsberg, E. Greenspan, L.-W. Hu, et al., Design
+and licensing strategies for the fluoride-salt-cooled, high-temperature reactor (fhr)
+technology, Progress in Nuclear Energy 77 (2014) 406–420.
+[14] N. Zweibaum, G. Cao, A. T. Cisneros, B. Kelleher, M. R. Laufer, R. O. Scarlat,
+J. E. Seifried, M. H. Anderson, C. W. Forsberg, E. Greenspan, et al., Phenomenology,
+methods and experimental program for fluoride-salt-cooled, high-temperature reactors
+(fhrs), Progress in Nuclear Energy 77 (2014) 390–405.
+[15] E. M. Duchnowski, R. F. Kile, K. Bott, L. L. Snead, J. R. Trelewicz, N. R. Brown,
+Pre-conceptual high temperature gas-cooled microreactor design utilizing two-phase
+composite moderators. part i: Microreactor design and reactor performance, Progress
+in Nuclear Energy 149 (2022) 104257.
+[16] S. Ueta, J. Aihara, K. Sawa, A. Yasuda, M. Honda, N. Furihata, Development of high
+temperature gas-cooled reactor (htgr) fuel in japan, Progress in Nuclear Energy 53 (7)
+(2011) 788–793.
+[17] C. W. Forsberg, P. F. Peterson, K. Sridharan, L.-w. Hu, M. Fratoni, A. K. Prinja,
+Integrated fhr technology development: Tritium management, materials testing, salt
+chemistry control, thermal hydraulics and neutronics, associated benchmarking and
+commercial basis, Tech. rep., Massachusetts Inst. of Technology (MIT), Cambridge,
+MA (United States . . . (2018).
+[18] R. Mithe, S. Indalkar, N. Divekar, Optical character recognition, International journal
+of recent technology and engineering (IJRTE) 2 (1) (2013) 72–75.
+[19] W. L. Martinez, Graphical user interfaces, Wiley Interdisciplinary Reviews: Compu-
+tational Statistics 3 (2) (2011) 119–133.
+31
+[20] A. Bazgir, R. chandra Praneeth Madugula, Y. Zhang, Matagent: A human-in-the-loop
+multi-agent LLM framework for accelerating the material science discovery cycle, in:
+AI for Accelerated Materials Design - ICLR 2025, 2025.
+URL https://openreview.net/forum?id=2Nm6Ef4tZD
+[21] Y. Tang, W. Xu, J. Cao, W. Gao, S. Farrell, B. Erichson, M. W. Mahoney, A. Non-
+aka, Z. Yao, Matterchat: A multi-modal llm for material science, arXiv preprint
+arXiv:2502.13107 (2025).
+[22] C. Wang, Q. Long, M. Xiao, X. Cai, C. Wu, Z. Meng, X. Wang, Y. Zhou, Biorag: A
+rag-llm framework for biological question reasoning, arXiv preprint arXiv:2408.01107
+(2024).
+[23] A. Fallahpour, A. Magnuson, P. Gupta, S. Ma, J. Naimer, A. Shah, H. Duan,
+O. Ibrahim, H. Goodarzi, C. J. Maddison, et al., Bioreason: Incentivizing multimodal
+biological reasoning within a dna-llm model, arXiv preprint arXiv:2505.23579 (2025).
+[24] S. Goyal, E. Rastogi, S. P. Rajagopal, D. Yuan, F. Zhao, J. Chintagunta, G. Naik,
+J. Ward, Healai: A healthcare llm for effective medical documentation, in: Proceedings
+of the 17th ACM International Conference on Web Search and Data Mining, 2024,
+pp. 1167–1168.
+[25] Z. Yang, X. Xu, B. Yao, E. Rogers, S. Zhang, S. Intille, N. Shara, G. G. Gao,
+D. Wang, Talk2care: An llm-based voice assistant for communication between health-
+care providers and older adults, Proceedings of the ACM on Interactive, Mobile, Wear-
+able and Ubiquitous Technologies 8 (2) (2024) 1–35.
+[26] G. Iacovides, T. Konstantinidis, M. Xu, D. Mandic, Finllama: Llm-based financial
+sentiment analysis for algorithmic trading, in: Proceedings of the 5th ACM Interna-
+tional Conference on AI in Finance, 2024, pp. 134–141.
+[27] J. Wang, W. Ding, X. Zhu, Financial analysis: Intelligent financial data analysis
+system based on llm-rag, arXiv preprint arXiv:2504.06279 (2025).
+[28] H. Li, Z. Wang, J. Wang, Y. Wang, A. K. H. Lau, H. Qu, Cllmate:
+A mul-
+timodal benchmark for weather and climate events forecasting, arXiv preprint
+arXiv:2409.19058 (2024).
+[29] Y. Hao, D. Xie, A multi-llm-agent-based framework for economic and public policy
+analysis, arXiv preprint arXiv:2502.16879 (2025).
+[30] L. Chen, Y. Song, S. Ding, L. Sun, P. Childs, H. Zuo, Triz-gpt: An llm-augmented
+method for problem-solving, in: International Design Engineering Technical Confer-
+ences and Computers and Information in Engineering Conference, Vol. 88407, Amer-
+ican Society of Mechanical Engineers, 2024, p. V006T06A010.
+32
+[31] L. Lin, S. Zhang, S. Fu, Y. Liu, Fd-llm: Large language model for fault diagnosis of
+complex equipment, Advanced Engineering Informatics 65 (2025) 103208.
+[32] Z. N. Ndum, J. Tao, J. Ford, Y. Liu, Automating monte carlo simulations in nuclear
+engineering with domain knowledge-embedded large language model agents, Energy
+and AI (2025) 100555.
+[33] Y. Liu, Z. Abulawi, A. Garimidi, D. Lim, Automating data-driven modeling and
+analysis for engineering applications using large language model agents, arXiv preprint
+arXiv:2510.01398 (2025).
+[34] Z. N. Ndum, D. Lim, J. Ford, S. Adu, J. Tao, Y. Hassan, Y. Liu, Large language
+model-assisted digital twin for remote monitoring and control of advanced reactors,
+Progress in Nuclear Energy 192 (2026) 106172.
+[35] D. Lim, Z. N. Ndum, C. Young, Y. Hassan, Y. Liu, An ai-driven thermal-fluid testbed
+for advanced small modular reactors: Integration of digital twin and large language
+models, AI Thermal Fluids (2025) 100023.
+[36] P. Xu, X. Ji, M. Li, W. Lu, Small data machine learning in materials science, npj
+Computational Materials 9 (1) (2023) 42.
+[37] B. Goldacre, S. Lane, K. R. Mahtani, C. Heneghan, I. Onakpoya, I. Bushfield,
+L. Smeeth, Pharmaceutical companies’ policies on access to trial data, results, and
+methods: audit study, Bmj 358 (2017).
+[38] R. Tvaroˇzek, O. Haffner, What if llm doesn’t know, in: 2025 Cybernetics & Informatics
+(K&I), IEEE, 2025, pp. 1–6.
+[39] Q. Liu, W. Wang, J. Willard, Effects of prompt length on domain-specific tasks for
+large language models, arXiv preprint arXiv:2502.14255 (2025).
+[40] J. Li, M. Wang, Z. Zheng, M. Zhang, Loogle: Can long-context language models under-
+stand long contexts?, in: Proceedings of the 62nd Annual Meeting of the Association
+for Computational Linguistics (Volume 1: Long Papers), 2024, pp. 16304–16333.
+[41] N. F. Liu, K. Lin, J. Hewitt, A. Paranjape, M. Bevilacqua, F. Petroni, P. Liang, Lost
+in the middle: How language models use long contexts, Transactions of the Association
+for Computational Linguistics 12 (2024) 157–173.
+[42] P. Xu, W. Ping, X. Wu, L. McAfee, C. Zhu, Z. Liu, S. Subramanian, E. Bakhturina,
+M. Shoeybi, B. Catanzaro, Retrieval meets long context large language models, arXiv
+preprint arXiv:2310.03025 (2023).
+33
+[43] Y. Chang, P. Finck, C. Grandy, J. Cahalan, L. Deitrich, F. Dunn, D. Fallin, M. Farmer,
+T. Fanning, T. Kim, et al., Advanced burner test reactor preconceptual design report.,
+Tech. rep., Argonne National Lab.(ANL), Argonne, IL (United States) (2008).
+[44] P. N. Haubenreich, J. Engel, Experience with the molten-salt reactor experiment,
+Nuclear Applications and technology 8 (2) (1970) 118–136.
+[45] L. Zhou, H. Ling, C. Fu, Y. Huang, M. Sun, W. Yu, X. Wang, X. Li, X. Su, J. Zhang,
+et al., Autonomous agents for scientific discovery: Orchestrating scientists, language,
+code, and physics, arXiv preprint arXiv:2510.09901 (2025).
+34

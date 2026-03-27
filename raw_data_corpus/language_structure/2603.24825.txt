@@ -1,0 +1,1721 @@
+Learning From Developers: Towards Reliable Patch Validation at Scale for Linux
+Chih-En Lin
+Purdue University
+Attreyee Mukherjee
+Purdue University
+Ajay Rawat
+Purdue University
+Ruqi Zhang
+Purdue University
+Pedro Fonseca
+Purdue University
+Abstract
+Patch reviewing is critical for software development, espe-
+cially in distributed open-source development, which highly
+depends on voluntary work, such as Linux. This paper studies
+the past 10 years of patch reviews of the Linux memory man-
+agement subsystem to characterize the challenges involved
+in patch reviewing at scale. Our study reveals that the review
+process is still primarily reliant on human effort despite a
+wide-range of automatic checking tools. Although kernel de-
+velopers strive to review all patch proposals, they struggle
+to keep up with the increasing volume of submissions and
+depend significantly on a few developers for these reviews.
+To help scale the patch review process, we introduce
+FLINT, a patch validation system framework that synthesizes
+insights from past discussions among developers and auto-
+matically analyzes patch proposals for compliance. FLINT
+employs a rule-based analysis informed by past discussions
+among developers and an LLM that does not require training
+or fine-tuning on new data, and can continuously improve
+with minimum human effort. FLINT uses a multi-stage ap-
+proach to efficiently distill the essential information from
+past discussions. Later, when a patch proposal needs review,
+FLINT retrieves the relevant validation rules for validation
+and generates a reference-backed report that developers can
+easily interpret and validate. FLINT targets bugs that tradi-
+tional tools find hard to detect, ranging from maintainabil-
+ity issues, e.g., design choices and naming conventions, to
+complex concurrency issues, e.g., deadlocks and data races.
+FLINT detected 2 new issues in Linux v6.18 development
+cycle and 7 issues in previous versions. FLINT achieves 21%
+and 14% of higher ground-truth coverage on concurrency
+bugs than the baseline with LLM only. Moreover, FLINT
+achieves a 35% false positive rate, which is lower than the
+baseline.
+1
+Introduction
+Large and widely-used open source software systems, par-
+ticularly for systems like Linux kernel, rely on distributed
+development to achieve high code quality. However, main-
+taining high quality requires extensive code review processes,
+which are unreliable and challenging to scale [9,10] are com-
+plex and require extensive domain knowledge.
+The Linux kernel community uses various tools to enhance
+code robustness. For example, static analysis tools [14,37,39]
+are used to identify semantic issues and specific bug patterns.
+Additionally, dynamic tools, such as fuzzers [15–18,42,49]
+and other automated testing tools [25,31], are executed around
+the clock to detect a range of runtime errors in Linux. Al-
+though these tools are useful, there are classes of problems
+they cannot easily check, especially in a very dynamic code-
+base. This includes providing feedback on design trade-offs
+and choices, identifying complex bugs caused by subtleties
+of the complex kernel API, and addressing non-compliance
+with code conventions. As a result, during the patch review,
+developers still have to do a lot of the work, requiring man-
+ual effort that could have been used in other tasks, creating
+development bottlenecks, and making the process difficult to
+scale. Our analysis (§2.2) shows that only 7.3% of reviews
+are based on tool checks, whereas 92.7% of the reviews are
+from developers’ manual analysis.
+The non-scalable patch review process has recently
+emerged as a major bottleneck in the Linux development [9].
+Recently, the gap between the growth of patch proposals and
+the number of developers available to review them has become
+a problem. Our analysis of the Linux’s memory management,
+a core and the most active Linux subsystem, is illustrative
+of the severity of this problem. Over the past 10 years, the
+number of emails exchanged in the memory management
+subsystem list has increased steadily from 17,108 in 2015
+to 49,855 in 2025, as shown in Figure 1. This activity led
+to impressive advances in the kernel – the memory manage-
+ment subsystem now achieves much higher scalability and
+performance while also supporting a wide range of new fea-
+tures that handle application needs. However, this also made
+the memory management subsystem grow by more than 5
+times, leading to the adoption of new and complex system
+designs. In fact, the review period – from patch proposal to
+completion – often exceeds one year [9]. This lengthy review
+1
+arXiv:2603.24825v1  [cs.SE]  25 Mar 2026
+2016
+2018
+2020
+2022
+2024
+Year
+20k
+30k
+40k
+50k
+Total Count
+Total Emails
+Figure 1: Emails exchanged in the Linux memory manage-
+ment mailing list from 2015 to November 2025.
+process is largely due to the complex modifications involved
+in many patch proposals and limited expertise for reviewing
+them [1,9,10]. Moreover, it was found that the patches, which
+were merged before kernel version 5.8, introduced more bugs
+than were fixed, leading to the introduction of poor quality
+code, degrading the kernel [6,8].
+To improve the reliability and effectiveness of the review
+process, some works [7,19,40] have used large language mod-
+els (LLMs) to identify bug patterns in past data and systemat-
+ically apply these patterns to detect bugs in new codebases or
+patches. However, these approaches either have an approxi-
+mately 50% false positive rate of reporting bugs [7], detect
+simple bugs on less mature subsystems like drivers [48], or
+require human effort [40] to annotate the feedback for fine-
+tuning or training the model to keep pace with software up-
+dates. As a result, there is a critical need for scalable patch
+review tools capable of identifying the conventional, complex,
+and high-priority errors that human reviewers target.
+To address this need, this paper analyzes the root causes of
+the patch review process inefficiency by analyzing data from
+the past 10 years in the Linux Kernel Mailing List (LKML).
+Our study reveals that, despite the community’s efforts to
+maintain a steady pace in reviewing the volume of patch pro-
+posals submitted to the LKML, 73.87% of them have not been
+reviewed in the past 10 years. We estimate that approximately
+21.5% of patches require maintenance work, such as merging
+them into the source tree. Additionally, 92.7% of the review
+feedback comes from human reviewers, and 51.8% of that
+feedback pertains to design and style aspects, including imple-
+mentation decisions, coding style, and documentation. This
+suggests a critical need for an automatic and reliable patch
+validation system that can support the kernel.
+This paper introduces FLINT, a rule-based, interpretable,
+LLM-modularized patch validation system. FLINT does not
+require training or fine-tuning the model and uses an attached
+rule set that can be collected automatically. FLINT aims
+to provide an automated system that triage the majority of
+issues and offers actionable and interpretable feedback for
+developers to fix them. Ultimately, our goal is not to replace
+maintainers, but instead to provide a useful signal to develop-
+ers proposing patches that can relieve the significant workload
+kernel maintainers face, and the patch proposals are still vali-
+dated by a human before acceptance.
+Given a developer discussion, FLINT automatically an-
+alyzes the discussion and summarizes the critical concepts
+discussed into rules. These rules provide reliable and consis-
+tent content that leverages the powerful reasoning capabilities
+of LLMs while minimizing the risk of LLM hallucination,
+resulting in a reduced false positive rate. Moreover, FLINT
+provides bug reports with the rules used and their provenance
+to maintain interpretability, keeping the developer in control
+of the process. FLINT uses these rules and the kernel source
+code to validate patch quality from various perspectives. This
+includes detecting issues related to function naming, code con-
+ventions, and race conditions, capabilities that remain difficult
+for traditional tools to match.
+Two main challenges need to be addressed to implement
+and evaluate FLINT. First, how to design the consolidated
+rule set to provide the comprehensive concepts from the large
+number of past discussions while maintaining the LLM perfor-
+mance. Specifically, a previous study [22] shows that a larger
+size of the context window can affect the LLM performance
+significantly. FLINT solves this problem by processing past
+discussions in multiple stages to extract the concept. When-
+ever FLINT extracts the rules from a single discussion thread,
+FLINT generates raw rules and applies a filtering process
+to remove duplicates and non-substantive rules. After filter-
+ing, FLINT categorizes the rules into two types, code logic
+and code convention, to have a more fine-grained dataset that
+can continually improve quality. Then, FLINT will merge
+the new rules into the existing rule set with some conditions
+to preserve detailed information while reducing the context
+window size.
+The second challenge is to measure the accuracy and qual-
+ity of issues reported by FLINT in real-world scenarios. Tra-
+ditional machine learning metrics, such as F1 score and recall,
+are inapplicable due to the lack of an established ground
+truth. The reported issues fall into three types: the fixed
+bugs, undiscovered bugs, and non-bugs. However, because
+the space of potential candidates, including false negatives
+in fixed and undiscovered bugs, as well as true negatives
+in non-bugs, is effectively infinite, it is impossible to enu-
+merate all the possibilities for classification. To address this
+problem, we propose a Ground-truth Coverage Score (GCS),
+which references the metrics from reinforcement learning
+rewards [21, 23, 26, 50, 51, 53]. First, GCS instructs a tar-
+get system, such as FLINT, to generate the issues based on
+the specific buggy patch. Second, GCS employs the LLM-
+based verifier [5,28,43,52] using Chain-of-Thought (CoT)
+reasoning [45] to quantify the extent to which the generated
+issues cover the concepts in the ground truth, bug-fix patch.
+To avoid hallucination, GCS uses majority voting [44] and
+best-of-N [3,5] to avoid the inconsistent LLM behavior.
+Our evaluation shows that our CoT-verifiers can achieve
+close to human performance in judging issues that are close to
+the ground truth. The evaluation also shows the performance
+2
+benefits of FLINT for the multiple-stage rule and issue gener-
+ation with several benchmarks. FLINT can identify complex
+bugs, such as data races, fragmented locking, and deadlocks.
+Moreover, FLINT detects 2 new issues in Linux v6.18 devel-
+opment cycle, and 7 issues in past versions. FLINT improves
+ground truth coverage by 21% over the baseline with LLM
+only. FLINT provides consistent issues, and performs 1.6
+times lower false positive rate than the baseline.
+In summary, this paper makes the following contributions:
+(1) a quantitative analysis of Linux’s memory management
+subsystem patch review process (2) the design and implemen-
+tation of FLINT, a first patch validation system for Linux; and
+(3) a comprehensive metric framework of the patch validation
+system.
+2
+Motivation
+In this section, we analyze the past 10 years of patch reviews
+for Linux on the Linux Kernel Mailing List (LKML) to iden-
+tify the challenges associated with the existing tools. First,
+we explain how we selected the dataset. Next, we discuss the
+analysis of Linux code reviews and evaluate the benefits and
+drawbacks of existing approaches to patch validation.
+2.1
+Methodology of Study
+Thread Selection. We select the memory management sub-
+system from the LKML as the data source, as it is one of the
+core, mature subsystem in Linux with substantial developer
+participation. Moreover, the memory management subsystem
+often intersects with several crucial system topics, resulting
+in other subsystems, such as the file system, driver, and hard-
+ware, frequently submitting their patches to this subsystem.
+Therefore, using the memory management subsystem as the
+source ensures broad coverage of kernel activities while main-
+taining a manageable workload for analysis. We collected
+patch discussion threads over the past 10 years, from 2015 to
+November 2025. The trend in total email volume is shown in
+Figure 1.
+Random Sampling. The memory management subsystem
+contains 386,535 messages over the past 10 years. Given this
+scale, a detailed manual analysis of the entire dataset is infea-
+sible. Therefore, we generated a randomized list of message
+IDs for each year to conduct a manual analysis. We then iter-
+ated through these randomized lists to draw a representative
+sample.
+2.2
+10 Years Patch Review Analysis
+Unreviewed Patches. To determine whether the review work-
+load of developers and maintainers can handle the increased
+throughput of the emails in the mailing list, we analyze the
+percentage of patches that have not received any replies un-
+til November 2025. We randomly sampled 100 discussion
+threads for each year. As shown in Figure 2, the percentage
+of patches without any replies has consistently exceeded 50%
+throughout 10 years in our dataset. This suggests that, despite
+2015
+2016
+2017
+2018
+2019
+2020
+2021
+2022
+2023
+2024
+2025*
+Year
+500
+1000
+1500
+2000
+2500
+Number of Patches
+59.32%
+71.45%
+63.74%
+71.00%
+58.07%
+76.60%
+85.45%
+71.25%
+66.04%
+60.53%
+55.29%
+#patches
+#patches w/o reply
+Figure 2: Number of patches and without any reply in the mail-
+ing list of the memory management subsystem from 2015 to
+Nov 2025, with random sampling of the 100 threads for each
+year. The number in the figure for each year is the percentage
+of the patches without any reply.
+an increase in the volume of emails and patches submitted
+to the mailing list, both maintainers and developers have in-
+tensified their efforts in code review over the past decade.
+However, the workload associated with code reviews has not
+been adequate to handle the large number of patches submit-
+ted.
+Finding: Over the past 10 years, the percentage of
+patches without any replies has consistently exceeded
+50%. This indicates that the code review process is fun-
+damentally unscalable.
+Implication: The inherent scalability limits of patch
+review necessitate the adoption of automated tooling to
+assist developers in prioritizing and triaging the over-
+whelming volume of incoming contributions.
+Type of Review Feedback. To further understand where de-
+velopers and maintainers spend most time reviewing, we ex-
+amine the reply emails in the patch series. We randomly
+sampled 20 reply emails for each year. First, we manually cat-
+egorize the reply email into three major categories: (1) static
+tools [14,37,39], like GCC static analysis and kernel static
+analysis tools; (2) dynamic tools [17,18,25], such as fuzzer
+and runtime testing; (3) and human, such as kernel developers
+and maintainers. Second, we break down the human category
+into four subtypes, design, security, style, and others, to inves-
+tigate what kind of feedback is most frequently provided by
+the reviewers. The design type includes content that primarily
+discusses decisions regarding the logic and design of imple-
+mentations, such as tradeoffs and corner cases. The security
+type contains the content that mainly discusses the bug or
+security concerns. The style type covers the feedback related
+to documentation, coding conventions, such as function types,
+and coding style. We classify the rest of the reply emails as
+3
+2015
+2016
+2017
+2018
+2019
+2020
+2021
+2022
+2023
+2024
+2025*
+Year
+0
+5
+10
+15
+20
+Count
+human - security
+human - others
+human - design
+static tools
+human - style
+dynamic tools
+Figure 3: Distribution of the feedback came from. The dataset
+is a random sampling of 20 reply emails for each year.
+others if the email only contains feedback related to signatures
+and email communications, such as CCing someone who was
+missed or casual comments unrelated to the patches. Finally,
+if one reply email has more than one type, we choose the most
+dominant type, defined as the primary focus or most important
+aspect of the discussion. For example, if a reviewer mentions
+variable naming and design choice simultaneously [11], we
+categorize this email response within the design category.
+As shown in Figure 3, the human feedback dominates the
+review process (92.7%), while the tools only contribute to
+a minority of code reviews (7.3%). In the human category,
+excluding the other type (32.7%), design feedback is the
+most prevalent (40.0%), followed by style (11.8%) and se-
+curity (8.2%). This design feedback often involves specific
+knowledge of the subsystem. For example, one reply clari-
+fies that smp_mb__after_atomic() can only be used with
+the read-modify-write (RMW) atomic operations rather than
+non-RMW atomic operations, e.g., atomic_read(), should
+use smp_mb() or other primitives.
+Finding: Human experts carry the primary burden of
+the review process (60%), primarily addressing complex
+design flaws (40%) rather than simple stylistic errors.
+Implication: Current automation is insufficient because
+it targets low-level compliance. To meaningfully reduce
+reviewer load, tools must evolve to understand domain-
+specific semantics and architectural logic.
+2.3
+Patch Review Analysis
+We conduct a thorough analysis of the workload details to
+identify the specific types of challenges that kernel developers
+face. We focus on the 2024 dataset, the most recent and most
+active period from the past 10 years, providing a comprehen-
+sive overview of the developers’ workload throughout the
+year. We also perform an automated analysis of data from
+2022 and 2023, but the results do not show significant changes
+from 2024.
+Total
+Threads
+228
+Emails
+5,717
+Replies
+3,950
+Patches
+1,633
+Perc.
+Patches requiring maintenance
+21.5%
+Patches without review
+53.2%
+Patches with maintainer review
+23.2%
+Maintainer email reply rate
+36.4%
+Table 1: LKML 2024 sampled dataset properties.
+Patch Thread Selection. We randomly sample 20 threads
+from each month in 2024, removing duplicates to avoid
+double-counting threads that span across consecutive months.
+As shown in Table 1, our dataset consists of 5,717 emails
+from 228 threads. 1,633 of these emails are patch propos-
+als submitted for reviews, 3,950 are emails replied to them,
+and the rest are emails unrelated to patch reviews, such as
+conference proposals.
+Patch Thread Property. We analyze the basic properties of
+each patch thread to understand how much effort developers
+and maintainers spend on code review. First, in terms of re-
+sponse latency, the results show that 69.7% of threads receive
+an initial reply within 5 hours, and 35.1% within just 2 hours.
+However, the length of the discussion remains long. Among
+threads that receive a response, the median length is nearly 11
+replies. This shows that while the memory management com-
+munity is responsive, the review process demands substantial
+and sustained effort from developers and maintainers.
+Maintenance Work. We manually analyze the tasks that are
+exclusive to maintainers, the work that cannot be distributed to
+non-maintainer developers, who are the vast majority of the re-
+viewers. This work includes tasks such as maintaining patches
+and the source tree, like merging and dropping patches. The
+results show that only 21.5% of the patches require main-
+tenance work. This suggests that most of the maintainers’
+workload does not primarily stem from maintenance tasks.
+Patch Response. We analyze the number of patch propos-
+als that remain unreviewed and determine how many emails
+receive responses from maintainers. This helps us to under-
+stand if the current code review process adequately covers all
+patch proposals and whether maintainers are engaging with
+the emails. We find that there are 53.2% patch proposals that
+have not been reviewed, and maintainers responded to only
+23.2% of the total patch proposals. Moreover, we found that
+the code review workload is significantly unbalanced among
+maintainers. Although the maintainer email reply rate, i.e.,
+the percentage of total reply emails sent by maintainers, is
+36.4%, impressively, a single maintainer is responsible for
+13.7% of these responses. One of the potential reasons [9]
+is that most developers are not confident enough to review
+complex patch proposals, specifically, those outside of their
+comfort zone.
+Finding: While the community is highly responsive
+4
+Past
+Discussion
+Threads
+2. Rule
+Substantive
+Filter
+1. Extracting
+Concepts
+3. Rule
+Categorizer
+Issues
+3. Patch Analysis
+Raw Issues
+1. Src
+Retriever
+4. Batched Issues Filter
+2. Rule
+Retriever
+Rules
+Patch Set
+Related
+Source Code
+4. Rule
+Merging
+Multiple-Stage Rule Generation
+Multiple-Stage Patch Validation 
+Mailing List
+Figure 4: System Overview.
+(69.7% of replies are sent in less than 5 hours) and ad-
+ministrative overhead is low (21.5%), over 53.2% of
+patch proposals remain without a review, and the work-
+load is heavily skewed toward a few experts.
+Implication: The bottleneck of patch review is the lack
+of experts. The current reliance on a few maintainers to
+sustain deep technical discussions is insufficient to cover
+the volume of complex patch proposals, demanding tools
+that augment reviewer capacity.
+2.4
+Towards Scaling Linux Development
+Although there are several tools available to find bugs and
+formatting issues (§6), Linux is highly dynamic, and the ex-
+isting tools are not able to detect the issues found in the vast
+majority of patch proposals. Many existing tools rely on static
+analysis with high false positives, require version-specific ker-
+nel annotations, or ultimately have a narrow scope of checks.
+The need to accommodate the dramatic and ongoing increase
+in the workload of Linux maintainers motivates us to explore
+automated techniques that can address an exceptionally large,
+complex, and dynamic codebase.
+3
+Design
+This section discusses the design of FLINT and shows how to
+achieve summarization of the past discussion threads to create
+reliable rules, use the rules to analyze the patch proposal,
+and report the issues while reducing the false positives of
+issues. We first explain the FLINT system model. Then,
+we present the multiple-stage rule extraction and how we
+extract the important information from past discussions and
+synthesize the rules. Next, we discuss how the multiple-stage
+patch validation in FLINT works to synthesize the reliable
+issues.
+3.1
+System Model
+Figure 4 shows the system model of FLINT. FLINT extracts
+the concepts from past discussion threads through multiple
+stages to summarize into rules. These stages ensure a broad
+coverage of the concepts while distilling the important in-
+formation, fitting within the LLM context window, and then
+Example Rule
+Content: In critical kernel paths that must guarantee for-
+ward progress, such as I/O, memory reclamation, or filesys-
+tem writeback, do not introduce potentially failing memory
+allocations without implementing a robust fallback mecha-
+nism. Instead of causing a hard failure or panic, the system
+must be able to continue operating, for instance by using
+pre-allocated resource pools, limiting I/O depth, or using
+reserves.
+Sources
+- message-id: <source of the message ID>
+- author: <the author of source>
+History
+- <previous rule content>
+- <previous rule content>
+Figure 5: A simplified rule generated by FLINT.
+summarizing discussions on similar topics into individual
+rules. After generating the rule set from past developer discus-
+sions, FLINT validates the patch proposal that includes the
+cover letter, the commit message and the code, in incoming
+patches using the rule set. FLINT uses multiple stages of val-
+idation to retrieve relevant rules and source code, synthesize
+the issues, and filter out the false issues.
+Multiple-Stage Processing. FLINT processes data in mul-
+tiple stages for both rule generation and patch validation to
+decompose a complicated task into a set of simplified tasks.
+This allows LLMs to focus on one specific goal, ensuring
+high performance [4]. Furthermore, this approach reduces the
+size of the LLM context window, mitigating the performance
+degradation often caused by excessive context length [22].
+3.2
+Rule Generation
+In this section, we discuss the multi-staged pipeline in FLINT
+for transforming past discussions into a consolidated rule set.
+We first describe how FLINT extracts key concepts from
+the discussion threads. Next, we explain the mechanism for
+filtering invalid and redundant rules. Finally, we present our
+strategy for managing the dataset size without losing detailed
+information. An example of a rule is shown in Figure 5.
+1. Extracting Concepts. FLINT extracts key concepts about
+the patch reviews from the interaction between developers and
+maintainers. The interactions contain the vital information
+that might not be present in existing documentation. Specif-
+ically, this information does not appear in the source code
+or the Git commit history, as it is only discussed during the
+code review stage. We summarize these concepts into a set
+of rules while also keeping a record of the patch emails for
+each rule, as the source for the rules might be lost when com-
+pressing rules on the concepts. This is necessary to ensure
+that the issues reported by our system are reliable and can be
+5
+traced back to specific old patches from where the rules were
+generated.
+2. Filtering Invalid and Redundant Rules. After extracting
+the concept and generating the rules, FLINT filters out the
+non-substantive content. Examples of non-substantive content
+are vague principles (e.g., use allocator to allocate memory),
+redundancy (e.g., fix this bug in the next version), and overlap-
+ping rules from the same context, as well as communication
+conventions. Furthermore, to evaluate the effectiveness of the
+filter, we randomly sampled 50 rules from the rule set and
+manually reviewed each one using the following standard: a
+rule should only guide developers on how to use a specific
+feature to implement a particular function. We exclude any
+rule that does not meet this standard. As shown in Table 2,
+the filtering stage reduced the number of rules by 1.7 times,
+while achieving a false negative rate of 2% for invalid rules.
+3. Categorizing Rules. As we continually generate and col-
+lect more rules, the rule set could quickly become so large
+that it cannot even fit into the LLM’s context window when
+performing patch validation (§3.3). To solve this problem,
+FLINT reduces the size of the rule set by merging rules based
+on their topic. Therefore, FLINT follows the conventional hu-
+man feedback (§2.3), categorizing rules into two types: code
+logic and convention rules, to allow more precise merging.
+Code logic concerns system design and security issues, while
+convention relates to coding style, patch and commit message
+format, and documentation.
+4. Consolidating Rules In this stage, we first create a meta
+rule that covers the same topic of rules, reducing the number
+of redundant concepts in the rule set. We use this method to
+reduce the number of rules by 15.7 times, from 3035 rules
+to 193, generated from 177 discussion threads. However, this
+approach can lead to a loss of detailed information if we
+simply combine the duplicated rules by using LLMs. Our
+observations reveal that LLMs may unintentionally merge two
+different topics of rules when there is only a slight overlap
+between them. For example, if one rule addresses control-
+group concurrency concerns and another discusses memory
+barriers, LLMs might merge these two rules and overlook the
+specific details related to one of them. This occurs because
+LLMs mistakenly assume that the memory barrier concept is
+adequately covered within the other concept, which, in reality,
+it is not.
+To avoid information loss, rather than just merging dupli-
+cated rules, we tailor the prompts to ensure that only rules
+on the same topic are merged, making LLMs to preserve all
+relevant details. However, even with the prompt restrictions
+in place, LLMs may still experience some loss of information.
+To address this, we introduce a diversity level for each rule,
+which indicates how often the rule has been referenced in past
+discussions. This metric is based on the number of developers
+(authors) and discussion threads involved. As shown in Equa-
+tion 1, we quantify the diversity of contributions. The formula
+Example Issue
+Title: Race condition when accessing per-cpu data in pre-
+emptible context
+static int zswap_frontswap_store(...) {
+struct crypto_acomp_ctx *acomp_ctx;
+...
+acomp_ctx = raw_cpu_ptr(...);
+mutex_lock(acomp_ctx->mutex);
+dst = acomp_ctx->dstmem;
+...
+}
+> message-id: <current patch message-ID>
+Issue Content
+The patch uses ‘raw_cpu_ptr()‘ to obtain a pointer to the per-
+cpu ‘acomp_ctx‘ in a preemptible context and then locks a
+mutex contained within that context. A race condition exists
+between the ‘raw_cpu_ptr()‘ call and the subsequent ‘mu-
+tex_lock()‘. If the task is preempted and migrates to a differ-
+ent CPU in this window, ‘acomp_ctx‘ will be a stale pointer
+to the per-cpu data of the original CPU. The task would then
+proceed to lock the wrong mutex and use the wrong ‘dst-
+mem‘, leading to data corruption and incorrect synchroniza-
+tion. This same issue exists in ‘zswap_frontswap_load()‘
+and ‘zswap_writeback_entry()‘.
+Rules Used
+• To prevent race conditions from acting on stale state,
+perform critical checks immediately before the action
+is taken. If an initial check was performed without
+a lock, the state must be re-verified under a proper
+lock before executing the action. Specifically, do not
+attempt to secure a reference to a kernel object based
+on an arbitrary address without re-validation, as a race
+can occur where the memory is freed and reallocated
+before the reference is taken.
+> - message-id: <source of the rule>
+> - Author: <the author of source>
+Figure 6: A simplified report from about a race condition [2,
+38] reported by FLINT.
+calculates the geometric mean of the number of unique au-
+thors, “nr_author”, and the number of threads, “nr_msgid”,
+representing the equal balance between two factors with dis-
+cussion volume. This ensures that both factors influence the
+overall diversity score. Subsequently, we scale the factor of
+10 to map the geometric mean to a human-readable integer
+range and set the threshold at 30 to merge rules with lower
+diversity levels. We use this alternative approach to achieve
+almost 3 times smaller rule set, while effectively preventing
+any loss of information.
+6
+Stage
+Rule Category
+Numbers
+1. Extraction
+5211
+2. Filter
+3003
+3. Categorization
+Logic
+1825
+Convention
+1178
+4. Consolidation
+Logic
+592
+Convention
+437
+Table 2: Number of rules after each rule generation stage.
+1: struct page {
+2:     /* Atomic flags, some possibly updated asynchronously */
+3:     unsigned long flags;
+4:     /* ... */
+5: };
+Figure 7: An example of comments providing more details.
+diversity_level =
+p
+nr_authors×nr_msgid ×10
+(1)
+3.3
+Patch Validation
+FLINT uses the collected rules from §3.2 to validate the
+incoming patch proposals. In this section, we discuss how
+FLINT uses the rules generated to validate issues, provide
+the reliable source for each issue, and reduce the false issues.
+1. Retrieve Relevant Source Code In this stage, FLINT
+parses the patch content to identify the relevant source code
+symbols, such as functions and variable types. By using these
+symbols, FLINT then locates the function call paths and the
+definition of variable types, and uses this information, like
+comments, to provide a clear logic and detailed implementa-
+tion to the LLM, which helps prevent misleading judgments
+caused by insufficient information. For example, as shown
+in Figure 7, if the LLM receives a patch proposal that only
+has partial access to page->flags, it is likely to overlook the
+data race issue in this situation due to the lack of detailed
+information.
+2. Retrieve Validation-related Rules In this stage, FLINT
+focuses on retrieving the relevant rules to validate patches.
+First, FLINT instructs the LLM to analyze the patch con-
+tent and summarize the changes. Next, FLINT examines the
+source code and iterates through the rule set to prioritize the
+rules, ranking them from most to least relevant to the patch
+content.
+3. Issue Generation. After FLINT collects the rules and
+relevant source code, FLINT calls the LLM to review each
+patch proposal individually, focusing on identifying potential
+issues within the patch.
+4. Batch and Filter. After the initial review, FLINT batches
+all the identified issues and filters out possible false positives
+by analyzing the entire patch set, thereby reducing the number
+of false alarms. This is because Linux development typically
+follows a step-by-step approach that begins by creating a
+function prototype and progresses to detailed implementation.
+This process aims to transform abstract concepts into specific
+implementations while minimizing the impact on other sub-
+systems and preventing crashes when individual patches are
+merged. Therefore, the issue identified in the first patch may
+be resolved in a later patch, indicating a false report.
+Example. Figure 6 shows an example report from FLINT
+when validating the code in a patch proposal [38], which has a
+race condition bug [2], and provides the issues. This example
+shows that FLINT can point out the exact bugs, even complex
+and real-world ones, while also showing the rules used and the
+references from which the rules were extracted. This allows
+developers to easily verify the basis of the report.
+4
+Scalable Validation of System Result
+In the field of machine learning, researchers typically rely on
+established benchmarks [27,35] to evaluate various ML-based
+tools. These benchmarks provide a standardized framework
+for assessment, enabling comparisons across different sys-
+tems using widely accepted evaluation metrics like precision,
+F1 score, and recall. However, a notable gap in the current lit-
+erature is the absence of studies specifically addressing Linux
+patch validation. Unlike deterministic testing [12, 30, 52],
+patch validation systems can generate an unbounded number
+of potential issues. This creates a problem space that is im-
+possible to enumerate or fully capture within a single, finite
+benchmark, as discussed in §1. Furthermore, manually ver-
+ifying each reported issue is prohibitively time-consuming,
+resulting in traditional human-in-the-loop evaluation being
+unscalable. Thus, this area requires focused investigation, par-
+ticularly on developing scalable, reliable, and reproducible
+validation techniques that minimize human intervention. Such
+advancements could significantly enhance the reliability and
+efficiency of ML-based methods, which are integral to various
+ML applications.
+Evaluating such a system is crucial to help users calibrate
+the system, in particular, choose the LLM model that best
+performs within the budget available. This is important as
+models vary widely in capability and cost.
+Human reviewing [19, 40] does not scale and is subjec-
+tive and prone to inconsistencies. Moreover, verifying that
+the generated issues requires domain-specific knowledge and
+is challenging and time-consuming, particularly given the
+unbounded nature of issue discovery.
+To address the evaluation problem, this paper proposes a
+Ground-truth Coverage Score (GCS). This metric measures
+how well generated issues align with the ground-truth of
+Linux bug-fix commit messages using past discussions. It
+is important to note that the goal of mechanisms is not to re-
+place the developer validation during deployment, ultimately
+patch proposals need to be validated by developers. Instead,
+the goal is to provide an aggregate approximation of the cor-
+7
+rectness of the system. As we discuss in §5.4, we ultimately
+confirm the effectiveness of GCS using a manual approach,
+allowing us to compare the effectiveness of FLINT across a
+vast space of configuration scenarios.
+Under the hood, GCS combines rubric-based rewards [21],
+LLM-as-a-judge [50,52], and a Chain-of-Thought [45] (CoT)
+verifier [5,28,43].
+4.1
+Ground-truth Coverage Score (GCS)
+Ground-truth Coverage Score (GCS) implements a backtest-
+ing strategy to measure the true positives using past issues
+found in the kernel code. False positives are inherently harder
+to measure automatically, thus we measured them manually
+in our methodology §3.3. In practice, GCS measures the per-
+formance of the patch validation system by estimating the
+ground truth coverage of the issues fixed.
+Preliminaries. We assume a dataset composed of pairs of
+patches that were later found to be buggy (Pb) with their
+respective patch fixes (Pf ). In practice, we use the recent
+discussions among developers to gather this dataset (§5.2).
+A buggy patch (Pb) introduces a subsequently fixed prob-
+lem [38], while the bug-fix patch (Pf ) fixes the corresponding
+issue [2]. We treat the bug-fix patch (Pf ) from this dataset
+as the ground truth (GT), given that we aim to automate the
+existing process. Finally, we define “system” as the candidate
+that will generate a set of issues for each Pb, such as FLINT
+and baseline:
+I = {ix}|I|
+x=1 = system(P),
+for P ∈{Pb,Pf }
+(2)
+Later, we utilize a Chain-of-Thought [45] (CoT) reasoning
+model [50, 52] as the verifier [5, 28, 43] for the following
+judgment framework. We leverage this model’s advanced
+reasoning capability to evaluate the validity of each issue.
+Evaluation Criteria. For each issue, ix, we use a judg-
+ment framework with Pf to generate the issue-specific cri-
+terion [21], denoted as CP. Our framework for evaluation
+consists of four criteria, where CP = (ci)4
+i=1, to pose ques-
+tions for issue that align with the various properties of the
+ground truth, Pf :
+1. Root Cause: Formulate a question about the specific
+root cause you identified. For example, does the issue
+describe a problem caused by a race condition between
+“function_A” and “function_B”?
+2. Code Location: Formulate a question about the change
+surface. For example, does the issue point to code within
+the patch’s change surface, specifically mentioning files
+like “file.c” or functions like “function_name”?
+3. Fixing Strategy: Formulate a question about the patch’s
+solution. This is different from the root cause. For ex-
+ample, does the issue suggest a solution that involves
+“adding a lock”, “checking a variable before use”, or a
+similar strategy implemented in the patch?
+4. Keyword or Concept Overlap: Formulate a question
+about unique technical terms or concepts from the com-
+mit message. For example, does the issue discuss con-
+cepts central to the patch description, such as “a specific
+memory barrier type”, “the I/O memory management
+unit (IOMMU)”, or “a particular scheduler policy”?
+Weighted Confidence Score (WCS). To quantify the cri-
+teria, the framework uses a CoT-verifier that computes a
+score for every criterion cj on a specific issue, ix, as shown
+in Equation 3. This metric integrates the "Yes/No" re-
+sponse with a self-confidence score [44]. In the formula,
+b
+(Pf ,k,n)
+j
+(ix) ∈{0,1} is a binary correctness function that indi-
+cates whether the response "Yes" satisfies the criterion given
+in the prompt. And, c
+(Pf ,k,n)
+j
+(ix) ∈[1,100] is a self-reported
+confidence score [44] from the CoT-verifier. The framework
+computes a weighted confidence score based on the positive
+probability, normalizing the final value to the range [0,1] to
+derive the issue’s overall score.
+WCS
+(Pf ,k,n)
+j
+(ix) =
+1
+100c
+(Pf ,k,n)
+j
+(ix)·b
+(Pf ,k,n)
+j
+(ix)
+(3)
+Then, the framework uses the four criteria with WCS. And,
+the overall output of CoT-verifier, the CoT-verification ratio-
+nale, will be the score of the system, which we will discuss
+further for the consistency of the judgment. Equation 4 shows
+the entire equation. Additionally, Figure 8 shows an example
+of judgment.
+CoT-verifier(k,n)(I,Pf ) = 1
+|I|
+|I|
+∑
+x=1
+ 
+1
+|CP|
+|CP|
+∑
+j=1
+WCS
+(Pf ,k,n)
+j
+(ix)
+!
+(4)
+Ground-truth Coverage Score (GCS). To reduce the noise
+from individual reasoning paths and select the most consis-
+tent answer, we employ majority voting [44,50]. Specifically,
+we generate K CoT-verification rationales and aggregate the
+‘yes’ verdicts to calculate an average confidence score. This
+aggregation mitigates the impact of reasoning errors from
+individual CoT-verifiers. We integrate this voting mechanism
+into a Best-of-N strategy [3,5], in which N candidate solutions
+are generated by the LLM, ranked by the aggregated verifi-
+cation scores, and the top candidate is selected. Furthermore,
+we denote the k-th verification from majority voting and the
+n-th solution from Best-of-N as (k,n), where 1 ≤k ≤K and
+1 ≤n ≤N.
+Next, we calculate the overall score for every single issue
+ix by running the Best-of-N (N), majority voting (K), and the
+criterion (CP). We call this the Ground-truth Coverage Score
+(GCS), reflecting the weighted ground-truth coverage [29,52],
+and define it as follows:
+GCS(system,N,K)(Pf ,Pb) =
+max
+1≤n≤N
+(
+1
+K
+K
+∑
+k=1
+CoT-verifier(k,n)(system(Pb),Pf )
+)
+(5)
+8
+Issue Analysis
+Title: Race condition when accessing per-CPU data in pre-
+emptible context
+Overall match: Yes
+Confidence score: 95
+Criterion #1 - Root cause:
+• Criterion description: Does the issue describe a
+race condition between zswap_[de]compress() and
+CPU hotplug, where migration after getting a per-
+CPU pointer leads to a use-after-free?
+• Reason: Yes, the issue describes a race condition
+where a task migrates after ‘raw_cpu_ptr()‘ and before
+‘mutex_lock()‘, leading to incorrect synchronization
+and data use. This is the precise scenario the patch’s
+UAF fix is designed to prevent.
+• Match: Yes
+• Confidence score: 95
+···
+Figure 8: Abbreviated example of an evaluated issue [2,38]
+by CoT-verifier.
+Therefore, we can get the system performance from GCS
+for a single pair of buggy patch-bug-fix patch. This gives us
+two key metrics: (1) ground truth performance: GCSGT. (2)
+candidate system performance: GCSsystem. The final verifica-
+tion is the ratio of the candidate’s performance to the ground
+truth’s performance:
+FinalScore = GCS(system,N,K)(Pf ,Pb)
+GCS(GT,N,K)(Pf ,Pf )
+(6)
+Highest Ground-truth Coverage Score (H-GCS). GCS
+shows the average quality of the issues. To measure the high-
+est coverage, for each CoT-verification rationale, instead of
+averaging all the issues’ scores, H-GCS reports the highest
+one.
+5
+Evaluation
+This section first discusses the experiment setup (§5.1 and
+§5.2), and evaluates our system and our methodology along
+the following questions:
+• Can our system detect the issue in Linux? (§5.3)?
+• What is the accuracy of CoT-verifier with GCS (§5.4)?
+• What is the accuracy of issue from our system (§5.5)?
+5.1
+Experiment Setup
+Model. We use three open models [24, 41, 47] and two
+closed models [13] for all the experiments. The models
+and their knowledge cut-off are listed in Table 3. We
+Model
+Knowledge cutoff
+Thinking
+Gemini-2.5-Pro
+January, 2025 [13]
+Dynamic
+Gemini-2.5-Flash ∗
+Gemma3:4b
+August, 2024 [41]
+No
+Gemma3:12b
+Qwen3-coder:30b ∗
+May, 2025 [24,47]
+(release date)
+Yes
+Table 3:
+Information
+of models in
+evaluation.
+We
+use qwen3-coder:30b-a3b-q4_K_M as Qwen3-coder:30b,
+and gemini-2.5-flash-preview-09-2025 as Gemini-2.5-
+Flash in the system.
+use gemini-2.5-flash-preview-09-2025 as Gemini-2.5-
+Flash due to the truncated output token problem [20]. How-
+ever, we still use the stable version of Gemini-2.5-Flash as
+CoT-verifier.
+Dataset and Knowledge Cut-off. To ensure fairness, we split
+the dataset based on time and the knowledge cut-off point of
+the latest model, which is January 1, 2025. The buggy patch
+and bug-fix patch data collected before January 1, 2025, are
+used to generate the rule set. The buggy patch and bug-fix
+patch data after this date are used for the validation dataset to
+prevent data leakage affecting the evaluation.
+Kernel Source Code. We use Linux v6.15-rc5 since its re-
+lease date, December 29, 2024, is within the cut-off dates for
+the models that we use. This allows us to simulate limited
+information during the review process.
+System Setup. We evaluate FLINTR/S, which uses the rule
+set and source code, and FLINTLLM, which does not use the
+rule set (§3.2) or relevant source code (§3.3), in our evaluation.
+CoT-verifier. CoT-verifier needs to be at least as powerful
+as the system’s model; thus, it can judge the system result
+most correctly. To satisfy this requirement and reduce costs,
+we use Gemini-2.5-Pro as CoT-verifier when the system uses
+Gemini-2.5-Pro and Gemini-2.5-Flash, and a stable version
+of Gemini-2.5-Flash as CoT-verifier for all the open models.
+5.2
+Dataset Collection
+We construct the dataset using on our analysis of the memory
+management subsystem from 2024. This set covers a wide
+range of topics from the memory management subsystems,
+such as synchronization, zswap, process address space, migra-
+tion, and others. In total, this data set includes 177 discussion
+threads and 3934 reply emails. We use Gemini-2.5-Pro during
+the rule collection. Moreover, we use 21 buggy and bug-fix
+patch pairs as a validation dataset.
+Extracting Rules. FLINTR/S extracts 1029 rules. Figure 9
+shows number of rules across stages as FLINTR/S progres-
+sively analyzes the 177 discussion threads. First, the repeated
+concept has a positive correlation with the number of discus-
+sion threads; as the number of extracted threads increased,
+9
+0
+20
+40
+60
+80
+100
+120
+140
+160
+Number of Discussions
+0
+500
+1000
+1500
+2000
+CDF of Rules
+Code Logic
+Code Convention
+Filtered
+Merged
+Figure 9: Filtered, merged, and collected code logic and con-
+vention rules as threads are progressively analyzed.
+the merged rule also increased. Second, we notice that for
+each thread, the number of rules has a positive correlation
+with the number of reply emails. In most of the cases, for
+the discussions with substantial interactions, the filtered rules
+have also increased.
+5.3
+Issues Found in Linux
+We run FLINTR/S on the LKML to assess the effectiveness
+of detecting previously unreported issues. In the v6.18 devel-
+opment cycle, FLINTR/S detects 2 new issues in the v6.18
+Linux development, and 7 issues in previous versions.
+One of the two new issues identified is a coding convention
+violation regarding inconsistent function naming. In particu-
+lar, FLINTR/S detects an inconsistency in a patch proposal
+that introduced a new feature by adding functions to an ex-
+isting API family. While this issue negatively impacts main-
+tainability and readability, it is notoriously difficult for tradi-
+tional tools to detect. We reported this issue to the developer,
+and they confirmed it. Detecting such issues demonstrates
+FLINTR/S’s capability to assist developers in patch reviews.
+The second new issue involves variable misuse within the
+newly introduced code. As the introduced code is a minor
+part of the code in Linux, traditional tools can detect this type
+of issue, but require significant additional computational re-
+sources to do so. This issue has been reported by the reviewer
+and confirmed by the developer.
+The other 7 issues are either the design choice, race con-
+dition, the inconsistent return type with the comment, or the
+inconsistency of the commit message description with the
+implementation.
+5.4
+CoT-verifier Accuracy
+To evaluate the accuracy of the CoT-verifier’s judgments, we
+conduct a manual review of each criterion associated with
+any identified issues. We sample 10 data points for each true
+or false criterion result from the CoT-verifier and manually
+analyze the data. In total, we review 80 criterion results for
+both the Gemini-2.5-Pro and Gemini-2.5-Flash CoT-verifiers.
+To evaluate the CoT-verifier against our ground truth, we
+calculate standard classification metrics including accuracy,
+precision, recall, specificity, and F1 score. Additionally, we
+employ Cohen’s Kappa [34] to quantify inter-rater reliability
+and account for chance agreement between the LLM-based
+Gemini-2.5-Pro
+Gemini-2.5-Flash
+Metric
+Full Set
+Full Set
+High Conf.
+(N = 80)
+(N = 80)
+(> 90, N = 41)
+Cohen’s Kappa
+0.925
+0.475
+0.809
+Precision
+0.950
+0.500
+0.750
+Recall
+0.974
+0.952
+1.000
+F1 Score
+0.962
+0.658
+0.857
+Specificity
+0.951
+0.661
+0.906
+Table 4: Performance and inter-rater reliability of the CoT-
+verifier against human review. The evaluation covers 80
+judgments balanced across correctness labels (10 true and
+10 false per criterion). We compare Gemini-2.5-Pro (veri-
+fying Gemini-2.5-Pro) against Gemini-2.5-Flash (verifying
+Gemma3:4b). Full Set includes all 80 judgments; High Conf.
+refers to the subset where the confidence score is > 90.
+CoT-verifiers and humans. Table 4 presents these metrics,
+highlighting the verifier’s performance across different confi-
+dence thresholds.
+Gemini-2.5-Pro CoT-verifier. The overall agreement accu-
+racy is 96.25%. The precision, recall, specificity, and F1 score
+further demonstrate that the CoT-verifier is generally accu-
+rate. Specifically, out of 80 total cases, there were only 3
+instances of disagreement between the CoT-verifier and the
+reviewer: 2 false positives and 1 false negative relative to the
+reviewer. Furthermore, Cohen’s Kappa indicates an almost
+perfect agreement between the CoT-verifier and human re-
+viewers, with a value of κ = 0.925 and a 95% confidence
+interval of [0.842,1.000].
+Gemini-2.5-Flash CoT-verifier. The overall agreement ac-
+curacy is 73.75%. The metrics in Table 4 show lower ac-
+curacy than Gemini-2.5-Pro. The confusion matrix shows
+that Gemini-2.5-Flash has a systematic bias, which has high
+sensitivity (0.95) and low precision (0.50). This discrep-
+ancy (20 false positives and 1 false negative) suggests that
+Gemini-2.5-Flash applied a significantly more relaxed thresh-
+old than Gemini-2.5-Pro. Also, Cohen’s Kappa indicates mod-
+erate agreement (κ = 0.475), and 95% confidence interval
+[0.282,0.668], which has the lowest level of agreement with
+a human reviewer.
+Gemini-2.5-Flash CoT-verifier With High Confidence. To
+enhance the reliability of Gemini-2.5-Flash on the CoT-
+verifier, we further analyze the judgments and confidence
+scores it provides. We investigate the incorrect criterion judg-
+ments to evaluate the average confidence scores for both in-
+correct and correct judgments. The average confidence score
+for incorrect judgments is 80.24, while for correct judgments,
+it is 92.63. This indicates that with Gemini-2.5-Flash, if we
+disregard confidence scores below 90, we are likely to achieve
+results that closely align with a human reviewer. Based on this
+10
+Score
+GA3:4b
+GA3:12b
+Q3C:30b
+G2.5F
+G2.5P
+GCS
+0.18
+0.35
+0.51
+0.63
+0.65
+0.43
+0.41
+0.47
+0.71
+0.63
+H-GCS
+0.27
+0.40
+0.75
+0.72
+0.67
+0.52
+0.59
+0.78
+0.77
+0.75
+Table 5: The true positives analysis. Overall GCS and H-
+GCS with Best-of-10 and majority voting, K = 3. FLINTR/S
+is gray color, and FLINTLLM is white color. Gemini-2.5-
+Pro (G2.5P) and Gemini-2.5-Flash (G2.5F)’s CoT-verifier
+are Gemini-2.5-Pro, others, Gemma3 (GA3:4b and GA3:12b)
+and Qwen3-coder:30b (Q3C:30b), CoT-verifier is Gemini-2.5-
+Flash. Higher is better.
+observation, we set the threshold of the weighted confidence
+score to obtain a more accurate score using Gemini-2.5-Flash.
+Applying a confidence threshold of 90 significantly en-
+hances the reliability of the lightweight model. Specifi-
+cally, filtering for high-confidence judgments raises the Co-
+hen’s Kappa for Gemini-2.5-Flash to substantial agreement
+(κ = 0.809), with a 95% confidence interval of [0.601,1.000],
+which is close to almost perfect agreement. This confirms that
+Gemini-2.5-Flash is capable of high-fidelity verification when
+the evaluation is restricted to its most confident predictions.
+In summary, by breaking down judgment into smaller, spe-
+cific criteria, Gemini-2.5-Pro performs similarly to human
+judgment. In contrast, while Gemini-2.5-Flash can identify
+when the results do not align with the ground truth, Gemini-
+2.5-Flash struggles with accurately assessing when a result is
+close to the ground truth if the judgment’s confidence score
+is below 90. However, by filtering out judgments with a confi-
+dence score below 90, Gemini-2.5-Flash can perform close to
+human.
+5.5
+Report Accuracy
+We evaluate the capabilities of FLINTR/S, which reports is-
+sues based on the rule set, using the GCS metric described
+in §4.1. We use the validation dataset, where each data point
+consists of a buggy patch and bug-fix patch pair, and all
+data points are after January 1, 2025. We run FLINTR/S and
+FLINTLLM with 5 different models. For the open models,
+we use Gemini-2.5-Flash as the CoT-verifier, while for the
+closed models, we use Gemini-2.5-Pro. The bug-fix patch is
+considered the ground truth in this evaluation. Among the val-
+idation dataset, only one data point’s ground truth received a
+score of less than the maximum (1) on the GCS metric, which
+is buffer overflow. For every data point, we run each model
+and system 10 times to obtain the Best-of-10 outcomes using
+K = 3 majority voting. We categorize all the data points into
+8 types, coding convention (style), uninitialized local vari-
+able (ULV), design choice and implementation error (design),
+performance regression (perf), locking issues (lock), data
+race and race condition (racing), use-after-free (UAF), and
+buffer overflow (BOF), to illustrate the different capabilities
+style
+ULV
+design
+perf
+lock
+racing
+UAF
+BOF
+0.00
+0.25
+0.50
+0.75
+1.00
+GCS
+FLINTR/S
+FLINTLLM
+(a) GCS of Gemini-2.5-Pro.
+style
+ULV
+design
+perf
+lock
+racing
+UAF
+BOF
+0.00
+0.25
+0.50
+0.75
+1.00
+H-GCS
+(b) H-GCS of Gemini-2.5-Pro.
+Figure 10: The true positives analysis. GCS and H-GCS with
+Best-of-10 and majority voting, K = 3, of Gemini-2.5-Pro.
+on different bug patterns.
+Ground-truth Coverage Score (GCS). We first evaluate
+the GCS on both systems to show the average performance
+across all the issues and trials. A high GCS indicates that the
+system can consistently identify the ground truth. In other
+words, the system is able to consistently pinpoint the true
+bug we specify. As shown in Table 5, FLINTR/S achieves an
+average improvement 8% with Qwen3-coder:30b and 3% with
+Gemini-2.5-Pro. However, FLINTR/S does not have the same
+performance on weaker models, indicating that the stronger
+reasoning or coding-specific models are more suitable for the
+patch validation.
+We further detailed analyze FLINTR/S on each type of is-
+sue. Figure 10a shows that with the strongest model, Gemini-
+2.5-Pro FLINTR/S achieves higher scores on lock (21%),
+racing (14%), perf (4%), and UAF (6%). On the other hand,
+FLINTLLM performs better on style, design, and buffer over-
+flow. This difference primarily comes from the rule set used
+by FLINTR/S, which is collected from unbalanced past discus-
+sions on concurrency topics. In contrast, FLINTLLM is not re-
+stricted by the rule set. Therefore, across 10 trials, FLINTLLM
+can generate a more diverse range of issues, allowing it to
+cover the ground truth more effectively.
+Highest Ground-Truth Coverage Score (H-GCS). We then
+evaluate the H-GCS to show the peak ground truth cover-
+age across trials. A high H-GCS indicates that, among all
+the issues in a trial, the system can accurately pinpoint the
+specific true bug. As shown in Table 5, FLINTR/S generally
+underperforms compared to FLINTLLM. This is primarily
+because FLINTR/S is constrained to reporting the issue only
+based on the rule set. However, looking into specific types in
+Figure 10b with Gemini-2.5-Pro, FLINTR/S achieves better
+11
+System
+Total
+TP
+FP
+FPR
+Prec.
+FLINTR/S
+20
+13
+7
+35%
+65%
+FLINTLLM
+20
+9
+11
+55%
+45%
+Table 6: False report rate and precision of FLINTR/S versus
+FLINTLLM with Gemini-2.5-Pro.
+scores on lock (11%) and UAF (13%). Furthermore, when
+comparing the GCS and H-GCS for FLINTR/S, we notice
+minimal differences. In contrast, FLINTLLM shows signifi-
+cant variation in some types, such as data race, buffer overflow,
+and design/logic issue. For example, FLINTLLM has a GCS
+of 0.34 and H-GCS of 1.00 on BOF type with Gemini-2.5-Pro.
+This difference is because FLINTR/S provides more consis-
+tent issues across trials based on the reliable rule set, whereas
+FLINTLLM may experience more hallucinations, leading to a
+higher false positive rate (Figure 5.5).
+False Positives. In this experiment, we evaluate the false pos-
+itive rate of FLINTR/S and FLINTLLM. To determine the
+ground truth for each issue, we manually check to see if a
+sample of issues reported by our system have been fixed in
+the recent version 6.18 of the Linux and/or discussed in the
+LKML. Thus, this is a conservative analysis, as some issues
+might be true positives but not yet identified by developers.
+Due to the substantial verification workload involved in an-
+alyzing each issue, we randomly sampled 20 issues from
+FLINTR/S and FLINTLLM. Both FLINTR/S and FLINTLLM
+use Gemini-2.5-Pro in this experiment.
+As shown in Table 6, FLINTR/S has a precision of 65%
+and a false positive rate of 35%, which is nearly twice as low
+as that of FLINTLLM, which has a precision of 55%. This
+indicates that FLINTR/S provides more accurate results with
+fewer false reports compared to FLINTLLM. Additionally,
+most of the true positive issues have already been fixed in the
+most recent version.
+6
+Related Work
+Automated Code Review. Several works [19, 40] utilize
+LLMs to conduct code reviews. BitsAI-CR [40] employs a
+customized fine-tuned LLM to automate patch review, while
+adopting costly human annotation to collect developer feed-
+back, creating a flywheel mechanism to continuously improve
+BitsAI-CR. Sashiko [19] uses an agentic code review system
+with a set of Linux kernel-specific prompts and protocol to
+automatically review. In contrast, FLINT utilizes a rule set de-
+rived from past discussions to sustain and enhance its accuracy
+without the need for costly fine-tuning, human annotation, or
+a heavy agentic system.
+Static Analysis. The static analysis tools for Linux, such as
+Sparse [39] and Smatch [37], use a semantic parser to inspect
+and report on the abstract syntax tree of a C program with
+kernel-specific annotation. These tools usually depend on
+the manual and the specific annotations to reduce the false
+positive rate [36,37]. In comparison, FLINT has a lower false
+positive rate and can detect not only semantic errors but also
+design and coding convention issues.
+LLM-Synthesized Static Analysis. An alternative ap-
+proach [46, 48] to preventing security vulnerabilities is to
+use a machine learning-based method to identify similar bug
+patterns from past data. For example, BugStone [46] employs
+this technique. BugStone introduces a rule-centric system that
+analyzes recurring bug patterns from past research to identify
+similar bugs in source code. Additionally, Knighter [48] uti-
+lizes LLMs to create a set of static analysis tools for direct
+analysis of the source code. These LLM-based static analysis
+tools are close to FLINT but have several differences. First,
+FLINT aims to find the bug with the fragmented information
+of the source code. Second, FLINT can detect the design
+and coding conventions issues in the patch proposals. On the
+other hand, these LLM-based static analysis tools need the
+full source code and focus on finding existing logic bugs.
+Testing Tools. The traditional [17, 18, 25] and ML-based
+testing tools [15,16,42,49] for Linux usually tend to take more
+than an hour to find the bug, which is not a suitable case for
+rapid interactive response in Linux development. For example,
+the Linux Kernel Performance [25] (LKP) only tests specific
+kernel versions weekly, and Syzbot [17,18] also focuses on
+specific kernel versions. This coarse and relatively long-term
+testing makes it difficult to provide immediate feedback and
+limits the testing to accepted patches, which does not alleviate
+the workload associated with patch reviews.
+LLM-Synthesized Testing. Several studies [32,33] focus on
+generating test input to validate source code. For example,
+Cleverest [32] is a feedback-directed, zero-shot LLM-based
+regression test generation technique that can create test cases
+for new patches. Additionally, KGym [33] provides a vir-
+tual environment for testing and patching kernels to detect
+bugs. These studies are independent and orthogonal to our
+system, as they aim to perform runtime tests on software. This
+approach requires more computational resources and is not
+designed to handle the high throughput of incoming patches
+in the kernel.
+7
+Conclusion
+This paper presents a 10 years study of the patch review pro-
+cess in the Linux memory subsystem. To address the problems
+identified in the study, this paper introduces a novel approach
+called FLINT, a rule-based patch validation system. FLINT
+effectively bridges the gap between the reasoning capabilities
+of LLMs and the practical constraints of the patch review
+process. FLINT achieves 1.6× lower false positive rate, and
+detects 2 issues in the recent Linux version.
+References
+[1] Iago Abal, Claus Brabrand, and Andrzej Wasowski. 42
+variability bugs in the linux kernel: a qualitative analy-
+12
+sis. In Proceedings of the 29th ACM/IEEE International
+Conference on Automated Software Engineering, ASE
+’14, page 421–432, New York, NY, USA, 2014. Associ-
+ation for Computing Machinery.
+[2] Yosry Ahmed. [patch v2] mm: zswap: properly synchro-
+nize freeing resources during cpu hotunplug, Jan 2025.
+https://lore.kernel.org/all/20250108222441.
+3622031-1-yosryahmed@google.com/.
+[3] Eugene Charniak and Mark Johnson. Coarse-to-fine
+n-best parsing and MaxEnt discriminative reranking. In
+Kevin Knight, Hwee Tou Ng, and Kemal Oflazer, editors,
+Proceedings of the 43rd Annual Meeting of the Associ-
+ation for Computational Linguistics (ACL’05), pages
+173–180, Ann Arbor, Michigan, June 2005. Association
+for Computational Linguistics.
+[4] Lingjiao Chen, Jared Davis, Boris Hanin, Peter Bailis,
+Ion Stoica, Matei Zaharia, and James Zou. Are more llm
+calls all you need? towards the scaling properties of com-
+pound ai systems. In A. Globerson, L. Mackey, D. Bel-
+grave, A. Fan, U. Paquet, J. Tomczak, and C. Zhang,
+editors, Advances in Neural Information Processing Sys-
+tems, volume 37, pages 45767–45790. Curran Asso-
+ciates, Inc., 2024.
+[5] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian,
+Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias Plap-
+pert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano,
+Christopher Hesse, and John Schulman. Training veri-
+fiers to solve math word problems, 2021.
+[6] Jonathan Corbet. Development statistics for 6.17, 2025.
+https://lwn.net/Articles/1038358/.
+[7] Jonathan Corbet. Large language models for patch re-
+view, 2025. https://lwn.net/Articles/1041694/.
+[8] Jonathan Corbet. Some 6.16 development statistics,
+2025. https://lwn.net/Articles/1031161/.
+[9] Jonathan Corbet. The state of the memory-management
+development process, 2025 edition, 2025. https://
+lwn.net/Articles/1016724/.
+[10] Jonathan Corbet and Greg Kroah-Hartman. Linux ker-
+nel development – how fast it is going, who is do-
+ing it, what they are doing, and who is sponsoring it,
+2016. https://www.linuxfoundation.org/hubfs/
+lf_pub_whowriteslinux2016.pdf.
+[11] Hillf Danton.
+Re:
+[patch 01/10] mm/hugetlb:
+add cache
+of descriptors
+to
+resv_map
+for re-
+gion_add, 2015.
+https://lore.kernel.org/
+all/008301d0b547$b62a10e0$227e32a0$@
+alibaba-inc.com/.
+[12] Xueying Du, Mingwei Liu, Kaixin Wang, Hanlin Wang,
+Junwei Liu, Yixuan Chen, Jiayi Feng, Chaofeng Sha,
+Xin Peng, and Yiling Lou. Evaluating large language
+models in class-level code generation. In Proceedings of
+the IEEE/ACM 46th International Conference on Soft-
+ware Engineering, ICSE ’24, New York, NY, USA, 2024.
+Association for Computing Machinery.
+[13] Gheorghe Comanici et al. Gemini 2.5: Pushing the
+frontier with advanced reasoning, multimodality, long
+context, and next generation agentic capabilities, 2025.
+[14] Gcc command options: 3.10 options that control static
+analysis, 2025. https://gcc.gnu.org/onlinedocs/
+gcc/Static-Analyzer-Options.html.
+[15] Sishuai Gong, Dinglan Peng, Deniz Altınbüken, Pedro
+Fonseca, and Petros Maniatis. Snowcat: Efficient kernel
+concurrency testing using a learned coverage predictor.
+In Proceedings of the 29th Symposium on Operating
+Systems Principles, SOSP ’23, page 35–51, New York,
+NY, USA, 2023. Association for Computing Machinery.
+[16] Sishuai Gong, Wang Rui, Deniz Altinbüken, Pedro Fon-
+seca, and Petros Maniatis. Snowplow: Effective Ker-
+nel Fuzzing with a Learned White-box Test Mutator,
+page 1124–1138. Association for Computing Machin-
+ery, New York, NY, USA, 2025.
+[17] Google.
+Syzbot dashboard, 2025.
+https://
+syzkaller.appspot.com/upstream.
+[18] Google.
+Syzkaller-kernel fuzzer, 2025.
+https://
+github.com/google/syzkaller.
+[19] Google. Sashiko - agentic review of linux kernel code
+changes, 2026. https://github.com/sashiko-dev/
+sashiko.
+[20] Google
+ai
+discussion:
+Truncated
+re-
+sponses
+despite
+being
+under
+limits,
+2025.
+https://discuss.ai.google.dev/t/
+truncated-responses-despite-being-under-limits/
+87898.
+[21] Anisha Gunjal, Anthony Wang, Elaine Lau, Vaskar Nath,
+Bing Liu, and Sean Hendryx. Rubrics as rewards: Rein-
+forcement learning beyond verifiable domains, 2025.
+[22] Kelly Hong, Anton Troynikov, and Jeff Huber. Context
+rot: How increasing input tokens impacts llm perfor-
+mance. Technical report, Chroma, July 2025.
+[23] Zenan Huang, Yihong Zhuang, Guoshan Lu, Zeyu Qin,
+Haokai Xu, Tianyu Zhao, Ru Peng, Jiaqi Hu, Zhan-
+ming Shen, Xiaomeng Hu, Xijun Gu, Peiyi Tu, Jiaxin
+Liu, Wenyu Chen, Yuzhuo Fu, Zhiting Fan, Yanmei Gu,
+Yuanyuan Wang, Zhengkai Yang, Jianguo Li, and Junbo
+13
+Zhao.
+Reinforcement learning with rubric anchors,
+2025.
+[24] Binyuan Hui, Jian Yang, Zeyu Cui, Jiaxi Yang, Dayiheng
+Liu, Lei Zhang, Tianyu Liu, Jiajun Zhang, Bowen Yu,
+Kai Dang, et al. Qwen2. 5-coder technical report. arXiv
+preprint arXiv:2409.12186, 2024.
+[25] Intel
+-
+linux
+kernel
+performance,
+2025.
+https://www.intel.com/content/www/us/
+en/developer/topic-technology/open/
+linux-kernel-performance/overview.html.
+[26] Ruipeng Jia, Yunyi Yang, Yongbo Gai, Kai Luo, Shihao
+Huang, Jianhe Lin, Xiaoxi Jiang, and Guanjun Jiang.
+Writing-zero: Bridge the gap between non-verifiable
+tasks and verifiable rewards, 2025.
+[27] Carlos E Jimenez, John Yang, Alexander Wettig, Shunyu
+Yao, Kexin Pei, Ofir Press, and Karthik R Narasimhan.
+SWE-bench: Can language models resolve real-world
+github issues? In The Twelfth International Conference
+on Learning Representations, 2024.
+[28] Hunter Lightman, Vineet Kosaraju, Yuri Burda, Harrison
+Edwards, Bowen Baker, Teddy Lee, Jan Leike, John
+Schulman, Ilya Sutskever, and Karl Cobbe. Let’s verify
+step by step. In The Twelfth International Conference
+on Learning Representations, 2024.
+[29] Stephanie Lin, Jacob Hilton, and Owain Evans. Teach-
+ing models to express their uncertainty in words. Trans-
+actions on Machine Learning Research, 2022.
+[30] Stephanie Lin, Jacob Hilton, and Owain Evans. Truth-
+fulQA: Measuring how models mimic human false-
+hoods. In Smaranda Muresan, Preslav Nakov, and Aline
+Villavicencio, editors, Proceedings of the 60th Annual
+Meeting of the Association for Computational Linguis-
+tics (Volume 1: Long Papers), pages 3214–3252, Dublin,
+Ireland, May 2022. Association for Computational Lin-
+guistics.
+[31] Linux test project, 2025.
+https://github.com/
+linux-test-project/ltp.
+[32] Jing Liu, Seongmin Lee, Eleonora Losiouk, and Marcel
+Böhme. Can llm generate regression tests for software
+commits?, 2025.
+[33] Alex Mathai, Chenxi Huang, Petros Maniatis, Aleksandr
+Nogikh, Franjo Ivanˇci´c, Junfeng Yang, and Baishakhi
+Ray. Kgym: a platform and dataset to benchmark large
+language models on linux kernel crash resolution. In
+Proceedings of the 38th International Conference on
+Neural Information Processing Systems, NIPS ’24, Red
+Hook, NY, USA, 2024. Curran Associates Inc.
+[34] Mary McHugh. Interrater reliability: The kappa statis-
+tic. Biochemia medica : ˇcasopis Hrvatskoga društva
+medicinskih biokemiˇcara / HDMB, 22:276–82, 10 2012.
+[35] Sujin Park, Mingyu Guan, Xiang Cheng, and Taesoo
+Kim. Principles and methodologies for serial perfor-
+mance optimization. In Proceedings of the 19th USENIX
+Conference on Operating Systems Design and Imple-
+mentation, OSDI ’25, USA, 2025. USENIX Associa-
+tion.
+[36] Gabriel Ryan, Burcu Cetin, Yongwhan Lim, and Suman
+Jana. Accurate data race prediction in the linux kernel
+through sparse fourier learning. Proc. ACM Program.
+Lang., 8(OOPSLA1), April 2024.
+[37] Smatch: pluggable static analysis for c, 2025. https:
+//repo.or.cz/w/smatch.git.
+[38] Barry Song.
+[patch v7] mm/zswap: move to use
+crypto_acomp api for hardware acceleration, Nov, 2020.
+https://lore.kernel.org/all/20201107065332.
+26992-1-song.bao.hua@hisilicon.com/.
+[39] Sparse documentation, 2025. https://sparse.docs.
+kernel.org/en/latest/.
+[40] Tao Sun, Jian Xu, Yuanpeng Li, Zhao Yan, Ge Zhang,
+Lintao Xie, Lu Geng, Zheng Wang, Yueyan Chen, Qin
+Lin, Wenbo Duan, Kaixin Sui, and Yuanshuo Zhu.
+Bitsai-cr: Automated code review via llm in practice. In
+Proceedings of the 33rd ACM International Conference
+on the Foundations of Software Engineering, FSE Com-
+panion ’25, page 274–285, New York, NY, USA, 2025.
+Association for Computing Machinery.
+[41] Gemma Team and Aishwarya Kamath et al. Gemma 3
+technical report, 2025.
+[42] Daimeng Wang, Zheng Zhang, Hang Zhang, Zhiyun
+Qian, Srikanth V.
+Krishnamurthy, and Nael Abu-
+Ghazaleh.
+SyzVegas: Beating kernel fuzzing odds
+with reinforcement learning. In 30th USENIX Security
+Symposium (USENIX Security 21), pages 2741–2758.
+USENIX Association, August 2021.
+[43] Peiyi Wang, Lei Li, Zhihong Shao, Runxin Xu, Damai
+Dai, Yifei Li, Deli Chen, Yu Wu, and Zhifang Sui. Math-
+shepherd: Verify and reinforce LLMs step-by-step with-
+out human annotations. In Lun-Wei Ku, Andre Martins,
+and Vivek Srikumar, editors, Proceedings of the 62nd
+Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pages 9426–9439,
+Bangkok, Thailand, August 2024. Association for Com-
+putational Linguistics.
+14
+[44] Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc V
+Le, Ed H. Chi, Sharan Narang, Aakanksha Chowdhery,
+and Denny Zhou. Self-consistency improves chain of
+thought reasoning in language models. In The Eleventh
+International Conference on Learning Representations,
+2023.
+[45] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten
+Bosma, Brian Ichter, Fei Xia, Ed H. Chi, Quoc V. Le,
+and Denny Zhou. Chain-of-thought prompting elicits
+reasoning in large language models. In Proceedings
+of the 36th International Conference on Neural Infor-
+mation Processing Systems, NIPS ’22, Red Hook, NY,
+USA, 2022. Curran Associates Inc.
+[46] Qiushi Wu, Yue Xiao, Dhilung Kirat, Kevin Eykholt, Jiy-
+ong Jang, and Douglas Lee Schales. One bug, hundreds
+behind: Llms for large-scale bug discovery, 2025.
+[47] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang,
+Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chen-
+gen Huang, Chenxu Lv, Chujie Zheng, Dayiheng Liu,
+Fan Zhou, Fei Huang, Feng Hu, Hao Ge, Haoran Wei,
+Huan Lin, Jialong Tang, Jian Yang, Jianhong Tu, Jian-
+wei Zhang, Jianxin Yang, Jiaxi Yang, Jing Zhou, Jingren
+Zhou, Junyang Lin, Kai Dang, Keqin Bao, Kexin Yang,
+Le Yu, Lianghao Deng, Mei Li, Mingfeng Xue, Mingze
+Li, Pei Zhang, Peng Wang, Qin Zhu, Rui Men, Ruize
+Gao, Shixuan Liu, Shuang Luo, Tianhao Li, Tianyi Tang,
+Wenbiao Yin, Xingzhang Ren, Xinyu Wang, Xinyu
+Zhang, Xuancheng Ren, Yang Fan, Yang Su, Yichang
+Zhang, Yinger Zhang, Yu Wan, Yuqiong Liu, Zekun
+Wang, Zeyu Cui, Zhenru Zhang, Zhipeng Zhou, and
+Zihan Qiu. Qwen3 technical report, 2025.
+[48] Chenyuan Yang, Zijie Zhao, Zichen Xie, Haoyu Li, and
+Lingming Zhang. Knighter: Transforming static anal-
+ysis with llm-synthesized checkers. In Proceedings of
+the ACM SIGOPS 31st Symposium on Operating Sys-
+tems Principles, SOSP ’25, New York, NY, USA, 2025.
+Association for Computing Machinery.
+[49] Chenyuan Yang, Zijie Zhao, and Lingming Zhang. Ker-
+nelGPT: Enhanced Kernel Fuzzing via Large Language
+Models, page 560–573. Association for Computing Ma-
+chinery, New York, NY, USA, 2025.
+[50] Lunjun Zhang, Arian Hosseini, Hritik Bansal, Mehran
+Kazemi, Aviral Kumar, and Rishabh Agarwal. Genera-
+tive verifiers: Reward modeling as next-token prediction.
+In The Thirteenth International Conference on Learning
+Representations, 2025.
+[51] Xuandong Zhao, Zhewei Kang, Aosong Feng, Sergey
+Levine, and Dawn Song. Learning to reason without
+external rewards, 2025.
+[52] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan
+Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin, Zhuo-
+han Li, Dacheng Li, Eric P. Xing, Hao Zhang, Joseph E.
+Gonzalez, and Ion Stoica. Judging llm-as-a-judge with
+mt-bench and chatbot arena. In Proceedings of the 37th
+International Conference on Neural Information Pro-
+cessing Systems, NIPS ’23, Red Hook, NY, USA, 2023.
+Curran Associates Inc.
+[53] Xiangxin Zhou, Zichen Liu, Anya Sims, Haonan Wang,
+Tianyu Pang, Chongxuan Li, Liang Wang, Min Lin, and
+Chao Du. Reinforcing general reasoning without ver-
+ifiers. In The Fourteenth International Conference on
+Learning Representations, 2026.
+15

@@ -1,0 +1,3126 @@
+Scaling Recurrence-aware Foundation Models for
+Clinical Records via Next-Visit Prediction
+Haresh Rengaraj Rajamohan1,†, Xiang Gao1,†, Weicheng Zhu1, Shih-Lun Huang1, Long
+Chen1, Gabe Schulman1, Huizhen Jin1, Shengduo Li1, Yixuan Wang1, Huidi Yang1,
+Kyunghyun Cho1, Cem M. Deniz2,4, and Narges Razavian2,3,*
+1Center for Data Science, New York University, New York, NY, USA
+2Department of Radiology, NYU Grossman School of Medicine, New York, NY, USA
+3Department of Population Health, NYU Grossman School of Medicine, New York, NY, USA
+4Center for Biomedical Imaging, NYU Grossman School of Medicine, New York, NY, USA
+*B Corresponding author: narges.razavian@nyulangone.org
+†These authors contributed equally to this work
+Abstract
+While large-scale pretraining has revolutionized language modeling, its potential remains underexplored
+in healthcare with structured electronic health records (EHRs). We present RAVEN, a novel generative
+pretraining strategy for sequential EHR data based on Recurrence-Aware next-Visit EveNt prediction.
+Leveraging a dataset of over one million unique individuals, our model learns to autoregressively generate
+tokenized clinical events for the next visit conditioned on patient history. We introduce regularization
+on predicting repeated events and highlight a key pitfall in EHR-based foundation model evaluations:
+repeated event tokens can inflate performance metrics when new onsets are not distinguished from
+subsequent occurrences.
+Furthermore, we empirically investigate the scaling behaviors in a data-
+constrained, compute-saturated regime, showing that simply increasing model size is suboptimal without
+commensurate increases in data volume. We evaluate our model via zero-shot prediction for forecasting
+the incidence of a diverse set of diseases, where it rivals fully fine-tuned representation-based Transformer
+models and outperforms widely used simulation-based next-token approaches. Finally, without additional
+parameter updates, we show that RAVEN can generalize to an external patient cohort under lossy clinical
+code mappings and feature coverage gaps.
+Introduction
+Early detection and progression forecasting for chronic conditions such as dementia, osteoarthritis,
+and cancer can significantly improve healthcare outcomes and further optimize clinical trial design.1–4
+Electronic health records (EHRs) offer an enormous amount of longitudinal data for this purpose, but they
+present challenges to modeling because they are sequential, high-dimensional, irregularly sampled, and
+heterogeneous across diagnoses, medications, laboratory measurements, and demographics.5–8
+Despite the rapid developments in artificial intelligence, many clinical prediction pipelines still train disease-
+specific discriminative models for a fixed endpoint and horizon. This approach is costly to scale, statistically
+inefficient, and poorly matched to health-system deployment, where many outcomes must be monitored
+simultaneously. Such models repeatedly learn representations from limited task-specific supervision with
+the same underlying longitudinal patient data9; therefore, they fail to exploit shared temporal structures
+across clinical outcomes. This inefficiency is pronounced for long-horizon disease-onset prediction tasks,
+where the sample size of disease-specific cohorts is small by construction due to the need for extended
+follow-up, increasing the risk of overfitting and unstable generalization. By discretizing and tokenizing
+clinical concepts, foundation models offer a more attractive alternative because they can learn a unified
+arXiv:2603.24562v1  [cs.LG]  25 Mar 2026
+representation of longitudinal EHR data and capture the full joint distribution of clinical events over time,
+enabling flexible transfer across diseases, endpoints, and prediction horizons10,11.
+Prior work in training foundation models on EHR data with masked pretraining or encoder-decoder
+architecture requires an additional fine-tuning stage for adapting the model to particular downstream
+tasks12–14. This requires curating additional task-specific datasets. More recently, generative pretraining
+for EHRs has gained traction due to success in other data modalities and the flexibility for zero-shot
+inference10,11,15,16. However, many of these approaches are based on the next-token paradigm or trained
+on specific clinical records like these from intensive care units (ICU)10, which fail to demonstrate the
+challenges we outline below in learning longitudinal records from hospital visits. In this work, we propose
+a novel approach for developing and evaluating foundation models in the space of longitudinal EHR called
+the Recurrence-Aware next-Visit EveNt prediction (RAVEN).
+One of the key challenges in modeling longitudinal EHR data with foundation models is that clinical
+events that occurred within a single patient visit lack fine-grained temporal order, making the standard
+next-token prediction insufficient. We believe that next-visit event prediction via multi-label generations
+provides a natural and scalable pretraining objective for structured EHRs. Longitudinal clinical data are
+inherently organized around visits, within which events are usually unordered but semantically related,
+while meaningful temporal structures exist across visits. Predicting the full set of events at the next
+encounter allows RAVEN to reason jointly over heterogeneous clinical variables without imposing an
+arbitrary within-visit token order, and it enables efficient downstream inference through one single forward
+pass compared to simulation-based inference.
+Moreover, unlike text or image tokens, recurring clinical event tokens, especially chronic conditions, can
+reappear throughout a patient’s record. Once diagnoses such as hypertension or diabetes appear, they
+often reoccur in subsequent visits. Hence, the marginal distribution of clinical events is highly skewed
+toward repeated tokens, with new disease onsets constituting a relatively rare but clinically critical subset
+of events. When training generative models with the naive next-visit objective, the model can achieve
+lower loss by simply repeating a condition at future visits once a chronic condition appears in the patient
+history. This basic objective can therefore reward models for merely repeating previously observed events
+instead of learning to anticipate new onsets. In particular, a model that merely echoes previously observed
+diagnoses may score well on aggregate metrics17, yet degrades its performance on predicting new onsets
+for early disease detection or risk forecasting.
+To address this, we equip RAVEN with a history-dependent regularization mechanism that explicitly
+downweights the contribution of repeatedly observed clinical events during pretraining. By penalizing
+predictions of tokens in proportion to their frequency in a patient’s history, we encourage the model to
+focus on informative changes in the clinical trajectory rather than simple repetitions. This inductive bias
+promotes the ability to predict emerging conditions while preserving the capacity to model chronic disease
+persistence, leading to models that better align with clinically meaningful disease onset prediction tasks.
+We carefully investigate how RAVEN performs with different choices of model and sample sizes. Most
+scaling laws for foundation models, including large language models (LLMs) and EHR foundation models,
+are often studied under compute-constrained regimes by assuming limited compute and near-infinite
+data source, where models are trained for a fixed compute budget which then determines the model size
+and the number of tokens for a single training pass.16,18–20. In such settings, they provide meaningful
+guidance on how to optimally trade off model size and data exposure under a fixed compute budget;
+others have also shown data-constrained scaling on the relationship between model size and the number
+of repeated training runs with a fixed compute budget21.
+2/28
+A
+Visit-level pretraining and horizon-conditioned zero-shot inference
+Autoregressive Pretraining
+Pretraining target
+Age 62
+HTN
+HLD
+HbA1c 5.9
+Statin
+Visit 1 | day 0
+HTN
+Age 58
+HbA1c 5.6
+Visit 2 | day 755
+Age 60
+Statin
+SEP
+SEP
+HTN
+HbA1c 5.8
+time = 755
+time = 1512
+Observed patient history
+visit order is explicit; unordered events within each visit
+Visit 3 | day 1512
+HTN
+Age 60
+HLD
+Statin
+HbA1c 5.9
+SEP
+time = 1711
+...
+Pretraining target
+Age 60
+Statin
+HbA1c 5.8
+HTN
+Pretraining target
+Diabetes
+HTN
+HLD
+Statin
+Metformin
+...
+Query <SEP>
+time = 1512 + H
+Zero-shot Inference
+Zero-shot disease scores
+append sep at t + H, run one forward pass,
+then pool logits over disease code sets
+Dementia
+Diabetes
+...
+Knee OA
+Single forward pass
+no MC rollouts
+B
+Recurrence-aware objective
+Repeated conditions down-weighted; novel onsets keep full gradient
+Token occurrence
+λ
+,
+= max(
+)
+c(k, Hᵥ)
+λ = 0.5
+1st   w = 1.00
+first onset: c = 0
+repeat count c(k, Hᵥ)
+λ < 1 
+2nd  w = 0.50
+3rd   w = 0.25
+HTN
+HTN
+HTN
+HTN
+HTN
+4th   w = 0.13
+w = 1.0
+w = λ
+w = λ²
+w = λ³
+w = λ⁴
+5th   w = 0.10
+Diabetes
+...
+w = 1.0
+nth   w = 0.10
+time
+V5
+V1
+w
+v+1, k
+V2
+V3
+w  = 0.1
+min
+V4
+w
+min
+C
+Compute-saturated scaling
+Finite cohort, repeated epochs, and capacity-data matching under train-to-convergence.
+Finite Data
+fixed patient cohort 
+growing at slow rate
+Abundant compute
+model size
+training epochs
+Larger models are more sample-
+efficient but eventually overfit
+Test Loss
+1M
+10M
+144M
+Number of parameters (log scale)
+1B
+Data budget
+Full data
+50% subset
+25% subset
+10% subset
+D
+Datasets, evaluations, and lossy zero-shot generalization
+A patient-level NYU split for internal development; EHRSHOT zero-shot transfer setting.
+NYU Langone Health
+Longitudinal institutional cohort
+median 21 visits
+2013-2023
+Training
+70% n = ~ 902K
+n = ~ 193K
+pretraining
+early stopping
+scaling sweeps
+threshold tuning
+Tasks
+Token space
+42337 tokens in vocab
+n = ~193K
+held out
+internal zero-shot
+2- / 5-year disease onset
+N = 1,288,242
+Validation
+15%
+Internal test
+15%
+Lossy code transfer
+Code mapping
+Medication: RxNorm to Internal
+Noisy many-to-many map
+Coverage gap
+drop unmapped or codes not 
+covered from vocabulary
+Procedures
+Vitals
+Sites
+...
+Diagnosis: SNOMED to ICD-10
+...
+EHRSHOT
+Public benchmark for evaluations
+N = 6739
+zero-shot
+kept ~25% rows
+no fine-tuning
+Benchmark
+6 assignment of new diagnoses tasks (1-year onset)
+with benchmark-provided label definitions
+Evaluation
+take the held-out portion of the data
+apply the pretrained model without gradient updates
+Figure 1. Study overview of recurrence-aware next-visit foundation modeling on longitudinal
+EHRs. a, Patient trajectories are represented as temporally ordered visits containing unordered clinical
+events. During pretraining, a time-coded separator token [SEP] predicts the full event set at the next visit;
+during zero-shot inference, the same interface queries disease risk at future horizons by appending a
+separator token at time t + H and pooling logits over condition-specific code sets. b, Repeated chronic
+targets are downweighted during pretraining according to their prior count so that rare first onsets retain
+training signal. c, In a finite EHR corpus revisited for many epochs, model size must match the
+corresponding available data as larger models eventually overfit, and the selected 144M model lies near
+the full-data optimum. d, Model development uses a patient-level 70%/15%/15% split on patient data from
+NYU Langone; a schematic external zero-shot transfer setting based on Stanford EHRSHOT highlights
+ontology harmonization between benchmark concepts and the institutional token space, which can
+introduce information loss and drop of certain features.
+3/28
+Nevertheless, they do not fully reflect the nature of modeling structured EHR data, where the total number
+of patient trajectories is orders of magnitude smaller than the internet text tokens used in language
+modeling and repeated training on the same records is inevitable. Hence, similar to recent work in LLMs22,
+where the concern for running out of data is rising, we study the scaling behaviors of EHR foundation
+models in a data-limited, compute-saturated regime. We assume that we have infinite compute and
+limited data, where compute is more naturally spent on optimizing convergence of large models over the
+available data. We train RAVEN under varying parameter counts and data budgets for multiple epochs
+until validation convergence. We find that the model size eventually becomes too large to avoid overfitting,
+and model capacity must be matched to the available cohort size.
+In this work, RAVEN autoregressively learns the joint state of medications, labs, and diagnoses for the next
+encounter, conditioned on patient history and the time of the next visit. Also, we show how repeated event
+tokens can inflate model performance through pretraining evaluations and propose recurrence-aware
+regularization for repeated events to encourage the learning of new events. We evaluate RAVEN with
+rigorously constructed downstream disease onset tasks and demonstrate strong zero-shot generalization
+in forecasting different types of diseases with different prediction horizons, compared to a fully fine-tuned
+BERT-based foundation model baseline and several popular next-token-based approaches. Additionally,
+we apply RAVEN pretrained on our own dataset to EHRSHOT, a public benchmark of longitudinal EHR
+sourced from a different health system.23 Despite the coding differences for clinical concepts and gaps for
+coverage of features between the health systems, we showcase RAVEN’s ability to generalize beyond its
+training distribution without additional few-shot samples.
+Results
+We developed RAVEN, a generative foundation model for structured longitudinal electronic health records
+that learns to predict the full set of clinical events at a patient’s next visit, conditioned on their prior history
+and the timing of the encounter (Fig. 1a). The model was pretrained on de-identified EHR trajectories
+from approximately 1.29 million patients at NYU Langone Health, spanning a decade of inpatient and
+outpatient encounters (2013–2023) and comprising over 42,000 unique clinical tokens across diagnoses,
+medications, laboratory results, and demographics. All data splits were performed at the patient level to
+prevent information leakage, yielding training (70%, n = 901,769), validation (15%, n = 193,236), and test
+(15%, n = 193,237) sets. To address the tendency of models to rely on repeating conditions rather than
+learning to anticipate new disease onsets, we introduced a recurrence-aware regularization mechanism
+that downweights recurrent events during training (Fig. 1b). We systematically investigated model scaling
+under a data-constrained, compute-saturated regime to identify the capacity–data trade-off appropriate
+for finite clinical cohorts (Fig. 1c). We evaluated RAVEN’s ability to perform zero-shot disease-onset
+forecasting at multiple horizons on held-out internal data, and further tested its generalization capability
+through zero-shot transfer to EHRSHOT, a public benchmark derived from a separate health system with
+different coding conventions and feature coverage (Fig. 1d).
+Zero-shot disease forecasting
+Without any task-specific fine-tuning, we evaluated the zero-shot ability of RAVEN to forecast future
+long-term disease incidence across seven diverse clinical conditions: dementia, knee osteoarthritis (OA),
+pancreatic cancer, prostate cancer, acute myocardial infarction (MI), congestive heart failure (CHF), and
+chronic obstructive pulmonary disease (COPD). The ground truth label was defined by the first occurrence
+of the condition, which is determined by a set of diagnosis and medication codes within the prediction
+window. For each condition, we constructed evaluation examples using rolling prediction windows over
+patient trajectories: a past input history serves as context, and the model predicts whether the first onset
+4/28
+of the condition occurs within the specified horizon. Here, we chose to evaluate at both 2-year and 5-year
+horizons. To ensure the model is predicting future new onset based on prior history, rather than simply
+repeating the conditions if already present, we exclude patients’ windows if their input history windows
+contain any label code, or if the disease onset occurred within one year following the prediction time point.
+This ensures the model forecasts medium- to long-term risk rather than imminent events and reduces the
+risks of label leakage.
+We benchmarked RAVEN against three variants of popular autoregressive next-token baselines that
+estimate risk via multiple simulations of future trajectories. Particularly, we include a standard next-token
+cross-entropy model (Multiclass), a next-token set-based loss model (SeqLoss), and a joint gap-and-event
+generation model (EGE). For these baselines, long-horizon risk is estimated via inference autoregressively
+with R=100 rollouts per patient window, whereas RAVEN uses a single forward pass per example.We
+also compare against a strong supervised baseline via a BERT-based foundation model pretrained using
+the same training data but also finetuned for each particular condition and horizon. Full details of the
+evaluation protocol, including endpoint definitions and baseline descriptions, are provided in the Methods
+section.
+Table 1. Zero-shot forecasting at the 2-year horizon (AUROC / AUPRC). RAVEN produces a risk
+score conditioned on the horizon in one forward pass. Autoregressive baselines estimate risk via R = 100
+Monte Carlo rollouts. BERT is fully supervised for each condition.
+Condition
+RAVEN
+Multiclass
+SeqLoss
+EGE
+BERT (FT)
+Dementia
+0.789 / 0.037
+0.700 / 0.030
+0.700 / 0.035
+0.684 / 0.034
+0.731 / 0.050
+Knee OA
+0.726 / 0.057
+0.622 / 0.040
+0.692 / 0.057
+0.605 / 0.040
+0.743 / 0.064
+COPD
+0.691 / 0.052
+0.545 / 0.038
+0.637 / 0.049
+0.598 / 0.044
+0.703 / 0.055
+CHF
+0.857 / 0.078
+0.710 / 0.048
+0.742 / 0.052
+0.626 / 0.044
+0.862 / 0.085
+Acute MI
+0.793 / 0.031
+0.605 / 0.017
+0.586 / 0.016
+0.606 / 0.019
+0.818 / 0.049
+Pancreatic Cancer 0.693 / 0.002 0.496 / 0.0002
+0.494 / 0.001
+0.501 / 0.0005
+0.600 / 0.001
+Prostate Cancer
+0.910 / 0.022
+0.799 / 0.017
+0.801 / 0.017
+0.743 / 0.008
+0.905 / 0.022
+Macro average
+0.780 / 0.040
+0.640 / 0.027
+0.665 / 0.032
+0.623 / 0.027
+0.766 / 0.047
+Table 2. Zero-shot forecasting at the 5-year horizon (AUROC / AUPRC). The same evaluation
+protocol is used as in Table 1.
+Condition
+RAVEN
+Multiclass
+SeqLoss
+EGE
+BERT (FT)
+Dementia
+0.773 / 0.108 0.665 / 0.084
+0.684 / 0.108
+0.644 / 0.094
+0.721 / 0.146
+Knee OA
+0.697 / 0.200 0.639 / 0.168
+0.676 / 0.201
+0.606 / 0.165
+0.717 / 0.220
+COPD
+0.676 / 0.164 0.532 / 0.125
+0.639 / 0.181
+0.621 / 0.160
+0.699 / 0.189
+CHF
+0.821 / 0.184 0.719 / 0.119
+0.729 / 0.148
+0.667 / 0.145
+0.838 / 0.219
+Acute MI
+0.754 / 0.080 0.618 / 0.068
+0.575 / 0.053
+0.625 / 0.065
+0.782 / 0.107
+Pancreatic Cancer 0.639 / 0.004 0.504 / 0.002
+0.512 / 0.002
+0.498 / 0.001
+0.639 / 0.003
+Prostate Cancer
+0.901 / 0.073 0.796 / 0.066
+0.812 / 0.051
+0.784 / 0.047
+0.897 / 0.067
+Macro average
+0.752 / 0.116 0.639 / 0.090
+0.661 / 0.106 0.635 / 0.097 0.756 / 0.136
+Tables 1 and 2 report zero-shot forecasting performance at 2-year and 5-year horizons, respectively.
+RAVEN produces a horizon-conditioned prediction in a single forward pass, while next-token baselines
+estimate risk via Monte Carlo rollouts. All results in this section use the regularized RAVEN (λ⋆=
+5/28
+0.5) with 144 million parameters; the effect of regularization strength is examined in the Recurrence-
+aware regularization section below. 95% confidence intervals for all RAVEN results are provided in the
+Supplementary.
+Across conditions, our model achieves the highest AUROC among all approaches requiring autoregressive
+inference for most conditions at both horizons. At the 2-year horizon (Table 1), RAVEN attains a macro-
+average AUROC of 0.780, substantially exceeding Multiclass (0.640), SeqLoss (0.665), and EGE (0.623).
+The gains are particularly pronounced for dementia (AUROC 0.789 vs. 0.700 for the best next-token
+baseline) and CHF (0.857 vs. 0.742). A similar pattern holds at the 5-year horizon (Table 2), where
+RAVEN achieves a macro-average AUROC of 0.752 compared to 0.639, 0.661, and 0.635 for Multiclass,
+SeqLoss, and EGE, respectively.
+For prostate cancer, RAVEN achieves the highest AUROC across all methods at both horizons (0.910 at
+2 years, 0.901 at 5 years), matching or exceeding even the fine-tuned BERT baseline (0.905 and 0.897).
+For pancreatic cancer, the next-visit model similarly outperforms BERT at both horizons (0.693 vs. 0.600
+at 2 years; 0.639 vs. 0.639 at 5 years), despite the extremely low condition prevalence reflected in AUPRC
+values below 0.005 at the 2-year window. The fine-tuned BERT baseline achieves the highest AUROC on
+CHF (0.862 at 2 years, 0.838 at 5 years), knee OA, and COPD, where task-specific supervision provides
+an advantage. However, the gap between our zero-shot model and fully fine-tuned BERT is modest
+in most cases (e.g., COPD 2-year AUROC 0.691 vs. 0.703; knee OA 0.726 vs. 0.743), and RAVEN
+consistently outperforms all rollout-based autoregressive baselines across conditions and horizons. At
+the macro-average level, RAVEN (0.780 / 0.752 at 2 / 5 years) is competitive with BERT (0.766 / 0.756)
+while requiring no task-specific training or per-condition fine-tuning.
+Generalization to EHRSHOT
+To understand how RAVEN generalizes out-of-distribution, we take RAVEN, pretrained exclusively on
+our internal NYU Langone data, to EHRSHOT, a public benchmark of longitudinal EHR tasks sourced
+from Stanford Medicine23, for zero-shot transfer evaluations. There are six binary classification tasks
+predicting whether a patient will receive a first diagnosis of a condition within one year post-discharge
+from an inpatient visit: acute myocardial infarction (MI), lupus, hyperlipidemia, hypertension, celiac
+disease, and pancreatic cancer. It is worth noting that EHRSHOT uses different coding systems for many
+clinical concepts from our own and contains features like vitals that are currently not in RAVEN’s training
+vocabulary. Therefore, we perform lossy transfer of existing concepts and drop information that we do
+not cover in the vocabulary. We are only able to utilize 25% of the data rows from EHRSHOT, meaning
+RAVEN accesses far fewer features in the input sequence than other baselines.
+Importantly, RAVEN was pretrained on an external EHR corpus and received no labeled examples or
+any training from the target institution, making this a strict zero-shot transfer evaluation. We compared
+three RAVEN variants, corresponding to different strengths of a history-dependent regularization that
+downweights repeated clinical events during pretraining (λ ∈{1.0, 0.5, 0.25}, where λ = 1.0 denotes
+no regularization; see Recurrence-aware regularization below), against four supervised baselines from
+EHRSHOT: CLMBR-T, gradient-boosted machines (GBM), logistic regression, and random forest, each
+trained with K ∈{1, 2, 4, . . . , 128} labeled examples per class as well as the full training set (Fig. 2)23,24.
+RAVEN, using different regularization strengths, achieved competitive discrimination under several condi-
+tions without access to any target-domain labels. On acute MI, RAVEN (λ = 1.0) attained an AUROC
+of 0.627 (95% CI: 0.584–0.670), matching or exceeding all four baselines trained with up to K = 16
+labeled examples per class. For hypertension, we observed that RAVEN (λ = 1.0 and λ = 0.5) reached
+an AUROC of 0.678 and 0.635 (95% CI: 0.636–0.724, 0.586–0.681), comparable to CLMBR-T and
+exceeding GBM and random forest trained with the full dataset. RAVEN (λ = 0.25) notably achieved better
+performance on lupus and celiac disease, outperforming two supervised baselines trained at K = all.
+6/28
+0
+1
+2
+4
+8
+1216 2432 4864
+128
+0.40
+0.45
+0.50
+0.55
+0.60
+0.65
+0.70
+0.75
+AUROC
+Acute MI
+0
+1
+2
+4
+8
+1216 2432 4864
+128
+0.35
+0.40
+0.45
+0.50
+0.55
+0.60
+0.65
+0.70
+0.75
+Lupus
+0
+1
+2
+4
+8
+1216 2432 4864
+128
+0.45
+0.50
+0.55
+0.60
+0.65
+0.70
+Hyperlipidemia
+0
+1
+2
+4
+8
+1216 2432 4864
+128
+# of Train Examples per Class
+0.45
+0.50
+0.55
+0.60
+0.65
+0.70
+AUROC
+Hypertension
+0
+1
+2
+4
+8
+1216 2432 4864
+128
+# of Train Examples per Class
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+Celiac
+0
+1
+2
+4
+8
+1216 2432 4864
+128
+# of Train Examples per Class
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+Pancreatic Cancer
+CLMBR-T
+GBM
+Logistic Reg.
+Random Forest
+RAVEN ( =1.0)
+RAVEN ( =0.5)
+RAVEN ( =0.25)
+Acute MI
+Lupus
+Hyperlipidemia
+Hypertension
+Celiac
+Pancreatic
+Cancer
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+AUROC
+CLMBR-T
+GBM
+Logistic Reg.
+Random Forest
+RAVEN ( =1.0)
+RAVEN ( =0.5)
+RAVEN ( =0.25)
+Figure 2. Zero-shot generalization of RAVEN for new diagnosis predictions on EHRSHOT. All
+baseline models (CLMBR-T, GBM, Logistic Regression, Random Forest) are trained on varying numbers
+of labeled examples per class (K) drawn from the training dataset, whereas RAVEN is evaluated in a
+zero-shot setting with no target-domain supervision. a, AUROC as a function of the number of training
+examples per class. Solid lines denote baseline models with s.d. shading across random seeds; dashed
+horizontal lines indicate RAVEN performance at K = 0 for three regularization strengths
+(λ = 1.0, 0.5, 0.25), with 95% confidence intervals shown at the zero-shot axis. RAVEN with different
+regularization strengths matches or exceeds baselines trained on different number of labeled examples
+for conditions including acute MI, hyperlipidaemia, and hypertension. b, Comparison to baselines at
+K = all (full EHRSHOT training set). RAVEN can be competitive on certain conditions with fully finetuned
+models despite having seen zero training examples. Error bars denote 95% confidence intervals.
+7/28
+The optimal regularization strength varied across conditions, suggesting that the degree of distributional
+alignment needed for effective transfer is task-dependent. For acute MI and hypertension, the unregular-
+ized variant (λ = 1.0) performed best, whereas for celiac disease, the strongest regularization (λ = 0.25)
+yielded the highest AUROC of 0.667 (95% CI: 0.541–0.782), substantially outperforming both λ = 1.0
+and λ = 0.5. A similar pattern emerged for pancreatic cancer, where λ = 0.25 achieved an AUROC
+of 0.642 (95% CI: 0.565–0.721), exceeding the other two variants by a wide margin. For lupus, both
+λ = 0.25 (AUROC = 0.634) and λ = 0.5 (AUROC = 0.624) outperformed λ = 1.0 (AUROC = 0.520),
+indicating that regularization potentially helped mitigate distribution shift for rarer conditions. These results
+demonstrate that pretrained RAVEN captures clinically meaningful signals sufficient for discriminating
+conditions without any task-specific supervision under difficult transfer conditions.
+However, when baselines were trained with the full labeled training set (K = all), many consistently
+outperformed zero-shot RAVEN (Fig. 2b), with the performance gap being most pronounced for pancreatic
+cancer (best baseline AUROC = 0.885 versus best RAVEN AUROC = 0.642) and lupus (0.793 versus
+0.634). This indicates that while our pretrained model provides a strong initial transfer capability, super-
+vised fine-tuning with sufficient in-distribution data remains advantageous, particularly when the model
+must deal with missing information and incompatible clinical coding practices under distribution shift. Also,
+the wide confidence intervals observed for certain RAVEN variants, most notably on celiac disease and
+lupus, reflect the limited number of positive cases for rare conditions (N = 21) in the EHRSHOT test set
+and suggest that larger validation cohorts would be needed to draw definitive conclusions about zero-shot
+performance on low-prevalence diseases.
+Recurrence-aware regularization
+0.25
+0.50
+0.75
+1.00
+0.30
+0.31
+0.32
+0.33
+0.34
+0.35
+AUPRC
+Dementia
+0.25
+0.50
+0.75
+1.00
+0.28
+0.29
+0.30
+0.31
+0.32
+0.33
+Knee
+0.25
+0.50
+0.75
+1.00
+0.46
+0.48
+0.50
+0.52
+0.54
+Prostate Cancer
+0.25
+0.50
+0.75
+1.00
+0.12
+0.13
+0.14
+0.14
+0.14
+Acute MI
+0.25
+0.50
+0.75
+1.00
+Decay Factor 
+0.52
+0.54
+0.56
+0.58
+0.60
+0.62
+0.64
+0.66
+AUPRC
+Pancreatic Cancer
+0.25
+0.50
+0.75
+1.00
+Decay Factor 
+0.25
+0.26
+0.27
+0.28
+0.29
+0.30
+CHF
+0.25
+0.50
+0.75
+1.00
+Decay Factor 
+0.21
+0.22
+0.23
+0.24
+0.25
+COPD
+0.12
+0.12
+0.13
+0.14
+0.14
+0.15
+0.22
+0.24
+0.26
+0.28
+0.30
+0.14
+0.16
+0.18
+0.20
+0.22
+0.24
+0.26
+0.06
+0.07
+0.08
+0.09
+0.10
+0.11
+0.12
+On-time Rate
+0.04
+0.06
+0.08
+0.10
+0.12
+0.14
+0.20
+0.22
+0.24
+0.26
+0.28
+0.14
+0.16
+0.18
+0.20
+0.22
+On-time Rate
+AUPRC
+On-time rate
+Figure 3. Effect of history-dependent regularization strength. We sweep the decay parameter λ that
+downweights repeated target events during training and report OnTime and AUPRC across conditions.
+All main downstream results use a single global setting with intermediate level λ⋆= 0.5.
+Certain clinical concepts such as hypertension or diabetes tend to reappear at nearly every visit once
+first documented. A model trained with a naive next-visit objective can therefore simply memorizing
+and repeating existing events in the history, achieving strong apparent performance without learning to
+8/28
+Dem. 2y
+Knee 2y
+Prost. 2y
+MI 2y
+Panc. 2y
+CHF 2y
+COPD 2y
+Dem. 5y
+Knee 5y
+Prost. 5y
+MI 5y
+Panc. 5y
+CHF 5y
+COPD 5y
+-0.050
+-0.040
+-0.030
+-0.020
+-0.010
+0
++0.010
++0.020
++0.030
+ AUROC
+(a)  AUROC 
+ 2-year and 5-year
+Dem. 2y
+Knee 2y
+Prost. 2y
+MI 2y
+Panc. 2y
+CHF 2y
+COPD 2y
+Dem. 5y
+Knee 5y
+Prost. 5y
+MI 5y
+Panc. 5y
+CHF 5y
+COPD 5y
+-0.015
+-0.010
+-0.005
+0
++0.005
++0.010
++0.015
+ F1
+(b)  F1 
+ 2-year and 5-year
+0.25
+0.5
+0.75
+1.0
+0.72
+0.74
+0.76
+0.78
+0.80
+0.82
+AUROC
+Dementia
+0.25
+0.5
+0.75
+1.0
+0.64
+0.66
+0.68
+0.70
+0.72
+0.74
+0.76
+Knee OA
+0.25
+0.5
+0.75
+1.0
+0.88
+0.89
+0.90
+0.91
+0.92
+0.93
+0.94
+Prostate Cancer
+0.25
+0.5
+0.75
+1.0
+0.70
+0.72
+0.74
+0.76
+0.78
+0.80
+0.82
+Acute MI
+0.25
+0.5
+0.75
+1.0
+0.55
+0.60
+0.65
+0.70
+0.75
+AUROC
+Pancreatic Cancer
+0.25
+0.5
+0.75
+1.0
+0.80
+0.81
+0.82
+0.83
+0.84
+0.85
+0.86
+0.87
+0.88
+CHF
+0.25
+0.5
+0.75
+1.0
+0.64
+0.65
+0.66
+0.67
+0.68
+0.69
+0.70
+0.71
+0.72
+COPD
+0.25
+0.5
+0.75
+1.0
+0.72
+0.74
+0.76
+0.78
+0.80
+0.82
+Macro average
+= 0.25
+= 0.5
+= 0.75
+(c) AUROC vs regularization strength per condition (95% CI)
+2-year
+5-year
+Figure 4. Effect of recurrence-aware regularization on zero-shot disease onset prediction. a,
+Change in AUROC from no regularization (λ = 1.0) across seven conditions at 2-year and 5-year horizons.
+Bars above zero indicate improved discrimination under regularization. b, Corresponding change in F1
+score. Dashed vertical lines separate the 2-year and 5-year evaluation groups. c, Per-condition AUROC
+as a function of the decay parameter λ for the 2-year and 5-year horizons, with shaded 95% confidence
+intervals. The macro-average panel (bottom right) summarizes the overall trend. All results use 144M
+model trained on the full dataset; lower λ corresponds to stronger penalization of repeated clinical events.
+anticipate new disease onsets. We introduce a history-dependent weighting scheme that uses decay
+parameter λ to exponentially downweight the loss contribution of each positive target token according
+to how many times it has already appeared in the patient’s prior visits. When λ = 1.0, all tokens receive
+equal weight (no regularization), while smaller values of λ progressively suppress the training signal from
+frequently repeated events.
+To assess the pretraining process and the effect of the repeat token regularization, we evaluate the
+overall next-visit prediction performance of RAVEN on several conditions. Standard metrics can be
+inflated in longitudinal EHR data because many endpoints correspond to chronic conditions that repeat
+once observed, and model can achieve strong apparent performance by echoing previously observed
+9/28
+diagnoses. To explicitly evaluate onset timing, we define a new metric called the on-time ratio for each
+condition, which measures the proportion of true positive predictions that occur at or before the first
+recorded onset of the condition in the patient trajectory. Here, true positives are defined at the trajectory
+level: a patient is considered a true positive if they eventually develop the condition and the model
+predicts it at any point across the rolling evaluation windows. This helps us to distinguish performance on
+forecasting new onsets versus merely repeating known information.
+We investigated the effects of our decay regularization approach on repeated clinical events and varied the
+decay factor parameter λ from 0.25 to 1.0 where smaller λ leads to stronger penalization. Figure 3 shows
+the effect of sweeping the decay parameter λ that downweights repeated tokens during training on both
+the on-time ratio and AUPRC: increasing the penalization (smaller λ) significantly improved the on-time
+rate at the expense of overall precision and recall. For example, in acute MI, the on-time ratio nearly
+doubles when moving from λ = 1.0 to λ = 0.25, and similar gains are observed for knee OA, CHF, and
+COPD. This improvement does come at a cost: AUPRC tends to decline under stronger regularization,
+reflecting a drop in overall precision and recall as the model becomes worse to tokens it has seen before,
+including those that are genuinely recurring. This pattern is consistent with the intuition that the model is
+being nudged away from simply repeating already-observed conditions and toward anticipating informative
+changes in the clinical trajectory.
+Furthermore, to evaluate whether the recurrence-aware regularization improves downstream disease
+onset prediction, we compared zero-shot forecasting performance on seven conditions at 2-year and
+5-year horizons with different λ (Fig. 4). Regularization consistently improved AUROC for conditions: at
+the 2-year horizon, λ = 0.5 improved AUROC over the unregularized baseline for dementia (+0.017),
+knee OA (+0.020), and acute MI (+0.017), with similar gains at the 5-year horizon (Fig. 4a). Prostate
+cancer, which already exhibited strong discrimination (AUROC > 0.90), showed modest but consistent
+improvement across all regularization strengths. Also, F1 scores remained stable or improved for most
+conditions under regularization (Fig. 4b).
+Nevertheless, the benefit was not universal: CHF and COPD showed minimal sensitivity to λ at both
+horizons, with AUROC varying by less than 0.01 across settings. Pancreatic cancer presented an
+exception: at the 5-year horizon, strong regularization (λ = 0.25) reduced AUROC by 0.046 relative to
+the unregularized model, likely reflecting the extremely low event prevalence where the model benefits
+from retaining all available signal, including recurrence patterns. Per-condition AUROC curves (Fig. 4c)
+confirmed these trends. At the macro-average level, regularized models (λ = 0.5) achieved higher AUROC
+than the unregularized baseline at both horizons (0.783 vs. 0.778 at 2 years; 0.770 vs. 0.767 at 5 years),
+supporting λ⋆= 0.5 as a balanced operating point which we use for downstream evaluations.
+Compute-saturated scaling
+Unlike traditional scaling studies, we operate under the assumption of unconstrained compute, meaning
+we train the largest feasible models for as long as possible. The goal is to build the best possible model
+with the sole constraint of data. To study how RAVEN scales under this regime, we evaluate eight model
+configurations spanning 0.68 million to 848.80 million parameters, trained on four data budgets. The
+configurations also vary in width-to-depth ratio to probe whether this affects performance independently of
+model size; full configuration details are provided in the Supplementary. The four data budgets consist of
+three randomly drawn subsets of the training data (10%, 25%, and 50%) plus the full dataset, enabling us
+to characterize how data scale interacts with model size.
+Rather than fixing an epoch count or compute budget, we adopt a convergence-oriented training protocol
+with early stopping on validation loss. The actual number of epochs trained ranges from 10 to 20
+depending on the data scale where smaller datasets benefited more from further repeating. In total, we
+10/28
+106
+107
+108
+109
+Number of Parameters
+0.8
+0.9
+1.0
+1.1
+1.2
+1.3
+1.4
+Validation Loss
+Data budget
+Full Data
+50% Subset
+25% Subset
+10% Subset
+106
+107
+108
+109
+Number of Parameters
+0.8
+0.9
+1.0
+1.1
+1.2
+1.3
+Test Loss
+106
+107
+108
+109
+Number of Parameters
+0.8
+1.0
+1.2
+1.4
+Validation Loss
+Data budget
+Full Data
+50% Subset
+25% Subset
+10% Subset
+106
+107
+108
+109
+Number of Parameters
+0.8
+1.0
+1.2
+1.4
+Test Loss
+Figure 5. Compute-saturated scaling of standard and RAVEN pretraining. (a) Validation loss and test
+loss under the standard next-visit objective as a function of model size across multiple dataset budgets.
+The fitted minima shift toward larger models as the data budget increases, indicating that the optimal
+capacity depends strongly on the amount of available training data. (b) The same scaling analysis with
+full RAVEN history-dependent regularization enabled during pretraining, showing how the evidence
+transfers to training with recurrence-aware weighting.
+trained over 80 different models across all settings to full convergence, and this allows us to not only select
+the optimal model size for downstream tasks but also understand the intricate relationships between
+model size and data scale under this regime.
+Figure 5a reports validation and test pretraining loss as a function of model size across dataset budgets.
+Loss exhibits a U-shaped dependence on parameter count: larger models are more sample-efficient up to
+a point, beyond which performance degrades. To summarize these trends, we fit a smooth curve to the
+loss-versus-model-size relationship for each budget and identify the fitted minimum (diamond markers). In
+the repeated-epoch regime, we observe that increasing parameter count will eventually lead to overfitting,
+consistent with observations in LLMs22. The estimated optimal model size shifts with data budget: larger
+datasets support larger optimal models, while smaller budgets favor more compact architectures. This
+highlights that over-parameterization can be harmful when training repeatedly over a finite cohort.
+Additionally, Figure 5b repeats the same scaling analysis with history-dependent downweighting of
+repeated events, and the results are broadly consistent with the standard pretraining findings. We also
+note that the pretraining loss performance correlates largely with the downstream tasks performance.
+11/28
+10%
+25%
+50%
+100%
+Fraction of training data
+0.74
+0.76
+0.78
+0.80
+Macro-avg AUROC
+2-year horizon
+47M
+47M
+47M
+144M
+a
+10%
+25%
+50%
+100%
+Fraction of training data
+0.0300
+0.0325
+0.0350
+0.0375
+0.0400
+0.0425
+0.0450
+Macro-avg AUPRC
+2-year horizon
+47M
+47M
+47M
+144M
+10%
+25%
+50%
+100%
+Fraction of training data
+0.70
+0.72
+0.74
+0.76
+0.78
+Macro-avg AUROC
+5-year horizon
+47M
+47M
+47M
+144M
+b
+10%
+25%
+50%
+100%
+Fraction of training data
+0.09
+0.10
+0.11
+0.12
+0.13
+Macro-avg AUPRC
+5-year horizon
+47M
+47M
+47M
+144M
+0.7M
+2.8M
+5.8M
+14M
+47M
+144M
+446M
+Number of parameters
+0.70
+0.72
+0.74
+0.76
+0.78
+0.80
+Macro-avg AUROC
+2-year horizon
+c
+0.7M
+2.8M
+5.8M
+14M
+47M
+144M
+446M
+Number of parameters
+0.020
+0.025
+0.030
+0.035
+0.040
+0.045
+Macro-avg AUPRC
+2-year horizon
+0.7M
+2.8M
+5.8M
+14M
+47M
+144M
+446M
+Number of parameters
+0.66
+0.68
+0.70
+0.72
+0.74
+0.76
+0.78
+Macro-avg AUROC
+5-year horizon
+d
+0.7M
+2.8M
+5.8M
+14M
+47M
+144M
+446M
+Number of parameters
+0.08
+0.09
+0.10
+0.11
+0.12
+0.13
+0.14
+Macro-avg AUPRC
+5-year horizon
+Figure 6. Scaling downstream zero-shot disease forecasting performance. a, b. Macro-average
+AUROC and AUPRC for 2-year (a) and 5-year (b) zero-shot disease onset prediction with shaded 95%
+confidence intervals, averaged across seven conditions. At each data budget, the optimal model size from
+the compute-saturated scaling analysis (Fig. 1c) is used: 47M parameters for the 10%, 25%, and 50%
+subsets, and 144M parameters for the full dataset. All models are trained with recurrence-aware
+regularization (λ = 0.5). c, d. Same zero-shot task metrics 2-year (c) and 5-year (d) plotted with respect
+to model sizes. All models are trained with full data and regularization (λ = 0.5)
+Under full RAVEN pretraining, we see the right tail of the U-shaped curve continues to decrease with model
+size, suggesting headroom for further scaling, a pattern consistent with LLM scaling laws18. Unfortunately,
+we do not have access to additional data needed to trace a strict power law across more budget levels.
+Unless otherwise noted, we use the 144M-parameter model as our main model, selected by validation
+loss under the full-data budget in the sweep.
+We further explored whether the scaling behaviors observed in pretraining loss propagate to downstream
+zero-shot forecasting metrics by evaluating the optimal model at each data budget on disease onset
+prediction at both 2-year and 5-year horizons (Fig. 6a, b). Across all four settings, each data budget
+uses the model size selected by the compute-saturated scaling sweep: 47M parameters for the 10–50%
+subsets and 144M for the full dataset. At the 5-year horizon, both metrics show consistent improvement
+with increasing data: macro-average AUROC rises from 0.723 at 10% of the training data to 0.751 at
+full data, while macro-average AUPRC increases from 0.103 to 0.113. At the 2-year horizon, AUROC
+improves from 0.755 to 0.770 and AUPRC from 0.034 to 0.037.
+Also, we examined how model size affects downstream zero-shot forecasting when all models are trained
+on the full cohort. Figure 6c, d shows macro-average AUROC and AUPRC across seven conditions at
+both horizons for models ranging from 0.69M to 446M parameters. The most pronounced gains occur in
+the smallest model range: scaling from 0.69M to 2.81M parameters improves 5-year AUROC from 0.705
+to 0.748 and 5-year AUPRC from 0.094 to 0.115. Performance plateaus and even diminishes once we
+move to models larger than the optimal 144 million parameters from Fig. 5. These findings suggest that
+increasing model capacity beyond a modest threshold yields diminishing returns on downstream task
+performance, whereas expanding the pretraining cohort continues to produce meaningful gains. This
+asymmetry has practical implications for resource allocation, suggesting that efforts to acquire additional
+patient data are likely to be more impactful than scaling model parameters alone.
+12/28
+Discussion
+In this work, we present a new generative pretraining framework for sequential EHR data called RAVEN,
+centered on next-visit multi-label event prediction with regularization on repeated clinical events. It
+respects the unordered nature of events within a visit, supports zero-shot querying at arbitrary future
+horizons, and avoids retraining separate supervised models for every endpoint and prediction window.
+We studied its zero-shot multi-year disease forecasting with RAVEN trained on structured longitudinal
+EHR trajectories from a large de-identified health system cohort with approximately 1.29M patients.
+Across diverse endpoints and both 2-year and 5-year horizons, a single-pass inference strategy produced
+competitive AUROC/AUPRC compared to commonly used autoregressive rollout baselines, and in several
+settings approached a fully fine-tuned representation baseline (Tables 1–2). In addition, we show that
+pretrained RAVEN can perform competitively with supervised and fine-tuned baselines on new diagnosis
+tasks from external data under extremely difficult transfer conditions. These results suggest that generative
+EHR foundation models can support efficient, horizon-conditioned risk estimation without task-specific
+fine-tuning, making them ideal candidates for scalable screening and retrospective cohort stratification in
+large health systems.
+We showed that zero-shot forecasting is feasible and can be operationally attractive. A consistent
+empirical takeaway is that competitive performance does not require per-endpoint supervised training.
+For health systems that need to monitor many conditions simultaneously, this shifts the bottleneck from
+building and maintaining large amount of task-specific models to validating and calibrating a single
+foundation model interface. Practically, this can enable rapid endpoint expansion (new code sets and
+phenotypes) and simpler deployment surfaces, with the caveat that calibration and threshold selection
+remain application-specific.
+One key contribution of this work is to highlight an important lesson in evaluations for foundation models
+trained on longitudinal EHRs. Our pretraining evaluations revealed an inherent trade-off when emphasizing
+the prediction of new clinical events: stronger regularization improved the on-time rate for new onsets
+but could reduce overall precision and recall. This underscores that if models are blindly evaluated and
+optimized solely on certain metrics without careful design, there is a risk of developing clinically ineffective
+systems that primarily repeat patient history rather than effectively predicting new disease onsets.
+For instance, a model might achieve high recall by simply echoing chronic diagnoses seen earlier in the
+trajectory, without demonstrating a genuine understanding of when a condition first arose or changed in
+severity. Our regularization scheme directly mitigates this issue by penalizing predictions of frequently
+repeated clinical events, thereby guiding the model to prioritize meaningful predictions of new disease
+occurrences. By explicitly separating and evaluating these two phenomena - predicting new onsets versus
+repeating known information - evaluations can better reflect real-world clinical needs, such as providing
+early warnings for new diagnoses or enabling timely intervention. This approach ensures more clinically
+relevant and accurate assessments of model performance.
+Also, since patient data is often scarce, we should not use the same scaling paradigm for EHR foundation
+models as LLMs trained on web-scale corpora. In our data-constrained, compute-saturated regime, we
+observed a U-shaped dependence of validation/test loss on model size across multiple data budgets.
+This implies that practical EHR foundation modeling behaves more like a capacity-data matching problem.
+Naively increasing parameter count without increasing effective data diversity can be neutral or even
+harmful, and capacity should be selected jointly with data budget and training protocol. We also highlight
+that there is an enormous opportunity to scale models like RAVEN in healthcare even further by collecting
+and gathering health-system level data from different sources.
+Our results suggest three pragmatic recommendations. First, evaluation should explicitly separate onset
+anticipation from recurrence detection to avoid optimistic conclusions driven by chronic repetition. Second,
+13/28
+when reporting aggregate performance across conditions, it is important to contextualize AUPRC as
+prevalence-sensitive and to complement it with metrics tied to the intended clinical use (e.g., onset timing
+or time-to-event variants). Third, for deployment-facing settings, the efficiency of single-pass horizon-
+conditioned scoring can materially reduce inference cost and eliminate sensitivity to rollout protocol
+choices, but it should be paired with careful calibration, subgroup analysis, and monitoring for distribution
+shift.
+Several limitations remain. All experiments are conducted on one large de-identified health-system cohort,
+so the precise trade-offs may differ under other coding practices, population mixes, and follow-up patterns.
+In particular, our current vocabulary does not operate under a hierarchical system for codes like ICD-10;
+hence, codes from different systems cannot give generic high-level signal to our model if it cannot be
+mapped to our granular token concept. Second, documented onset in the EHR is also only a proxy for true
+clinical onset and may lag the underlying disease process. It is also not clear if imitating existing practices
+are optimal for everyone in the healthcare system. Lastly, it would be useful to understand to what extent
+that the model can infer interventional queries to estimate the effects of potential new treatment policies.
+A natural next step is to expand beyond binary onset toward progression, remission, and treatment
+response, where repetition and timing are clinically meaningful in more nuanced ways. Our findings in
+scaling analysis also motivate developing more data-efficient algorithms for learning longitudinal EHRs
+and methods for generating synthetic data to augment constrained data sources. Moreover, we have
+not fully leveraged the generative nature of this pretrained model as we have only focused on one-step
+predictions so far, and it is not entirely clear what is the best way to sequentially generate future trajectories
+with a next-visit prediction framework. In contrast, for large language models, there is a rich literature and
+methods on inference-time algorithms and scaling such as improving reasoning and generating long-form
+responses through reinforcement learning, and we believe these methods could potentially continue to
+improve foundation models on sequential tabular data.
+Methods
+Dataset and cohort
+We develop and evaluate our pretraining framework using a large-scale, de-identified longitudinal EHR
+dataset derived from NYU Langone Health, a major academic health system in New York City. This study
+has been approved by the Institutional Review Board (IRB) of NYU Langone. The dataset spans both
+inpatient and outpatient encounters over a ten-year period (January 2013 to January 2023) and comprises
+approximately 1.29 million unique patients (N=1,288,242), with a median of 21 visits per patient (mean:
+37.76, range: 2–2123). All data splits are performed at the patient level to prevent information leakage
+across training (70%), validation (15%), and test (15%) sets.
+For external evaluation, we use EHRSHOT, a public benchmark of longitudinal structured EHR data from
+6,739 patients at Stanford Medicine23. It contains adult patients only and excludes patients with a history
+of fewer than 10 total clinical events. The training, validation, and test sets are roughly the same size;
+we only leverage the test set for evaluating RAVEN (N = 2212). We include statistics of demographic
+information for both our internal data at NYU Langone and EHRSHOT in Table 3.
+Tokenization and input representation
+Each patient record is represented as a sequence of visits, where each visit consists of a set of het-
+erogeneous clinical events. We include patient demographics (self-reported ethnicity, race, sex), age
+at visit, diagnoses (ICD-10 codes), prescribed medications, and laboratory results (LOINC codes and
+14/28
+Table 3. Patient demographics for NYU Langone and EHRSHOT cohorts. Patient demographics in
+the train, validation, and test splits for the two cohorts. For EHRSHOT, we only used the test set.
+NYU Langone (N=1,288,242)
+EHRSHOT (N=6,739)
+Attribute
+Train
+Val
+Test
+All
+Train
+Val
+Test
+All
+Gender
+Male
+347,497
+74,128
+74,291
+495,916
+1,122
+1,090
+1,086
+3,298
+Female
+531,280 114,160
+113,995
+759,435
+1,173
+1,142
+1,126
+3,441
+Age
+< 20
+73,478
+15,743
+15,597
+104,818
+8
+3
+2
+13
+21–40
+228,578
+49,002
+48,939
+326,519
+412
+457
+431
+1,300
+41–60
+291,009
+62,040
+62,348
+415,397
+648
+597
+576
+1,821
+61–80
+179,244
+38,343
+38,547
+256,134
+916
+892
+905
+2,713
+> 81
+17,866
+3,939
+3,842
+25,647
+311
+283
+298
+892
+Race
+American Indian
+14
+7
+4
+25
+Asian
+40,859
+8,829
+8,718
+58,406
+356
+347
+340
+1,043
+Black
+85,477
+18,384
+18,442
+122,303
+98
+105
+95
+298
+Pacific Islander
+3,573
+804
+755
+5,132
+23
+21
+30
+74
+White
+498,249 106,429
+106,583
+711,261
+1,286
+1,222
+1,228
+3,736
+Unknown
+195,931
+41,999
+42,041
+279,971
+518
+530
+515
+1,563
+Ethnicity
+Hispanic
+12,053
+2,639
+2,575
+17,267
+374
+342
+322 1,038
+Non-Hispanic
+143,565
+30,697
+30,955
+205,217
+1,921
+1,890
+1,890
+5,701
+Total
+901,769 193,236
+193,237
+1,288,242
+2,295
+2,232
+2,212 6,739
+values). Continuous variables, namely age and laboratory test results, are discretized into quantile-based
+bins (e.g., 10 bins for lab results). Each unique demographic category, discretized age bin, medication
+concept, ICD-10 code, and discretized lab result bin is treated as a distinct token. This results in a total
+vocabulary size |V | of 42,337 unique tokens. On average, each visit contains 11.16 tokens, and each
+patient trajectory comprises 474.21 tokens (median: 191).
+Within each patient trajectory, visits are ordered chronologically and separated by a special <sep> token
+that explicitly marks visit boundaries. Importantly, no artificial ordering is imposed on tokens within a visit,
+reflecting the fact that many clinical events recorded at the same encounter are unordered.
+Notably, EHRSHOT uses different coding systems for many clinical concepts including diagnoses and
+medications, and it contains features such as vitals and care sites that are not in RAVEN’s training
+vocabulary. We incorporated mapping mechanisms (SNOMED to ICD-10 for diagnoses; RxNorm to
+internal codes for medications) that do not precisely translate to our granular vocabulary given the lossy
+nature of the mapping, and we dropped unmapped or uncovered information. Certain mapped codes are
+dropped because they do not appear in our vocabulary. For instance, we were able to translate and use
+6,211 out of 11,598 unique diagnosis codes and 3,743 out of 5,433 medication codes from EHRSHOT to
+our own vocabulary. While we mapped 92% of medication events and 29% diagnosis events, we only
+utilized approximately 25% of total rows of data from EHRSHOT with loss primarily coming from missing
+vitals, meaning RAVEN accesses fewer features in the input sequence than other baselines.
+Model architecture
+We employ a decoder-only Transformer25 based on the GPT-2 architecture26 for RAVEN, adapted to
+model longitudinal EHR data. Let {x1, . . . , xT } denote the tokenized multi-hot representation of a patient
+15/28
+trajectory. The model parameterizes the conditional distribution p(xt | x<t) using causal self-attention. We
+use 8 attention heads, 8 layers, and hidden dimension of 1024 for our main 144 million parameter model
+with a maximum sequence length of 512. For our scaling studies, we used a variety of model architecture
+configurations with each model size. Full details can be found in the supplement.
+To better reflect the structure of EHR data, we modify the standard causal attention mechanism to operate
+at the visit level. Specifically, tokens belonging to the same visit are allowed to attend to one another
+without restriction, while causal ordering is enforced only across visits. That is, a token from visit v may
+attend to all tokens from visits v′ ≤v, but not to tokens from future visits. This design avoids imposing
+spurious order within visits while preserving temporal causality across encounters. We ALSO incorporate
+rotary positional embeddings (RoPE)27 to encode temporal information. All tokens within a visit share
+the same positional embedding, corresponding to the elapsed time since the patient’s first recorded visit.
+The <sep> token concluding visit v is assigned the positional embedding of the subsequent visit v + 1,
+explicitly encoding the inter-visit time gap. This allows the model to condition the prediction on both patient
+history and the timing of the next encounter.
+Moreover, for training efficiency, we use sequence packing to have multiple patients in one training
+sequence if their tokens can fit the context length28,29. To prevent information leakage across patients,
+we explicitly condition the model on patient rank in the batch. Specifically, each token embedding is
+augmented with a patient-specific embedding derived from a sinusoidal encoding of the window’s local
+identifier within the packed sequence. For example, if a packed sequence contains windows from three
+patients, tokens from those windows are tagged with identifiers such as 0, 1, and 2 to indicate which
+packed patient window they belong to. Our implementation allows attention across concatenated patient
+sequences, potentially offering broader context alongside improved GPU throughput. All downstream
+evaluations and zero-shot inference are performed on individual patient trajectories without packing.
+RAVEN Pretraining
+Next-visit pretraining objective
+RAVEN is pretrained using a next-visit multi-label prediction objective. Given a patient history up to
+visit v, the model predicts the set of clinical events that will occur at visit v + 1. Concretely, the hidden
+representation of the <sep> token following visit v is passed through a linear projection and sigmoid
+activation to produce a probability ˆPv+1,k = P(k|Htv, tv+1) for each token k in the vocabulary.
+Let Vv+1 ∈{0, 1}|V | denote the multi-hot vector indicating which tokens occur at visit v + 1, and let ˆPv+1
+denote the model’s predicted probabilities. The base loss is a binary cross-entropy objective summed
+over all tokens:
+LBCE = −
+|V|
+X
+k=1
+h
+Vv+1,k log( ˆPv+1,k) + (1 −Vv+1,k) log(1 −ˆPv+1,k)
+i
+.
+Regularization for repeated clinical events
+To prevent the model from memorizing trivial repetition, we introduce a history-dependent regularization
+scheme that downweights the contribution of frequently observed tokens. For each positive token k in the
+target visit v + 1, we compute its count c(k, Hv) in the patient’s prior history Hv. The weight is:
+wv+1,k = max(λc(k,Hv), wmin),
+where λ ∈(0, 1] is a decay factor hyperparameter, and wmin is a minimum weight hyperparameter that
+prevents the weight from vanishing entirely. For token predictions where the ground truth is negative
+16/28
+(Vv+1,k = 0), the weight is 1. The final loss is the weighted binary cross-entropy:
+Lreg = −
+|V|
+X
+k=1
+w′
+v+1,k
+h
+Vv+1,k log( ˆPv+1,k) + (1 −Vv+1,k) log(1 −ˆPv+1,k)
+i
+,
+where w′
+v+1,k = wv+1,k if Vv+1,k = 1, and w′
+v+1,k = 1 otherwise. This allows the model to focus on
+potentially novel events rather than highly predictable recurrent tokens. In the main experiments, we
+regularize with intermediate strengths and select a single global setting λ⋆= 0.5 through extensive
+evaluations.
+Comparative baselines
+We benchmark our next-visit objective against three variants of the representative next-token simulation
+paradigms. All models use the same tokenizer and vocabulary (|V | = 42337) and a context window of 1024
+tokens. For simulation-based models, long-horizon risk is estimated via inference with R=100 rollouts
+per patient window. First, we include a standard next-token model with cross-entropy loss (Multiclass).
+This baseline flattens each patient trajectory into a single token sequence with pre-defined structural
+order for different types of clinical concepts within the same visit. For instance, the demographics and
+diagnosis codes are inserted to the front of the visit, similar to prior work in this space16. It also trains a
+decoder-only Transformer with standard cross-entropy loss for predicting the next token. Inter-visit time
+gaps are provided as observed input tokens during both training and evaluation.
+Many clinical events within a visit are unordered. Similar to RAVEN, to reduce sensitivity to arbitrary
+within-visit token order, we also include a next-token set-based loss model (SeqLoss) that uses a set-
+prediction loss30. At each decoding step within a visit, the target distribution is uniform over the remaining
+unseen tokens:
+qt(x) =
+( 1
+|Ut|,
+x ∈Ut,
+0,
+otherwise,
+where Ut is the set of tokens not yet predicted at step t. Let pθ(· | ·) be the model’s next-token distribution.
+The model is rewarded for selecting any remaining correct token, rather than a specific permutation. The
+last next-token baseline we benchmark is a joint gap-and-event generation model (EGE). This baseline
+jointly models inter-visit time gaps and clinical events in a fully autoregressive manner, predicting the next
+gap token and then the next clinical event token(s), repeating until a visit-separator token is produced.
+Additionally, we compare against a supervised baseline using a BERT-based foundation model2 that
+leverages masked pretraining followed by task-specific fine-tuning for each condition and horizon. This
+bidirectional Transformer encoder is trained to reconstruct 20% randomly masked tokens and use
+prediction head on top of final representation token to obtain supervised signals during fine-tuning.
+Model inference procedure
+Monte Carlo rollouts for baselines
+Our next-visit model produces a horizon-conditioned risk score in a single forward pass. In contrast,
+next-token baselines do not natively output a horizon-conditioned probability; therefore, we estimate
+disease-onset risk via Monte Carlo simulations of future trajectories10,16.
+Given a context history window ending at time t and a horizon H ∈{2, 5} years, we estimate risk using
+R = 100 independent rollouts. For the Multiclass and SeqLoss baselines, we use a discrete-time rollout:
+17/28
+we query the model at fixed 3-month increments ∆and sample the predicted event tokens for each step,
+yielding simulated timestamps {t + ∆, t + 2∆, . . . , t + H} with ∆=3 months. For EGE, we generate a fully
+autoregressive token stream and stop when either (i) the simulated time exceeds t + H (via generated
+gap tokens) or (ii) a maximum of 512 tokens is generated, whichever occurs first. Let Xr(t, H) be the set
+of tokens generated in rollout r whose simulated timestamps lie in the prediction interval (t+365, t+H].
+For condition c with code-set tokens Sc, the rollout-derived label is
+yr,c(t, H) = 1[Xr(t, H) ∩Sc ̸= ∅] .
+(1)
+The Monte Carlo risk estimate is:
+ˆproll
+c (t, H) = 1
+R
+R
+X
+r=1
+yr,c(t, H).
+(2)
+RAVEN inference
+Given an input window ending at time t, we perform a single forward pass to obtain condition risk at
+horizon H by appending a separator token that encodes the desired future time. Specifically, we append
+a <sep> token whose positional embedding corresponds to t + H (the last observed visit day plus the
+prediction horizon). The model then produces logits over the full token vocabulary at the <sep> position,
+representing the predicted set of clinical events at the next encounter occurring at time t + H conditioned
+on the history up to t.
+To obtain a scalar risk score for condition c comprised of several tokens, we aggregate the model outputs
+over the condition’s code set. Let Sc denote the set of token indices corresponding to diagnosis and/or
+medication codes used to define condition c. We compute the condition score by pooling logits over Sc
+(summing logits and applying a sigmoid, or alternative pooling such as noisy-or), yielding a probability
+ˆpc(t, H) for onset within the horizon.
+Zero-shot disease forecasting evaluation
+We evaluate whether pretrained RAVEN can be used for zero-shot long-horizon disease-onset forecasting
+without any task-specific fine-tuning. The key idea is to convert long-horizon forecasting into a single next-
+visit prediction query by explicitly conditioning the model on a future time horizon via the visit-separator
+token. For each target condition c, we construct evaluation examples from longitudinal patient trajectories
+using rolling prediction windows. Each example consists of: (i) an input window containing a fixed-length
+history of past visits (365 days), (ii) a prediction horizon (e.g., 2 years or 5 years), and (iii) a binary label
+indicating whether the first onset of condition c occurs within the specified horizon.
+To further ensure that performance reflects true onset forecasting rather than repetition, we filter out
+any window where the patient already exhibits the target condition in the input history. We also exclude
+windows where the onset occurs within the first year after the anchor time (e.g. a gap of 1 year), which
+mitigates leakage from preclinical signals that may correspond to a diagnosis already underway.
+We evaluate on seven disease endpoints: dementia, knee OA, pancreatic cancer, prostate cancer, acute
+MI, CHF, and COPD. Each endpoint is defined by a set of fine-grained diagnosis and/or medication codes.
+We do not perform additional cohort filtering or matching based on age, sex, or other demographic variables
+beyond the task-specific endpoint definitions. Certain conditions have low prevalence; for example, there
+are only 143 positive cases out of 283,814 examples for 2-year pancreatic cancer prediction. We
+benchmark our next-visit objective against three representative autoregressive paradigms: Multiclass,
+SeqLoss, and EGE. For these baselines, long-horizon risk is estimated via inference autoregressively with
+18/28
+R=100 rollouts per patient window, whereas RAVEN uses a single forward pass per example. Additionally,
+we compare against a fully fine-tuned BERT baseline for each task that was pretrained using the same
+dataset as RAVEN.
+For the external EHRSHOT evaluation, we applied the same pretrained RAVEN model without any
+parameter updates or target-domain supervision. EHRSHOT defines six binary classification tasks
+predicting whether a patient will receive a first diagnosis of a condition within one year post-discharge
+from an inpatient visit: acute MI, lupus, hyperlipidemia, hypertension, celiac disease, and pancreatic
+cancer. Prevalence is low for several tasks, including celiac and lupus, which have very few positive test
+labels (21 and 20, respectively). Prediction time is 11:59 PM on the day of discharge, and patients who
+already carry the diagnosis at prediction time are excluded. EHRSHOT dataset do not take any gap into
+account between prediction time and condition onset.
+We compared three RAVEN variants corresponding to different regularization strengths (λ ∈{1.0, 0.5, 0.25},
+where λ = 1.0 denotes no regularization) against four supervised baselines from EHRSHOT: CLMBR-
+T24, gradient-boosted machines (GBM)31, logistic regression, and random forest32, each trained with
+K ∈{1, 2, 4, . . . , 128} labeled examples per class as well as the full training set.
+Evaluation metrics
+Throughout the experiments, we report AUROC and AUPRC for each condition and horizon. To compute
+thresholded predictions, we select a condition-specific decision threshold τc on the validation set by
+maximizing the validation F1 score for condition c (alternatively, we consider a prevalence-matched
+quantile thresholding scheme). Also, we obtain 95% confidence intervals via bootstrapping the test set for
+1000 resamples. Given the low prevalence of certain conditions, we stratify the resamples within each
+label class. This ensures that we have the same number of positive samples for each resample with
+replacement.
+Additionally, we report the on-time ratio to evaluate whether model predictions arrive before or at the time
+of first documented onset. For each patient and condition c, let tgt
+c denote the time of the first ground-truth
+occurrence of any code in the condition’s code set, and let tpred
+c
+denote the first time the model predicts c
+above the selected threshold τc. Among patients counted as true positives, who developed the condition
+and predicted to have the condition along any evaluation windows, we define the on-time indicator as
+1[tpred
+c
+≤tgt
+c ]. The on-time ratio is the fraction between true positive patients whose first prediction occurs
+at or before the first documented onset and the total patients who had the condition:
+OnTime(c) = #{TP patients with tpred
+c
+≤tgt
+c }
+#{Positive patients∗}
+.
+We note that the positive patients are these who had the conditions except for people had the condition
+during the first visit, as the model needs at least one visit to serve as context history to make predictions.
+This metric directly quantifies whether the model provides clinically meaningful early warning rather than
+simply repeating an already-documented condition.
+19/28
+References
+1. Dubois, B., Padovani, A., Scheltens, P., Rossi, A. & Dell’Agnello, G. Timely diagnosis for alzheimer’s
+disease: a literature review on benefits and challenges. Journal of Alzheimer’s disease 49, 617–631
+(2015).
+2. Zhu, W. et al. Predicting risk of alzheimer’s diseases and related dementias with ai foundation model
+on electronic health records. medRxiv (2024).
+3. Arnold, M. et al. Current and future burden of breast cancer: Global statistics for 2020 and 2040. The
+Breast 66, 15–23 (2022).
+4. Karsdal, M. et al. Disease-modifying treatments for osteoarthritis (dmoads) of the knee and hip:
+lessons learned from failures and opportunities for the future. Osteoarthritis and cartilage 24, 2013–
+2021 (2016).
+5. Nordo, A. H. et al. Use of ehrs data for clinical research: historical progress and current applications.
+Learning health systems 3, e10076 (2019).
+6. Choi, E., Schuetz, A., Stewart, W. F. & Sun, J. Using recurrent neural network models for early
+detection of heart failure onset. Journal of the American Medical Informatics Association 24, 361–370
+(2017).
+7. Xiao, C., Choi, E. & Sun, J. Opportunities and challenges in developing deep learning models using
+electronic health records data: a systematic review. Journal of the American Medical Informatics
+Association 25, 1419–1428 (2018).
+8. Shickel, B., Tighe, P. J., Bihorac, A. & Rashidi, P. Deep ehr: a survey of recent advances in deep
+learning techniques for electronic health record (ehr) analysis. IEEE journal of biomedical and health
+informatics 22, 1589–1604 (2017).
+9. Rajkomar, A. et al. Scalable and accurate deep learning with electronic health records. NPJ digital
+medicine 1, 18 (2018).
+10. Renc, P. et al. Zero shot health trajectory prediction using transformer. NPJ Digital Medicine 7, 256
+(2024).
+11. Pang, C. et al. Cehr-xgpt: A scalable multi-task foundation model for electronic health records. arXiv
+preprint arXiv:2509.03643 (2025).
+12. Li, Y. et al. Behrt: transformer for electronic health records. Scientific reports 10, 7155 (2020).
+13. Pang, C. et al. Cehr-bert: Incorporating temporal information from structured ehr data to improve
+prediction tasks. In Machine Learning for Health, 239–260 (PMLR, 2021).
+14. Yang, Z., Mitra, A., Liu, W., Berlowitz, D. & Yu, H. Transformehr: transformer-based encoder-decoder
+generative model to enhance prediction of disease outcomes using electronic health records. Nature
+communications 14, 7857 (2023).
+15. McDermott, M., Nestor, B., Argaw, P. & Kohane, I. S. Event stream gpt: a data pre-processing and
+modeling library for generative, pre-trained transformers over continuous-time sequences of complex
+events. Advances in Neural Information Processing Systems 36, 24322–24334 (2023).
+16. Waxler, S. et al. Generative medical event models improve with scale. arXiv preprint arXiv:2508.12104
+(2025).
+17. Kraljevic, Z. et al. Foresight–generative pretrained transformer (gpt) for modelling of patient timelines
+using ehrs. arXiv preprint arXiv:2212.08072 (2022).
+18. Kaplan, J. et al. Scaling laws for neural language models. arXiv preprint arXiv:2001.08361 (2020).
+20/28
+19. Hoffmann, J. et al. Training compute-optimal large language models. arXiv preprint arXiv:2203.15556
+(2022).
+20. Zhang, S. et al. Exploring scaling laws for ehr foundation models. arXiv preprint arXiv:2505.22964
+(2025).
+21. Muennighoff, N. et al. Scaling data-constrained language models. Advances in Neural Information
+Processing Systems 36, 50358–50376 (2023).
+22. Kim, K., Kotha, S., Liang, P. & Hashimoto, T. Pre-training under infinite compute. arXiv preprint
+arXiv:2509.14786 (2025).
+23. Wornow, M., Thapa, R., Steinberg, E., Fries, J. & Shah, N. Ehrshot: An ehr benchmark for few-
+shot evaluation of foundation models. Advances in Neural Information Processing Systems 36,
+67125–67137 (2023).
+24. Steinberg, E. et al. Language models are an effective representation learning technique for electronic
+health record data. Journal of biomedical informatics 113, 103637 (2021).
+25. Vaswani, A. et al. Attention is all you need. Advances in neural information processing systems 30
+(2017).
+26. Radford, A. et al. Language models are unsupervised multitask learners. OpenAI blog 1, 9 (2019).
+27. Su, J. et al. Roformer: Enhanced transformer with rotary position embedding. Neurocomputing 568,
+127063 (2024).
+28. Raffel, C. et al. Exploring the limits of transfer learning with a unified text-to-text transformer. Journal
+of machine learning research 21, 1–67 (2020).
+29. Krell, M. M., Kosec, M., Perez, S. P. & Fitzgibbon, A. Efficient sequence packing without cross-
+contamination: Accelerating large language models without impacting performance. arXiv preprint
+arXiv:2107.02027 (2021).
+30. Welleck, S. et al. Loss functions for multiset prediction. Advances in Neural Information Processing
+Systems 31 (2018).
+31. Ke, G. et al. Lightgbm: A highly efficient gradient boosting decision tree. Advances in neural
+information processing systems 30 (2017).
+32. Breiman, L. Random forests. Machine learning 45, 5–32 (2001).
+21/28
+Supplementary Information
+Disease code-set details for labeling
+For zero-shot evaluation, disease onset (label) was defined based on the first occurrence of any code from
+a predefined set of relevant diagnosis codes (ICD-10) and potentially medication codes associated with
+that condition within the specified 2- or 5-year prediction window. For instance, the dementia label relied
+on a group of specific ICD codes (e.g., G30.x, F01.x, F03.x) and dementia-related medication codes (e.g.,
+RxNorm codes for donepezil, memantine). Similar specific code sets were defined for other conditions.
+The model’s output probabilities for tokens in the target condition’s code set were aggregated (sum of
+logits) into a single probability.
+Table S1. Diagnosis and medication codes for disease defintion and labeling.
+Disease
+Type
+Description
+Code
+Dementia
+Diagnosis
+Vascular dementia without behavioral disturbance
+F01.50
+Dementia
+Diagnosis
+Vascular dementia with behavioral disturbance
+F01.51
+Dementia
+Diagnosis
+Dementia in other diseases w/o behavioral disturbance
+F02.80
+Dementia
+Diagnosis
+Dementia in other diseases w/ behavioral disturbance
+F02.81
+Dementia
+Diagnosis
+Unspecified dementia without behavioral disturbance
+F03.90
+Dementia
+Diagnosis
+Unspecified dementia with behavioral disturbance
+F03.91
+Dementia
+Diagnosis
+Amnestic disorder due to physiological condition
+F04
+Dementia
+Diagnosis
+Progressive supranuclear ophthalmoplegia
+G23.1
+Dementia
+Diagnosis
+Alzheimer’s disease with early onset
+G30.0
+Dementia
+Diagnosis
+Alzheimer’s disease with late onset
+G30.1
+Dementia
+Diagnosis
+Other Alzheimer’s disease
+G30.8
+Dementia
+Diagnosis
+Alzheimer’s disease, unspecified
+G30.9
+Dementia
+Diagnosis
+Pick’s disease
+G31.01
+Dementia
+Diagnosis
+Other frontotemporal dementia
+G31.09
+Dementia
+Diagnosis
+Senile degeneration of brain
+G31.1
+Dementia
+Diagnosis
+Dementia with Lewy bodies
+G31.83
+Dementia
+Diagnosis
+Mild cognitive impairment
+G31.84
+Dementia
+Diagnosis
+Corticobasal degeneration
+G31.85
+Dementia
+Diagnosis
+Degenerative disease of nervous system, unspecified
+G31.9
+Dementia
+Medication
+RIVASTIGMINE TARTRATE 1.5 MG ORAL CAP
+57619
+Dementia
+Medication
+MEMANTINE 10 MG ORAL TAB
+30323
+Dementia
+Medication
+GALANTAMINE 4 MG ORAL TAB
+1232
+Dementia
+Medication
+DONEPEZIL 10 MG ORAL TAB
+31624
+Dementia
+Medication
+DONEPEZIL 5 MG ORAL TAB
+31811
+Dementia
+Medication
+GALANTAMINE 24 MG ORAL C24P
+31774
+Dementia
+Medication
+DONEPEZIL 5 MG ORAL TBDL
+31866
+Dementia
+Medication
+RIVASTIGMINE TARTRATE 3 MG ORAL CAP
+57575
+Dementia
+Medication
+RIVASTIGMINE TARTRATE 6 MG ORAL CAP
+58034
+Dementia
+Medication
+DONEPEZIL ORAL
+60609
+Dementia
+Medication
+GALANTAMINE 8 MG ORAL TAB
+6685
+Dementia
+Medication
+MEMANTINE ORAL
+73925
+Dementia
+Medication
+DONEPEZIL 10 MG ORAL TBDL
+31609
+Dementia
+Medication
+RIVASTIGMINE 4.6 MG/24 HR TRANSDERMAL PT24
+32859
+Dementia
+Medication
+MEMANTINE 5 MG ORAL TAB
+20149
+Dementia
+Medication
+GALANTAMINE 8 MG ORAL C24P
+31828
+Dementia
+Medication
+MEMANTINE 5-10 MG ORAL DSPK
+20151
+Dementia
+Medication
+RIVASTIGMINE TARTRATE 4.5 MG ORAL CAP
+57679
+Dementia
+Medication
+GALANTAMINE 16 MG ORAL C24P
+31604
+Dementia
+Medication
+RIVASTIGMINE 9.5 MG/24 HR TRANSDERMAL PT24
+33175
+Dementia
+Medication
+MEMANTINE-DONEPEZIL 28-10 MG ORAL CSPX
+143836
+Dementia
+Medication
+MEMANTINE-DONEPEZIL 7-10 MG ORAL CSPX
+150473
+(Continued on next page)
+22/28
+(Continued from previous page)
+Disease
+Type
+Description
+Code
+Dementia
+Medication
+MEMANTINE-DONEPEZIL 14-10 MG ORAL CSPX
+143871
+Dementia
+Medication
+MEMANTINE 28 MG ORAL CSPX
+101254
+Dementia
+Medication
+MEMANTINE-DONEPEZIL 21-10 MG ORAL CSPX
+150139
+Dementia
+Medication
+MEMANTINE 7 MG ORAL CSPX
+112860
+Dementia
+Medication
+MEMANTINE 7-14-21-28 MG ORAL C24K
+101328
+Dementia
+Medication
+DONEPEZIL 23 MG ORAL TAB
+111311
+Dementia
+Medication
+MEMANTINE 14 MG ORAL CSPX
+101112
+Dementia
+Medication
+MEMANTINE 21 MG ORAL CSPX
+101141
+Dementia
+Medication
+RIVASTIGMINE 13.3 MG/24 HR TRANSDERMAL PT24
+98524
+Knee OA
+Diagnosis
+Bilateral primary osteoarthritis of knee
+M17.0
+Knee OA
+Diagnosis
+Unilateral primary osteoarthritis, unspecified knee
+M17.10
+Knee OA
+Diagnosis
+Unilateral primary osteoarthritis, right knee
+M17.11
+Knee OA
+Diagnosis
+Unilateral primary osteoarthritis, left knee
+M17.12
+Knee OA
+Diagnosis
+Bilateral post-traumatic osteoarthritis of knee
+M17.2
+Knee OA
+Diagnosis
+Unilateral post-traumatic osteoarthritis, unspecified
+M17.30
+Knee OA
+Diagnosis
+Unilateral post-traumatic osteoarthritis, right knee
+M17.31
+Knee OA
+Diagnosis
+Unilateral post-traumatic osteoarthritis, left knee
+M17.32
+Knee OA
+Diagnosis
+Other bilateral secondary osteoarthritis of knee
+M17.4
+Knee OA
+Diagnosis
+Other unilateral secondary osteoarthritis of knee
+M17.5
+Knee OA
+Diagnosis
+Osteoarthritis of knee, unspecified
+M17.9
+Prostate Cancer
+Diagnosis
+Malignant neoplasm of prostate
+C61
+Prostate Cancer
+Diagnosis
+Carcinoma in situ of prostate
+D07.5
+Prostate Cancer
+Diagnosis
+Personal history of malignant neoplasm of prostate
+Z85.46
+Acute MI
+Diagnosis
+Acute myocardial infarction, unspecified
+I21.9
+Acute MI
+Diagnosis
+Myocardial infarction type 2
+I21.A1
+Acute MI
+Diagnosis
+Other myocardial infarction type
+I21.A9
+Acute MI
+Diagnosis
+ST elevation (STEMI) myocardial infarction involving left main coronary artery
+I21.01
+Acute MI
+Diagnosis
+ST elevation (STEMI) myocardial infarction involving left anterior descending
+coronary artery
+I21.02
+Acute MI
+Diagnosis
+ST elevation (STEMI) myocardial infarction involving other coronary artery of
+anterior wall
+I21.09
+Acute MI
+Diagnosis
+ST elevation (STEMI) myocardial infarction involving right coronary artery
+I21.11
+Acute MI
+Diagnosis
+ST elevation (STEMI) myocardial infarction involving other coronary artery of
+inferior wall
+I21.19
+Acute MI
+Diagnosis
+ST elevation (STEMI) myocardial infarction involving left circumflex coronary
+artery
+I21.21
+Acute MI
+Diagnosis
+ST elevation (STEMI) myocardial infarction involving other sites
+I21.29
+Acute MI
+Diagnosis
+ST elevation (STEMI) myocardial infarction of unspecified site
+I21.3
+Acute MI
+Diagnosis
+Non-ST elevation (NSTEMI) myocardial infarction
+I21.4
+Acute MI
+Diagnosis
+Subsequent ST elevation (STEMI) myocardial infarction of anterior wall
+I22.0
+Acute MI
+Diagnosis
+Subsequent ST elevation (STEMI) myocardial infarction of inferior wall
+I22.1
+Acute MI
+Diagnosis
+Subsequent non-ST elevation (NSTEMI) myocardial infarction
+I22.2
+Acute MI
+Diagnosis
+Subsequent ST elevation (STEMI) myocardial infarction of other sites
+I22.8
+Acute MI
+Diagnosis
+Subsequent ST elevation (STEMI) myocardial infarction of unspecified site
+I22.9
+Acute MI
+Diagnosis
+Hemopericardium as current complication following acute myocardial infarction
+I23.0
+Acute MI
+Diagnosis
+Atrial septal defect as current complication following acute myocardial infarction
+I23.1
+Acute MI
+Diagnosis
+Rupture of cardiac wall without hemopericardium as current complication follow-
+ing acute myocardial infarction
+I23.3
+Acute MI
+Diagnosis
+Rupture of chordae tendineae as current complication following acute myocardial
+infarction
+I23.4
+Acute MI
+Diagnosis
+Thrombosis of atrium, auricular appendage, and ventricle as current complica-
+tions following acute myocardial infarction
+I23.6
+Acute MI
+Diagnosis
+Postinfarction angina
+I23.7
+Acute MI
+Diagnosis
+Other current complications following acute myocardial infarction
+I23.8
+Pancreatic Cancer
+Diagnosis
+Malignant neoplasm of head of pancreas
+C25.0
+Pancreatic Cancer
+Diagnosis
+Malignant neoplasm of body of pancreas
+C25.1
+(Continued on next page)
+23/28
+(Continued from previous page)
+Disease
+Type
+Description
+Code
+Pancreatic Cancer
+Diagnosis
+Malignant neoplasm of tail of pancreas
+C25.2
+Pancreatic Cancer
+Diagnosis
+Malignant neoplasm of pancreatic duct
+C25.3
+Pancreatic Cancer
+Diagnosis
+Malignant neoplasm of other parts of pancreas
+C25.7
+Pancreatic Cancer
+Diagnosis
+Malignant neoplasm of overlapping sites of pancreas
+C25.8
+Pancreatic Cancer
+Diagnosis
+Malignant neoplasm of pancreas, unspecified
+C25.9
+CHF
+Diagnosis
+Right heart failure, unspecified
+I50.810
+CHF
+Diagnosis
+Acute right heart failure
+I50.811
+CHF
+Diagnosis
+Chronic right heart failure
+I50.812
+CHF
+Diagnosis
+Acute on chronic right heart failure
+I50.813
+CHF
+Diagnosis
+Right heart failure due to left heart failure
+I50.814
+CHF
+Diagnosis
+Biventricular heart failure
+I50.82
+CHF
+Diagnosis
+End stage heart failure
+I50.84
+CHF
+Diagnosis
+Other heart failure
+I50.89
+CHF
+Diagnosis
+Rheumatic heart failure
+I09.81
+CHF
+Diagnosis
+Hypertensive heart disease with heart failure
+I11.0
+CHF
+Diagnosis
+Hypertensive heart and chronic kidney disease with heart failure and stage 1
+through stage 4 chronic kidney disease, or unspecified chronic kidney disease
+I13.0
+CHF
+Diagnosis
+Hypertensive heart and chronic kidney disease with heart failure and with stage
+5 chronic kidney disease, or end stage renal disease
+I13.2
+CHF
+Diagnosis
+Left ventricular failure
+I50.1
+CHF
+Diagnosis
+Unspecified systolic (congestive) heart failure
+I50.20
+CHF
+Diagnosis
+Acute systolic (congestive) heart failure
+I50.21
+CHF
+Diagnosis
+Chronic systolic (congestive) heart failure
+I50.22
+CHF
+Diagnosis
+Acute on chronic systolic (congestive) heart failure
+I50.23
+CHF
+Diagnosis
+Unspecified diastolic (congestive) heart failure
+I50.30
+CHF
+Diagnosis
+Acute diastolic (congestive) heart failure
+I50.31
+CHF
+Diagnosis
+Chronic diastolic (congestive) heart failure
+I50.32
+CHF
+Diagnosis
+Acute on chronic diastolic (congestive) heart failure
+I50.33
+CHF
+Diagnosis
+Unspecified combined systolic (congestive) and diastolic (congestive) heart
+failure
+I50.40
+CHF
+Diagnosis
+Acute combined systolic (congestive) and diastolic (congestive) heart failure
+I50.41
+CHF
+Diagnosis
+Chronic combined systolic (congestive) and diastolic (congestive) heart failure
+I50.42
+CHF
+Diagnosis
+Acute on chronic combined systolic (congestive) and diastolic (congestive) heart
+failure
+I50.43
+CHF
+Diagnosis
+Heart failure, unspecified
+I50.9
+COPD
+Diagnosis
+Bronchitis, not specified as acute or chronic
+J40
+COPD
+Diagnosis
+Simple chronic bronchitis
+J41.0
+COPD
+Diagnosis
+Mucopurulent chronic bronchitis
+J41.1
+COPD
+Diagnosis
+Mixed simple and mucopurulent chronic bronchitis
+J41.8
+COPD
+Diagnosis
+Unspecified chronic bronchitis
+J42
+COPD
+Diagnosis
+Unilateral pulmonary emphysema [MacLeod’s syndrome]
+J43.0
+COPD
+Diagnosis
+Panlobular emphysema
+J43.1
+COPD
+Diagnosis
+Centrilobular emphysema
+J43.2
+COPD
+Diagnosis
+Emphysema, unspecified
+J43.9
+COPD
+Diagnosis
+Chronic obstructive pulmonary disease with acute lower respiratory infection
+J44.0
+COPD
+Diagnosis
+Chronic obstructive pulmonary disease with (acute) exacerbation
+J44.1
+COPD
+Diagnosis
+Chronic obstructive pulmonary disease, unspecified
+J44.9
+COPD
+Diagnosis
+Bronchiectasis with acute lower respiratory infection
+J47.0
+COPD
+Diagnosis
+Bronchiectasis with (acute) exacerbation
+J47.1
+COPD
+Diagnosis
+Bronchiectasis, uncomplicated
+J47.9
+COPD
+Diagnosis
+Interstitial emphysema
+J98.2
+Hyperparameters and configurations
+We present the training hyperparameters for the main 144M model on the full data in Table S2. The
+hyperparameters are largely the same among models trained on different data budgets except for the
+24/28
+number of iterations for training and learning rate decay. Table S3 contains architecture configurations for
+different model sizes used in the scaling analysis.
+Table S2. Training hyperparameters and configuration settings for the main 144M model.
+Hyperparameter
+Value
+n_embd
+1024
+n_head
+8
+n_layer
+8
+n_tokens
+42,337
+bias
+false
+dropout
+0
+block_size
+512
+batch_size
+16
+optimizer
+AdamW
+beta1
+0.9
+beta2
+0.95
+decay_lr
+true
+grad_clip
+1
+gradient_accumulation_steps
+8
+learning_rate
+0.00022
+lr_decay_iters
+800,000
+max_iters
+810,000
+min_lr
+0.000022
+rotary
+true
+temporal_decay
+0.5
+warmup_iters
+20,000
+weight_decay
+0.01
+Table S3. Model configurations used in the scaling experiments.
+Layers
+Heads
+Embedding Dim
+Parameters
+4
+4
+16
+0.69M
+2
+2
+64
+2.81M
+2
+2
+128
+5.81M
+4
+4
+256
+13.99M
+8
+8
+512
+46.85M
+8
+8
+1024
+144.04M
+32
+32
+1024
+446.08M
+64
+64
+1024
+848.80M
+Zero-shot tasks statistics
+In Table S4, we show the task-specific test set information across horizons and conditions. Prevalence
+varies dramatically across conditions and horizons: pancreatic cancer at the 2-year window is just 0.05%,
+while knee OA at 5 years reaches 10.49%.
+25/28
+Table S4. Evaluation cohort statistics for zero-shot disease-onset forecasting tasks on the held-out test
+set. Prevalence denotes the fraction of positive examples in each task.
+Condition
+Horizon
+Total (n)
+Positive
+Negative
+Prevalence (%)
+COPD
+2-year
+239,464
+5,255
+234,209
+2.19
+COPD
+5-year
+47,628
+4,251
+43,377
+8.93
+CHF
+2-year
+263,220
+2,874
+260,346
+1.09
+CHF
+5-year
+52,072
+2,168
+49,904
+4.16
+Dementia
+2-year
+271,172
+2,021
+269,151
+0.75
+Dementia
+5-year
+53,520
+1,685
+51,835
+3.15
+Pancreatic Cancer 2-year
+283,814
+143
+283,671
+0.05
+Pancreatic Cancer 5-year
+55,364
+82
+55,282
+0.15
+Prostate Cancer
+2-year
+275,208
+887
+274,321
+0.32
+Prostate Cancer
+5-year
+53,698
+708
+52,990
+1.32
+Acute MI
+2-year
+269,442
+2,270
+267,172
+0.84
+Acute MI
+5-year
+52,816
+1,651
+51,165
+3.13
+Knee OA
+2-year
+240,858
+5,808
+235,050
+2.41
+Knee OA
+5-year
+48,226
+5,060
+43,166
+10.49
+Full zero-shot forecasting results
+This supplementary section provides a complete view of RAVEN model performance across seven disease
+onsets, using two prediction horizons (2-year versus 5-year). We include the full experimental results with
+95% confidence intervals using different regularization strengths, model size, and data budgets.
+Regularization strengths
+Table S5. Zero-shot forecasting with λ = 0.25 for the 144M model trained on full data.
+Condition
+Hor.
+AUROC
+AUPRC
+F1
+Precision
+Recall
+CHF
+2y
+0.854 [0.848, 0.861]
+0.078 [0.072, 0.085]
+0.140 [0.132, 0.149]
+0.097 [0.091, 0.103]
+0.254 [0.238, 0.271]
+5y
+0.826 [0.818, 0.834]
+0.189 [0.177, 0.203]
+0.267 [0.255, 0.279]
+0.190 [0.182, 0.199]
+0.445 [0.424, 0.465]
+COPD
+2y
+0.687 [0.680, 0.695]
+0.050 [0.048, 0.053]
+0.096 [0.091, 0.102]
+0.066 [0.062, 0.070]
+0.179 [0.168, 0.189]
+5y
+0.659 [0.651, 0.668]
+0.155 [0.149, 0.163]
+0.222 [0.215, 0.231]
+0.153 [0.148, 0.159]
+0.404 [0.389, 0.420]
+Dementia
+2y
+0.781 [0.770, 0.792]
+0.035 [0.032, 0.039]
+0.082 [0.076, 0.090]
+0.051 [0.047, 0.055]
+0.213 [0.196, 0.233]
+5y
+0.787 [0.776, 0.797]
+0.121 [0.110, 0.133]
+0.180 [0.167, 0.194]
+0.136 [0.126, 0.146]
+0.268 [0.246, 0.289]
+Heart Attack
+2y
+0.794 [0.785, 0.802]
+0.030 [0.028, 0.032]
+0.068 [0.062, 0.074]
+0.042 [0.038, 0.046]
+0.177 [0.160, 0.193]
+5y
+0.756 [0.745, 0.766]
+0.078 [0.074, 0.084]
+0.147 [0.138, 0.155]
+0.089 [0.084, 0.094]
+0.413 [0.389, 0.437]
+Knee OA
+2y
+0.722 [0.716, 0.728]
+0.053 [0.051, 0.056]
+0.098 [0.093, 0.103]
+0.062 [0.059, 0.064]
+0.242 [0.230, 0.253]
+5y
+0.687 [0.680, 0.694]
+0.182 [0.176, 0.188]
+0.266 [0.260, 0.271]
+0.172 [0.168, 0.176]
+0.584 [0.571, 0.598]
+Panc. Cancer
+2y
+0.676 [0.630, 0.722]
+0.002 [0.001, 0.005]
+0.010 [0.000, 0.029]
+0.015 [0.000, 0.048]
+0.007 [0.000, 0.021]
+5y
+0.617 [0.553, 0.679]
+0.010 [0.002, 0.042]
+0.010 [0.002, 0.019]
+0.005 [0.001, 0.010]
+0.061 [0.012, 0.122]
+Prostate Ca.
+2y
+0.911 [0.906, 0.916]
+0.022 [0.021, 0.025]
+0.031 [0.020, 0.042]
+0.032 [0.021, 0.043]
+0.030 [0.020, 0.042]
+5y
+0.901 [0.895, 0.906]
+0.071 [0.066, 0.080]
+0.115 [0.101, 0.130]
+0.076 [0.066, 0.086]
+0.242 [0.212, 0.275]
+Table S6. Zero-shot forecasting with λ⋆= 0.5 for the 144M model trained on full data.
+Condition
+Hor.
+AUROC
+AUPRC
+F1
+Precision
+Recall
+CHF
+2y
+0.857 [0.850, 0.864]
+0.078 [0.072, 0.085]
+0.147 [0.137, 0.157]
+0.111 [0.104, 0.119]
+0.216 [0.201, 0.233]
+5y
+0.821 [0.812, 0.829]
+0.184 [0.172, 0.198]
+0.257 [0.244, 0.268]
+0.186 [0.177, 0.195]
+0.414 [0.394, 0.434]
+continued on next page
+26/28
+Table S6 – continued
+Condition
+Hor.
+AUROC
+AUPRC
+F1
+Precision
+Recall
+COPD
+2y
+0.691 [0.684, 0.698]
+0.052 [0.049, 0.055]
+0.100 [0.095, 0.106]
+0.068 [0.064, 0.071]
+0.193 [0.184, 0.204]
+5y
+0.676 [0.668, 0.685]
+0.164 [0.157, 0.171]
+0.238 [0.230, 0.246]
+0.163 [0.158, 0.168]
+0.441 [0.426, 0.456]
+Dementia
+2y
+0.789 [0.778, 0.799]
+0.037 [0.034, 0.042]
+0.083 [0.075, 0.090]
+0.053 [0.049, 0.058]
+0.182 [0.165, 0.199]
+5y
+0.773 [0.762, 0.784]
+0.108 [0.101, 0.118]
+0.182 [0.169, 0.195]
+0.136 [0.127, 0.146]
+0.274 [0.254, 0.296]
+Heart Attack
+2y
+0.793 [0.784, 0.801]
+0.031 [0.029, 0.033]
+0.075 [0.068, 0.081]
+0.046 [0.042, 0.050]
+0.194 [0.177, 0.211]
+5y
+0.754 [0.742, 0.764]
+0.080 [0.075, 0.086]
+0.149 [0.140, 0.157]
+0.090 [0.085, 0.095]
+0.423 [0.399, 0.445]
+Knee OA
+2y
+0.726 [0.720, 0.732]
+0.057 [0.054, 0.060]
+0.107 [0.103, 0.111]
+0.065 [0.063, 0.068]
+0.299 [0.286, 0.310]
+5y
+0.697 [0.690, 0.704]
+0.200 [0.193, 0.207]
+0.272 [0.266, 0.279]
+0.183 [0.178, 0.187]
+0.534 [0.520, 0.548]
+Panc. Cancer
+2y
+0.693 [0.649, 0.735]
+0.002 [0.001, 0.003]
+0.007 [0.000, 0.021]
+0.007 [0.000, 0.022]
+0.007 [0.000, 0.021]
+5y
+0.639 [0.580, 0.699]
+0.004 [0.003, 0.014]
+0.008 [0.004, 0.014]
+0.004 [0.002, 0.007]
+0.134 [0.061, 0.220]
+Prostate Ca.
+2y
+0.910 [0.905, 0.915]
+0.022 [0.020, 0.025]
+0.043 [0.033, 0.053]
+0.030 [0.024, 0.037]
+0.072 [0.055, 0.090]
+5y
+0.901 [0.896, 0.907]
+0.073 [0.067, 0.081]
+0.108 [0.090, 0.127]
+0.089 [0.074, 0.104]
+0.138 [0.114, 0.164]
+Table S7. Zero-shot forecasting with λ = 0.75 for the 144M model trained on full data.
+Condition
+Hor.
+AUROC
+AUPRC
+F1
+Precision
+Recall
+CHF
+2y
+0.855 [0.848, 0.861]
+0.075 [0.070, 0.082]
+0.138 [0.129, 0.146]
+0.096 [0.089, 0.102]
+0.246 [0.230, 0.262]
+5y
+0.824 [0.816, 0.833]
+0.189 [0.177, 0.204]
+0.273 [0.259, 0.284]
+0.202 [0.192, 0.211]
+0.418 [0.398, 0.440]
+COPD
+2y
+0.686 [0.679, 0.693]
+0.050 [0.048, 0.053]
+0.097 [0.092, 0.103]
+0.072 [0.067, 0.076]
+0.152 [0.143, 0.161]
+5y
+0.668 [0.659, 0.676]
+0.162 [0.155, 0.169]
+0.231 [0.225, 0.237]
+0.146 [0.142, 0.150]
+0.551 [0.537, 0.567]
+Dementia
+2y
+0.766 [0.754, 0.776]
+0.034 [0.031, 0.038]
+0.081 [0.072, 0.089]
+0.057 [0.051, 0.063]
+0.142 [0.126, 0.156]
+5y
+0.761 [0.749, 0.772]
+0.109 [0.100, 0.122]
+0.182 [0.170, 0.195]
+0.129 [0.121, 0.138]
+0.309 [0.287, 0.331]
+Heart Attack
+2y
+0.790 [0.781, 0.799]
+0.031 [0.029, 0.033]
+0.070 [0.064, 0.075]
+0.041 [0.038, 0.044]
+0.228 [0.211, 0.245]
+5y
+0.739 [0.726, 0.749]
+0.074 [0.070, 0.080]
+0.134 [0.127, 0.141]
+0.079 [0.075, 0.083]
+0.448 [0.424, 0.470]
+Knee OA
+2y
+0.711 [0.705, 0.717]
+0.051 [0.049, 0.053]
+0.098 [0.094, 0.102]
+0.061 [0.058, 0.063]
+0.254 [0.242, 0.265]
+5y
+0.678 [0.672, 0.685]
+0.177 [0.172, 0.183]
+0.255 [0.249, 0.261]
+0.167 [0.163, 0.171]
+0.538 [0.526, 0.551]
+Panc. Cancer
+2y
+0.701 [0.659, 0.739]
+0.002 [0.001, 0.003]
+0.000 [0.000, 0.000]
+0.000 [0.000, 0.000]
+0.000 [0.000, 0.000]
+5y
+0.698 [0.642, 0.748]
+0.013 [0.005, 0.048]
+0.010 [0.005, 0.013]
+0.005 [0.003, 0.007]
+0.195 [0.110, 0.281]
+Prostate Ca.
+2y
+0.910 [0.905, 0.915]
+0.021 [0.019, 0.023]
+0.042 [0.036, 0.049]
+0.025 [0.021, 0.029]
+0.133 [0.113, 0.156]
+5y
+0.900 [0.894, 0.905]
+0.071 [0.065, 0.080]
+0.118 [0.104, 0.131]
+0.074 [0.065, 0.082]
+0.292 [0.259, 0.325]
+Table S8. Zero-shot forecasting with λ = 1.0 (no reg.) for the 144M model trained on full data.
+Condition
+Hor.
+AUROC
+AUPRC
+F1
+Precision
+Recall
+CHF
+2y
+0.856 [0.850, 0.862]
+0.073 [0.069, 0.080]
+0.139 [0.129, 0.148]
+0.104 [0.097, 0.111]
+0.207 [0.192, 0.222]
+5y
+0.830 [0.822, 0.838]
+0.186 [0.175, 0.199]
+0.268 [0.255, 0.280]
+0.202 [0.193, 0.212]
+0.396 [0.376, 0.417]
+COPD
+2y
+0.692 [0.684, 0.699]
+0.052 [0.049, 0.054]
+0.102 [0.096, 0.107]
+0.071 [0.067, 0.075]
+0.181 [0.170, 0.191]
+5y
+0.676 [0.667, 0.684]
+0.173 [0.166, 0.181]
+0.240 [0.232, 0.248]
+0.167 [0.162, 0.173]
+0.423 [0.409, 0.438]
+Dementia
+2y
+0.772 [0.761, 0.782]
+0.036 [0.033, 0.041]
+0.087 [0.079, 0.096]
+0.059 [0.054, 0.065]
+0.167 [0.151, 0.184]
+5y
+0.770 [0.759, 0.781]
+0.110 [0.101, 0.121]
+0.179 [0.167, 0.191]
+0.127 [0.118, 0.135]
+0.305 [0.284, 0.326]
+Heart Attack
+2y
+0.775 [0.766, 0.785]
+0.032 [0.029, 0.035]
+0.074 [0.067, 0.082]
+0.050 [0.045, 0.055]
+0.143 [0.128, 0.157]
+5y
+0.745 [0.733, 0.756]
+0.081 [0.076, 0.088]
+0.145 [0.137, 0.152]
+0.086 [0.082, 0.091]
+0.448 [0.423, 0.472]
+Knee OA
+2y
+0.706 [0.699, 0.712]
+0.051 [0.049, 0.053]
+0.097 [0.091, 0.102]
+0.067 [0.063, 0.071]
+0.174 [0.163, 0.184]
+5y
+0.674 [0.667, 0.682]
+0.181 [0.175, 0.188]
+0.257 [0.251, 0.263]
+0.171 [0.167, 0.176]
+0.513 [0.500, 0.526]
+Panc. Cancer
+2y
+0.692 [0.649, 0.735]
+0.002 [0.001, 0.002]
+0.000 [0.000, 0.000]
+0.000 [0.000, 0.000]
+0.000 [0.000, 0.000]
+5y
+0.663 [0.605, 0.720]
+0.004 [0.003, 0.006]
+0.007 [0.000, 0.021]
+0.005 [0.000, 0.015]
+0.012 [0.000, 0.037]
+Prostate Ca.
+2y
+0.908 [0.903, 0.913]
+0.021 [0.019, 0.023]
+0.035 [0.026, 0.045]
+0.027 [0.020, 0.035]
+0.051 [0.037, 0.065]
+5y
+0.897 [0.891, 0.902]
+0.069 [0.063, 0.077]
+0.108 [0.094, 0.122]
+0.070 [0.060, 0.079]
+0.240 [0.208, 0.273]
+27/28
+Data budgets and model capacity
+Table S9. Macro-averaged zero-shot forecasting across model sizes (full data, λ = 0.5).
+Model size
+Horizon
+AUROC
+AUPRC
+F1
+Precision
+Recall
+0.69M
+2y
+0.732 [0.719, 0.745]
+0.0274 [0.0260, 0.0294]
+0.057 [0.052, 0.062]
+0.037 [0.034, 0.040]
+0.128 [0.116, 0.140]
+5y
+0.706 [0.689, 0.722]
+0.0927 [0.0879, 0.0992]
+0.147 [0.136, 0.159]
+0.101 [0.093, 0.111]
+0.288 [0.270, 0.308]
+2.81M
+2y
+0.764 [0.752, 0.775]
+0.0345 [0.0325, 0.0371]
+0.072 [0.065, 0.078]
+0.048 [0.044, 0.052]
+0.158 [0.143, 0.174]
+5y
+0.748 [0.733, 0.763]
+0.1151 [0.1090, 0.1226]
+0.173 [0.164, 0.184]
+0.120 [0.113, 0.127]
+0.333 [0.312, 0.354]
+5.81M
+2y
+0.755 [0.743, 0.768]
+0.0345 [0.0325, 0.0374]
+0.071 [0.065, 0.077]
+0.049 [0.045, 0.053]
+0.150 [0.137, 0.163]
+5y
+0.725 [0.708, 0.741]
+0.1094 [0.1035, 0.1168]
+0.165 [0.155, 0.175]
+0.117 [0.110, 0.124]
+0.311 [0.285, 0.338]
+14M
+2y
+0.759 [0.746, 0.772]
+0.0361 [0.0338, 0.0390]
+0.074 [0.068, 0.081]
+0.050 [0.046, 0.055]
+0.166 [0.152, 0.182]
+5y
+0.748 [0.730, 0.764]
+0.1139 [0.1076, 0.1225]
+0.175 [0.164, 0.188]
+0.118 [0.110, 0.131]
+0.354 [0.334, 0.376]
+47M
+2y
+0.775 [0.763, 0.788]
+0.0393 [0.0368, 0.0427]
+0.081 [0.073, 0.089]
+0.053 [0.048, 0.059]
+0.174 [0.158, 0.192]
+5y
+0.749 [0.733, 0.765]
+0.1149 [0.1081, 0.1255]
+0.169 [0.160, 0.179]
+0.114 [0.108, 0.121]
+0.358 [0.335, 0.382]
+144M
+2y
+0.780 [0.767, 0.792]
+0.0398 [0.0372, 0.0434]
+0.080 [0.073, 0.088]
+0.054 [0.049, 0.061]
+0.166 [0.153, 0.181]
+5y
+0.752 [0.736, 0.767]
+0.1160 [0.1096, 0.1250]
+0.173 [0.163, 0.184]
+0.122 [0.114, 0.129]
+0.337 [0.310, 0.366]
+446M
+2y
+0.774 [0.761, 0.786]
+0.0384 [0.0361, 0.0415]
+0.077 [0.071, 0.085]
+0.053 [0.048, 0.058]
+0.156 [0.143, 0.171]
+5y
+0.754 [0.738, 0.770]
+0.1195 [0.1125, 0.1292]
+0.176 [0.166, 0.186]
+0.120 [0.113, 0.126]
+0.364 [0.338, 0.392]
+849M
+2y
+0.781 [0.769, 0.793]
+0.0398 [0.0373, 0.0430]
+0.078 [0.072, 0.084]
+0.052 [0.048, 0.055]
+0.178 [0.165, 0.192]
+5y
+0.755 [0.740, 0.770]
+0.1176 [0.1108, 0.1262]
+0.174 [0.165, 0.186]
+0.119 [0.112, 0.127]
+0.345 [0.325, 0.367]
+Table S10. Macro-averaged zero-shot forecasting across data budgets (λ = 0.5).
+Data budget
+Horizon
+AUROC
+AUPRC
+F1
+Precision
+Recall
+10%
+2y
+0.755 [0.741, 0.768]
+0.0339 [0.0320, 0.0368]
+0.069 [0.063, 0.076]
+0.046 [0.042, 0.051]
+0.154 [0.140, 0.171]
+5y
+0.723 [0.708, 0.738]
+0.1028 [0.0972, 0.1100]
+0.159 [0.151, 0.167]
+0.108 [0.102, 0.114]
+0.314 [0.296, 0.332]
+25%
+2y
+0.771 [0.758, 0.784]
+0.0368 [0.0345, 0.0399]
+0.076 [0.068, 0.084]
+0.052 [0.048, 0.059]
+0.157 [0.141, 0.173]
+5y
+0.739 [0.722, 0.755]
+0.1064 [0.1009, 0.1135]
+0.170 [0.160, 0.179]
+0.114 [0.108, 0.121]
+0.372 [0.347, 0.400]
+50%
+2y
+0.764 [0.750, 0.777]
+0.0378 [0.0356, 0.0409]
+0.077 [0.072, 0.084]
+0.051 [0.047, 0.055]
+0.183 [0.168, 0.199]
+5y
+0.740 [0.722, 0.756]
+0.1126 [0.1063, 0.1204]
+0.171 [0.162, 0.179]
+0.115 [0.110, 0.121]
+0.338 [0.320, 0.356]
+100%
+2y
+0.780 [0.767, 0.792]
+0.0398 [0.0372, 0.0434]
+0.080 [0.073, 0.088]
+0.054 [0.049, 0.061]
+0.166 [0.153, 0.181]
+5y
+0.752 [0.736, 0.767]
+0.1160 [0.1096, 0.1250]
+0.173 [0.163, 0.184]
+0.122 [0.114, 0.129]
+0.337 [0.310, 0.366]
+28/28

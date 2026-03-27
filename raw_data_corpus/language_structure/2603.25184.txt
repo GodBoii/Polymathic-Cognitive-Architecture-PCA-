@@ -1,0 +1,1796 @@
+Train at Moving Edge: Online-Verified Prompt Selection for Efficient RL
+Training of Large Reasoning Model
+Jiahao Wu * 1 2 Ning Lu * 1 3 Shengcai Liu 1 Kun Wang 4 2 Yanting Yang 5 Qing Li 2 Ke Tang 1
+Abstract
+Reinforcement learning (RL) has become es-
+sential for post-training large language models
+(LLMs) in reasoning tasks. While scaling roll-
+outs can stabilize training and enhance perfor-
+mance, the computational overhead is a critical
+issue. In algorithms like GRPO, multiple rollouts
+per prompt incur prohibitive costs, as a large por-
+tion of prompts provide negligible gradients and
+are thus of low utility. To address this problem,
+we investigate how to select high-utility prompts
+before the rollout phase. Our experimental anal-
+ysis reveals that sample utility is non-uniform
+and evolving: the strongest learning signals con-
+centrate at the “learning edge”, the intersection
+of intermediate difficulty and high uncertainty,
+which shifts as training proceeds. Motivated by
+this, we propose HIVE (History-Informed and
+online-VErified prompt selection), a dual-stage
+framework for data-efficient RL. HIVE utilizes
+historical reward trajectories for coarse selection
+and employs prompt entropy as a real-time proxy
+to prune instances with stale utility. By evaluat-
+ing HIVE across multiple math reasoning bench-
+marks and models, we show that HIVE yields
+significant rollout efficiency without compromis-
+ing performance.
+1. Introduction
+Reinforcement Learning (RL) has emerged as a prevalent
+paradigm for fine-tuning large language models (LLMs),
+particularly for enhancing complex reasoning capabili-
+ties (Guo et al., 2025; Yu et al., 2025; Jaech et al., 2024).
+Advanced RL algorithms such as group relative policy op-
+*Equal contribution 1Southern University of Science and Tech-
+nology, Shenzhen, China 2The Hong Kong Polytechnic University,
+Hong Kong, China 3The Hong Kong University of Science and
+Technology, Hong Kong, China 4Nanyang Technological Univer-
+sity, Singapore 5Rutgers University, New Jersey, USA. Correspon-
+dence to: Shengcai Liu <liusc3@sustech.edu.cn>.
+Preprint. March 27, 2026.
+9.2M fewer
+rollouts
+Figure 1. Selection efficiency on five math reasoning bench-
+marks. Using Qwen2.5-Math-7B trained on DAPO+MATH, we
+evaluate our approach (HIVE) against advanced baselines Dynamic
+Sampling (DS) and GRESO. HIVE exhibits superior efficiency,
+achieving comparable accuracy to DS while reducing up to 9.2M
+rollouts, also outperforming GRESO by a large margin.
+timization (GRPO) (Shao et al., 2024) leverage verifiable
+rewards to refine model reasoning abilities through extensive
+rollouts during each training iteration. While increasing the
+number of responses sampled per prompt, known as rollout
+scaling, effectively stabilizes training and enhances model
+performance (Xu et al., 2025; Yu et al., 2025), it introduces a
+severe computational overhead. In the RL-based training of
+LLMs, the majority of computational resources are spent on
+generating rollouts for low-utility prompts that are either too
+trivial or too intractable for the current model. This results
+in vanishing gradients and wasted resources, providing no
+informative learning signal for model updates (Zheng et al.,
+2025b; Yu et al., 2025; Noukhovitch et al., 2025; Sheng
+et al., 2025a). Consequently, we investigate the following
+research question in this paper: How to select valuable
+prompts for more efficient rollout scaling?
+Existing methods for prompt selection in RL-based fine-
+tuning face limitations. Traditional static methods rely on
+predefined heuristics (Wang et al., 2025b; Li et al., 2025b;
+Ye et al., 2025b), failing to capture evolving utility across
+models and training stages. To address this, recent online
+methods (Xu et al., 2025; Chen et al., 2025a; Ye et al.,
+2025a), such as Dynamic Sampling (Yu et al., 2025), focus
+on selecting instances that are neither too hard nor too easy.
+Yet, these approaches heavily rely on rollouts, incurring
+substantial extra rollout costs. Conversely, methods such
+as GRESO (Zheng et al., 2025b) utilize historical training
+dynamics to estimate utility with negligible cost (Gao et al.,
+2025b; Sun et al., 2025b). While efficient, these metrics
+based on historical dynamics quickly become stale during
+training; as model parameters update, the shifting ‘state of
+1
+arXiv:2603.25184v1  [cs.LG]  26 Mar 2026
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+(b) Entropy as a Utility Proxy
+(a) Decay of Historical Reliability
+Figure 2. (a) History-based selection suffers from metadata stale-
+ness, leading to a decay in effective (non-zero gradient) prompts.
+Real-time verification (Online) prevents this, sustaining high sam-
+ple validity. (b) Prioritizing high-entropy prompts among non-zero
+gradient prompts significantly improves accuracy compared to
+standard sampling, validating entropy as a key efficiency signal.
+knowledge’ often leads previously informative prompts to
+become trivial, making historical indicators unreliable for
+real-time selection (Figure 2a).
+To devise an efficient prompt selection framework for scal-
+ing rollouts in LLM RL, we begin by conducting an em-
+pirical analysis of training dynamics. Our findings reveal
+that sample utility is non-uniform and dynamic (Section 2).
+Specifically, among those prompts with effective gradients,
+high-entropy ones yield higher utility (Figure 2b). This
+aligns with the finding in Section 2: the strongest learn-
+ing signals are concentrated at the “learning edge” defined
+by the intersection of medium difficulty and high response
+entropy (Figure 3). Furthermore, this utility is inherently
+changing; as the model updates, a phenomenon we term
+“metadata staleness” occurs. We observe that the group of
+prompts identified as informative by history-based metrics
+becomes ineffective for current training (Figure 3).
+Based on these insights, we conclude that an ideal prompt
+selection framework for efficient LLM RL must satisfy three
+criterias: it must be online to track the model’s shifting
+learning edge, precise in identifying real-time utility of
+each prompts, and computationally efficient enough to
+ensure that the selection cost is minmimal.
+To meet these requirements, we propose HIVE (History-
+Informed and online-VErified prompt selection), a hierar-
+chical framework designed for data-efficient LLM train-
+ing (Figure 4). HIVE operates through a two-stage pro-
+cess: (1) leveraging historical reward trajectories and re-
+sponse entropies to prioritize informative prompts from
+the candidate pool; (2) utilizing prompt entropy as a high-
+fidelity and efficient proxy to resolve metadata staleness
+and select samples useful for the current model train-
+ing. We evaluate HIVE across six math reasoning bench-
+marks and six models: Qwen2.5-Math-1.5B/7B (Yang
+et al., 2024), DeepSeek-R1-Distill-Qwen-1.5B (Guo et al.,
+2025), Qwen2.5-14B/32B (Team, 2024), and Llama-3.2-
+3B-Instruct (Grattafiori et al., 2024). HIVE significantly
+outperforms baselines like Dynamic Sampling and GRESO,
+achieving up to 3.8× speedup in rollout and 2.2× faster
+total training time for models like Qwen2.5-Math-7B. Fi-
+nally, we show that HIVE drastically lowers computational
+overhead, achieving up to 9.2 million rollouts reduction
+while consistently maintaining or even exceeding the rea-
+soning accuracy of Dynamic Sampling and GRESO.
+2. Background and Motivation
+In this section, we dissect the learning dynamics of GRPO
+to identify the specific data characteristics that drive effec-
+tive model updates. Specifically, our empirical analysis is
+structured around two fundamental questions: (1) Prompt
+Utility: Which specific groups of samples carry the most
+significant information for model optimization? (2) Tempo-
+ral Dynamics: How does the utility of these samples shift
+and evolve during training? The insights gained from these
+observations directly inspire the design of HIVE.
+Zero Advantages in GRPO. Group relative policy opti-
+mization (GRPO) (Shao et al., 2024) is a widely adopted
+policy gradient algorithm in reinforcement learning with ver-
+ifiable rewards (RLVR) (Guo et al., 2025; Yang et al., 2025).
+Derived from proximal policy optimization (PPO) (Schul-
+man et al., 2017), GRPO is tailored for fine-tuning language
+models. GRPO has exhibited superior performance in var-
+ious tasks advances (Guo et al., 2025; Yang et al., 2025;
+Yu et al., 2025; Bai et al., 2024). The training objective of
+GRPO is as follows:
+JGRPO(θ) =E
+
+q ∼P(Q), {oi}G
+i=1 ∼πθold
+
+"
+1
+G
+G
+X
+i=1
+1
+|oi|
+|oi|
+X
+t=1
+
+Lclip
+i,t (θ) −βDKL(πθ∥πref)
+#
+,
+(1)
+where Lclip
+i,t (θ) is the clipped surrogate objective defined as:
+Lclip
+i,t (θ) = min
+
+ρi,t(θ) ˆAi,t, clip(ρi,t, 1 ± ε) ˆAi,t
+
+,
+(2)
+where ρi,t(θ) =
+πθ(oi|q)
+πθold(oi|q), and ˆAi is the advantage, com-
+puted from a group of rewards {ri}G
+i=1 as following:
+ˆAi = ri −mean({Ri}G
+i=1)
+std({Ri}G
+i=1)
+.
+(3)
+The advantage for each response is derived from the normal-
+ized reward within its respective group of sampled rollouts.
+Consequently, in cases where a prompt exhibits extreme dif-
+ficulty or simplicity, the advantage vanishes as the rewards
+for all responses converge (i.e., all correct or all incorrect).
+This result yields a zero gradient for policy updates, thereby
+providing no informative learning signal.
+Utility: Difficulty and Entropy. While prompts yield-
+ing zero gradients provide no informative signal for train-
+ing (Guo et al., 2025; Shao et al., 2024), we take a fur-
+ther step to investigate which prompts among those with
+2
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+Figure 3. Left: Peak gradients (color intensity) appear in the
+intersection of high-entropy and intermediate difficulty regions,
+indicating the strongest learning signals. Right: Selection based
+on historical metrics yields stale prompts with lower utility.
+non-zero gradients are most valuable for RL training. As
+Figure 2b suggests, non-zero gradient prompts with higher
+entropy can yield performance improvement with identi-
+cal rollout cost. On the other hand, previous studies (Kim
+et al., 2025; Paul et al., 2021; Fayyaz et al., 2022; Singhal
+et al., 2024) reveal that length-normalized gradient norm
+can serve as an effective metric to measure the utility of
+prompts. Therefore, in this section, we focus on analyzing
+how per-prompt difficulty (empirical accuracy across roll-
+outs) and response entropy correlate with the prompt utility,
+using the gradient as indicator.
+As illustrated in the heatmap in Figure 3 (Left), two distinct
+trends emerge that define the topography of sample utility:
+(1) Monotonicity in Entropy: Within any fixed difficulty
+band, the gradient norm increases almost monotonically
+with response entropy. (2) Inverted-U in Difficulty: For a
+fixed entropy level, the gradient norm follows an “inverted-
+U” pattern relative to difficulty. Magnitude is minimized at
+the saturated prompts that are either trivial (always correct)
+or intractable (always incorrect), and peaks near the “learn-
+ing edge”. The global maximum of utility, evaluated by
+the normalized gradient norm, is concentrated in the
+high-entropy, medium-difficulty region (e.g., the middle-
+right cells reaching ∼1.98). This suggests that a model’s
+learning trajectory is primarily driven by high-utility sam-
+ples. Prioritizing prompts at the intersection of high entropy
+and medium accuracy can prevent rollout budgets from be-
+ing wasted on samples that provide no discriminative signal.
+Staleness: Decay of Historical Reliability. While histori-
+cal metadata (e.g., response entropy, and reward trajectories)
+provides a useful prior for sample selection, its reliability
+is inherently transient (Cui et al., 2025; Tomihari, 2026;
+Li et al., 2026). As the model parameters update during
+training, the model’s “state of knowledge” shifts, causing
+the utility of specific prompts to decay, which we refer as
+data staleness.
+To quantify this effect, we compare the utility of prompts se-
+lected based on historical metadata (reward trajectories and
+response entropies from last epoch) against those identified
+by online metrics (variance of rewards in current rollouts
+and corresponding response entropies). As illustrated in
+Figure 3 (Right), we observe a sharp divergence in the re-
+sulting gradient norms. The prompts chosen via Historical
+Selection exhibit significantly lower gradient norms (clus-
+tering around 1.2), indicating they have degraded into “stale
+prompts” that provide diminished learning signals. In con-
+trast, Online Selection consistently isolates “High-Utility
+Prompts” with elevated gradient norms (median ≈1.9). This
+empirical gap underscores that metrics derived from the
+historical training trajectory rapidly lose their validity
+as proxies for real-time selection, as they fail to track the
+model’s shifting learning edge. Thus, metrics derived from
+the historical training trajectory may no longer serve as valid
+proxies for prompt selection in the current iteration.
+3. Methodology
+In this section, we present HIVE (History-Informed and
+online-VErified prompt selection), a hierarchical framework
+designed to improve RL training efficiency by identifying
+high-utility prompts. As motivated by the observations
+in Section 2, HIVE selects prompts through a two-stage
+process. It first leverages historical training dynamics (e.g.,
+reward trajectories and response entropies) for cost-free
+coarse selection, followed by an online verification stage
+that utilizes real-time prompt entropy to ensure the current
+relevance of selected samples before rollout phase. The
+overall framework is shown in Figure 4 and the detailed
+algorithm can be found in the Appendix E.
+3.1. Stage 1: History-Informed Selection
+Stage 1 involves a zero-cost, history-informed mechanism
+to select high-utility prompts. Based on the observation
+from Section 2, we define high-utility prompts as those with
+intermediate difficulty and high entropy. To avoid redundant
+rollout costs, we quantify the prompt difficulty by reward-
+trajectories and predictive diversity by response entropies
+from previous iterations. To prevent the model from pre-
+maturely discarding prompts that may become solvable as
+training progresses, we adopt a probabilistic selection strat-
+egy based on reward-trajectories (reward-based score) and
+response entropies (entropy-based score).
+Reward-based Score. Given a historical training dynamics
+trace Ti for each prompt xi ∈D:
+Ti = {Ri,1, ..., Ri,n},
+(4)
+where Ri,j = {r(k)
+i,j }G
+k=1 represents the set of response re-
+wards obtained from G rollouts in j-th epoch. As analyzed
+in Section 2, prompts that consistently yield zero reward
+variance provide vanishing gradients and offer no informa-
+tive signal for model updates. We quantify this lack of
+informativeness by tracking the consecutive zero-variance
+3
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+Stage 2: Online-Verified Selection
+Current LRM Parameters
+RL-based
+Training (e.g.,
+GRPO)
+Rollout
+Update
+Prompt Entropy: 
+Entropy
+Thresholding
+Selected
+High-value
+Full
+Prompt
+Pool
+History-Informed Selection
+Entropy-based
+Reward-based
+Reward & Entropy Buffer
+[Prompt ID | Reward History | Res Entropy]
+Stage 1: History-Informed Selection
+Historical Learning Trajectory/Update History (Reward, Entropy)
+Efficiency:
+ 
+ 
+Single
+Forward Pass
+per prompt
+Zero-cost (Based on Historical Signal)
+Low-cost (Single Forward Pass)
+Prompt Entropy Calculation
+Figure 4. Overview of the Proposed Framework. (1) Stage 1: History-Informed Selection utilizes reward histories and response
+entropies from historical rollouts to define the probability of selecting high-utility prompts at “learning edge”. (2) Stage 2: Online-Verified
+Selection calculates prompt entropies based on the current LRM parameters and select those in target range for training.
+count zi, which represents the number of most recent con-
+secutive iterations where xi yielded identical rewards:
+zi = max{k ∈[0, n] |
+n
+Y
+j=n−k+1
+Ii,j = 1},
+(5)
+where Ii,j is an indicator function that equals 1 if all rewards
+in Ri,j are identical, and 0 otherwise. The prompt selection
+probability based on reward trajectories is defined as:
+PRew(xi) = pzi
+e ,
+(6)
+where pe ∈(0, 1) is the base exploration probability. This
+mechanism ensures that prompts frequently identified as
+zero-variance are pruned with increasing probability, while
+still allowing for occasional re-sampling to account for shifts
+in the model’s “learning edge”.
+Manually determined pe can always be trivial when applied
+across models, datasets, and training stages. HIVE employs
+an adaptive mechanism to automatically adjust the base ex-
+ploration probability at each training iteration. Specifically,
+HIVE monitors the observed zero-variance ratio against a
+target α. If the actual ratio of uninformative rollouts ex-
+ceeds the target, pe decreases by step size ∆p to lower sam-
+pling intensity; otherwise, it increases. Furthermore, HIVE
+maintains decoupled probabilities, pe,easy and pe,hard, to
+independently track easy and hard prompts.
+Entropy-based Score. The entropy-based score further re-
+fines selection by prioritizing samples with high predictive
+uncertainty. We define the historical response entropy for
+a prompt xi, denoted as Hi, as the average of the mean
+token-level entropies across G independent rollouts gener-
+ated in the most recent epoch. Specifically, for each rollout
+r ∈{1, ..., G}, the model generates a response sequence of
+length Lr. Let p(r)
+θ,l = pθ(·|x(r)
+<l ) be the token probability
+distribution given context x(r)
+<l . Mean entropy of the r-th
+rollout U (r)(xi) and historical entropy Hi is calculated as:
+Hi = 1
+G
+G
+X
+r=1
+U (r)(xi), U (r)(xi) = 1
+Lr
+Lr
+X
+l=1
+H(p(r)
+θ,l ), (7)
+where Lr is the length of r-th rollout and H(p(r)
+θ,l ) is the
+token level entropy at position l:
+H(pθ(·|x(r)
+<l )) = −
+X
+v∈V
+pθ(v|x(r)
+<l ) log pθ(v|x(r)
+<l ).
+(8)
+To map the historical entropy Hi into a selection probability
+PEnt(xi), we employ a scoring mechanism that favors high-
+entropy candidates:
+PEnt(xi) =
+Hi −Hmin
+Hmax −Hmin
+,
+(9)
+where Hmax and Hmin are the maximum and minimum av-
+erage response entropies in the current epoch, respectively.
+History-Informed Selection. To identify the learning edge,
+HIVE integrates both reward and entropy signals. While the
+reward-based score PRew reflects the learning outcome (i.e.,
+whether the model has already mastered or is currently stuck
+on a prompt), the entropy-based score PEnt captures the in-
+ternal confidence of the model’s policy. By combining them,
+the final probability of selecting prompt xi is calculated as:
+Pselect = λ · PRew(xi) + (1 −λ) · PEnt(xi),
+(10)
+where λ is a balancing coefficient.
+3.2. Stage 2: Online-Verified Selection
+As motivated by the staleness analysis in Section 2, histori-
+cal metrics may fail to reflect the model’s current “state of
+4
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+knowledge” and select effective prompts for training. Thus,
+we choose to devise online metrics for prompt selection.
+However, calculating the full response entropies and roll-
+outs for every candidate is computationally prohibitive. To
+bridge this gap, stage 2 introduces an online verification
+phase. Unlike the soft selection in stage 1, this stage acts
+as a deterministic gatekeeper: it re-verifies the utility of
+candidate prompts using the current policy before any ex-
+pensive rollouts occur. To bridge this gap without incurring
+significant overhead, stage 2 introduces a lightweight online
+verification phase. Instead of expensive response generation,
+we pivot to using online prompt entropy as a high-fidelity,
+efficient proxy to select candidates before the rollout phase.
+Prompt Entropy as a Proxy. Formally, we define the
+prompt entropy V (x) as the average of token-level entropy
+across the prompt sequence:
+V (x) :=
+1
+Lp −1
+Lp
+X
+l=2
+H(pθ(·|x<l)),
+(11)
+where Lp is the prompt length and H(pθ(·|x<l)) is the token
+entropy at position l.
+To rigorously justify the use of prompt-side entropy V (x)
+as a proxy for response-side utility U(x), we establish a
+theoretical guarantee of Rank Consistency. Under the
+assumptions of Representation Approximation and Entropy
+Propagation (see Appendix A.2 for detailed formulations),
+we provide the following main result:
+Theorem 3.1 (Informal). For any pair of prompts (x,x’), if
+the difference in their prompt-side entropy ∆V exceeds a
+specific noise-related threshold, then their ranking in V (x)
+is consistent with their ranking in the true expected response
+entropy U(x) with high probability:
+sign(V (x) −V (x′)) = sign( ˆU(x) −ˆU(x′)).
+(12)
+This theorem (formally presented as Theorem A.4 in the
+Appendix A) ensures that V (x) is a theoretically sound
+estimator for tracking the model’s current learning edge.
+The theoretical proof is examined in Appendix A.
+Entropy-based Selection. Following the online calculation,
+HIVE implements a deterministic gate to finalize selection.
+To maintain adaptability as the LLM updates, we employ a
+dynamic median-based threshold. Let DS1 be the candidate
+set passing Stage 1. We define the verification threshold γ
+as the median prompt entropy of the current pool:
+γ := median (V (x) | x ∈DS1) .
+(13)
+A prompt xi is promoted to the rollout phase if it satisfies:
+xi ∈DS1
+and
+V (xi) ≥γ.
+(14)
+This “soft-to-hard” selection ensures a constant relative
+throughput, forcing the model to prioritize the top 50% most
+informative samples. By validating historical utility with
+online prompt entropy, HIVE resolves metadata staleness
+and maximizes gradient utility per rollout.
+Computational Efficiency. Stage 2 achieves extreme ef-
+ficiency by replacing multi-sample rollouts with a single
+forward pass over the prompt tokens. For a prompt of length
+Lp, group size G and response length Lr, calculating V (x)
+only needs one forward pass, whereas a full group rollout
+requires G·Lr forward passes. Specifically, this reduces the
+computational complexity from O(G · Lr) to O(1). By se-
+lecting prompts with high V (x), HIVE effectively resolves
+the metadata staleness issue while bypassing the prohibitive
+costs of full rollouts. The time cost of Stage 2 is empirically
+verified as negligible, shown in Figure 6d in Section 4.3.
+4. Experiments
+In this section, we evaluate HIVE on multiple benchmarks
+across six different models:
+• In Section 4.2, we show that HIVE achieves significant
+rollout reduction with no performance degradation.
+• In Section 4.3, we conduct a detailed analysis of how
+HIVE reduces training costs by identifying effective
+prompts for rollout and other training dynamics
+• In Section 4.4, we conduct investigation on the effects
+of HIVE’s different stages.
+4.1. Experimental Settings
+Models & Datasets. We run our experiments on Qwen2.5-
+Math-1.5B/7B (Yang et al., 2024), DeepSeek-R1-Distill-
+Qwen-1.5B (Guo et al., 2025), Qwen2.5-14B/32B (Team,
+2024), and Llama-3.2-3B-Instruct (Grattafiori et al., 2024).
+We use a context length of 4K for Qwen2.5-Math-1.5B/7B,
+and 8K for DeepSeek-R1-Distill-Qwen-1.5B and Llama-
+3.2-3B-Instruct. For Qwen2.5-14B/32B models, we set the
+context length to 16k. For training datasets, we adopt two
+datasets following Zheng et al. (2025b): 1) DAPO+MATH
+(DM): It is the combination of DAPO dataset (Yu et al.,
+2025) and MATH dataset (Hendrycks et al., 2021).
+2)
+OPEN-R1 30k subset (OR1): 30,000-example subset of
+the OPEN-R1 math dataset (Hugging Face, 2025).
+Training & Evaluation. Our method is implemented based
+on verl (Sheng et al., 2025b) and vLLM (Kwon et al.,
+2023). We use 8×A100-80G GPUs for Qwen2.5-Math-
+1.5B/7B, DeepSeek-R1-Distill-Qwen-1.5B and Llama-3.2-
+3B-Instruct in the main experiments.
+For benchmark
+datasets, we use six widely used complex mathematical rea-
+soning benchmarks to evaluate the performance of trained
+models: Math500 (Hendrycks et al., 2021), AIME24 (Art
+5
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+Table 1. Comprehensive evaluation of HIVE on math reasoning benchmarks and efficiency analysis. We train four models on DAPO +
+MATH. (a) Compared to Dynamic Sampling (DS) and GRESO, HIVE achieves similar accuracy while significantly reducing the number
+of rollouts. (b) HIVE significantlt lowers rollout cost, achieving up to 3.8× speedup in rollout, 2.2× speedup in total training cost over
+Dynamic Sampling, and consistently outperforming GRESO.
+(a) Performance (%) comparison across six math reasoning benchmarks.
+Method
+Math500
+AIME24
+AMC
+Gaokao
+Miner.
+Olymp.
+Avg.
+#Rollout
+Qwen2.5-Math-1.5B
+DS
+77.3
+16.7
+61.7
+64.2
+31.8
+38.7
+48.4
+7.6M (1.0×)
+GRESO
+77.3
+15.0
+59.3
+66.2
+32.6
+38.5
+48.1
+3.3M (2.3×)
+Our
+77.9
+16.7
+60.2
+66.1
+31.5
+40.3
+48.8
+3.1M (2.5×)
+DeepSeek-R1-Distill-Qwen-1.5B
+DS
+87.9
+36.7
+71.7
+78.7
+35.3
+54.9
+60.9
+2.4M (1.0×)
+GRESO
+85.5
+37.5
+70.7
+76.2
+34.3
+52.1
+59.4
+1.6M (1.5×)
+Our
+87.2
+37.5
+70.1
+77.2
+35.1
+53.2
+60.1
+1.5M (1.6×)
+Llama3.2-3b-Instruct
+DS
+52.4
+16.7
+46.0
+49.2
+20.0
+20.2
+34.1
+11.4M (1.0×)
+GRESO
+51.8
+16.7
+46.3
+49.4
+19.7
+19.6
+33.9
+5.9M (1.9×)
+Our
+53.8
+17.5
+45.5
+49.1
+20.5
+20.0
+34.4
+4.8M (2.4×)
+Qwen2.5-Math-7B
+DS
+82.9
+34.2
+79.2
+71.7
+35.4
+43.6
+57.8
+13.1M (1.0×)
+GRESO
+93.2
+30.0
+78.9
+70.2
+35.2
+44.1
+58.6
+6.3M (2.1×)
+Our
+93.0
+36.7
+79.2
+70.8
+34.8
+43.8
+59.7
+3.9M (3.4×)
+(b) Training time (hours) comparison.
+Method
+Train
+Other
+Rollout
+Total
+Qwen2.5-Math-1.5B
+DS
+10.9
+6.0
+77.3
+94.2
+GRESO
+11.3
+6.4
+46.0
+63.7
+Our
+11.2
+6.2
+42.1
+59.5
+DeepSeek-R1-Distill-Qwen-1.5B
+DS
+9.6
+6.1
+68.7
+84.4
+GRESO
+10.4
+6.6
+45.9
+62.9
+Our
+10.1
+6.7
+42.7
+59.5
+Llama3.2-3b-Instruct
+DS
+20.6
+10.2
+218.3
+249.1
+GRESO
+21.8
+10.5
+116.5
+148.8
+Our
+22.2
+10.6
+90.4
+123.2
+Qwen2.5-Math-7B
+DS
+32.1
+12.6
+153.7
+198.4
+GRESO
+32.8
+13.2
+66.3
+112.3
+Our
+32.7
+12.9
+40.2
+85.8
+of Problem Solving, 2024a), AMC (Art of Problem Solv-
+ing, 2024b), Minerva Math (Lewkowycz et al., 2022),
+Gaokao (Zhang et al., 2023), and Olympiad Bench (He
+et al., 2024). Following (Zheng et al., 2025b), we report
+the performance of the checkpoint that obtains the best aver-
+age performance on six benchmarks. We also include more
+detailed settings in Appendix B.
+4.2. Efficiency Comparison (Table 1 & 2, Figure 5)
+Comparable performance with up to 3.4× fewer roll-
+outs (Table 1a & 2). We evaluate the performance of
+HIVE against two distinct baselines: Dynamic Sampling
+(DS) (Yu et al., 2025), which filters out zero-variance ex-
+amples and resamples to fill the batch with effective data,
+and GRESO (Zheng et al., 2025b), a prevalent history-based
+selection method. Table 1a presents the comparative results
+across four LLMs, trained on DAPO + MATH dataset, and
+they are evaluated on six mathematical reasoning bench-
+marks. We report both the best average performance across
+six benchmarks and the accumulated number of rollouts
+over 1000 training steps. HIVE consistently reduces the
+number of rollouts and matches or exceeds the accuracy
+of DS and GRESO across all model architectures. For in-
+stance, on Qwen2.5-Math-7B, HIVE reduces rollouts by
+70% compared to DS (13.1M →3.9M), achieving a 3.4×
+speedup that surpasses GRESO (2.1×). At the same time,
+it achieves the highest average accuracy of 59.7%, outper-
+forming GRESO (58.6%) and DS (57.8%). This confirms
+the effectiveness of HIVE in selecting prompts for training
+efficiency. Such advancements are also observed on other
+models and training on dataset OpenR1 (Table 2).
+Up to 3.8× wall-clock time speed-up in rollout and 2.2×
+speed-up in training (Table 1b). To better understand
+the efficiency of HIVE, we report the detailed end-to-end
+training time (1000 steps) breakdown for different stages.
+All the models are trained on 8×A100. Table 1b shows that
+HIVE significantly reduces the computational overhead of
+training across all settings (1.5B to 7B parameters). While
+rollout is the primary computatonal cost in the RL-based
+training, HIVE achieves a rollout speedup of up to 3.8×
+(153.7h→40.2h) and a total training speedup of up to 2.3×
+(198.4h→85.8h). For instance, HIVE reduces total training
+time of Qwen2.5-Math-7B from 198.4 hours (DS) and 112.3
+hours (GRESO) to 85.8 hours, and reduces rollout time from
+153.7 hours (DS) and 66.3 hours (GRESO) to 40.2 hours.
+Scaling 14B and 32B Models (Figure 5). We extend our
+evaluation to the Qwen-2.5-14B and 32B models to verify
+HIVE’s effectiveness at larger scales. The reported results
+in Figure 5 show the average performance across the six
+benchmarks. HIVE exhibits a convergence trajectory similar
+to both DS and GRESO, ensuring no compromise in final
+performance. However, HIVE requires fewer rollouts. For
+example, for the training of Qwen-2.5-14B over 800 steps,
+HIVE requires only 1.56M rollouts, significantly less than
+GRESO (1.74M) and Dynamic Sampling (3.45M).
+4.3. Further Efficiency Analysis (Figure 6 & 7)
+Computational cost of online-verified selection (Stage
+2) is negligible (Figure 6a). The figure presents a break-
+6
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+Figure 5. Accuracy comparison on
+Qwen2.5-14B and Qwen2.5-32B.
+Table 2. Performance (%) comparison of Qwen2.5-Math-1.5B and Qwen2.5-Math-7B trained on
+OpenR1.
+Method
+Math500
+AIME24
+AMC
+Gaokao
+Miner.
+Olymp.
+Avg.
+#Rollout
+Qwen2.5-Math-1.5B
+DS
+77.1
+16.7
+50.3
+65.5
+30.9
+39.7
+46.7
+3.8M (1.0×)
+GRESO
+76.1
+20.0
+50.6
+65.1
+30.0
+39.2
+46.8
+1.6M (2.4×)
+Our
+76.9
+18.3
+48.7
+65.4
+30.1
+40.3
+46.6
+1.5M (2.5×)
+Qwen2.5-Math-7B
+DS
+82.8
+34.2
+63.5
+67.3
+35.7
+46.3
+55.0
+11.4M (1.0×)
+GRESO
+82.3
+35.0
+64.4
+66.8
+36.5
+45.7
+55.1
+3.4M (3.4×)
+Our
+82.6
+36.7
+63.9
+66.7
+36.2
+45.9
+55.3
+2.5M (4.7×)
+(a) Training Time Breakdown
+(b) Efficiency Comparison
+(c) Generation Time
+(d) Rollouts per Step
+Figure 6. Efficiency analysis of Qwen-Math-1.5B trained on the DAPO + MATH dataset. (a) Blue bars indicate shared components with
+DS and GRESO. Red bars show HIVE-specific additional time consuming. (b) Comparison of the accumulation of valid rollouts over
+rollout hours; HIVE achieves the fastest accumulation rate. (c) HIVE maintains low latency throughout training, whereas GRESO and DS
+incur significantly higher time costs. (d) HIVE consistently rollouts for fewer prompts per step than DS and GRESO.
+down of the wall-clock time per training step (averaged
+over the first 20 steps). The computational cost is heavily
+dominated by standard components shared with baselines
+(DS and GRESO), specifically the Rollout (147.46s) phase.
+In contrast, the calculation of online prompt entropy in the
+stage 2 (online-verified selection) of HIVE, introduces a
+marginal latency of only 0.82s. This demonstrates that the
+online-verified selection enhances performance with negli-
+gible computational cost (<0.4% of the total iteration time).
+HIVE yields better rollout efficiency and effective roll-
+out ratios (Figure 6b, 6c, 6d). We analyze the temporal
+dynamics of rollout generation in Figures 6b to 6d to vali-
+date the computational advantages of HIVE. As shown in
+Figure 6b, HIVE (red line) exhibits the steepest accumu-
+lation of effective rollouts per hour. This also confirms
+that the overhead of Stage 2 online verification is negligi-
+ble compared to the significant throughput gains achieved
+by avoiding redundant rollouts. Figure 6c reveals a criti-
+cal divergence: HIVE maintains consistently low latency
+( 145s/step), whereas GRESO suffers from increasing costs
+later in training (>200s/step). This degradation highlights
+the impact of metadata staleness; history-based methods fail
+to filter increasingly complex yet uninformative prompts
+as the model evolves. Figure 6d demonstrates that HIVE
+have the strictest selection volume, therefore yielding the
+least waste of rollout. By avoiding the increasing seen in
+DS and GRESO, HIVE ensures computational resources are
+focused on the effective prompts near “learning edge”.
+Dynamics of uninformative prompts (Figure 7). We an-
+alyze the zero-variance ratio to measure the proportion of
+selected prompts that yield zero gradients (uninformative
+signals). The results are presented in Figure 7. As the model
+improves, Dynamic Sampling (DS) wastes nearly 50% of
+rollouts on easy problems. GRESO fails to filter these effec-
+tively due to metadata staleness, while its historical records
+lag behind the newly updated model. In contrast, HIVE con-
+sistently maintains a low ratio. For ”hard” samples, HIVE
+converges at a lower zero-variance ratio than baselines. By
+aggressively filtering both easy and hard extremes, HIVE
+ensures that the computational budget is concentrated exclu-
+sively on the most informative prompts.
+4.4. Component Study (Figure 8)
+Threshold dynamics (Figure 8a). The reported result
+tracks the adaptive entropy threshold γ, which monoton-
+ically decreases from 1.3 to 0.35. This decline mirrors the
+model’s increasing confidence. By dynamically lowering γ,
+HIVE continuously tracks the shifting “learning edge”, en-
+suring selection criteria remains strict as the model matures
+to prevent the over-sampling of easy instances.
+Ablation study on two stages (Figure 8b). We quantify the
+7
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+Figure 7. Evolution of zero-variance ratios (lower indicates more
+effective prompts selected). HIVE (red) consistently minimizes
+the selection of uninformative prompts, both easy and hard.
+impact of each stage in Figure 8b. w/o Stage 2 (Blue): Re-
+moving online verification degrades efficiency, confirming
+that historical metrics alone suffer from metadata staleness
+and waste computation on outdated prompts. w/o Stage 1
+(Green): Removing historical selection yields the lowest
+efficiency, proving that a zero-cost “coarse” filter is neces-
+sary to prune obvious noise before verification. HIVE (Red):
+The full framework dominates the pareto frontier, demon-
+strating that the synergy between historical priors and online
+verification is essential for maximizing rollout efficiency.
+5. Related Works
+RL for LLM Reasoning. Reinforcement learning (RL)
+is central to post-training LLMs (Christiano et al., 2017;
+Bai et al., 2022) and recent work prioritizes reinforcement
+learning with verifiable rewards (RLVR) (Ouyang et al.,
+2022; Rafailov et al., 2023; Guo et al., 2025; Hu, 2025; Liu
+et al., 2025; Jaech et al., 2024; Zhang et al., 2025c). Recent
+methods are in two main categories: (1) Value-enhanced
+PPO, where algorithms like VC-PPO (Yuan et al., 2025)
+and VAPO (Yue et al., 2025) improve reasoning by strength-
+ening value-function learning; and (2) Group-based Policy
+Optimization, where methods like RLOO (Ahmadian et al.,
+2024) and GRPO (Shao et al., 2024) employ multi-sample
+baselines to bypass explicit value learning for efficiency.
+To further stabilize training, recent works have introduced
+experience replay (Liang et al., 2025; Li et al., 2025a; Zhang
+et al., 2025b) or modified optimization objectives to mitigate
+bias (Dr. GRPO (Liu et al., 2025)) and enhance sequence-
+level regulation (GSPO (Zheng et al., 2025a)). DAPO (Yu
+et al., 2025) attempts to filter zero-gradient instances based
+on computationally cost rollouts.
+Data Efficient LLM Training. Data curation is critical
+for efficient reinforced fine-tuning. Following the “less
+is more” principle (Zhou et al., 2023; Ye et al., 2025b),
+small, high-quality datasets often outperform large, noisy
+corpora (Wang et al., 2025b; Fatemi et al., 2025; Li et al.,
+2025b; Shi et al., 2025; Tang et al., 2025). Online selection
+methods have emerged to dynamically select data, falling
+into three types: (1) Rollout-based Selection: Discarding
+uninformative prompts via real-time sampling (Yu et al.,
+(a) Threshold Entropy (Stage 2)
+(b) Ablation Study
+Figure 8. (a) shows the response gamma entropy decreasing over
+steps. (b) compares the accuracy across different ablation settings.
+2025; Meng et al., 2025; Foster et al., 2025; Xu et al., 2025;
+Lin et al., 2025; Sun et al., 2025a; Bae et al., 2025). This
+incurs high computational overhead. (2) Estimator-based
+Selection: Utilizing historical logs (Zheng et al., 2025b) or
+Bayesian estimators (Chen et al., 2025b; Zeng et al., 2025;
+Shen et al., 2025) to predict utility, suffering from memory
+overhead or estimation errors. (3) Auxiliary-Model Selec-
+tion: Employing external scorers (DOTS (Sun et al., 2025c))
+or on-policy value models (PCL (Gao et al., 2025c)) to infer
+difficulty, adding compute costs. Alternatively, stage-wise
+curation (Zhang et al., 2025a;c) periodically refreshes data
+but fail to track real-time learning dynamics. In contrast,
+our method devises a low-cost, real-time selection stage to
+precisely identify and retain prompts at the model’s learning
+edge. Detailed related work is in Appendix C.
+6. Conclusion
+Reinforcement learning with verifiable rewards is becoming
+vital for advancing the reasoning abilities of large language
+models. Training algorithms should prioritize high-utility
+samples rather than indiscriminately scaling rollouts. The
+key insight of HIVE to select useful prompts is to precisely
+target the moving “learning edge” and use online prompt
+entropy to verify the utility. Through extensive evaluations
+on math reasoning benchmarks, we demonstrate that HIVE
+is highly effective, significantly reducing computational
+costs of rollouts without performance drop.
+7. Limitations
+First, our current evaluation is restricted to text-based large
+reasoning models (LRMs). We have not yet explored how
+the principle of prompt entropy as a utility proxy translates
+to multi-modal contexts, such as vision-language models
+(VLMs). Extending HIVE to multi-modal scenarios repre-
+sents a promising direction for future work. Second, HIVE
+introduces specific hyperparameters, such as the balancing
+coefficient λ and the adaptive step size ∆p. Although our
+adaptive mechanism effectively mitigates the need for man-
+ual tuning, we have not performed an exhaustive grid search
+to guarantee global optimality for these parameters across
+all possible training scales.
+8
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+Impact Statements
+This paper presents work whose goal is to advance the field
+of machine learning. The introduced framework (HIVE)
+has the potential to improve the data and computational effi-
+ciency of reinforcement learning for large language models
+in a wide range. HIVE directly contributes to Green AI
+by lowering the energy consumption and carbon footprint
+associated with training large reasoning models. Addition-
+ally, by reducing computational barriers, this work promotes
+the democratization of research, enabling smaller academic
+groups with limited resources to participate in advanced
+model fine-tuning. We do not foresee specific negative soci-
+etal consequences beyond the general risks associated with
+advancing data-efficient training for LLM reasoning.
+References
+Ahmadian, A., Cremer, C., Gall´e, M., Fadaee, M., Kreutzer,
+J., Pietquin, O., ¨Ust¨un, A., and Hooker, S.
+Back
+to basics: Revisiting reinforce style optimization for
+learning from human feedback in llms. arXiv preprint
+arXiv:2402.14740, 2024.
+Art of Problem Solving. AIME problems and solutions.
+https://artofproblemsolving.com/wiki/
+index.php/AIME_Problems_and_Solutions,
+2024a.
+Art of Problem Solving.
+AMC problems and solu-
+tions.
+https://artofproblemsolving.com/
+wiki/index.php?title=AMC_Problems_
+and_Solutions, 2024b.
+Bae, S., Hong, J., Lee, M. Y., Kim, H., Nam, J., and Kwak,
+D. Online difficulty filtering for reasoning oriented re-
+inforcement learning. arXiv preprint arXiv:2504.03380,
+2025.
+Bai, J., Bai, S., Yang, S., Wang, S., Tan, S., Wang, P.,
+Lin, J., Zhou, C., and Zhou, J. Qwen-VL: A versatile
+vision-language model for understanding, localization,
+text reading, and beyond. In Proceedings of the Twelfth
+International Conference on Learning Representations
+(ICLR), 2024.
+Bai, Y., Jones, A., Ndousse, K., Askell, A., Chen, A., Das-
+Sarma, N., Drain, D., Fort, S., Ganguli, D., Henighan, T.,
+et al. Training a helpful and harmless assistant with rein-
+forcement learning from human feedback. arXiv preprint
+arXiv:2204.05862, 2022.
+Chen, W., Koenig, S., and Dilkina, B. Lspo: Length-aware
+dynamic sampling for policy optimization in llm reason-
+ing. arXiv preprint arXiv:2510.01459, 2025a.
+Chen, X., Lu, J., Kim, M., Zhang, D., Tang, J., Pich´e,
+A., Gontier, N., Bengio, Y., and Kamalloo, E.
+Self-
+evolving curriculum for llm reasoning. arXiv preprint
+arXiv:2505.14970, 2025b.
+Christiano, P. F., Leike, J., Brown, T., Martic, M., Legg,
+S., and Amodei, D. Deep reinforcement learning from
+human preferences. In Proceedings of Advances in Neural
+Information Processing Systems (NeurIPS), 2017.
+Chu, X., Huang, H., Zhang, X., Wei, F., and Wang, Y. Gpg:
+A simple and strong reinforcement learning baseline for
+model reasoning. arXiv preprint arXiv:2504.02546, 2025.
+Cui, G., Zhang, Y., Ouyang, W., Cheng, Y., Zhou, B.,
+Ding, N., et al. The entropy mechanism of reinforcement
+learning for reasoning language models. arXiv preprint
+arXiv:2505.22617, 2025.
+Fatemi, M., Rafiee, B., Tang, M., and Talamadupula, K.
+Concise reasoning via reinforcement learning.
+arXiv
+preprint arXiv:2504.05185, 2025.
+Fayyaz, M., Aghazadeh, E., Modarressi, A., Pilehvar, M. T.,
+Yaghoobzadeh, Y., and Kahou, S. E. Bert on a data diet:
+Finding important examples by gradient-based pruning.
+In Proceedings of Advances in Neural Information Pro-
+cessing Systems (NeurIPS), 2022.
+Foster, T., Sims, A., Forkel, J., Fellows, M., and Foerster, J.
+Learning to reason at the frontier of learnability. arXiv
+preprint arXiv:2502.12272, 2025.
+Gao, S., Gong, T., Lin, Z., Xu, R., Zhou, H., and Li, J.
+Flue: Streamlined uncertainty estimation for large lan-
+guage models. In Proceedings of the Thirty-Ninth AAAI
+Conference on Artificial Intelligence, 2025a.
+Gao, Z., Kim, J., Sun, W., Joachims, T., Wang, S., Pang,
+R. Y., and Tan, L. Prompt curriculum learning for effi-
+cient llm post-training. arXiv preprint arXiv:2510.01135,
+2025b.
+Gao, Z., Kim, J., Sun, W., Joachims, T., Wang, S., Pang,
+R. Y., and Tan, L. Prompt curriculum learning for effi-
+cient llm post-training. arXiv preprint arXiv:2510.01135,
+2025c.
+Grattafiori, A. et al. The llama 3 herd of models. arXiv
+preprint arXiv:2407.21783, 2024.
+Guo, D., Yang, D., Zhang, H., Song, J., Zhang, R., Xu, R.,
+Zhu, Q., Ma, S., Wang, P., Bi, X., et al. Deepseek-r1: In-
+centivizing reasoning capability in llms via reinforcement
+learning. arXiv preprint arXiv:2501.12948, 2025.
+He, C., Luo, R., Bai, Y., Hu, S., Thai, Z., Shen, J., Hu, J.,
+Han, X., Huang, Y., Zhang, Y., Liu, J., Qi, L., Liu, Z., and
+9
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+Sun, M. OlympiadBench: A challenging benchmark for
+promoting AGI with olympiad-level bilingual multimodal
+scientific problems. In Proceedings of the 62nd Annual
+Meeting of the Association for Computational Linguistics
+(ACL), 2024.
+Hendrycks, D., Burns, C., Kadavath, S., Arora, A., Basart,
+S., Tang, E., Song, D., and Steinhardt, J. Measuring math-
+ematical problem solving with the math dataset. arXiv
+preprint arXiv:2103.03874, 2021.
+Hoeffding, W. Probability inequalities for sums of bounded
+random variables. Journal of the American Statistical
+Association, 1963.
+Hu, J.
+Reinforce++: A simple and efficient approach
+for aligning large language models.
+arXiv preprint
+arXiv:2501.03262, 2025.
+Huang, W., Zhang, Q., Fang, Y., Liang, J., Rong, X., Yao,
+H., Wan, G., Liang, K., He, W., Li, M., et al. Mapo:
+Mixed advantage policy optimization. arXiv preprint
+arXiv:2509.18849, 2025.
+Hugging Face. Open r1: A fully open reproduction of
+deepseek-r1, January 2025. URL https://github.
+com/huggingface/open-r1.
+Jaech, A., Kalai, A., Lerer, A., Richardson, A., El-Kishky,
+A., Low, A., Helyar, A., Madry, A., Beutel, A., Car-
+ney, A., et al. Openai o1 system card. arXiv preprint
+arXiv:2412.16720, 2024.
+Kim, H., Oh, S., and Lee, S. Mitigating length bias in rlhf
+through a causal lens. arXiv preprint arXiv:2511.12573,
+2025.
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+memory management for large language model serving
+with pagedattention. In Proceedings of the 29th Sympo-
+sium on Operating Systems Principles (SOSP), 2023.
+Lewkowycz, A., Andreassen, A., Dohan, D., Dyer, E.,
+Michalewski, H., et al.
+Solving quantitative reason-
+ing problems with language models.
+In Proceedings
+of Advances in Neural Information Processing Systems
+(NeurIPS), 2022.
+Li, S., Zhou, Z., Lam, W., Yang, C., and Lu, C. Repo:
+Replay-enhanced policy optimization. arXiv preprint
+arXiv:2506.09340, 2025a.
+Li, X., Zou, H., and Liu, P. Limr: Less is more for rl scaling.
+arXiv preprint arXiv:2502.11886, 2025b.
+Li, Z., Jiang, L., Hu, Y., Zeng, X., Li, Y., Zhang, X., Chen,
+G., Pan, Z., Li, X., and Liu, Y. No more stale feedback:
+Co-evolving critics for open-world agent learning. arXiv
+preprint arXiv:2601.06794, 2026.
+Liang, J., Tang, H., Ma, Y., Liu, J., Zheng, Y., Hu, S., Bai,
+L., and Hao, J. Squeeze the soaked sponge: Efficient
+off-policy reinforcement finetuning for large language
+model. arXiv preprint arXiv:2507.06892, 2025.
+Lin, Z., Lin, M., Xie, Y., and Ji, R. Cppo: Accelerating the
+training of group relative policy optimization-based rea-
+soning models. arXiv preprint arXiv:2503.22342, 2025.
+Liu, Z., Chen, C., Li, W., Qi, P., Pang, T., Du, C., Lee, W. S.,
+and Lin, M. Understanding r1-zero-like training: A criti-
+cal perspective, 2025. arXiv preprint arXiv:2503.20783,
+2025.
+Loshchilov, I. and Hutter, F. Decoupled weight decay reg-
+ularization. In Proceedings of the Seventh International
+Conference on Learning Representations (ICLR), 2019.
+Lu, N., Liu, S., Wu, J., Chen, W., Zhang, Z., Ong, Y.-S.,
+Wang, Q., and Tang, K. Safe delta: Consistently preserv-
+ing safety when fine-tuning LLMs on diverse datasets. In
+Proceedings of Forty-second International Conference on
+Machine Learning (ICML), 2025.
+Meng, F., Du, L., Liu, Z., Zhou, Z., Lu, Q., Fu, D., Shi,
+B., Wang, W., He, J., Zhang, K., et al.
+Mm-eureka:
+Exploring visual aha moment with rule-based large-scale
+reinforcement learning. arXiv preprint arXiv:2503.07365,
+2025.
+Noukhovitch, M., Huang, S., Xhonneux, S., Hosseini, A.,
+Agarwal, R., and Courville, A. Faster, more efficient
+RLHF through off-policy asynchronous learning. In Pro-
+ceedings of the Thirteenth International Conference on
+Learning Representations (ICLR), 2025.
+Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright, C.,
+Mishkin, P., Zhang, C., Agarwal, S., Slama, K., Ray, A.,
+et al. Training language models to follow instructions
+with human feedback. In Proceedings of Advances in
+Neural Information Processing Systems (NeurIPS), 2022.
+Paul, M., Ganguli, S., and Dziugaite, G. K. Deep learning
+on a data diet: Finding important examples early in train-
+ing. In Proceedings of Advances in Neural Information
+Processing Systems (NeurIPS), 2021.
+Rafailov, R., Sharma, A., Mitchell, E., Manning, C. D., Er-
+mon, S., and Finn, C. Direct preference optimization:
+Your language model is secretly a reward model. In Pro-
+ceedings of Advances in Neural Information Processing
+Systems (NeurIPS), 2023.
+Schulman, J., Wolski, F., Dhariwal, P., Radford, A., and
+Klimov, O. Proximal policy optimization algorithms.
+arXiv preprint arXiv:1707.06347, 2017.
+10
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., Bi, X., Zhang,
+H., Zhang, M., Li, Y., Wu, Y., et al. Deepseekmath: Push-
+ing the limits of mathematical reasoning in open language
+models. arXiv preprint arXiv:2402.03300, 2024.
+Shen, Q., Chen, D., Huang, Y., Ling, Z., Li, Y., Ding, B., and
+Zhou, J. Bots: A unified framework for bayesian online
+task selection in llm reinforcement finetuning. arXiv
+preprint arXiv:2510.26374, 2025.
+Sheng, G., Zhang, C., Ye, Z., Wu, X., Zhang, W., Zhang, R.,
+Peng, Y., Lin, H., and Wu, C. Hybridflow: A flexible and
+efficient rlhf framework. In Proceedings of the Twentieth
+European Conference on Computer Systems (EuroSys),
+2025a.
+Sheng, G., Zhang, C., Ye, Z., Wu, X., Zhang, W., Zhang, R.,
+Peng, Y., Lin, H., and Wu, C. Hybridflow: A flexible and
+efficient rlhf framework. In Proceedings of the Twentieth
+European Conference on Computer Systems (EuroSys),
+2025b.
+Shi, T., Wu, Y., Song, L., Zhou, T., and Zhao, J. Efficient
+reinforcement finetuning via adaptive curriculum learning.
+arXiv preprint arXiv:2504.05520, 2025.
+Singhal, P., Goyal, T., Xu, J., and Durrett, G. A long way
+to go: Investigating length correlations in RLHF. In
+Proceedings of First Conference on Language Modeling
+(COLM), 2024.
+Sun, Y., Guo, J., Kok, S., Wang, Z., Wen, Z., and
+Zhang, Z. Efficient reinforcement learning for large lan-
+guage models with intrinsic exploration. arXiv preprint
+arXiv:2511.00794, 2025a.
+Sun, Y., Shen, J., Wang, Y., Chen, T., Wang, Z., Zhou,
+M., and Zhang, H. Improving data efficiency for llm
+reinforcement fine-tuning through difficulty-targeted on-
+line data selection and rollout replay. In Proceedings
+of Advances in Neural Information Processing Systems
+(NeurIPS), 2025b.
+Sun, Y., Shen, J., Wang, Y., Chen, T., Wang, Z., Zhou,
+M., and Zhang, H. Improving data efficiency for llm
+reinforcement fine-tuning through difficulty-targeted on-
+line data selection and rollout replay. arXiv preprint
+arXiv:2506.05316, 2025c.
+Tang, X., Zhang, Z., Liu, Y., Zhao, W. X., Wen, Z., Zhang,
+Z., and Zhou, J. Towards high data efficiency in rein-
+forcement learning with verifiable reward. arXiv preprint
+arXiv:2509.01321, 2025.
+Team, Q. Qwen2.5: A party of foundation models, Septem-
+ber 2024.
+URL https://qwenlm.github.io/
+blog/qwen2.5/.
+Tomihari, A. Learning dynamics in rl post-training for lan-
+guage models. arXiv preprint arXiv:2601.04670, 2026.
+Wang, K., Zhang, G., Zhou, Z., Wu, J., et al. A comprehen-
+sive survey in llm(-agent) full stack safety: Data, train-
+ing and deployment. arXiv preprint arXiv:2504.15585,
+2025a.
+Wang, Y., Yang, Q., Zeng, Z., Ren, L., Liu, L., Peng, B.,
+Cheng, H., He, X., Wang, K., Gao, J., Chen, W., Wang,
+S., Du, S. S., and Shen, Y. Reinforcement learning for
+reasoning in large language models with one training
+example. arXiv preprint arXiv:2504.20571, 2025b.
+Wu, J., Fan, W., Chen, J., Liu, S., Li, Q., and Tang, K. Dis-
+entangled contrastive learning for social recommendation.
+In Proceedings of the 31st ACM International Confer-
+ence on Information & Knowledge Management (CIKM),
+2022.
+Wu, J., Fan, W., Chen, J., Liu, S., Liu, Q., He, R., Li, Q.,
+and Tang, K. Condensing pre-augmented recommen-
+dation data via lightweight policy gradient estimation.
+IEEE Transactions on Knowledge and Data Engineering,
+2025a.
+Wu, J., Liu, Q., Hu, H., Fan, W., Liu, S., Li, Q., Wu, X.-M.,
+and Tang, K. Leveraging chatgpt to empower training-
+free dataset condensation for content-based recommen-
+dation. In Companion Proceedings of the ACM on Web
+Conference 2025, 2025b.
+Xu, Y. E., Savani, Y., Fang, F., and Kolter, J. Z. Not all
+rollouts are useful: Down-sampling rollouts in llm rein-
+forcement learning. arXiv preprint arXiv:2504.13818,
+2025.
+Yang, A., Zhang, B., Hui, B., Gao, B., Yu, B., Li, C., Liu, D.,
+et al. Qwen2.5-math technical report: Toward mathemat-
+ical expert model via self-improvement. arXiv preprint
+arXiv:2409.12122, 2024.
+Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng,
+B., et al.
+Qwen3 technical report.
+arXiv preprint
+arXiv:2505.09388, 2025.
+Ye, C., Yu, Z., Zhang, Z., Chen, H., Sadagopan, N., Huang,
+J., Zhang, T., and Beniwal, A. Beyond correctness: Har-
+monizing process and outcome rewards through rl train-
+ing. arXiv preprint arXiv:2509.03403, 2025a.
+Ye, Y., Huang, Z., Xiao, Y., Chern, E., Xia, S., and Liu, P.
+LIMO: Less is more for reasoning. In Proceedings of
+the Second Conference on Language Modeling (COLM),
+2025b.
+Yu, Q., Zhang, Z., Zhu, R., Yuan, Y., Zuo, X., Yue, Y., Dai,
+W., Fan, T., Liu, G., Liu, L., et al. Dapo: An open-source
+11
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+llm reinforcement learning system at scale. arXiv preprint
+arXiv:2503.14476, 2025.
+Yuan, Y., Yue, Y., Zhu, R., Fan, T., and Yan, L. What’s
+behind ppo’s collapse in long-cot? value optimization
+holds the secret. arXiv preprint arXiv:2503.01491, 2025.
+Yue, Y., Yuan, Y., Yu, Q., Zuo, X., Zhu, R., Xu, W., Chen,
+J., Wang, C., Fan, T., Du, Z., et al. Vapo: Efficient and
+reliable reinforcement learning for advanced reasoning
+tasks. arXiv preprint arXiv:2504.05118, 2025.
+Zeng, Y., Sun, Z., Ji, B., Min, E., Cai, H., Wang, S., Yin, D.,
+Zhang, H., Chen, X., and Wang, J. Cures: From gradient
+analysis to efficient curriculum learning for reasoning
+llms. arXiv preprint arXiv:2510.01037, 2025.
+Zhang, E., Yan, X., Lin, W., Zhang, T., and Qianchun, L.
+Learning like humans: Advancing llm reasoning capa-
+bilities via adaptive difficulty curriculum learning and
+expert-guided self-reformulation. In Proceedings of the
+2025 Conference on Empirical Methods in Natural Lan-
+guage Processing (EMNLP), 2025a.
+Zhang, H., Fu, J., Zhang, J., Fu, K., Wang, Q., Zhang,
+F., and Zhou, G. Rlep: Reinforcement learning with
+experience replay for llm reasoning.
+arXiv preprint
+arXiv:2507.07451, 2025b.
+Zhang, X., Li, C., Zong, Y., Ying, Z., He, L., and Qiu, X.
+Evaluating the performance of large language models on
+gaokao benchmark, 2023.
+Zhang, X., Wang, J., Cheng, Z., Zhuang, W., Lin, Z.,
+Zhang, M., Wang, S., Cui, Y., Wang, C., Peng, J., Jiang,
+S., Kuang, S., Yin, S., Wen, C., Zhang, H., Chen, B.,
+and Yu, B. Srpo: A cross-domain implementation of
+large-scale reinforcement learning on llm. arXiv preprint
+arXiv:2504.14286, 2025c.
+Zhao, Y., Gu, A., Varma, R., Luo, L., Huang, C.-C., Xu, M.,
+Wright, L., Shojanazeri, H., Ott, M., Shleifer, S., et al.
+Pytorch fsdp: experiences on scaling fully sharded data
+parallel. arXiv preprint arXiv:2304.11277, 2023.
+Zheng, C., Liu, S., Li, M., Chen, X.-H., Yu, B., Gao,
+C., Dang, K., Liu, Y., Men, R., Yang, A., et al.
+Group sequence policy optimization.
+arXiv preprint
+arXiv:2507.18071, 2025a.
+Zheng, H., Zhou, Y., Bartoldson, B. R., Kailkhura, B., Lai,
+F., Zhao, J., and Chen, B. Act only when it pays: Efficient
+reinforcement learning for llm reasoning via selective
+rollouts. arXiv preprint arXiv:2506.02177, 2025b.
+Zhou, C., Liu, P., Xu, P., Iyer, S., Sun, J., Mao, Y., Ma,
+X., Efrat, A., Yu, P., Yu, L., et al. Lima: Less is more
+for alignment. In Proceedings of Advances in Neural
+Information Processing Systems (NeurIPS), 2023.
+12
+Appendix of HIVE: Online-Verified Prompt Selection for Efficient RL Training
+of Large Reasoning Model
+In this appendix, we provide proofs for Theorem 3.1 (Appendix A), the details for experimental settings (Appendix B),
+detailed related work (Appendix C), additional experiments (Appendix D), and algorithm (Appendix E).
+A. Proof of Theorem 3.1
+In this section, we provide a rigorous theoretical analysis of our method. We aim to establish a probabilistic guarantee that
+the ranking of the prompt-side entropy V (x) consistently reflects the ranking of the true response-side entropy U ∗(x).
+A.1. Preliminaries and Notations
+Let the fixed model parameters be ˆθ and the vocabulary size be |V|. We denote the sampling policy used for generation as
+q(·|x) (e.g., temperature sampling with parameter τ).
+Observable: Prompt-side Entropy.
+Given a prompt sequence x = (x1, . . . , xL), the model computes the probability
+distribution over the vocabulary at each position. Let pˆθ,τ(·|x<l) = softmax(zˆθ(x<l)/τ) denote the temperature-scaled
+probability. The observable token entropy at position l is el(x) := H(pˆθ,τ(·|x<l)). We define the aggregated prompt entropy
+as:
+V (x) :=
+1
+L −1
+L
+X
+l=2
+el(x).
+(15)
+Observable: Response-side Entropy.
+For a given prompt x, we generate G independent rollouts to estimate the output
+entropy. For the r-th rollout, let the response be y(r)
+1:Lr. Define the step context as c(r)
+t
+:= (x, y(r)
+<t ). The token entropy at
+step t is u(r)
+t (x) := H(pˆθ,τ(·|c(r)
+t )). The length-normalized entropy for rollout r is U (r)(x) :=
+1
+Lr
+PLr
+t=1 u(r)
+t (x). The final
+empirical estimator is the average over n rollouts:
+ˆU(x) := 1
+n
+n
+X
+r=1
+U (r)(x).
+(16)
+We define the target U ∗(x) := Ey∼q(·|x)[U (r)(x)] as the expected entropy under the sampling policy.
+A.2. Theoretical Bridges and Assumptions
+To bridge the gap between the computationally tractable token-level logits entropy and the model’s high-level semantic
+entropy, we establish our theoretical analysis upon two pivotal assumptions. First, we map the observable token entropy to
+the model’s internal representation entropy (Representation Approximation). Second, we posit that this internal entropy
+propagates linearly from the prompt to the response (Entropy Propagation).
+A.2.1. FROM TOKEN TO REPRESENTATION.
+While observable entropies V (x) and U ∗(x) are derived from the final output layer, true epistemic entropy is often better
+encoded in the latent space. Following (Gao et al., 2025a), we define the Representation Entropy s(c) as the entropy of
+hidden states at a deep layer b ≈N, formally s(c) ≈ˆH[H(b)|c]. We define the aggregated representation entropies for the
+prompt and response as:
+Sprompt(x) :=
+1
+L −1
+L
+X
+l=2
+s(x<l), Sresp(x) := Ey
+"
+1
+T
+T
+X
+t=1
+s(ct)
+#
+.
+(17)
+13
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+Based on this definition, we introduce our first assumption to link observables to internal states.
+Assumption A.1 (Representation Approximation). The observable token entropy approximates the internal representation
+entropy up to a small residual δ:
+|V (x) −Sprompt(x)| ≤δ
+and
+|U ∗(x) −Sresp(x)| ≤δ.
+(18)
+Justification (Theoretical): This assumption is grounded in Proposition 1 of (Gao et al., 2025a), which proves that for trained
+LLMs, the entropy of hidden states in deep layers serves as an approximate upper bound for the predictive posterior entropy
+(i.e., our token entropy). As the layer depth b →N, the mutual information is maximized, ensuring the token entropy is
+tightly correlated with the internal representation.
+A.2.2. ENTROPY PROPAGATION.
+Figure 9. Validation of Entropy Propagation (Assump-
+tion A.2). The scatter plot illustrates the relationship between
+Prompt Mean Entropy and Response Entropy over 2,048 sam-
+ples. Due to the stochastic nature of generation, we visualize
+binned statistics (blue points, mean ± std) to disentangle the
+linear signal from individual sample noise (grey dots). The
+regression line on the binned data exhibits an exceptional
+fit(R2 = 0.9216, r = 0.9600), confirming that prompt en-
+tropy linearly dictates the expected response entropy.
+Having established the link to internal representations, we next
+model how this entropy evolves from the input context to the
+generation phase.
+Assumption A.2 (Entropy Propagation). The representation
+entropy in the prompt propagates linearly to the response gen-
+eration stage. There exist constants a > 0, b ∈R such that:
+|Sresp(x) −(aSprompt(x) + b)| ≤ϵ.
+(19)
+Justification (Empirical): To validate this linearity and quantify
+the noise ϵ, we analyzed 2,048 prompts. We computed V (x)
+as the proxy for Sprompt (per Assumption A.1). To mitigate the
+intrinsic stochasticity of LLM generation and reveal the under-
+lying propagation law, we employ a binned analysis. As shown
+in Figure 9, we observe an exceptionally strong positive cor-
+relation (Pearson r=0.9600) between the prompt and response
+entropy. By analyzing the data through binned means (blue
+error bars), we find that the average response entropy scales
+strictly linearly with prompt entropy. The linear regression fit
+achieves a high coefficient of determination (R2 = 0.9216),
+empirically confirming that higher entropy in the prompt repre-
+sentation propagates predictably to the generation phase (a > 0),
+validating the linear structure of Assumption A.2 despite intrinsic generation stochasticity.
+A.3. Concentration Bound
+Lemma A.3 (High-probability Concentration). For any fixed prompt x and tolerance η > 0, the empirical entropy ˆU(x)
+concentrates around the true expectation U ∗(x):
+Pr
+
+| ˆU(x) −U ∗(x)| > η
+
+≤2 exp
+
+−
+2nη2
+(log |V|)2
+
+.
+(20)
+Consequently, for any confidence level 1 −α (where α ∈(0, 1)), with probability at least 1 −α:
+| ˆU(x) −U ∗(x)| ≤η(α) := log |V|
+r
+log(2/α)
+2n
+.
+(21)
+Proof. The sequence-level entropy U (r)(x) for each rollout is bounded within [0, log |V|]. Since the n rollouts are generated
+independent and identically distributed (i.i.d.) from the sampling policy q(·|x), Hoeffding’s inequality (Hoeffding, 1963)
+applies directly to the empirical mean ˆU(x), yielding the stated bound.
+14
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+A.4. Main Result: Rank Consistency
+Theorem A.4 (Theorem 3.1). Consider a pair of prompts (x, x′). Let ∆V := V (x) −V (x′) be the observable difference in
+prompt entropy, and ∆U := ˆU(x) −ˆU(x′) be the difference in estimated response entropy. Under Assumptions A.1 and A.2,
+for any α ∈(0, 1), with probability at least 1 −2α:
+|∆U −a∆V | ≤2ϵ + 2(a + 1)δ + 2η(α).
+(22)
+Crucially, if the prompt entropy margin satisfies |a∆V | > 2ϵ + 2(a + 1)δ + 2η(α), then the ranking is preserved:
+sign( ˆU(x) −ˆU(x′)) = sign(V (x) −V (x′)).
+(23)
+Proof. We decompose the error into three components: sampling noise, propagation residual, and representation approxima-
+tion error.
+Step 1: Sampling Noise. By applying Lemma A.3 and a union bound over prompts x and x′, with probability ≥1 −2α,
+the empirical estimates are close to their true expectations:
+|∆U −(U ∗(x) −U ∗(x′))| ≤2η(α).
+(24)
+Step 2: Propagation Dynamics. From Assumption A.2, we express the response representation entropy as Sresp(x) =
+aSprompt(x) + b + ξ(x) where |ξ(x)| ≤ϵ. The difference between two prompts cancels out the bias term b:
+|(Sresp(x) −Sresp(x′)) −a(Sprompt(x) −Sprompt(x′))| ≤2ϵ.
+(25)
+Step 3: Representation Approximation. Using Assumption A.1, we substitute the theoretical representation entropies with
+observable token entropies. We have |(U ∗(x) −U ∗(x′)) −(Sresp(x) −Sresp(x′))| ≤2δ and |(Sprompt(x) −Sprompt(x′)) −
+∆V | ≤2δ. Applying the triangle inequality and scaling the prompt-side error by a:
+|(U ∗(x) −U ∗(x′)) −a∆V | ≤2ϵ + 2δ + 2aδ = 2ϵ + 2(a + 1)δ.
+(26)
+Combining Eq. (24) and Eq. (26) yields the final bound in Eq. (22). The condition |a∆V | > RHS (Right-Hand Side)
+ensures that the signal magnitude exceeds the worst-case cumulative noise, guaranteeing that the sign of the difference
+remains unchanged.
+B. Detailed Experimental Setting for Main Study
+For the experimental settings, we mainly follow GRESO (Zheng et al., 2025b). The details are introduced as follows.
+Models & Datasets. We run our experiments on Qwen2.5-Math-1.5B (Yang et al., 2024), DeepSeek-R1-Distill-Qwen-
+1.5B (Guo et al., 2025), Qwen2.5-Math-7B (Yang et al., 2024), and Llama-3.2-3B-Instruct (Grattafiori et al., 2024). For
+Qwen2.5-Math-1.5B/7B, we set the context length to 4096. For DeepSeek-R1-Distill-Qwen-1.5B and Llama-3.2-3B-Instruct,
+we set the context length to 8196. For training datasets, we evaluate our methods with two datasets following (Zheng et al.,
+2025b): 1) DAPO+MATH (DM): It is the combination of DAPO dataset (Yu et al., 2025) and MATH dataset (Hendrycks
+et al., 2021), which also contains LaTeX-formatted solutions. 2) OPEN-R1 30k subset (R1): 30,000-example subset of the
+OPEN-R1 math dataset (Hugging Face, 2025).
+Training & Evaluation. Our method is implemented based on verl (Sheng et al., 2025b) and vLLM (Kwon et al., 2023).
+We use 8×A100 GPUs for all experiments. We follow GRESO (Zheng et al., 2025b) to set the rollout sampling temperature
+to 1. For Qwen2.5-Math-1.5B/7B and Llama-3.2-3B-Instruct, the training batch size is set to 256, rollout sampling batch
+size to 384, and the mini-batch size to 512. For DeepSeek-R1-Distill-Qwen-1.5B, the training batch size is set to 128, the
+rollout sampling batch size to 192, and the mini-batch size to 512. We sample 8 responses per prompt. For all four models,
+we use 8× A100 to for training. For DeepSeek-R1-Distill-Qwen-1.5B and Llama-3.2-3B-Instruct, we set the context length
+to 8196. For Qwen2.5-Math-1.5B/7B, we set the context length to 4096. All the models are trained for 1000 steps, and the
+optimizer is AdamW (Loshchilov & Hutter, 2019) with a constant learning rate of 1e-6, β1 = 0.9, β2 = 0.999, and a weight
+decay of 0.01. We use the following question template to prompt the LLM. For reward assignment, we give a score of 0.1 for
+15
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+successfully extracting an answer and a score of 1.0 if the extracted answer is correct. Similar to (Yu et al., 2025), we remove
+the KL-divergence term. The optimization is performed on the parameters of the actor module wrapped with Fully Sharded
+Data Parallel (FSDP) (Zhao et al., 2023) for efficient distributed training. For benchmark datasets, we use six widely used
+complex mathematical reasoning benchmarks to evaluate the performance of trained models: Math500 (Hendrycks et al.,
+2021), AIME24 (Art of Problem Solving, 2024a), AMC (Art of Problem Solving, 2024b), Minerva Math (Lewkowycz et al.,
+2022), Gaokao (Zhang et al., 2023), and Olympiad Bench (He et al., 2024). Following (Zheng et al., 2025b), we evaluate
+models on those benchmarks every 50 steps and report the performance of the checkpoint that obtains the best average
+performance on six benchmarks.
+Question Template
+Please solve the following math problem: {{Question Description}}. The assistant first thinks about the reasoning
+process step by step and then provides the user with the answer. Return the final answer in \boxed{} tags, for example
+\boxed{1}. Let’s solve this step by step.
+C. Detailed Related Work
+RL for LLM Reasoning. Reinforcement learning (RL) has become a key technique for post-training large language models
+(LLMs) (Christiano et al., 2017; Bai et al., 2022). Early work (Ouyang et al., 2022; Rafailov et al., 2023) used RL to
+incorporate reward signals from human feedback, enabling LLMs to generate faithful and harmless responses that follow
+instructions and align with human preferences. More recently, reinforcement learning with verifiable rewards (RLVR)
+has emerged as a strong alternative (Guo et al., 2025; Hu, 2025; Liu et al., 2025; Jaech et al., 2024; Zhang et al., 2025c;
+Wang et al., 2025a). Instead of relying on a learned reward model, RLVR optimizes policies using verifiable reward
+signals. This leads to large gains in reasoning, especially in mathematics and programming. Building on RLVR, subsequent
+work has developed RL algorithms tailored to LLM reasoning, most commonly within the Proximal Policy Optimization
+(PPO) (Schulman et al., 2017) and Generalized Relative Policy Optimization (GRPO) (Shao et al., 2024) frameworks. For
+example, VC-PPO (Yuan et al., 2025) and VAPO (Yue et al., 2025) improve reasoning by strengthening value-function
+learning under PPO. In contrast, RLOO (Ahmadian et al., 2024) and GRPO (Shao et al., 2024) use multi-sample baselines
+to avoid explicit value learning, enabling efficient and stable updates. Some studies (Liang et al., 2025; Li et al., 2025a;
+Zhang et al., 2025b; Lu et al., 2025) also explore experience-replay variants that incorporate historical trajectories or expert
+demonstrations to enhance LLM reasoning. Other work modifies the optimization objective to improve stability and reduce
+bias (Liu et al., 2025; Chu et al., 2025; Huang et al., 2025): Dr. GRPO (Liu et al., 2025) analyzes and mitigates systematic
+optimization bias during training, while GSPO (Zheng et al., 2025a) replaces token-level ratio/clipping with sequence-level
+counterparts. However, these methods still under-explore rollouts at the frontier of model capability. DAPO (Yu et al.,
+2025) further improves sample efficiency by filtering instances that are consistently correct or consistently incorrect across
+multiple rollouts, but it relies on costly multi-sample evaluation to identify such instances, which limits scalability.
+Data Efficient LLM Training. Data quality and selection are key drivers of LLM performance. Consistent with the “less is
+more” principle, small curated datasets can match or outperform finetuning on large noisy corpora in SFT (Zhou et al., 2023;
+Ye et al., 2025b), and reinforced finetuning similarly depends on prompt and trajectory quality—making data curation central
+to efficient learning. A common approach is offline filtering, which ranks prompts before finetuning using static heuristics
+(e.g., difficulty, domain balance, diversity) (Wang et al., 2025b; Fatemi et al., 2025; Li et al., 2025b; Shi et al., 2025; Tang
+et al., 2025; Wu et al., 2025a; 2022). However, it adds substantial preprocessing cost and cannot adapt to the model’s
+rapidly changing competence during training. To address this, recent work explores online selection, dynamically choosing
+prompts conditioned on the current policy. A line of work adopts step-wise selection: at each training step, it rollouts and
+evaluate candidate prompts to discard uninformative prompts (Yu et al., 2025; Meng et al., 2025; Foster et al., 2025; Xu
+et al., 2025; Lin et al., 2025; Sun et al., 2025a; Wu et al., 2025b) or prioritize those of medium difficulty (Bae et al., 2025),
+but these methods requires repeated rollouts and evaluations, incurring substantial computational overhead. Other methods
+evaluate without direct rollout by maintaining historical logs and applying heuristics (Zheng et al., 2025b) or Bayesian
+estimators (Chen et al., 2025b; Zeng et al., 2025; Shen et al., 2025) to filter prompts; however, they introduce additional
+memory overhead and can suffer from large estimation errors. In contrast, some studies use auxiliary model to estimate
+diffuculty. For example, DOTS (Sun et al., 2025c) trains an auxiliary model and rollouts a small set of reference tasks to
+infer the difficulty of the remaining prompts, whereas PCL (Gao et al., 2025c) leverages an on-policy value model updated
+jointly with the policy to identify medium-difficulty prompts; however, these methods impose non-trivial additional compute
+16
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+(a) r = 10%
+(b) r = 20%
+(c) r = 30%
+(d) r = 40%
+Figure 10. Relationship between prompt entropy and response entropy computed over the top-r% tokens in the response distribution,
+sweeping r ∈{10, 20, 30, 40}. Each panel reports the binned mean trend under the corresponding ratio setting.
+and memory costs for policy optimization. Another approches adopt stage-wise data curation periodically re-estimates
+difficulty to refresh the training set (Zhang et al., 2025a;c), but it is often insufficiently adaptive and fails to track real-time
+learning dynamics.
+In contrast, our method, HIVE, establishes a hierarchical filtering paradigm that simultaneously achieves the high precision of
+online selection and the low overhead of historical heuristics. Unlike rollout-dependent approaches (Yu et al., 2025; Xu et al.,
+2025) that incur prohibitive costs by generating full responses before filtering, HIVE leverages prompt entropy as a cost-
+effective proxy to preemptively prune uninformative samples. Furthermore, distinct from estimator-based methods (Zheng
+et al., 2025b) that suffer from metadata staleness as the model updates, HIVE employs this real-time verification to
+dynamically track the shifting “learning edge.” This allows HIVE to discard prompts that have become trivial or intractable
+in the current iteration, eliminating the resource waste caused by the discrepancy between historical logs and real-time
+capability. By integrating history-informed priors with online-verified precision, HIVE offers a Pareto-optimal solution for
+scaling RLVR efficiently.
+D. Additional Experiments
+D.1. Correlation Between Prompt Entropy and Response Entropy
+Building on the empirical validation of Assumption A.2, we conduct an additional robustness study by redefining the
+response entropy Sresp(x) as the entropy computed over only the top-r% tokens of the response distribution, sweeping
+17
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+r ∈{10, 20, 30, 40}. To suppress intrinsic decoding stochasticity, we follow the same binned-mean protocol on 2,048
+prompts, binning by Sprompt(x) (proxied by V (x)) and averaging S(r)
+resp(x) within each bin. As shown in Figure 10,
+the prompt–response relationship remains strongly linear across all ratios. This indicates that the observed entropy
+propagation law is a stable property of the generation dynamics, further strengthening the linear structure and bounded-noise
+characterization in Assumption A.2.
+D.2. Case Study
+To gain deeper insight into the behavior of our selective filtering algorithm, we analyze a case study based on prompts from
+the MATH dataset. We divide these prompts into four categories: Frequently Skipped Prompts (Easy), Frequently Skipped
+Prompts (Hard), Frequently Selected Prompts, and Prompts Frequently Selected by Stage 1 but Skipped by Stage 2. We
+observe that frequently skipped easy prompts often involve simple computations or routine use of formulas, leading to high
+solution rates across sampled responses. In contrast, hard prompts that are often skipped tend to be too difficult for the
+model, leading to low or zero success across rollouts, limiting their value for training. Frequently selected prompts tend to
+be moderately difficult, making consistent contributions to model learning. Furthermore, we analyze the prompts selected in
+stage 1 but filtered after stage 2. Most prompts are relatively easy, showing that the historical information is not reliable for
+filtering.
+Frequently Skipped Prompts (Easy)
+1. Question: What is the value of (2x + 5)2 when x = 3? Solution: 121.
+2. Question: Solve for x: 5x+4 = 125x? Solution: 21.
+3. Question: A squirrel travels at a constant 4 miles per hour. How long does it take for this squirrel to travel 1 mile?
+Express your answer in minutes. Solution: 15.
+4. Question: Evaluate log5625. Solution: 4.
+5. Question: What value of x will give the minimum value for x2 −10x + 24? Solution: 5.
+Frequently Skipped Prompts (Hard)
+1. Question: Let △PQR be a right triangle with PQ = 90, PR = 120, and QR = 150. Let C1 be the inscribed
+circle. Construct ST with S on PR and T on QR, such that ST is perpendicular to PR and tangent to C1. Construct
+UV with U on PQ and V on QR such that UV is perpendicular to PQ and tangent to C1. Let C2 be the inscribed
+circle of △RST and C3 the inscribed circle of △QUV . The distance between the centers of C2 and C3 can be
+written as
+√
+10n. What is n? Solution: 725.
+2. Question: Consider the region A in the complex plane that consists of all points z such that both z
+40 and 40
+z have
+real and imaginary parts between 0 and 1, inclusive. Find the area of A. Solution: 1200 −200π.
+3. Question: Ephram is growing 3 different variants of radishes in a row of 13 radishes total, but he forgot where
+he planted each radish variant and he can’t tell what variant a radish is before he picks it. Ephram knows that he
+planted at least one of each radish variant, and all radishes of one variant will form a consecutive string, with all such
+possibilities having an equal chance of occurring. He wants to pick three radishes to bring to the farmers market, and
+wants them to all be of different variants. Given that he uses optimal strategy, the probability that he achieves this can
+be expressed as m
+n , where m and n are relatively prime positive integers. Find m + n. Solution: 17.
+4. Question: There are 1000 rooms in a row along a long corridor. Initially, the first room contains 1000 people, and
+the remaining rooms are empty. Each minute, the following happens: for each room containing more than one person,
+someone in that room decides it is too crowded and moves to the next room. All these movements are simultaneous
+(so nobody moves more than once within a minute). After one hour, how many different rooms will have people in
+them? Solution: 31.
+5. Question: A regular hexagon has side length 6. Congruent arcs with radius 3 are drawn with the center at each of
+the vertices, creating circular sectors as shown. The region inside the hexagon but outside the sectors is shaded as
+shown. The original answer is in the form a
+√
+b −cπ. Please find the value of a + b + c. Solution: 75.
+18
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+Frequently Selected Prompts After Stage 2
+1. Question: Let z be a complex number such that
+|z −12| + |z −5i| = 13.
+Find the smallest possible value of |z|. Solution: 60
+13.
+2. Question: Find all real solutions to x4 + (2 −x)4 = 34. Enter all the solutions, separated by commas. Solution:
+1 +
+√
+2, 1 −
+√
+2.
+3. Question: Let b be a real number randomly selected from the interval [−17, 17]. Then, m and n are two relatively
+prime positive integers such that mn is the probability that the equation x4 + 25b2 = (4b2 −10b)x2 has at least two
+distinct real solutions. Find the value of m + n. Solution: 63.
+4. Question: Let a, b, c, d be real numbers such that
+frac(a −b)(c −d)(b −c)(d −a) = frac25.
+Find the sum of all possible values of
+(a −c)(b −d)
+(a −b)(c −d).
+Solution: −3
+2.
+5. Question: The function f, defined on the set of ordered pairs of positive integers, satisfies the following properties:
+f(x, x) = x,
+f(x, y) = f(y, x),
+and
+(x + y)f(x, y) = yf(x, x + y).
+Calculate f(14, 52). Solution: 364.
+Prompts Frequently Selected by Stage 1 but Skipped by Stage 2
+1. Question: A polynomial with integer coefficients is of the form
+9x4 + a3x3 + a2x2 + a1x + 15 = 0.
+Find the number of different possible rational roots of this polynomial. Solution: 16.
+2. Question: When an integer is divided by 15, the remainder is 7. Find the sum of the remainders when the same
+integer is divided by 3 and by 5. Solution: 3.
+3. Question: Find the number of positive divisors of 2002. Solution: 16.
+4. Question: What is the base five product of the numbers 1215 and 115? Solution: 1331.
+5. Question: If sin x = 3 cos x, then what is sin x cos x Solution:
+3
+10.
+E. Algorithm
+The HIVE training procedure is illustrated in Algorithm 1. The process begins with History-Informed Selection, where the
+system iteratively samples raw prompts from the dataset D. For each sampled prompt, we retrieve its historical metadata,
+consisting of the consecutive zero-variance counts zi and the historical response entropy Hi. These metrics are combined
+into a selection probability Pselect using a weighted combination of reward decay and entropy normalization. We employ
+Bernoulli sampling to accumulate a candidate pool Dcand until its size reaches twice the target training batch size (i.e.,
+2 · Bt). This 2× oversampling strategy is a prerequisite for the subsequent median-based truncation, ensuring the final batch
+size aligns with the target computational budget.
+19
+HIVE: Online-Verified Prompt Selection for Efficient RL Training of LRM
+Algorithm 1 Training Iteration in HIVE
+Require: Dataset D; Historical trace T ; Target training batch size Bt; Group size G; Base exploration probability pe,easy,
+pe,hard; Step size ∆p; Target zero-var ratio α.
+1: Dcand ←∅
+2: neasy, nhard, ntotal ←0, 0, 0
+3: # Stage 1: History-Informed Selection
+4: repeat
+5:
+{xi} ←Sample raw prompts from D
+6:
+for each xi in batch do
+7:
+Retrieve zero-var count zi and history entropy Hi from T
+8:
+PRew ←pzi
+e ;
+PEnt ←Normalize(Hi)
+9:
+Pselect ←λPRew + (1 −λ)PEnt
+10:
+if Bernoulli(Pselect) = 1 then
+11:
+Dcand ←Dcand ∪{xi}
+12:
+end if
+13:
+end for
+14: until |Dcand| ≥2 · Bt
+15: # Stage 2: Online-Verified Selection (Deterministic Gate)
+16: Calculate prompt entropy V (x) for all x ∈Dcand
+17: γ ←median({V (x) | x ∈Dcand})
+18: Dfinal ←{x ∈Dcand | V (x) ≥γ}
+19: # Rollout Phase
+20: {xi, ri} ←Generate G rollouts for each x ∈Dfinal
+21: # GRPO Training
+22: Update policy model πθ using GRPO on {xi, ri}
+23: # History Update & Statistics
+24: Update T with new rewards and response entropies
+25: ntotal ←|Dfinal|
+26: neasy ←count zero var(easy subset);
+nhard ←count zero var(hard subset)
+27: # Adaptive Exploration Adjustment
+28: for type ∈{easy, hard} do
+29:
+if ntype/ntotal > α then
+30:
+pe,type ←pe,type −∆p
+31:
+else
+32:
+pe,type ←pe,type + ∆p
+33:
+end if
+34: end for
+Once the candidate pool is populated, the flow transitions to Online-Verified Selection, a deterministic gatekeeper grounded
+in the model’s current state. For every candidate in Dcand, we compute the prompt-side entropy V (x) via a single efficient
+forward pass. To adaptively identify the current learning edge, we calculate the median entropy γ = median({V (x)}) of
+the accumulated pool. A strict filter is then applied to retain only prompts where V (x) ≥γ. This step effectively discards
+the bottom 50% of samples with low uncertainty, yielding a final high-utility batch Dfinal.
+With the filtered batch established, the system proceeds to the normal Rollout and Policy Update phase, which is identical
+to the GRPO algorithm. After training finishes, the resulting rewards and response entropies are immediately written back to
+the historical trace T to update the metadata for future iterations.
+20

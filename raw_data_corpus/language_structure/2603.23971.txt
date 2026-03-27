@@ -1,0 +1,1563 @@
+The Price Reversal Phenomenon: When Cheaper Reasoning
+Models End Up Costing More
+Lingjiao Chen1,4
+Chi Zhang3
+Yeye He4
+Ion Stoica2
+Matei Zaharia2
+James Zou1
+1Stanford University
+2UC Berkeley
+3CMU
+4Microsoft Research
+Abstract
+Developers and consumers increasingly choose reasoning language models (RLMs) based on
+their listed API prices. However, how accurately do these prices reflect actual inference costs? We
+conduct the first systematic study of this question, evaluating 8 frontier RLMs across 9 diverse
+tasks covering competition math, science QA, code generation, and multi-domain reasoning. We
+uncover the pricing reversal phenomenon: in 21.8% of model-pair comparisons, the model with
+a lower listed price actually incurs a higher total cost, with reversal magnitude reaching up to
+28×. For example, Gemini 3 Flash’s listed price is 78% cheaper than GPT-5.2’s, yet its actual
+cost across all tasks is 22% higher.
+We trace the root cause to vast heterogeneity in thinking
+token consumption: on the same query, one model may use 900% more thinking tokens than
+another. In fact, removing thinking token costs reduces ranking reversals by 70% and raises the
+rank correlation (Kendall’s τ) between price and cost rankings from 0.563 to 0.873. We further
+show that per-query cost prediction is fundamentally difficult: repeated runs of the same query
+yield thinking token variation up to 9.7×, establishing an irreducible noise floor for any predictor.
+Our findings demonstrate that listed API pricing is an unreliable proxy for actual cost, calling for
+cost-aware model selection and transparent per-request cost monitoring.
+1
+Introduction
+There has been an arms race in the AI industry to offer reasoning language models (RLMs) with
+affordable API pricing [OpenAI, 2024, Guo et al., 2025, Chen et al., 2025, Google, 2025, Muennighoff
+et al., 2025]. For example, OpenAI GPT-4, when initially released in 2023, cost $30 per million input
+tokens and $60 per million output tokens [Chen et al., 2024]. Today, GPT-5.2 costs only $1.75 per
+million input tokens and $14 per million output tokens [OpenAI], and Google Gemini 3 Flash charges
+$0.5 per million input tokens and $3 per million output tokens [Google AI]. The drop in API pricing
+makes these models accessible to a broad range of users, and listed prices have become the primary
+basis on which developers and enterprises compare and select models.
+Model cost comparison is a common component in designing real-world AI applications. Based
+on our discussions with practitioners, nominal API pricing is often directly used to compare the cost
+of different models [Chen et al., 2020, Erol et al., 2025, Wang et al., 2025]. For example, Gemini 3
+Flash is typically deemed cheaper than GPT-5.2, as the former’s API price is lower than the latter for
+both input and output tokens. The cost comparison plays an important role for cost-sensitive users
+to determine which model to use. Underlying this practice is an implicit assumption: a model with a
+lower unit price will also incur a lower total cost on any workload.
+However, does this assumption hold? Does the API pricing reflect the actual cost accurately? In
+this paper, we perform a systematic study on frontier RLMs’ actual cost on a diverse set of tasks.
+Our study has found the pricing reversal phenomenon: a model with lower API pricing can cost much
+more than a model with higher API pricing. For example, GPT-5.2’s API pricing is 4.5x of Gemini 3
+Flash, but its actual cost is only 81% of Gemini 3 Flash (see Figure 1). Similarly, Claude Opus 4.6’s
+API pricing is twice that of Google Gemini 3.1 Pro, but its actual cost is 35% lower.
+This phenomenon has a deep connection to economic and sociological intuitions. In hourly billing
+settings, a more efficient worker may charge a higher rate but complete the job in less time, resulting
+1
+arXiv:2603.23971v1  [cs.CL]  25 Mar 2026
+0
+10
+20
+30
+40
+Listed price ($ per MTok)
+0
+200
+400
+600
+800
+1000
+1200
+1400
+1600
+Actual cost ($)
+Claude Opus 4.6
+GPT-5.2
+Gemini 3.1 Pro
+Kimi K2.5
+Gemini 3 Flash
+a
+0
+5
+0
+25
+50
+Claude Haiku 4.5
+GPT-5 Mini
+MiniMax-M2.5
+Input pricing
+Output pricing
+GPT-5.2  
+$15.8
+  GPT-5.2
+$527
+GPT-5 Mini  
+$2.25
+  GPT-5 Mini
+$53
+Gemini 3.1 Pro  
+$14.0
+  Gemini 3.1 Pro
+$1,169
+Gemini 3 Flash  
+$3.50
+  Gemini 3 Flash
+$643
+Claude Opus 4.6  
+$30.0
+  Claude Opus 4.6
+$768
+Claude Haiku 4.5  
+$6.00
+  Claude Haiku 4.5
+$37
+Kimi K2.5  
+$3.60
+  Kimi K2.5
+$290
+MiniMax-M2.5  
+$1.50
+  MiniMax-M2.5
+$23
+Listed price rank
+Actual cost rank
+($ per MTok)
+(total $)
+b
+Figure 1: The phenomenon of mismatch between AI model pricing and their actual costs. (a) On the
+same user workloads, AI models with lower listed prices may incur much higher expenses than those
+with higher prices. For example, Gemini 3 Flash’s list price ($3.5/1 million tokens) is 78% cheaper
+than that of GPT-5.2 ($15.75), but its actual cost ($643) is actually 22% higher than GPT-5.2 ($527).
+(b) This dramatically changes the cost ranking and poses a pressing challenge to cost-sensitive users.
+For example, one might choose GPT-5 Mini over Claude Haiku 4.5 due to its listed lower price, but
+recognize later that it is 43% more expensive on her workload.
+in a lower total cost. Similarly, a well-prepared student often solves an exam problem with fewer steps
+and thus finishes early. This suggests that seemingly “cheaper” options do not necessarily lead to lower
+overall cost. In our setting, token consumption plays the role of “time”, and thus a model with higher
+per-token pricing may still be more cost-efficient if it requires substantially fewer tokens.
+Building on this intuition, we find that the root cause is the heterogeneity in thinking token con-
+sumption across models. RLMs produce both visible response tokens and invisible thinking tokens, the
+latter of which often vary by an order of magnitude across models on the same query. Hence, the think-
+ing tokens can dominate the actual cost and override any advantage conferred by a lower unit price.
+We establish this through cost decomposition, ablation experiments, and controlled comparisons.
+Since API pricing alone is insufficient for actual cost comparison, we formalize cost estimation as
+an open challenge: how to predict an RLM’s actual cost of answering a query, given its pricing and
+the query? Our exploration suggests that this problem is non-trivial, calling for more in-depth study.
+To the best of our knowledge, this is the first systematic study of the gap between listed API pricing
+and actual inference cost for reasoning language models. Our contributions are as follows:
+• Discovery. We discover the pricing reversal phenomenon and show it is pervasive: across 8
+frontier RLMs and 9 diverse tasks, we find systematic mismatches between listed price rankings
+and actual cost rankings: across all model pairs studied in this paper, 21.8% exhibits the price
+reversal issue (Section 3).
+• Explanation. We identify thinking tokens as the root cause through cost decomposition, ab-
+lation experiments, and a detailed case study. Removing thinking token costs restores pricing-
+consistent rankings across diverse tasks (Section 4).
+• Open challenge. We formalize actual cost prediction as an open problem and provide initial
+evidence that it is challenging due to high per-query cost variance (Section 5).
+• Data and code.
+We also release our data and code to stimulate further research https:
+//github.com/lchen001/pricing-reversal.
+The rest of the paper is organized as follows. Section 2 introduces the cost auditing framework.
+Section 3 presents the pricing reversal phenomenon. Section 4 analyzes why pricing reversal happens.
+Section 5 discusses cost prediction as an open challenge. Section 6 discusses the related work, and
+Section 7 concludes.
+2
+2
+Cost Auditing Framework
+This paper studies how accurately API pricing reflects the actual cost. To study this, we need a cost
+auditing framework, which includes (i) the RLM APIs and tasks, and (ii) how to formalize the actual
+cost. Standard generation parameters (e.g., temperature, top-p) are explicitly set, while reasoning-
+specific configurations are set to enable each model’s full reasoning capability. Detailed parameter
+settings are provided in Appendix A.3.
+RLM APIs and tasks.
+Our study focuses on 8 widely used RLMs, including GPT-5.2, GPT-5
+Mini, Gemini 3.1 Pro, Gemini 3 Flash, Claude Opus 4.6, Claude Haiku 4.5, Kimi K2.5, and MiniMax
+M2.5. We evaluate these models on 9 datasets covering a diverse set of tasks. In particular, this
+includes competition math problems (AIME [Mathematical Association of America, 2026]), visual
+reasoning puzzles (ARC-AGI [Chollet, 2019]), science QA (GPQA [Rein et al., 2024]), open-ended chat
+(ArenaHard [Li et al., 2024]), Humanity’s Last Exam (HLE [Phan et al., 2025]), LiveCodeBench [Jain
+et al., 2024], LiveMathBench [Liu et al., 2025], MMLUPro [Wang et al., 2024], and knowledge-intensive
+QA (SimpleQA [Wei et al., 2024]). More details about the datasets can be found in Appendix A.1.
+Formalizing API Pricing and Actual Cost.
+The frontier RLMs usually use a pay-as-you-go
+pricing mechanism. In other words, a user pays separately for each query she sends to the RLM. This
+pricing mechanism often involves two components for a given model m, a price/million output tokens
+denoted by po,m, and a price/million input tokens denoted by pi,m. For a given query, the cost is the
+sum of the two prices weighted by the number of prompt tokens and output tokens. More formally,
+the cost of processing a query q by a model m is
+cm(q) ≜pi,m · ni,m(q) + po,m · no,m(q),
+(1)
+where ni,m(q) and no,m(q) are the number of input and output tokens, respectively. The actual cost
+of a dataset D is then cm(D) = P
+q∈D cm(q). As the actual cost is unavailable without sending the
+query, users often assess RLMs’ cost ranking by their listed price. Here, we add the input and output
+prices as the listed price, a commonly used metric based on discussions with practitioners.
+3
+The Pricing Reversal Phenomenon
+How accurately do the listed prices reflect the actual cost? To answer this question, we measure the
+rankings of both listed prices and actual costs across all the tasks, as shown in Figure 2.
+Listed price rankings systematically mismatch actual cost rankings.
+We first observe that
+models which appear cheaper according to their listed API prices can indeed incur much higher actual
+costs under real workloads. For example, Gemini 3 Flash’s listed price ($3.5) is only 22% of GPT-5.2’s
+price ($15.75), but its actual cost on MMLUPro is actually six times higher! This leads to systematic
+ranking inversions between pricing and true expenditure. In fact, Gemini 3 Flash is the third cheapest
+model according to the API listed pricing, but it is the most expensive one on MMLUPro. Its real
+cost is almost twice that of Gemini 3.1 Pro.
+The reversal is pervasive.
+To quantify the prevalence of pricing reversal, we examine all
+ 8
+2
+
+= 28
+model pairs across 9 tasks, yielding 252 pairwise cost comparisons. Of these, 55 comparisons (21.8%)
+exhibit pricing reversal, i.e., the model with lower listed price actually incurs a higher total cost. In
+other words, roughly one in five cost judgments based on listed pricing alone would be wrong. The
+reversal rate varies across tasks, ranging from 10.7% on ArenaHard to 32.1% on MMLUPro.
+The reversal can be severe.
+Pricing reversal is not only frequent but also extreme in magnitude.
+In the most striking case, Gemini 3 Flash’s listed price is 1.7× cheaper than Claude Haiku 4.5, yet its
+actual cost on MMLUPro is 28× higher. Even among models that all employ extended thinking, the
+severity can be large: Gemini 3 Flash is listed at 4.5× cheaper than GPT-5.2, but costs 6.2× more
+on MMLUPro. These examples show that relying on API pricing for model selection can lead to cost
+estimates that are off by an order of magnitude.
+3
+GPT-5.2
+$16
+GPT-5.2
+$6.19
+GPT-5 Mini
+$2.2
+GPT-5 Mini
+$0.61
+Gemini 3.1 Pro
+$14
+Gemini 3.1 Pro
+$8.54
+Gemini 3 Flash
+$3.5
+Gemini 3 Flash
+$3.13
+Claude Opus 4.6
+$30
+Claude Opus 4.6
+$9.45
+Claude Haiku 4.5
+$6.0
+Claude Haiku 4.5
+$0.37
+Kimi K2.5
+$3.6
+Kimi K2.5
+$3.01
+MiniMax-M2.5
+$1.5
+MiniMax-M2.5
+$0.15
+Price rank
+Cost rank
+aime
+GPT-5.2
+$16
+GPT-5.2
+$69.6
+GPT-5 Mini
+$2.2
+GPT-5 Mini
+$7.99
+Gemini 3.1 Pro
+$14
+Gemini 3.1 Pro
+$70.6
+Gemini 3 Flash
+$3.5
+Gemini 3 Flash
+$39.3
+Claude Opus 4.6
+$30
+Claude Opus 4.6
+$85.3
+Claude Haiku 4.5
+$6.0
+Claude Haiku 4.5
+$3.69
+Kimi K2.5
+$3.6
+Kimi K2.5
+$26.3
+MiniMax-M2.5
+$1.5
+MiniMax-M2.5
+$1.40
+Price rank
+Cost rank
+arc-agi-v1
+GPT-5.2
+$16
+GPT-5.2
+$28.2
+GPT-5 Mini
+$2.2
+GPT-5 Mini
+$4.00
+Gemini 3.1 Pro
+$14
+Gemini 3.1 Pro
+$36.9
+Gemini 3 Flash
+$3.5
+Gemini 3 Flash
+$8.70
+Claude Opus 4.6
+$30
+Claude Opus 4.6
+$72.6
+Claude Haiku 4.5
+$6.0
+Claude Haiku 4.5
+$5.91
+Kimi K2.5
+$3.6
+Kimi K2.5
+$10.2
+MiniMax-M2.5
+$1.5
+MiniMax-M2.5
+$1.61
+Price rank
+Cost rank
+arenahard
+GPT-5.2
+$16
+GPT-5.2
+$9.15
+GPT-5 Mini
+$2.2
+GPT-5 Mini
+$1.09
+Gemini 3.1 Pro
+$14
+Gemini 3.1 Pro
+$15.4
+Gemini 3 Flash
+$3.5
+Gemini 3 Flash
+$11.3
+Claude Opus 4.6
+$30
+Claude Opus 4.6
+$18.4
+Claude Haiku 4.5
+$6.0
+Claude Haiku 4.5
+$0.75
+Kimi K2.5
+$3.6
+Kimi K2.5
+$7.68
+MiniMax-M2.5
+$1.5
+MiniMax-M2.5
+$0.46
+Price rank
+Cost rank
+gpqa
+GPT-5.2
+$16
+GPT-5.2
+$253.5
+GPT-5 Mini
+$2.2
+GPT-5 Mini
+$18.7
+Gemini 3.1 Pro
+$14
+Gemini 3.1 Pro
+$445.5
+Gemini 3 Flash
+$3.5
+Gemini 3 Flash
+$176.5
+Claude Opus 4.6
+$30
+Claude Opus 4.6
+$380.6
+Claude Haiku 4.5
+$6.0
+Claude Haiku 4.5
+$8.11
+Kimi K2.5
+$3.6
+Kimi K2.5
+$136.5
+MiniMax-M2.5
+$1.5
+MiniMax-M2.5
+$5.35
+Price rank
+Cost rank
+hle
+GPT-5.2
+$16
+GPT-5.2
+$51.2
+GPT-5 Mini
+$2.2
+GPT-5 Mini
+$5.07
+Gemini 3.1 Pro
+$14
+Gemini 3.1 Pro
+$106.5
+Gemini 3 Flash
+$3.5
+Gemini 3 Flash
+$162.6
+Claude Opus 4.6
+$30
+Claude Opus 4.6
+$77.2
+Claude Haiku 4.5
+$6.0
+Claude Haiku 4.5
+$7.11
+Kimi K2.5
+$3.6
+Kimi K2.5
+$37.4
+MiniMax-M2.5
+$1.5
+MiniMax-M2.5
+$2.40
+Price rank
+Cost rank
+livecodebench
+GPT-5.2
+$16
+GPT-5.2
+$5.01
+GPT-5 Mini
+$2.2
+GPT-5 Mini
+$0.66
+Gemini 3.1 Pro
+$14
+Gemini 3.1 Pro
+$8.14
+Gemini 3 Flash
+$3.5
+Gemini 3 Flash
+$5.52
+Claude Opus 4.6
+$30
+Claude Opus 4.6
+$9.01
+Claude Haiku 4.5
+$6.0
+Claude Haiku 4.5
+$0.59
+Kimi K2.5
+$3.6
+Kimi K2.5
+$3.36
+MiniMax-M2.5
+$1.5
+MiniMax-M2.5
+$0.26
+Price rank
+Cost rank
+livemathbench
+GPT-5.2
+$16
+GPT-5.2
+$35.1
+GPT-5 Mini
+$2.2
+GPT-5 Mini
+$7.32
+Gemini 3.1 Pro
+$14
+Gemini 3.1 Pro
+$110.5
+Gemini 3 Flash
+$3.5
+Gemini 3 Flash
+$219.5
+Claude Opus 4.6
+$30
+Claude Opus 4.6
+$74.0
+Claude Haiku 4.5
+$6.0
+Claude Haiku 4.5
+$7.84
+Kimi K2.5
+$3.6
+Kimi K2.5
+$44.4
+MiniMax-M2.5
+$1.5
+MiniMax-M2.5
+$4.84
+Price rank
+Cost rank
+mmlupro
+GPT-5.2
+$16
+GPT-5.2
+$68.7
+GPT-5 Mini
+$2.2
+GPT-5 Mini
+$7.45
+Gemini 3.1 Pro
+$14
+Gemini 3.1 Pro
+$366.7
+Gemini 3 Flash
+$3.5
+Gemini 3 Flash
+$16.5
+Claude Opus 4.6
+$30
+Claude Opus 4.6
+$41.2
+Claude Haiku 4.5
+$6.0
+Claude Haiku 4.5
+$2.33
+Kimi K2.5
+$3.6
+Kimi K2.5
+$21.1
+MiniMax-M2.5
+$1.5
+MiniMax-M2.5
+$6.50
+Price rank
+Cost rank
+simpleqa
+Figure 2: The ranking inversion phenomenon.
+Overall, we observe that the listed price rankings
+systematically mismatch the actual costs. In addition, the actual cost rankings vary substantially
+across different tasks. This suggests that standard assessment according to a fixed listed API pricing
+is misleading.
+Actual cost rankings vary substantially across tasks.
+Finally, the relative cost ordering of
+models is highly task-dependent. A model that is cost-efficient on one dataset can become one of the
+most expensive on another. Consider GPT-5.2 and Claude Opus 4.6 as an example. On SimpleQA,
+GPT-5.2’s actual cost is 40% higher than Claude Opus 4.6, but on AIME, Claude Opus 4.6’s actual
+cost is 30% higher than GPT-5.2. More broadly, no single model is consistently the cheapest or the
+most expensive: MiniMax-M2.5 is the cheapest model on 8 out of 9 tasks, but it is not the cheapest
+on SimpleQA, where Claude Haiku 4.5 takes the lead. This task dependence means that cost ranking
+cannot be determined from pricing or any single benchmark alone.
+4
+Why Does Pricing Reversal Happen?
+The previous section established that pricing reversal is pervasive and severe. A natural follow-up
+question is: why does the listed pricing fail to reflect the actual cost? Recall from the cost formula
+(Eq. 1) that cm(q) = pi,m · ni,m(q) + po,m · no,m(q): the actual cost is the product of per-token prices
+and token consumption. Since the listed price fixes the per-token prices, any ranking reversal must
+originate from heterogeneous token consumption across models. But which token type is responsible?
+In this section, we show that thinking tokens is the dominant driver of pricing reversal, through
+three layers of evidence.
+4.1
+Thinking Tokens Dominate Actual Cost
+To identify which token type is most responsible for cost differences, we decompose total cost and
+token consumption by type, namely, prompt, thinking, and generation, as shown in Figure 3.
+This breakdown reveals that thinking tokens are the dominant cost component across nearly all
+models. Across our 8 models and 9 tasks, thinking tokens account for the majority of output tokens
+and, consequently, the majority of actual cost. This means that if any single factor can drive ranking
+reversals, it must be thinking tokens: a token type that constitutes only a small fraction of cost cannot
+flip the ranking regardless of how much it varies across models.
+4
+0
+200
+400
+600
+800
+1000
+1200
+Cost ($)
+Gemini 3.1 Pro
+Claude Opus 4.6
+Gemini 3 Flash
+GPT-5.2
+Kimi K2.5
+GPT-5 Mini
+Claude Haiku 4.5
+MiniMax-M2.5
+$1102.5
+$604.9
+$626.0
+$476.9
+$274.8
+$141.5
+a
+Prompt
+Thinking
+Generation
+0
+50M
+100M
+150M
+200M
+Tokens
+Gemini 3.1 Pro
+Claude Opus 4.6
+Gemini 3 Flash
+GPT-5.2
+Kimi K2.5
+GPT-5 Mini
+Claude Haiku 4.5
+MiniMax-M2.5
+91.9M
+24.2M
+208.7M
+34.1M
+91.6M
+23.2M
+b
+Prompt
+Thinking
+Generation
+Figure 3: Cost and token consumption breakdown by token types. Thinking tokens dominate both
+token volume and total cost for most models, establishing them as the primary candidate for explaining
+pricing reversal.
+4.2
+Cross-Model Variance in Thinking Token Consumption
+However, dominance alone is insufficient to explain reversal.
+If all models consumed roughly the
+same number of thinking tokens, thinking costs would scale proportionally with listed prices and no
+ranking inversion would occur. The critical mechanism is that different models consume vastly different
+amounts of thinking tokens on the same tasks.
+At the aggregate level, the disparity is striking: Claude Opus 4.6 uses 24.2M thinking tokens across
+all tasks, while Gemini 3 Flash uses 208M, leading to an 860% difference. Yet their listed output prices
+differ by only a modest factor. This mismatch between token volume disparity and price disparity is
+precisely what drives cost reversals.
+To illustrate the mechanism concretely, consider the case study in Figure 4.
+Given the same
+AIME 2025 question, both GPT-5.2 and Gemini 3 Flash arrive at the correct answer using a similar
+approach, and their prompt and final-answer token counts are comparable. The difference lies entirely
+in thinking: GPT-5.2 uses only 562 thinking tokens, while Gemini 3 Flash requires over 11,000 tokens
+to reach the same conclusion. Despite Gemini 3 Flash’s substantially lower per-token price, this 20×
+gap in thinking token consumption results in a 2.5× higher actual cost for this query.
+4.3
+Removing Thinking Token Costs Restores Ranking
+The evidence above shows that thinking tokens dominate cost and vary enormously across models.
+But are they truly the cause of pricing reversal, or merely correlated with it? To answer this, we
+conduct an ablation study: we set the cost of thinking tokens to zero for all models and recompute the
+actual cost rankings. If thinking tokens are the root cause, removing their cost contribution should
+substantially restore the alignment between listed price rankings and actual cost rankings.
+Setup.
+For each model m and query q, we compute the ablated cost as cabl
+m (q) = pi,m·ni,m(q)+po,m·
+(no,m(q) −nt,m(q)), where nt,m(q) denotes the number of thinking tokens. We then rank models by
+total ablated cost per task and compare with the listed price ranking using Kendall’s τ and pairwise
+reversal counts.
+Results.
+As shown in Figure 5, removing thinking token costs substantially restores ranking consis-
+tency across all 9 tasks. The average Kendall’s τ between listed price ranking and actual cost ranking
+increases from 0.563 to 0.873 (+55%), and the average number of pairwise ranking reversals drops from
+6.1 to 1.8 per task (a 70% reduction). Every single task shows improvement, with the most dramatic
+case on MMLUPro: thinking tokens account for up to 97.9% of output tokens for some models, and
+removing their cost reduces ranking reversals from 9 to 2 while improving τ from 0.357 to 0.857.
+These results confirm that thinking tokens are the primary cause. When their cost contribution is
+removed, the listed price ranking becomes a substantially more accurate predictor of actual cost.
+5
+AIME Problem
+Jen enters a lottery by picking 4 distinct numbers from S = {1, 2, 3, ..., 9, 10}. 4 numbers are
+randomly chosen from S. She wins a prize if at least two of her numbers were 2 of the randomly
+chosen numbers, and wins the grand prize if all four of her numbers were the randomly chosen
+numbers. The probability of her winning the grand prize given that she won a prize is m/n where m
+and n are relatively prime positive integers. Find m + n.
+Correct answer: 116
+a
+GPT-5.2  (Correct)
+461 thinking  |  562 generation  |  1,023 completion
+Let Jen's chosen set be a fixed set of 4 distinct
+numbers from {1,2,...,10}. Let X be the number of
+matches between her 4 numbers and the 4 drawn.
+P(X=k) = C(4,k) C(6,4-k) / C(10,4)
+...
+P(X>=2) = 90/210 + 24/210 + 1/210 = 115/210
+P(X=4|X>=2) = (1/210) / (115/210) = 1/115
+m + n = 1 + 115 = 116
+b
+Gemini 3 Flash  (Correct)
+11,749 thinking  |  586 generation  |  12,335 completion
+To find the probability of Jen winning the grand
+prize given that she won a prize, we first identify
+total ways: C(10,4) = 210. Let X = matches.
+P(X=k) = C(4,k) C(6,4-k) / 210
+...
+P(X>=2) = 115/210,  P(X=4) = 1/210
+P(X=4|X>=2) = (1/210) / (115/210) = 1/115
+m + n = 1 + 115 = 116
+c
+0
+2K
+4K
+6K
+8K
+10K
+12K
+14K
+Tokens
+GPT-5.2
+Gemini 3 Flash
+12K
+25x thinking tokens
+d
+0.000
+0.005
+0.010
+0.015
+0.020
+0.025
+0.030
+0.035
+0.040
+Cost ($)
+GPT-5.2
+Gemini 3 Flash
+$0.01
+$0.01
+$0.04
+2.5x total cost
+e
+Prompt
+Thinking
+Generation
+Figure 4: Case study: on the same AIME problem, GPT-5.2 uses 562 thinking tokens while Gemini 3
+Flash uses over 11,000, leading to 2.5× higher actual cost despite lower API pricing. The mechanism
+of reversal is the enormous cross-model variance in thinking token consumption.
+5
+Can We Predict the Actual Cost?
+The previous section identified thinking tokens as the root cause of pricing reversal. A natural follow-up
+question is: since we now know what drives the cost discrepancy, can we predict a model’s actual cost
+before sending a query? Such prediction would enable cost-aware model selection without requiring
+expensive pilot runs.
+Note that this is a fundamentally different problem from the aggregate analysis in §3. The pricing
+reversals documented there are computed over entire benchmarks (hundreds or thousands of queries),
+where averaging smooths out per-query fluctuations. Cost prediction, by contrast, must operate at the
+level of individual queries.
+We present two layers of evidence for why per-query cost prediction is fundamentally difficult: (1) a
+practical failure: a KNN baseline trained on query embeddings achieves poor accuracy on high-variance
+models (§5.1), and (2) a deeper explanation: part of the variance is irreducible, arising from stochastic
+internal reasoning even when the query is held constant (§5.2).
+5.1
+A Prediction Baseline
+We formalize the cost prediction problem as follows. Given a query q, a model m, and its API pricing,
+we seek a mapping:
+ˆcm(q) ≜fθ(Φ(q), m)
+that minimizes the expected empirical risk E(q,c)∼D[L(ˆcm(q), c)], where Φ(q) is a feature extractor and
+L is a distance metric between predicted and actual cost.
+We evaluate three baselines of increasing sophistication, using an 80/20 train/test split stratified
+by dataset:
+1. Mean baseline. Predicts every query’s cost as the per-model training-set mean. This represents
+the best constant predictor and provides a lower bound on what any model should achieve.
+2. Prompt-length linear regression. Uses the prompt token count ni,m(q) as a single feature
+and fits a per-model linear regression ˆcm(q) = αm·ni,m(q)+βm. This tests whether the observable
+6
+AIME
+ARC-AGI
+ArenaHard
+GPQA
+HLE
+LiveCode
+LiveMath
+MMLUPro
+SimpleQA
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Kendall’s τ
+avg = 0.56
+avg = 0.87
+(a) Ranking correlation
+With thinking tokens
+Without thinking tokens
+AIME
+ARC-AGI
+ArenaHard
+GPQA
+HLE
+LiveCode
+LiveMath
+MMLUPro
+SimpleQA
+0
+2
+4
+6
+8
+Pairwise ranking reversals
+avg = 6.1
+avg = 1.8
+(b) Ranking reversals
+With thinking tokens
+Without thinking tokens
+Figure 5: Ablation study: removing thinking token costs from actual cost computation. (a) Kendall’s
+τ between listed price ranking and actual cost ranking increases substantially across all tasks. (b) The
+number of pairwise ranking reversals drops by 70% on average, confirming that thinking tokens are
+the primary cause of pricing reversal.
+Table 1: MAE (USD) of per-query cost prediction across three baselines (K=5, test ratio=0.2).
+Model
+Mean
+Prompt-Length LR
+Embedding + KNN
+GPT-5.2
+0.0490
+0.0487
+0.0458
+GPT-5 Mini
+0.0039
+0.0038
+0.0027
+Gemini 3.1 Pro
+0.1117
+0.1120
+0.0941
+Gemini 3 Flash
+0.0555
+0.0549
+0.0344
+Claude Opus 4.6
+0.0721
+0.0715
+0.0520
+Claude Haiku 4.5
+0.0023
+0.0022
+0.0013
+Kimi K2.5
+0.0233
+0.0229
+0.0138
+MiniMax-M2.5
+0.0008
+0.0008
+0.0006
+Average
+0.0398
+0.0394
+0.0306
+input length carries predictive signal.
+3. Embedding + KNN. Embeds each query with gemini-text-embedding-001 as the feature
+function Φ and uses k-nearest neighbors with K = 5 to predict cost from semantically similar
+historical queries.
+Table 1 reports the mean absolute error (MAE) per model. The prompt-length baseline offers
+negligible improvement over the mean baseline (average MAE: $0.0394 vs. $0.0398), confirming that
+prompt length alone has little predictive power over thinking token consumption. Embedding + KNN
+achieves the best average MAE ($0.0306, a 23% reduction), indicating that query semantics carry some
+signal. However, the improvement is concentrated on low-variance models; on high-variance models
+like Gemini 3.1 Pro, all three baselines perform poorly.
+As shown in Figure 6, the best baseline’s (KNN) prediction accuracy varies substantially across
+models. On Claude Haiku 4.5, which uses virtually no thinking tokens (CV of per-query cost: 0.19–
+0.64 across tasks), the predicted and actual costs show meaningful correlation. On frontier reasoning
+models such as Gemini 3.1 Pro and GPT-5.2, where per-query cost CV exceeds 2.0 on several tasks,
+the prediction scatter is far wider.
+One might suspect that stronger predictors (e.g., neural regressors) could close this gap. However,
+the next subsection reveals a more fundamental obstacle: even a perfect predictor cannot eliminate
+the variance, because part of it does not originate from the query at all.
+5.2
+Irreducible Variance: Same Query, Different Costs
+To disentangle the predictable component of cost variance (driven by query difficulty) from the irre-
+ducible component (driven by the model’s internal stochasticity), we run a controlled experiment: for
+7
+0.0
+0.5
+0.0
+0.2
+0.4
+0.6
+0.8
+Predicted Cost ($)
+MAE = $0.073
+R2 = 0.003
+Gemini 3.1 Pro
+0.0
+0.5
+1.0
+0.00
+0.25
+0.50
+0.75
+1.00
+MAE = $0.045
+R2 = 0.232
+Claude Opus 4.6
+0.0
+0.1
+0.2
+0.00
+0.05
+0.10
+0.15
+0.20
+MAE = $0.031
+R2 = 0.258
+Gemini 3 Flash
+0.0
+0.5
+0.0
+0.2
+0.4
+0.6
+0.8
+MAE = $0.037
+R2 = 0.101
+GPT-5.2
+0.00
+0.05
+0.10
+Actual Cost ($)
+0.000
+0.025
+0.050
+0.075
+0.100
+Predicted Cost ($)
+MAE = $0.013
+R2 = 0.483
+Kimi K2.5
+0.00
+0.05
+Actual Cost ($)
+0.00
+0.02
+0.04
+0.06
+MAE = $0.002
+R2 = 0.423
+GPT-5 Mini
+0.000
+0.025
+0.050
+Actual Cost ($)
+0.00
+0.02
+0.04
+0.06
+MAE = $0.001
+R2 = 0.540
+Claude Haiku 4.5
+0.0000
+0.0025
+0.0050
+Actual Cost ($)
+0.000
+0.002
+0.004
+0.006
+MAE = $0.001
+R2 = 0.061
+MiniMax-M2.5
+Figure 6: Query-level actual cost prediction using a KNN baseline. The prediction accuracy varies
+across models: relatively tighter on low-variance models such as Claude Haiku 4.5, but poor on high-
+variance models such as Gemini 3.1 Pro, where per-query thinking token consumption is highly un-
+predictable.
+each of the AIME queries, we call GPT-5.2, GPT-5 Mini, and Gemini 3 Flash five additional times
+with identical prompts, yielding six independent observations per query–model pair.1
+Figure 7 shows the results normalized by per-query mean. The variance is striking: across all three
+models, the average within-query coefficient of variation (CV) is 0.29, and the average max/min ratio
+is 2.6×. The most extreme case reaches 9.7×. This suggests that the most expensive run of the same
+query costs nearly ten times the cheapest.
+The magnitude of this within-query variance differs across providers. GPT-5 Mini exhibits the
+highest instability (mean CV = 0.38, max/min up to 9.7×), followed by GPT-5.2 (mean CV = 0.24,
+max/min up to 2.9×).
+Gemini 3 Flash is relatively more stable (mean CV = 0.13, max/min up
+to 2.0×), though even its variance is nontrivial: a 2× cost fluctuation on the same query is hardly
+negligible for budget-conscious users.
+Implications.
+This within-query variance represents an irreducible noise floor for any cost predictor.
+No matter how sophisticated fθ and Φ are, they can only predict the expected cost conditioned on
+the query. With a within-query CV of 0.29, even a perfect predictor would face average prediction
+errors of at least 29% purely from the model’s internal randomness. Combined with the cross-query
+variance documented in §5.1, this makes per-query cost prediction for reasoning language models a
+fundamentally noisy estimation problem that resists simple solutions.
+We hope this formalization
+motivates future work on cost-aware model selection and inference budgeting.
+6
+Related Work
+Reasoning language models.
+Recent advances in language models have introduced chain-of-
+thought reasoning as a core capability. OpenAI’s o1 [OpenAI, 2024] and its successors demonstrated
+that models can be trained to perform extended internal deliberation before producing a final answer,
+significantly improving performance on complex reasoning tasks. Google’s Gemini models [Team et al.,
+2023] and Anthropic’s Claude [Anthropic, 2026] have followed suit, each implementing their own form
+of “thinking” during inference. DeepSeek-R1 [Guo et al., 2025] further showed that reinforcement
+1All API calls use default parameters (temperature is not user-adjustable for reasoning models). The five new runs
+are conducted on different days from the original data collection to capture temporal variation.
+8
+10
+20
+30
+40
+50
+60
+Query Index
+0
+20k
+40k
+Thinking Tokens
+GPT-5.2
+10
+20
+30
+40
+50
+60
+Query Index
+0
+5k
+10k
+15k
+20k
+25k
+GPT-5 Mini
+10
+20
+30
+40
+50
+60
+Query Index
+0
+20k
+40k
+60k
+Gemini 3 Flash
+Original run
+Repeated trial
+Figure 7: Thinking token consumption across 6 independent runs of the same query (1 original + 5
+repeated trials) on AIME. For each query, the vertical bar spans the min-to-max range; circles denote
+repeated trials and stars denote the original run. Substantial within-query variance is observed across
+all three models, with max/min ratios up to 9.7×.
+learning can elicit sophisticated reasoning behavior. A key architectural consequence is that these
+reasoning language models (RLMs) generate a variable and often large number of thinking tokens that
+are invisible to users but billed as output tokens. While prior work has focused on evaluating the
+accuracy benefits of extended reasoning, little attention has been paid to its cost implications—the
+gap our paper addresses.
+LLM inference efficiency.
+A growing body of work studies how to reduce the computational cost
+of LLM inference. Speculative decoding [Leviathan et al., 2023, Chen et al., 2023] uses a smaller draft
+model to accelerate generation. KV-cache optimization [Pope et al., 2023] and quantization [Dettmers
+et al., 2022] reduce memory and compute requirements at serving time. Miao et al. [Miao et al., 2025]
+provide a comprehensive survey of system-level optimizations for efficient LLM serving.
+However,
+these efforts focus on provider-side infrastructure costs rather than user-facing API costs. Our work
+complements this line of research by showing that even when providers optimize inference efficiency,
+the user-facing cost can still be unpredictable due to heterogeneous thinking token consumption.
+Model selection and routing.
+The problem of selecting cost-effective models has been studied in
+several contexts. FrugalML [Chen et al., 2020] and FrugalGPT [Chen et al., 2024] propose strategies
+to reduce API costs by cascading or routing queries across multiple models. Chen et al. [Chen et al.,
+2022] study efficient online selection of ML APIs. More recent work on LLM routing [Stripelis et al.,
+2024, Hu et al., 2024] aims to direct each query to the most suitable model based on quality-cost trade-
+offs. Shekhar et al. [Shekhar et al., 2024] and Huang et al. [Huang et al., 2025] specifically target cost
+optimization for LLM usage. Ultimately, the effectiveness of such routing hinges on holistic metrics
+like the “cost-of-pass” [Erol et al., 2025], measuring the actual financial expense required to obtain
+a correct answer. However, these approaches typically assume that the per-query cost of each model
+is known or can be estimated from API pricing. Our findings challenge this assumption: the pricing
+reversal phenomenon means that model cost rankings derived from listed prices can be systematically
+wrong, potentially undermining the cost estimates used by routing systems.
+7
+Conclusion
+This paper presents the first systematic study of the gap between listed API pricing and actual inference
+cost for reasoning language models. Through extensive evaluation of 8 frontier RLMs across 9 diverse
+tasks, we uncover the pricing reversal phenomenon: in 21.8% of model-pair comparisons, the model
+with lower listed price actually incurs higher actual cost, with severity reaching up to 28×. We trace
+the root cause to vast heterogeneity in thinking token consumption across models: a hidden cost
+9
+factor invisible to users yet dominating actual expenditure. An ablation study confirms this causal
+link, showing that removing thinking token costs reduces ranking reversals by 70% and raises the
+Kendall’s τ between price and cost rankings from 0.563 to 0.873. Furthermore, we demonstrate that
+predicting per-query cost is fundamentally difficult: a repeated-trial experiment reveals within-query
+thinking token CV of 0.29 and max/min ratios up to 9.7× across independent runs of the same query,
+establishing an irreducible noise floor for any cost predictor.
+These findings carry concrete implications. For AI providers, the current practice of quoting per-
+token prices without surfacing thinking token usage is insufficient; we advocate for per-request cost
+breakdowns and cost estimation APIs that expose the expected thinking overhead. For practitioners,
+our results caution against relying on listed prices for model selection; workload-specific cost auditing
+with representative queries is essential, especially on reasoning-heavy tasks where reversals are most
+severe. For the research community, we call for incorporating inference cost as a first-class evaluation
+dimension alongside accuracy, and highlight cost prediction for reasoning models as an open problem
+with both practical importance and theoretical depth. To stimulate more research, our data and code
+are publicly released at https://github.com/lchen001/pricing-reversal.
+10
+References
+Anthropic.
+The claude model overview.
+2026.
+https://docs.anthropic.com/en/docs/
+about-claude/models.
+Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John
+Jumper. Accelerating large language model decoding with speculative sampling. arXiv preprint
+arXiv:2302.01318, 2023.
+Lingjiao Chen, Matei Zaharia, and James Y Zou. Frugalml: How to use ml prediction apis more
+accurately and cheaply. Advances in neural information processing systems, 33:10685–10696, 2020.
+Lingjiao Chen, Matei Zaharia, and James Zou. Efficient online ml api selection for multi-label classi-
+fication tasks. In International conference on machine learning, pages 3716–3746. PMLR, 2022.
+Lingjiao Chen, Matei Zaharia, and James Zou. Frugalgpt: How to use large language models while
+reducing cost and improving performance. TMLR, 2024.
+Yanda Chen, Joe Benton, Ansh Radhakrishnan, Jonathan Uesato, Carson Denison, John Schulman,
+Arushi Somani, Peter Hase, Misha Wagner, Fabien Roger, et al. Reasoning models don’t always say
+what they think. arXiv preprint arXiv:2505.05410, 2025.
+Fran¸cois Chollet. On the measure of intelligence. arXiv preprint arXiv:1911.01547, 2019.
+Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. Gpt3.int8(): 8-bit matrix multi-
+plication for transformers at scale. NeurIPS, 2022.
+Mehmet Hamza Erol, Batu El, Mirac Suzgun, Mert Yuksekgonul, and James Zou. Cost-of-pass: An
+economic framework for evaluating language models. arXiv preprint arXiv:2504.13359, 2025.
+Google. Thinking with gemini. https://ai.google.dev/gemini-api/docs/thinking, 2025. Ac-
+cessed: Feburary 2026.
+Google AI.
+Gemini api pricing.
+https://ai.google.dev/gemini-api/docs/pricing.
+Accessed:
+2026-03-22.
+Daya Guo, Dejian Yang, Haowei Zhang, Junxiao Song, Peiyi Wang, Qihao Zhu, Runxin Xu, Ruoyu
+Zhang, Shirong Ma, Xiao Bi, et al.
+Deepseek-r1: Incentivizing reasoning capability in llms via
+reinforcement learning. arXiv preprint arXiv:2501.12948, 2025.
+Qitian Jason Hu, Jacob Bieker, Xiuyu Li, Nan Jiang, Benjamin Keigwin, Gaurav Ranganath, Kurt
+Keutzer, and Shriyash Kaustubh Upadhyay.
+Routerbench: A benchmark for multi-llm routing
+system. arXiv preprint arXiv:2403.12031, 2024.
+Keke Huang, Yimin Shi, Dujian Ding, Yifei Li, Yang Fei, Laks Lakshmanan, and Xiaokui Xiao.
+Thriftllm: On cost-effective selection of large language models for classification queries.
+arXiv
+preprint arXiv:2501.04901, 2025.
+Naman Jain, King Han, Alex Gu, Wen-Ding Li, Fanjia Yan, Tianjun Zhang, Sida Wang, Armando
+Solar-Lezama, Koushik Sen, and Ion Stoica. Livecodebench: Holistic and contamination free evalu-
+ation of large language models for code. arXiv preprint arXiv:2403.07974, 2024.
+Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative
+decoding. In International Conference on Machine Learning, pages 19274–19286. PMLR, 2023.
+Tianle Li, Wei-Lin Chiang, Evan Frick, Lisa Dunlap, Tianhao Wu, Banghua Zhu, Joseph E Gonzalez,
+and Ion Stoica. From crowdsourced data to high-quality benchmarks: Arena-hard and benchbuilder
+pipeline. arXiv preprint arXiv:2406.11939, 2024.
+Junnan Liu, Hongwei Liu, Linchen Xiao, Ziyi Wang, Kuikun Liu, Songyang Gao, Wenwei Zhang,
+Songyang Zhang, and Kai Chen. Are your llms capable of stable reasoning?
+In Findings of the
+Association for Computational Linguistics: ACL 2025, pages 17594–17632, 2025.
+11
+Mathematical Association of America.
+American invitational mathematics examination.
+2026.
+https://artofproblemsolving.com/wiki/index.php/American_Invitational_Mathematics_
+Examination?srsltid=AfmBOoq3krkpjousW7mesa5I5_bNTPwEbldcWYs1N7c0XjQPNYX2l-0E.
+Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Hongyi Jin, Tianqi Chen, and Zhihao
+Jia. Towards efficient generative large language model serving: A survey from algorithms to systems.
+ACM Computing Surveys, 58(1):1–37, 2025.
+Niklas Muennighoff, Zitong Yang, Weijia Shi, Xiang Lisa Li, Li Fei-Fei, Hannaneh Hajishirzi, Luke
+Zettlemoyer, Percy Liang, Emmanuel Cand`es, and Tatsunori B Hashimoto. s1: Simple test-time
+scaling. In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing,
+pages 20286–20332, 2025.
+OpenAI. Api pricing. https://openai.com/api/pricing/. Accessed: 2026-Feb.
+OpenAI.
+Learning
+to
+reason
+with
+llms.
+2024.
+https://openai.com/index/
+learning-to-reason-with-llms/.
+Long Phan, Alice Gatti, Ziwen Han, Nathaniel Li, Josephina Hu, Hugh Zhang, Chen Bo Calvin
+Zhang, Mohamed Shaaban, John Ling, Sean Shi, et al.
+Humanity’s last exam.
+arXiv preprint
+arXiv:2501.14249, 2025.
+Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Jonathan Heek,
+Kefan Xiao, Shivani Agrawal, and Jeff Dean. Efficiently scaling transformer inference. Proceedings
+of machine learning and systems, 5:606–624, 2023.
+David Rein, Betty Li Hou, Asa Cooper Stickland, Jackson Petty, Richard Yuanzhe Pang, Julien Dirani,
+Julian Michael, and Samuel R Bowman. Gpqa: A graduate-level google-proof q&a benchmark. In
+First conference on language modeling, 2024.
+Shivanshu Shekhar, Tanishq Dubey, Koyel Mukherjee, Apoorv Saxena, Atharv Tyagi, and Nishanth
+Kotla. Towards optimizing the costs of llm usage. arXiv preprint arXiv:2402.01742, 2024.
+Dimitris Stripelis, Zhaozhuo Xu, Zijian Hu, Alay Dilipbhai Shah, Han Jin, Yuhang Yao, Jipeng Zhang,
+Tong Zhang, Salman Avestimehr, and Chaoyang He. Tensoropera router: A multi-model router for
+efficient llm inference.
+In Proceedings of the 2024 Conference on Empirical Methods in Natural
+Language Processing: Industry Track, pages 452–462, 2024.
+Gemini Team, Rohan Anil, Sebastian Borgeaud, Jean-Baptiste Alayrac, Jiahui Yu, Radu Soricut,
+Johan Schalkwyk, Andrew M Dai, Anja Hauth, Katie Millican, et al. Gemini: a family of highly
+capable multimodal models. arXiv preprint arXiv:2312.11805, 2023.
+Xinyuan Wang, Yanchi Liu, Wei Cheng, Xujiang Zhao, Zhengzhang Chen, Wenchao Yu, Yanjie Fu,
+and Haifeng Chen. Mixllm: Dynamic routing in mixed large language models. In Proceedings of
+the 2025 Conference of the Nations of the Americas Chapter of the Association for Computational
+Linguistics: Human Language Technologies (Volume 1: Long Papers), pages 10912–10922, 2025.
+Yubo Wang, Xueguang Ma, Ge Zhang, Yuansheng Ni, Abhranil Chandra, Shiguang Guo, Weiming
+Ren, Aaran Arulraj, Xuan He, Ziyan Jiang, et al. Mmlu-pro: A more robust and challenging multi-
+task language understanding benchmark. Advances in Neural Information Processing Systems, 37:
+95266–95290, 2024.
+Jason Wei, Denny Huang, Yifeng Lu, Denny Zhou, and Quoc V Le. Measuring short-form factuality
+in large language models. arXiv preprint arXiv:2411.02343, 2024.
+12
+A
+Additional Details
+A.1
+Dataset Details
+Table 2 summarizes the 9 datasets used in our evaluation, covering competition math, visual reasoning,
+science QA, open-ended chat, multi-domain reasoning, code generation, and knowledge-intensive QA.
+Table 2: Summary of evaluation datasets.
+Dataset
+Category
+# Queries
+Description
+AIME [Mathematical Association of America, 2026]
+Math
+60
+Competition math (AMC/AIME level)
+ARC-AGI [Chollet, 2019]
+Reasoning
+400
+Visual/abstract reasoning puzzles
+ArenaHard [Li et al., 2024]
+General
+750
+Open-ended chat (Chatbot Arena hard subset)
+GPQA [Rein et al., 2024]
+Science
+198
+Graduate-level science QA (diamond set)
+HLE [Phan et al., 2025]
+General
+2,056
+Humanity’s Last Exam (multi-domain)
+LiveCodeBench [Jain et al., 2024]
+Code
+962
+Competitive programming problems
+LiveMathBench [Liu et al., 2025]
+Math
+120
+Dynamic math benchmark
+MMLUPro [Wang et al., 2024]
+Knowledge
+3,000
+Multi-domain knowledge (pro subset)
+SimpleQA [Wei et al., 2024]
+QA
+4,326
+Knowledge-intensive factual QA
+Total
+11,872
+A.2
+API Pricing
+Table 3 reports the API pricing for each model as of February 28, 2026. All prices are in USD per
+million tokens (MTok). Thinking/reasoning tokens are billed at the output token rate for all providers.
+Table 3: API pricing for evaluated models (USD per million tokens, as of Feb 28, 2026). Listed Price
+= pi,m +po,m, used for ranking comparisons in the main text. Thinking tokens are billed at the output
+token rate by all providers. Cached input pricing is not shown, as our experiments do not use prompt
+caching.
+Model
+Provider
+Input $/MTok
+Output $/MTok
+Listed Price
+GPT-5.2
+OpenAI
+1.75
+14.00
+15.75
+GPT-5 Mini
+OpenAI
+0.25
+2.00
+2.25
+Gemini 3.1 Pro
+Google
+2.00
+12.00
+14.00
+Gemini 3 Flash
+Google
+0.50
+3.00
+3.50
+Claude Opus 4.6
+Anthropic
+5.00
+25.00
+30.00
+Claude Haiku 4.5
+Anthropic
+1.00
+5.00
+6.00
+Kimi K2.5
+Moonshot AI
+0.60
+3.00
+3.60
+MiniMax-M2.5
+MiniMax
+0.30
+1.20
+1.50
+A.3
+Model Configuration
+Table 4 details the generation parameters used for each model. All models are queried via OpenAI-
+compatible chat completion APIs. GPT-5.2 is run with reasoning effort="high" to maximize rea-
+soning capability; this does not change the per-token price but increases thinking token consumption.
+A.4
+Per-Dataset Actual Cost
+Table 5 reports the total actual cost (USD) for each model–dataset combination. These costs are
+computed using Eq. 1 with the API pricing listed in Table 3.
+A.5
+Per-Dataset Token Consumption
+Table 6 reports the total thinking token consumption for each model–dataset combination, illustrating
+the vast heterogeneity discussed in Section 4.
+13
+Table 4: Generation parameter settings per model. Temperature and top-p are explicitly set for all
+models. Kimi K2.5 uses higher temperature (T=1.0) following its provider’s recommended configura-
+tion. For reasoning, Gemini, Kimi, and MiniMax models have built-in thinking that is always active
+with no user-configurable budget; Claude Opus 4.6 uses Anthropic’s extended thinking mode; Claude
+Haiku 4.5 does not have extended thinking enabled, resulting in negligible thinking token consumption
+(Table 6).
+Model
+Temp.
+top-p
+Reasoning Configuration
+GPT-5.2
+0.2
+1.0
+reasoning effort="high"
+GPT-5 Mini
+0.2
+1.0
+reasoning effort="medium"
+Gemini 3.1 Pro
+0.2
+1.0
+Built-in thinking (always on)
+Gemini 3 Flash
+0.2
+1.0
+Built-in thinking (always on)
+Claude Opus 4.6
+0.2
+1.0
+Extended thinking enabled
+Claude Haiku 4.5
+0.2
+1.0
+No extended thinking
+Kimi K2.5
+1.0
+0.95
+Built-in thinking (always on)
+MiniMax-M2.5
+0.2
+1.0
+Built-in thinking (always on)
+Table 5: Total actual cost (USD) per model–dataset combination. Abbreviations: ARC = ARC-AGI,
+Arena = ArenaHard, LCB = LiveCodeBench, LMB = LiveMathBench, MMLU = MMLUPro, SQA
+= SimpleQA.
+Model
+AIME
+ARC
+Arena
+GPQA
+HLE
+LCB
+LMB
+MMLU
+SQA
+GPT-5.2
+6.19
+69.57
+28.22
+9.15
+253.47
+51.17
+5.01
+35.15
+68.67
+GPT-5 Mini
+0.61
+7.99
+4.00
+1.09
+18.73
+5.07
+0.66
+7.32
+7.45
+Gemini 3.1 Pro
+8.54
+70.55
+36.88
+15.41
+445.55
+106.53
+8.14
+110.47
+366.68
+Gemini 3 Flash
+3.13
+39.32
+8.70
+11.28
+176.47
+162.59
+5.52
+219.47
+16.49
+Claude Opus 4.6
+9.45
+85.33
+72.59
+18.36
+380.63
+77.21
+9.01
+74.01
+41.23
+Claude Haiku 4.5
+0.37
+3.69
+5.91
+0.75
+8.11
+7.11
+0.59
+7.84
+2.33
+Kimi K2.5
+3.02
+26.31
+10.17
+7.68
+136.52
+37.43
+3.36
+44.40
+21.12
+MiniMax-M2.5
+0.15
+1.40
+1.61
+0.46
+5.35
+2.40
+0.26
+4.84
+6.50
+Table 6: Total thinking tokens (in thousands) per model–dataset combination.
+Claude Haiku 4.5
+produces negligible thinking tokens across all tasks, explaining its consistently low actual cost relative
+to listed price. Gemini 3 Flash produces the most thinking tokens on 5 out of 9 tasks.
+Model
+AIME
+ARC
+Arena
+GPQA
+HLE
+LCB
+LMB
+MMLU
+SQA
+GPT-5.2
+389
+4,596
+1,090
+585
+17,309
+3,284
+289
+1,804
+4,722
+GPT-5 Mini
+272
+3,617
+1,140
+482
+8,766
+2,097
+284
+2,964
+3,530
+Gemini 3.1 Pro
+646
+5,340
+2,061
+1,147
+35,735
+8,231
+586
+8,007
+30,122
+Gemini 3 Flash
+994
+12,579
+2,087
+3,619
+57,797
+53,338
+1,754
+71,489
+5,024
+Claude Opus 4.6
+321
+2,797
+1,019
+614
+13,599
+2,405
+279
+1,827
+1,336
+Claude Haiku 4.5
+0.1
+0.8
+1.5
+0.4
+4.3
+2.1
+0.2
+6.0
+8.7
+Kimi K2.5
+967
+8,320
+2,410
+2,453
+44,627
+11,738
+1,059
+13,538
+6,484
+MiniMax-M2.5
+120
+818
+1,053
+357
+4,259
+1,785
+197
+3,455
+5,185
+14
+A.6
+Data Collection Timeline
+All API calls for the main evaluation were conducted in February and March 2026. API pricing was
+recorded as of February 28, 2026 (Table 3). We note that API pricing is subject to change and our
+findings reflect this specific time window.
+B
+Limitations
+Our study has several limitations. First, we evaluate 8 models and 9 tasks. while diverse, these do not
+cover all available RLMs or application domains, and findings may differ for other models or tasks.
+Second, API pricing changes frequently. Our analysis reflects a specific snapshot in time, and the
+precise reversal rates and severity may shift as providers update their pricing. Third, our cost analysis
+is decoupled from output quality. we do not analyze the cost-accuracy tradeoff, which is an important
+complementary dimension for model selection. Fourth, the repeated-trial experiment for irreducible
+variance is conducted only on AIME with three models, while variance characteristics may differ on
+other tasks. Finally, we evaluate three simple baselines (mean, prompt-length regression, and KNN)
+for cost prediction. This suffices for demonstration purposes, but stronger predictors may achieve
+better results, and the irreducible variance we study places a lower bound on prediction error.
+15
