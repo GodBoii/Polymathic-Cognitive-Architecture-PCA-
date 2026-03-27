@@ -30,6 +30,39 @@ Resume from checkpoint:
   --steps 20
 ```
 
+Phase-2 reasoning specialization (freeze bottom 20 layers, train top 32):
+
+```powershell
+& .\lrm-matrix\Scripts\python.exe .\train\train_step.py `
+  --resume .\train\checkpoints_phase1_52l_bulk\last.pt `
+  --resume-model-only `
+  --n-layers 52 `
+  --d-model 3072 `
+  --n-heads 24 `
+  --n-kv-heads 8 `
+  --ffn-dim 2048 `
+  --reasoning-start-layer 20 `
+  --freeze-layers-below 20 `
+  --gqa-layers 12 `
+  --lightning-end-layer 36 `
+  --mla-latent-dim 768 `
+  --steps 15000
+```
+
+Launcher preset flow:
+
+```powershell
+& .\lrm-matrix\Scripts\python.exe .\scripts\launch_pretrain.py --config .\train\presets\phase1_52l_bulk.json
+& .\lrm-matrix\Scripts\python.exe .\scripts\launch_pretrain.py --config .\train\presets\phase2_52l_reasoning.json
+```
+
+V5 MoE-reasoning preset flow:
+
+```powershell
+& .\lrm-matrix\Scripts\python.exe .\scripts\launch_pretrain.py --config .\train\presets\phase1_52l_v5.json
+& .\lrm-matrix\Scripts\python.exe .\scripts\launch_pretrain.py --config .\train\presets\phase2_52l_v5.json
+```
+
 Key metrics emitted each step as JSON:
 - `loss`
 - `main_loss`
