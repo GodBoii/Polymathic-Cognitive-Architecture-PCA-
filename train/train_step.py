@@ -71,13 +71,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-kv-heads", type=int, default=2)
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--ffn-dim", type=int, default=None)
+    parser.add_argument("--ffn-kind", choices=["swiglu", "standard", "moe"], default="swiglu")
+    parser.add_argument("--reasoning-start-layer", type=int, default=None)
+    parser.add_argument("--reasoning-ffn-dim", type=int, default=None)
+    parser.add_argument("--reasoning-ffn-kind", choices=["swiglu", "standard", "moe"], default=None)
+    parser.add_argument("--reasoning-moe-num-experts", type=int, default=16)
+    parser.add_argument("--reasoning-moe-top-k", type=int, default=2)
+    parser.add_argument("--reasoning-moe-num-groups", type=int, default=4)
+    parser.add_argument("--reasoning-moe-groups-top-k", type=int, default=1)
+    parser.add_argument("--reasoning-moe-gate-type", choices=["softmax", "sigmoid"], default="sigmoid")
+    parser.add_argument("--reasoning-moe-expert-ffn-kind", choices=["swiglu", "standard"], default="swiglu")
+    parser.add_argument("--gqa-layers", type=int, default=4)
+    parser.add_argument("--lightning-end-layer", type=int, default=16)
+    parser.add_argument("--mla-latent-dim", type=int, default=512)
     parser.add_argument("--ffn-multiple-of", type=int, default=256)
     parser.add_argument("--cognitive-loops", type=int, default=5)
     parser.add_argument("--cognitive-num-experts", type=int, default=8)
+    parser.add_argument("--cognitive-num-groups", type=int, default=1)
+    parser.add_argument("--cognitive-groups-top-k", type=int, default=1)
     parser.add_argument("--cognitive-top-k", type=int, default=4)
     parser.add_argument("--cognitive-gate-type", choices=["softmax", "sigmoid"], default="sigmoid")
     parser.add_argument("--cognitive-aux-alpha", type=float, default=0.01)
     parser.add_argument("--cognitive-entropy-alpha", type=float, default=0.001)
+    parser.add_argument("--cognitive-ffn-dim", type=int, default=None)
+    parser.add_argument("--cognitive-ffn-kind", choices=["swiglu", "standard"], default="swiglu")
+
+    parser.add_argument("--freeze-layers-below", type=int, default=0, help="Freeze transformer layers [0, N-1].")
+    parser.add_argument("--freeze-embeddings", action="store_true")
+    parser.add_argument("--freeze-final-norm", action="store_true")
+    parser.add_argument("--freeze-cognitive-block", action="store_true")
+    parser.add_argument("--resume-model-only", action="store_true", help="Load only model weights from checkpoint and reset optimizer/scheduler/step state.")
 
     return parser.parse_args()
 
@@ -91,14 +115,70 @@ def make_model_config(args: argparse.Namespace) -> ModelConfig:
         n_kv_heads=args.n_kv_heads,
         max_seq_len=args.max_seq_len,
         dropout=args.dropout,
+        ffn_dim=args.ffn_dim,
+        ffn_kind=args.ffn_kind,
+        reasoning_start_layer=args.reasoning_start_layer,
+        reasoning_ffn_dim=args.reasoning_ffn_dim,
+        reasoning_ffn_kind=args.reasoning_ffn_kind,
+        reasoning_moe_num_experts=args.reasoning_moe_num_experts,
+        reasoning_moe_top_k=args.reasoning_moe_top_k,
+        reasoning_moe_num_groups=args.reasoning_moe_num_groups,
+        reasoning_moe_groups_top_k=args.reasoning_moe_groups_top_k,
+        reasoning_moe_gate_type=args.reasoning_moe_gate_type,
+        reasoning_moe_expert_ffn_kind=args.reasoning_moe_expert_ffn_kind,
+        gqa_layers=args.gqa_layers,
+        lightning_end_layer=args.lightning_end_layer,
+        mla_latent_dim=args.mla_latent_dim,
         ffn_multiple_of=args.ffn_multiple_of,
         cognitive_loops=args.cognitive_loops,
         cognitive_num_experts=args.cognitive_num_experts,
+        cognitive_num_groups=args.cognitive_num_groups,
+        cognitive_groups_top_k=args.cognitive_groups_top_k,
         cognitive_top_k=args.cognitive_top_k,
         cognitive_gate_type=args.cognitive_gate_type,
         cognitive_aux_alpha=args.cognitive_aux_alpha,
         cognitive_entropy_alpha=args.cognitive_entropy_alpha,
+        cognitive_ffn_dim=args.cognitive_ffn_dim,
+        cognitive_ffn_kind=args.cognitive_ffn_kind,
     )
+
+
+def _set_trainable(module: torch.nn.Module, trainable: bool) -> None:
+    for p in module.parameters():
+        p.requires_grad = trainable
+
+
+def apply_freeze_policy(model: PCAModel, args: argparse.Namespace) -> None:
+    if args.freeze_layers_below < 0:
+        raise ValueError("--freeze-layers-below must be >= 0")
+    if args.freeze_layers_below > len(model.layers):
+        raise ValueError("--freeze-layers-below cannot exceed model n_layers")
+
+    for idx, layer in enumerate(model.layers):
+        _set_trainable(layer, idx >= args.freeze_layers_below)
+
+    if args.freeze_embeddings:
+        _set_trainable(model.embed_tokens, False)
+        # lm_head can be tied to embeddings; this naturally freezes both in tied mode.
+        if model.lm_head.weight is not model.embed_tokens.weight:
+            _set_trainable(model.lm_head, False)
+
+    if args.freeze_final_norm:
+        _set_trainable(model.final_norm, False)
+
+    if args.freeze_cognitive_block:
+        _set_trainable(model.cognitive_block, False)
+
+
+def parameter_counts(model: PCAModel) -> tuple[int, int]:
+    total = 0
+    trainable = 0
+    for p in model.parameters():
+        n = p.numel()
+        total += n
+        if p.requires_grad:
+            trainable += n
+    return trainable, total
 
 
 def _split_muon_param_groups(model: PCAModel) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
@@ -213,23 +293,31 @@ def load_checkpoint(
     schedulers: List[torch.optim.lr_scheduler.LambdaLR],
     scaler: torch.cuda.amp.GradScaler,
     device: str,
+    load_optimizer_state: bool = True,
 ) -> Tuple[int, int, int, float | None, float | None]:
     try:
         payload = torch.load(path, map_location=device, weights_only=True)
     except TypeError:
         payload = torch.load(path, map_location=device)
     model.load_state_dict(payload["model_state"])
-    states = payload.get("optimizer_states")
-    if states is None and "optimizer_state" in payload:
-        states = [payload["optimizer_state"]]
-    if states is not None:
-        for opt, state in zip(optimizers, states):
-            opt.load_state_dict(state)
-    scheduler_states = payload.get("scheduler_states")
-    if scheduler_states is not None:
-        for scheduler, state in zip(schedulers, scheduler_states):
-            scheduler.load_state_dict(state)
-    scaler.load_state_dict(payload["scaler_state"])
+    if load_optimizer_state:
+        states = payload.get("optimizer_states")
+        if states is None and "optimizer_state" in payload:
+            states = [payload["optimizer_state"]]
+        if states is not None:
+            try:
+                for opt, state in zip(optimizers, states):
+                    opt.load_state_dict(state)
+            except ValueError as exc:
+                raise ValueError(
+                    "Optimizer state restore failed, likely due to a changed trainable-parameter set. "
+                    "Use --resume-model-only when transitioning to a new freeze policy."
+                ) from exc
+        scheduler_states = payload.get("scheduler_states")
+        if scheduler_states is not None:
+            for scheduler, state in zip(schedulers, scheduler_states):
+                scheduler.load_state_dict(state)
+        scaler.load_state_dict(payload["scaler_state"])
     return (
         int(payload["step"]),
         int(payload["total_tokens"]),
@@ -302,6 +390,22 @@ def main() -> None:
     device = args.device
     cfg = make_model_config(args)
     model = PCAModel(cfg).to(device)
+    apply_freeze_policy(model, args)
+    trainable_params, total_params = parameter_counts(model)
+    print(
+        json.dumps(
+            {
+                "event": "trainable_params",
+                "trainable": trainable_params,
+                "total": total_params,
+                "frozen": total_params - trainable_params,
+                "freeze_layers_below": args.freeze_layers_below,
+                "freeze_embeddings": args.freeze_embeddings,
+                "freeze_final_norm": args.freeze_final_norm,
+                "freeze_cognitive_block": args.freeze_cognitive_block,
+            }
+        )
+    )
     optimizers = build_optimizers(model, args)
     schedulers = build_schedulers(optimizers, args)
     base_aux_alpha = float(cfg.cognitive_aux_alpha)
@@ -315,14 +419,26 @@ def main() -> None:
     micro_batches_seen = 0
     if args.resume is not None:
         start_step, total_tokens, micro_batches_seen, ckpt_current_aux_alpha, ckpt_base_aux_alpha = load_checkpoint(
-            args.resume, model, optimizers, schedulers, scaler, device=device
+            args.resume,
+            model,
+            optimizers,
+            schedulers,
+            scaler,
+            device=device,
+            load_optimizer_state=not args.resume_model_only,
         )
-        if micro_batches_seen <= start_step:
-            micro_batches_seen = start_step * args.grad_accum_steps
-        if ckpt_base_aux_alpha is not None:
-            base_aux_alpha = float(ckpt_base_aux_alpha)
-        if ckpt_current_aux_alpha is not None:
-            current_aux_alpha = float(ckpt_current_aux_alpha)
+        if args.resume_model_only:
+            start_step = 0
+            total_tokens = 0
+            micro_batches_seen = 0
+            print(json.dumps({"event": "resume_model_only", "checkpoint": str(args.resume)}))
+        else:
+            if micro_batches_seen <= start_step:
+                micro_batches_seen = start_step * args.grad_accum_steps
+            if ckpt_base_aux_alpha is not None:
+                base_aux_alpha = float(ckpt_base_aux_alpha)
+            if ckpt_current_aux_alpha is not None:
+                current_aux_alpha = float(ckpt_current_aux_alpha)
 
     model.train()
     for optimizer in optimizers:
@@ -466,7 +582,7 @@ def main() -> None:
         dt = time.perf_counter() - step_start
         tokens_per_sec = tokens_step / max(dt, 1e-9)
 
-        if step % args.log_every == 0:
+        if (step + 1) % args.log_every == 0:
             payload = {
                 "step": step + 1,
                 "loss": running_loss,
