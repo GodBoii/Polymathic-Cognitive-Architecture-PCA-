@@ -13,13 +13,35 @@ class PackedSequenceDataset(Dataset):
         self.shard_infos = self.manifest["shards"]
         self.seq_len = int(self.manifest["config"]["seq_len"])
 
-        self._shards = [np.load(info["path"], mmap_mode="r") for info in self.shard_infos]
+        self._shards = [np.load(self._resolve_shard_path(info), mmap_mode="r") for info in self.shard_infos]
         self._offsets = []
         total = 0
         for shard in self._shards:
             self._offsets.append(total)
             total += int(shard.shape[0])
         self.total_sequences = total
+
+    def _resolve_shard_path(self, shard_info: dict) -> Path:
+        raw_path = Path(shard_info["path"])
+        if raw_path.exists():
+            return raw_path
+
+        # Portable fallback: reuse the shard filename relative to the manifest directory.
+        candidate = self.manifest_path.parent / raw_path.name
+        if candidate.exists():
+            return candidate
+
+        # Secondary fallback: if output_dir exists in config, try that too.
+        output_dir = self.manifest.get("config", {}).get("output_dir")
+        if output_dir:
+            output_candidate = Path(output_dir) / raw_path.name
+            if output_candidate.exists():
+                return output_candidate
+
+        raise FileNotFoundError(
+            f"Shard file not found. Tried manifest path '{raw_path}', "
+            f"manifest-relative path '{candidate}', and output-dir fallback '{output_dir}'."
+        )
 
     def __len__(self) -> int:
         return self.total_sequences
