@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import torch
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Launch long-run pretraining from a JSON preset.")
@@ -96,12 +98,16 @@ def build_train_cmd(
 
     # Model architecture
     maybe_add(cmd, "--vocab-size", model.get("vocab_size", 32000))
+    maybe_add(cmd, "--architecture-kind", model.get("architecture_kind", "autoregressive_pca"))
     maybe_add(cmd, "--d-model", model.get("d_model", 2048))
     maybe_add(cmd, "--n-layers", model.get("n_layers", 24))
     maybe_add(cmd, "--n-heads", model.get("n_heads", 16))
     maybe_add(cmd, "--n-kv-heads", model.get("n_kv_heads", 4))
     maybe_add(cmd, "--max-seq-len", model.get("max_seq_len", 8192))
+    maybe_add(cmd, "--encoder-layers", model.get("encoder_layers"))
+    maybe_add(cmd, "--decoder-layers", model.get("decoder_layers"))
     maybe_add(cmd, "--dropout", model.get("dropout", 0.0))
+    maybe_add_bool(cmd, "--gradient-checkpointing", bool(model.get("gradient_checkpointing", False)))
     maybe_add(cmd, "--ffn-dim", model.get("ffn_dim"))
     maybe_add(cmd, "--ffn-kind", model.get("ffn_kind", "swiglu"))
     maybe_add(cmd, "--reasoning-start-layer", model.get("reasoning_start_layer"))
@@ -127,6 +133,12 @@ def build_train_cmd(
     maybe_add(cmd, "--cognitive-entropy-alpha", model.get("cognitive_entropy_alpha", 0.001))
     maybe_add(cmd, "--cognitive-ffn-dim", model.get("cognitive_ffn_dim"))
     maybe_add(cmd, "--cognitive-ffn-kind", model.get("cognitive_ffn_kind", "swiglu"))
+    maybe_add_bool(cmd, "--use-imagination", bool(model.get("use_imagination", False)))
+    maybe_add(cmd, "--imagination-num-latents", model.get("imagination_num_latents", 8))
+    maybe_add(cmd, "--imagination-steps", model.get("imagination_steps", 2))
+    maybe_add(cmd, "--imagination-heads", model.get("imagination_heads"))
+    maybe_add(cmd, "--imagination-ffn-dim", model.get("imagination_ffn_dim"))
+    maybe_add(cmd, "--imagination-anchor-alpha", model.get("imagination_anchor_alpha", 0.1))
 
     # Training hyperparams
     maybe_add(cmd, "--optimizer", train.get("optimizer", "muon"))
@@ -155,6 +167,42 @@ def build_train_cmd(
     maybe_add(cmd, "--aux-alpha-decay", alerts.get("aux_alpha_decay", 0.95))
 
     return cmd
+
+
+def resolve_hardware_profile(hw: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(hw)
+    requested_device = str(resolved.get("device", "auto"))
+    requested_precision = str(resolved.get("precision", "bf16"))
+
+    if requested_device == "auto":
+        resolved["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+    elif requested_device.startswith("cuda") and not torch.cuda.is_available():
+        print(
+            json.dumps(
+                {
+                    "event": "launcher_fallback",
+                    "reason": "cuda_requested_but_unavailable",
+                    "requested_device": requested_device,
+                    "resolved_device": "cpu",
+                }
+            )
+        )
+        resolved["device"] = "cpu"
+
+    if resolved["device"] == "cpu" and requested_precision != "fp32":
+        print(
+            json.dumps(
+                {
+                    "event": "launcher_fallback",
+                    "reason": "non_fp32_precision_on_cpu",
+                    "requested_precision": requested_precision,
+                    "resolved_precision": "fp32",
+                }
+            )
+        )
+        resolved["precision"] = "fp32"
+
+    return resolved
 
 
 def launch_chunk(cmd: list[str], log_path: Path) -> tuple[int, dict[str, Any] | None]:
@@ -190,6 +238,7 @@ def main() -> None:
     paths = cfg["Paths"]
     train = cfg["Training_Hyperparams"]
     alerts = cfg["Telemetry_Alerts"]
+    cfg["Hardware_Profile"] = resolve_hardware_profile(cfg["Hardware_Profile"])
 
     checkpoint_dir = Path(paths["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
