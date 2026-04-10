@@ -139,6 +139,9 @@ def build_train_cmd(
     maybe_add(cmd, "--imagination-heads", model.get("imagination_heads"))
     maybe_add(cmd, "--imagination-ffn-dim", model.get("imagination_ffn_dim"))
     maybe_add(cmd, "--imagination-anchor-alpha", model.get("imagination_anchor_alpha", 0.1))
+    maybe_add(cmd, "--imagination-aux-alpha", model.get("imagination_aux_alpha", 0.05))
+    maybe_add(cmd, "--imagination-stability-alpha", model.get("imagination_stability_alpha", 0.025))
+    maybe_add(cmd, "--imagination-consistency-alpha", model.get("imagination_consistency_alpha", 0.025))
 
     # Training hyperparams
     maybe_add(cmd, "--optimizer", train.get("optimizer", "muon"))

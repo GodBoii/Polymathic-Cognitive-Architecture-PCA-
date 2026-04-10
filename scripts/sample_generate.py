@@ -77,6 +77,9 @@ def _cfg_from_payload(payload: dict) -> ModelConfig:
         "imagination_heads",
         "imagination_ffn_dim",
         "imagination_anchor_alpha",
+        "imagination_aux_alpha",
+        "imagination_stability_alpha",
+        "imagination_consistency_alpha",
     }
     filtered = {k: v for k, v in raw.items() if k in allowed}
     return ModelConfig(**filtered)
