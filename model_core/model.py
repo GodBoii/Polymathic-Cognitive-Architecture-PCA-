@@ -122,6 +122,7 @@ class PCAModel(nn.Module):
                     "imagination_stability_loss": zero,
                     "imagination_consistency_loss": zero,
                     "imagination_norm_loss": zero,
+                    "imagination_contraction_loss": zero,
                 }
             else:
                 out["aux_losses"] = {
@@ -133,6 +134,7 @@ class PCAModel(nn.Module):
                     "imagination_stability_loss": zero,
                     "imagination_consistency_loss": zero,
                     "imagination_norm_loss": zero,
+                    "imagination_contraction_loss": zero,
                 }
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
