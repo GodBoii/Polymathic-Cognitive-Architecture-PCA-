@@ -105,6 +105,27 @@ python .\data_pipeline\create_manifest_split.py `
 
 Then point your local presets at the split manifests so train and eval are actually disjoint.
 
+Real-data local split workflow from `phase1_v5`:
+
+```powershell
+python .\data_pipeline\create_manifest_split.py `
+  --source-manifest .\data_pipeline\artifacts\phase1_v5\manifest.json `
+  --train-output-dir .\data_pipeline\artifacts\phase1_v5_local_train `
+  --eval-output-dir .\data_pipeline\artifacts\phase1_v5_local_eval `
+  --eval-ratio 0.1 `
+  --seed 42 `
+  --train-shard-sequences 256 `
+  --eval-shard-sequences 64
+```
+
+This works well with short local windows because the training loop now crops long packed sequences down to `seq_len`.
+
+Recommended real-data three-phase local run:
+
+```powershell
+python .\scripts\launch_pretrain.py --config .\train\presets\local_rtx3050_4gb_three_phase_v5_split.json
+```
+
 Key metrics emitted each step as JSON:
 - `loss`
 - `main_loss`
