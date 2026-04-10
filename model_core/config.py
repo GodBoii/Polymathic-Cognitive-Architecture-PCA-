@@ -59,6 +59,9 @@ class ModelConfig:
     imagination_heads: Optional[int] = None
     imagination_ffn_dim: Optional[int] = None
     imagination_anchor_alpha: float = 0.1
+    imagination_aux_alpha: float = 0.05
+    imagination_stability_alpha: float = 0.025
+    imagination_consistency_alpha: float = 0.025
 
     def __post_init__(self) -> None:
         if self.ffn_dim is None:
@@ -76,6 +79,10 @@ class ModelConfig:
             decoder_layers = max(1, self.n_layers - encoder_layers)
             self.encoder_layers = encoder_layers if self.encoder_layers is None else self.encoder_layers
             self.decoder_layers = decoder_layers if self.decoder_layers is None else self.decoder_layers
+        if self.architecture_kind == "three_phase":
+            # Hybrid-attention boundaries are irrelevant for the dedicated three-phase path.
+            self.gqa_layers = min(self.gqa_layers, self.n_layers)
+            self.lightning_end_layer = min(self.lightning_end_layer, self.n_layers)
         self.validate()
 
     @property
@@ -201,6 +208,12 @@ class ModelConfig:
             raise ValueError("imagination_ffn_dim must be > 0 when provided")
         if self.imagination_anchor_alpha < 0.0 or self.imagination_anchor_alpha > 1.0:
             raise ValueError("imagination_anchor_alpha must be in [0.0, 1.0]")
+        if self.imagination_aux_alpha < 0.0:
+            raise ValueError("imagination_aux_alpha must be >= 0.0")
+        if self.imagination_stability_alpha < 0.0:
+            raise ValueError("imagination_stability_alpha must be >= 0.0")
+        if self.imagination_consistency_alpha < 0.0:
+            raise ValueError("imagination_consistency_alpha must be >= 0.0")
 
     def ffn_kind_for_layer(self, layer_idx: int) -> str:
         if self.reasoning_start_layer is not None and layer_idx >= self.reasoning_start_layer:
