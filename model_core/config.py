@@ -8,12 +8,15 @@ def _is_multiple(value: int, factor: int) -> bool:
 
 @dataclass
 class ModelConfig:
+    architecture_kind: str = "autoregressive_pca"
     vocab_size: int = 32000
     d_model: int = 2048
     n_layers: int = 24
     n_heads: int = 16
     n_kv_heads: int = 4
     max_seq_len: int = 8192
+    encoder_layers: Optional[int] = None
+    decoder_layers: Optional[int] = None
 
     ffn_dim: Optional[int] = None
     ffn_kind: str = "swiglu"
@@ -30,6 +33,7 @@ class ModelConfig:
     rms_eps: float = 1e-6
     rope_theta: float = 10000.0
     dropout: float = 0.0
+    gradient_checkpointing: bool = False
 
     bos_token_id: int = 1
     eos_token_id: int = 2
@@ -49,6 +53,12 @@ class ModelConfig:
     gqa_layers: int = 4
     lightning_end_layer: int = 16
     mla_latent_dim: int = 512
+    use_imagination: bool = False
+    imagination_num_latents: int = 8
+    imagination_steps: int = 2
+    imagination_heads: Optional[int] = None
+    imagination_ffn_dim: Optional[int] = None
+    imagination_anchor_alpha: float = 0.1
 
     def __post_init__(self) -> None:
         if self.ffn_dim is None:
@@ -57,6 +67,15 @@ class ModelConfig:
             self.ffn_dim = ((approx + self.ffn_multiple_of - 1) // self.ffn_multiple_of) * self.ffn_multiple_of
         if self.cognitive_ffn_dim is None:
             self.cognitive_ffn_dim = int(self.ffn_dim)
+        if self.imagination_ffn_dim is None:
+            self.imagination_ffn_dim = int(self.ffn_dim)
+        if self.imagination_heads is None:
+            self.imagination_heads = self.n_heads
+        if self.encoder_layers is None or self.decoder_layers is None:
+            encoder_layers = max(1, self.n_layers // 2)
+            decoder_layers = max(1, self.n_layers - encoder_layers)
+            self.encoder_layers = encoder_layers if self.encoder_layers is None else self.encoder_layers
+            self.decoder_layers = decoder_layers if self.decoder_layers is None else self.decoder_layers
         self.validate()
 
     @property
@@ -74,6 +93,8 @@ class ModelConfig:
     def validate(self) -> None:
         if self.vocab_size <= 0:
             raise ValueError("vocab_size must be > 0")
+        if self.architecture_kind not in {"autoregressive_pca", "three_phase"}:
+            raise ValueError("architecture_kind must be 'autoregressive_pca' or 'three_phase'")
         if self.d_model <= 0:
             raise ValueError("d_model must be > 0")
         if self.n_layers <= 0:
@@ -88,6 +109,12 @@ class ModelConfig:
             raise ValueError("n_heads must be divisible by n_kv_heads")
         if self.max_seq_len <= 0:
             raise ValueError("max_seq_len must be > 0")
+        if self.encoder_layers is None or self.encoder_layers <= 0:
+            raise ValueError("encoder_layers must be > 0")
+        if self.decoder_layers is None or self.decoder_layers <= 0:
+            raise ValueError("decoder_layers must be > 0")
+        if self.architecture_kind == "three_phase" and (self.encoder_layers + self.decoder_layers) != self.n_layers:
+            raise ValueError("for three_phase, encoder_layers + decoder_layers must equal n_layers")
         if self.ffn_multiple_of <= 0:
             raise ValueError("ffn_multiple_of must be > 0")
         if self.ffn_dim is not None and self.ffn_dim <= 0:
@@ -123,6 +150,8 @@ class ModelConfig:
             raise ValueError("rms_eps must be > 0")
         if self.dropout < 0.0 or self.dropout >= 1.0:
             raise ValueError("dropout must be in [0.0, 1.0)")
+        if not isinstance(self.gradient_checkpointing, bool):
+            raise ValueError("gradient_checkpointing must be a bool")
         if self.cognitive_loops <= 0:
             raise ValueError("cognitive_loops must be > 0")
         if self.cognitive_num_experts <= 0:
@@ -156,8 +185,22 @@ class ModelConfig:
             raise ValueError("lightning_end_layer must be >= 0")
         if self.gqa_layers > self.lightning_end_layer:
             raise ValueError("gqa_layers must be <= lightning_end_layer")
+        if self.lightning_end_layer > self.n_layers:
+            raise ValueError("lightning_end_layer must be <= n_layers")
         if self.mla_latent_dim <= 0:
             raise ValueError("mla_latent_dim must be > 0")
+        if self.imagination_num_latents <= 0:
+            raise ValueError("imagination_num_latents must be > 0")
+        if self.imagination_steps < 0:
+            raise ValueError("imagination_steps must be >= 0")
+        if self.imagination_heads is None or self.imagination_heads <= 0:
+            raise ValueError("imagination_heads must be > 0")
+        if not _is_multiple(self.d_model, self.imagination_heads):
+            raise ValueError("d_model must be divisible by imagination_heads")
+        if self.imagination_ffn_dim is not None and self.imagination_ffn_dim <= 0:
+            raise ValueError("imagination_ffn_dim must be > 0 when provided")
+        if self.imagination_anchor_alpha < 0.0 or self.imagination_anchor_alpha > 1.0:
+            raise ValueError("imagination_anchor_alpha must be in [0.0, 1.0]")
 
     def ffn_kind_for_layer(self, layer_idx: int) -> str:
         if self.reasoning_start_layer is not None and layer_idx >= self.reasoning_start_layer:
