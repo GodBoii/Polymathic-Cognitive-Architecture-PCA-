@@ -62,6 +62,8 @@ class ModelConfig:
     imagination_aux_alpha: float = 0.05
     imagination_stability_alpha: float = 0.025
     imagination_consistency_alpha: float = 0.025
+    imagination_norm_alpha: float = 0.01
+    imagination_update_scale: float = 0.25
 
     def __post_init__(self) -> None:
         if self.ffn_dim is None:
@@ -214,6 +216,10 @@ class ModelConfig:
             raise ValueError("imagination_stability_alpha must be >= 0.0")
         if self.imagination_consistency_alpha < 0.0:
             raise ValueError("imagination_consistency_alpha must be >= 0.0")
+        if self.imagination_norm_alpha < 0.0:
+            raise ValueError("imagination_norm_alpha must be >= 0.0")
+        if self.imagination_update_scale <= 0.0 or self.imagination_update_scale > 1.0:
+            raise ValueError("imagination_update_scale must be in (0.0, 1.0]")
 
     def ffn_kind_for_layer(self, layer_idx: int) -> str:
         if self.reasoning_start_layer is not None and layer_idx >= self.reasoning_start_layer:

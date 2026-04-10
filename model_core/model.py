@@ -111,13 +111,17 @@ class PCAModel(nn.Module):
             if imagination_stats is not None:
                 out["imagination_stats"] = imagination_stats
         if return_aux_losses:
+            zero = logits.new_zeros(())
             if router_stats is None:
-                zero = logits.new_zeros(())
                 out["aux_losses"] = {
                     "total_aux_loss": zero,
                     "moe_aux_loss": zero,
                     "moe_load_balance_loss": zero,
                     "moe_entropy_reg_loss": zero,
+                    "imagination_aux_loss": zero,
+                    "imagination_stability_loss": zero,
+                    "imagination_consistency_loss": zero,
+                    "imagination_norm_loss": zero,
                 }
             else:
                 out["aux_losses"] = {
@@ -125,6 +129,10 @@ class PCAModel(nn.Module):
                     "moe_aux_loss": router_stats["moe_aux_loss"],
                     "moe_load_balance_loss": router_stats["moe_load_balance_loss"],
                     "moe_entropy_reg_loss": router_stats["moe_entropy_reg_loss"],
+                    "imagination_aux_loss": zero,
+                    "imagination_stability_loss": zero,
+                    "imagination_consistency_loss": zero,
+                    "imagination_norm_loss": zero,
                 }
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
