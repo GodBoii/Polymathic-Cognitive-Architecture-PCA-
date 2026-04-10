@@ -135,6 +135,8 @@ class ThreePhasePCAModel(nn.Module):
             dropout=cfg.dropout,
         )
         self.summary_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.self_attn_gate = nn.Parameter(torch.tensor(float(cfg.imagination_update_scale)))
+        self.ffn_gate = nn.Parameter(torch.tensor(float(cfg.imagination_update_scale)))
         self.final_norm = RMSNorm(cfg.d_model, eps=cfg.rms_eps)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if tie_embeddings:
@@ -195,13 +197,15 @@ class ThreePhasePCAModel(nn.Module):
         for _ in range(max(self.cfg.imagination_steps, 1)):
             prev = latents
             latent_norm = self.latent_norm_1(latents)
-            latents = latents + self.latent_self_attn(
+            self_attn_out = self.latent_self_attn(
                 latent_norm,
                 latent_norm,
                 latent_norm,
                 need_weights=False,
             )[0]
-            latents = latents + self.latent_ffn(self.latent_norm_2(latents))
+            latents = latents + torch.sigmoid(self.self_attn_gate) * self_attn_out
+            ffn_out = self.latent_ffn(self.latent_norm_2(latents))
+            latents = latents + torch.sigmoid(self.ffn_gate) * ffn_out
             latents = (1.0 - self.cfg.imagination_anchor_alpha) * latents + self.cfg.imagination_anchor_alpha * anchor
             step_delta = latents - prev
             step_delta_norm = step_delta.norm(dim=-1).mean()
@@ -214,9 +218,11 @@ class ThreePhasePCAModel(nn.Module):
         latent_summary = latents.mean(dim=1)
         stability_loss = torch.stack(step_delta_squares).mean() if step_delta_squares else latents.new_zeros(())
         consistency_loss = F.mse_loss(latent_summary.float(), summary_target.float())
+        norm_loss = latents.float().pow(2).mean()
         imagination_aux_loss = (
             self.cfg.imagination_stability_alpha * stability_loss
             + self.cfg.imagination_consistency_alpha * consistency_loss
+            + self.cfg.imagination_norm_alpha * norm_loss
         ) * self.cfg.imagination_aux_alpha
 
         stats = {
@@ -224,6 +230,8 @@ class ThreePhasePCAModel(nn.Module):
             "num_steps": float(self.cfg.imagination_steps),
             "avg_delta_norm": float((avg_delta / max(self.cfg.imagination_steps, 1)).detach().item()),
             "final_latent_norm": float(latents.norm(dim=-1).mean().detach().item()),
+            "self_attn_gate": float(torch.sigmoid(self.self_attn_gate).detach().item()),
+            "ffn_gate": float(torch.sigmoid(self.ffn_gate).detach().item()),
             "step_delta_norms": [float(v.item()) for v in step_delta_norms],
             "convergence_ratio": float(
                 (step_delta_norms[-1] / (step_delta_norms[0] + 1e-8)).item()
@@ -242,6 +250,7 @@ class ThreePhasePCAModel(nn.Module):
             "imagination_aux_loss": imagination_aux_loss.to(dtype=latents.dtype),
             "imagination_stability_loss": stability_loss.to(dtype=latents.dtype),
             "imagination_consistency_loss": consistency_loss.to(dtype=latents.dtype),
+            "imagination_norm_loss": norm_loss.to(dtype=latents.dtype),
         }
         return latents, stats, aux
 
