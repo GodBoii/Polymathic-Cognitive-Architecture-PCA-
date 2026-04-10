@@ -12,8 +12,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from model_core import build_model
 from model_core.config import ModelConfig
-from model_core.model import PCAModel
 from data_pipeline.dataset_loader import CUDAPrefetchLoader, create_packed_dataloader
 from train.muon import Muon
 
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         help="When using packed manifests, skip already-consumed micro-batches after resume.",
     )
 
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--optimizer", choices=["muon", "adamw"], default="muon")
@@ -65,12 +65,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
 
     parser.add_argument("--vocab-size", type=int, default=32000)
+    parser.add_argument("--architecture-kind", choices=["autoregressive_pca", "three_phase"], default="autoregressive_pca")
     parser.add_argument("--d-model", type=int, default=512)
     parser.add_argument("--n-layers", type=int, default=8)
     parser.add_argument("--n-heads", type=int, default=8)
     parser.add_argument("--n-kv-heads", type=int, default=2)
     parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument("--encoder-layers", type=int, default=None)
+    parser.add_argument("--decoder-layers", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--ffn-dim", type=int, default=None)
     parser.add_argument("--ffn-kind", choices=["swiglu", "standard", "moe"], default="swiglu")
     parser.add_argument("--reasoning-start-layer", type=int, default=None)
@@ -96,6 +100,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cognitive-entropy-alpha", type=float, default=0.001)
     parser.add_argument("--cognitive-ffn-dim", type=int, default=None)
     parser.add_argument("--cognitive-ffn-kind", choices=["swiglu", "standard"], default="swiglu")
+    parser.add_argument("--use-imagination", action="store_true")
+    parser.add_argument("--imagination-num-latents", type=int, default=8)
+    parser.add_argument("--imagination-steps", type=int, default=2)
+    parser.add_argument("--imagination-heads", type=int, default=None)
+    parser.add_argument("--imagination-ffn-dim", type=int, default=None)
+    parser.add_argument("--imagination-anchor-alpha", type=float, default=0.1)
 
     parser.add_argument("--freeze-layers-below", type=int, default=0, help="Freeze transformer layers [0, N-1].")
     parser.add_argument("--freeze-embeddings", action="store_true")
@@ -108,13 +118,17 @@ def parse_args() -> argparse.Namespace:
 
 def make_model_config(args: argparse.Namespace) -> ModelConfig:
     return ModelConfig(
+        architecture_kind=args.architecture_kind,
         vocab_size=args.vocab_size,
         d_model=args.d_model,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         n_kv_heads=args.n_kv_heads,
         max_seq_len=args.max_seq_len,
+        encoder_layers=args.encoder_layers,
+        decoder_layers=args.decoder_layers,
         dropout=args.dropout,
+        gradient_checkpointing=args.gradient_checkpointing,
         ffn_dim=args.ffn_dim,
         ffn_kind=args.ffn_kind,
         reasoning_start_layer=args.reasoning_start_layer,
@@ -140,7 +154,41 @@ def make_model_config(args: argparse.Namespace) -> ModelConfig:
         cognitive_entropy_alpha=args.cognitive_entropy_alpha,
         cognitive_ffn_dim=args.cognitive_ffn_dim,
         cognitive_ffn_kind=args.cognitive_ffn_kind,
+        use_imagination=args.use_imagination,
+        imagination_num_latents=args.imagination_num_latents,
+        imagination_steps=args.imagination_steps,
+        imagination_heads=args.imagination_heads,
+        imagination_ffn_dim=args.imagination_ffn_dim,
+        imagination_anchor_alpha=args.imagination_anchor_alpha,
     )
+
+
+def resolve_runtime_device_and_precision(requested_device: str, requested_precision: str) -> tuple[str, str]:
+    device = requested_device
+    precision = requested_precision
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        print(json.dumps({
+            "event": "runtime_fallback",
+            "reason": "cuda_requested_but_unavailable",
+            "requested_device": requested_device,
+            "resolved_device": "cpu",
+        }))
+        device = "cpu"
+
+    if device == "cpu" and precision != "fp32":
+        print(json.dumps({
+            "event": "runtime_fallback",
+            "reason": "non_fp32_precision_on_cpu",
+            "requested_precision": requested_precision,
+            "resolved_precision": "fp32",
+        }))
+        precision = "fp32"
+
+    return device, precision
 
 
 def _set_trainable(module: torch.nn.Module, trainable: bool) -> None:
@@ -148,14 +196,20 @@ def _set_trainable(module: torch.nn.Module, trainable: bool) -> None:
         p.requires_grad = trainable
 
 
-def apply_freeze_policy(model: PCAModel, args: argparse.Namespace) -> None:
+def apply_freeze_policy(model, args: argparse.Namespace) -> None:
     if args.freeze_layers_below < 0:
         raise ValueError("--freeze-layers-below must be >= 0")
-    if args.freeze_layers_below > len(model.layers):
-        raise ValueError("--freeze-layers-below cannot exceed model n_layers")
-
-    for idx, layer in enumerate(model.layers):
-        _set_trainable(layer, idx >= args.freeze_layers_below)
+    if hasattr(model, "layers"):
+        if args.freeze_layers_below > len(model.layers):
+            raise ValueError("--freeze-layers-below cannot exceed model n_layers")
+        for idx, layer in enumerate(model.layers):
+            _set_trainable(layer, idx >= args.freeze_layers_below)
+    elif hasattr(model, "encoder") and hasattr(model, "decoder"):
+        staged_layers = list(model.encoder) + list(model.decoder)
+        if args.freeze_layers_below > len(staged_layers):
+            raise ValueError("--freeze-layers-below cannot exceed encoder_layers + decoder_layers")
+        for idx, layer in enumerate(staged_layers):
+            _set_trainable(layer, idx >= args.freeze_layers_below)
 
     if args.freeze_embeddings:
         _set_trainable(model.embed_tokens, False)
@@ -166,11 +220,11 @@ def apply_freeze_policy(model: PCAModel, args: argparse.Namespace) -> None:
     if args.freeze_final_norm:
         _set_trainable(model.final_norm, False)
 
-    if args.freeze_cognitive_block:
+    if args.freeze_cognitive_block and hasattr(model, "cognitive_block"):
         _set_trainable(model.cognitive_block, False)
 
 
-def parameter_counts(model: PCAModel) -> tuple[int, int]:
+def parameter_counts(model) -> tuple[int, int]:
     total = 0
     trainable = 0
     for p in model.parameters():
@@ -181,7 +235,7 @@ def parameter_counts(model: PCAModel) -> tuple[int, int]:
     return trainable, total
 
 
-def _split_muon_param_groups(model: PCAModel) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+def _split_muon_param_groups(model) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
     muon_params: list[torch.nn.Parameter] = []
     adamw_params: list[torch.nn.Parameter] = []
     for name, param in model.named_parameters():
@@ -195,7 +249,7 @@ def _split_muon_param_groups(model: PCAModel) -> tuple[list[torch.nn.Parameter],
     return muon_params, adamw_params
 
 
-def build_optimizers(model: PCAModel, args: argparse.Namespace) -> List[torch.optim.Optimizer]:
+def build_optimizers(model, args: argparse.Namespace) -> List[torch.optim.Optimizer]:
     if args.optimizer == "muon":
         muon_params, adamw_params = _split_muon_param_groups(model)
         optimizers: list[torch.optim.Optimizer] = []
@@ -259,7 +313,7 @@ def autocast_context(device: str, precision: str):
 
 def save_checkpoint(
     path: Path,
-    model: PCAModel,
+    model,
     optimizers: List[torch.optim.Optimizer],
     schedulers: List[torch.optim.lr_scheduler.LambdaLR],
     scaler: torch.cuda.amp.GradScaler,
@@ -288,7 +342,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     path: Path,
-    model: PCAModel,
+    model,
     optimizers: List[torch.optim.Optimizer],
     schedulers: List[torch.optim.lr_scheduler.LambdaLR],
     scaler: torch.cuda.amp.GradScaler,
@@ -345,7 +399,7 @@ def to_device(batch: Dict[str, torch.Tensor], device: str) -> Dict[str, torch.Te
 
 @torch.no_grad()
 def run_eval(
-    model: PCAModel,
+    model,
     eval_loader,
     device: str,
     precision: str,
@@ -381,6 +435,7 @@ def run_eval(
 
 def main() -> None:
     args = parse_args()
+    args.device, args.precision = resolve_runtime_device_and_precision(args.device, args.precision)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -389,7 +444,7 @@ def main() -> None:
 
     device = args.device
     cfg = make_model_config(args)
-    model = PCAModel(cfg).to(device)
+    model = build_model(cfg).to(device)
     apply_freeze_policy(model, args)
     trainable_params, total_params = parameter_counts(model)
     print(
@@ -553,12 +608,15 @@ def main() -> None:
             running_moe_aux_loss += float(moe_aux_loss.item()) / args.grad_accum_steps
             running_moe_lb_loss += float(out["aux_losses"]["moe_load_balance_loss"].item()) / args.grad_accum_steps
             running_moe_entropy_reg_loss += float(out["aux_losses"]["moe_entropy_reg_loss"].item()) / args.grad_accum_steps
-            if want_router_stats:
-                running_router_entropy += float(out["router_stats"]["avg_router_entropy"])
-                usage = torch.tensor(out["router_stats"]["expert_usage"], dtype=torch.float64)
-                co_act = torch.tensor(out["router_stats"]["co_activation"], dtype=torch.float64)
-                agg_expert_usage = usage if agg_expert_usage is None else (agg_expert_usage + usage)
-                agg_co_activation = co_act if agg_co_activation is None else (agg_co_activation + co_act)
+            if want_router_stats and "router_stats" in out:
+                router_stats = out["router_stats"]
+                if "avg_router_entropy" in router_stats:
+                    running_router_entropy += float(router_stats["avg_router_entropy"])
+                if "expert_usage" in router_stats:
+                    usage = torch.tensor(router_stats["expert_usage"], dtype=torch.float64)
+                    co_act = torch.tensor(router_stats["co_activation"], dtype=torch.float64)
+                    agg_expert_usage = usage if agg_expert_usage is None else (agg_expert_usage + usage)
+                    agg_co_activation = co_act if agg_co_activation is None else (agg_co_activation + co_act)
 
         if scaler.is_enabled():
             for optimizer in optimizers:
@@ -615,6 +673,8 @@ def main() -> None:
                 )
                 payload["eval_loss"] = eval_loss
                 payload["eval_perplexity"] = eval_perplexity
+            if want_router_stats and "imagination_stats" in out:
+                payload["imagination_stats"] = out["imagination_stats"]
             if agg_expert_usage is not None:
                 mean_entropy = running_router_entropy / max(args.grad_accum_steps, 1)
                 usage_mean = float(agg_expert_usage.mean().item())
