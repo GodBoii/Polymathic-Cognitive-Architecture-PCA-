@@ -126,6 +126,12 @@ Recommended real-data three-phase local run:
 python .\scripts\launch_pretrain.py --config .\train\presets\local_rtx3050_4gb_three_phase_v5_split.json
 ```
 
+Run the three-phase ablation grid:
+
+```powershell
+python .\scripts\run_three_phase_ablation.py --fresh-start
+```
+
 Key metrics emitted each step as JSON:
 - `loss`
 - `main_loss`
