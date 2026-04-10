@@ -109,6 +109,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imagination-aux-alpha", type=float, default=0.05)
     parser.add_argument("--imagination-stability-alpha", type=float, default=0.025)
     parser.add_argument("--imagination-consistency-alpha", type=float, default=0.025)
+    parser.add_argument("--imagination-norm-alpha", type=float, default=0.01)
+    parser.add_argument("--imagination-update-scale", type=float, default=0.25)
 
     parser.add_argument("--freeze-layers-below", type=int, default=0, help="Freeze transformer layers [0, N-1].")
     parser.add_argument("--freeze-embeddings", action="store_true")
@@ -166,6 +168,8 @@ def make_model_config(args: argparse.Namespace) -> ModelConfig:
         imagination_aux_alpha=args.imagination_aux_alpha,
         imagination_stability_alpha=args.imagination_stability_alpha,
         imagination_consistency_alpha=args.imagination_consistency_alpha,
+        imagination_norm_alpha=args.imagination_norm_alpha,
+        imagination_update_scale=args.imagination_update_scale,
     )
 
 
@@ -599,6 +603,7 @@ def main() -> None:
         running_imagination_aux_loss = 0.0
         running_imagination_stability_loss = 0.0
         running_imagination_consistency_loss = 0.0
+        running_imagination_norm_loss = 0.0
         running_router_entropy = 0.0
         agg_expert_usage = None
         agg_co_activation = None
@@ -660,6 +665,7 @@ def main() -> None:
                 running_imagination_aux_loss += float(out["aux_losses"]["imagination_aux_loss"].item()) / args.grad_accum_steps
                 running_imagination_stability_loss += float(out["aux_losses"]["imagination_stability_loss"].item()) / args.grad_accum_steps
                 running_imagination_consistency_loss += float(out["aux_losses"]["imagination_consistency_loss"].item()) / args.grad_accum_steps
+                running_imagination_norm_loss += float(out["aux_losses"]["imagination_norm_loss"].item()) / args.grad_accum_steps
             if want_router_stats and "router_stats" in out:
                 router_stats = out["router_stats"]
                 if "avg_router_entropy" in router_stats:
@@ -703,6 +709,7 @@ def main() -> None:
                 "imagination_aux_loss": running_imagination_aux_loss,
                 "imagination_stability_loss": running_imagination_stability_loss,
                 "imagination_consistency_loss": running_imagination_consistency_loss,
+                "imagination_norm_loss": running_imagination_norm_loss,
                 "grad_norm": float(grad_norm.item()),
                 "lr": float(optimizers[0].param_groups[0]["lr"]),
                 "tokens_per_sec": tokens_per_sec,
