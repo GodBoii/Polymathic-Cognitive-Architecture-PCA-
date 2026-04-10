@@ -194,18 +194,19 @@ class ThreePhasePCAModel(nn.Module):
         step_delta_norms: list[torch.Tensor] = []
         step_delta_squares: list[torch.Tensor] = []
 
-        for _ in range(max(self.cfg.imagination_steps, 1)):
+        for step_idx in range(max(self.cfg.imagination_steps, 1)):
             prev = latents
             latent_norm = self.latent_norm_1(latents)
+            step_scale = self.cfg.imagination_step_decay ** step_idx
             self_attn_out = self.latent_self_attn(
                 latent_norm,
                 latent_norm,
                 latent_norm,
                 need_weights=False,
             )[0]
-            latents = latents + torch.sigmoid(self.self_attn_gate) * self_attn_out
+            latents = latents + (torch.sigmoid(self.self_attn_gate) * step_scale) * self_attn_out
             ffn_out = self.latent_ffn(self.latent_norm_2(latents))
-            latents = latents + torch.sigmoid(self.ffn_gate) * ffn_out
+            latents = latents + (torch.sigmoid(self.ffn_gate) * step_scale) * ffn_out
             latents = (1.0 - self.cfg.imagination_anchor_alpha) * latents + self.cfg.imagination_anchor_alpha * anchor
             step_delta = latents - prev
             step_delta_norm = step_delta.norm(dim=-1).mean()
@@ -219,10 +220,19 @@ class ThreePhasePCAModel(nn.Module):
         stability_loss = torch.stack(step_delta_squares).mean() if step_delta_squares else latents.new_zeros(())
         consistency_loss = F.mse_loss(latent_summary.float(), summary_target.float())
         norm_loss = latents.float().pow(2).mean()
+        contraction_terms: list[torch.Tensor] = []
+        for i in range(1, len(step_delta_squares)):
+            contraction_terms.append(torch.relu(step_delta_squares[i] - step_delta_squares[i - 1]))
+        contraction_loss = (
+            torch.stack(contraction_terms).mean()
+            if contraction_terms
+            else latents.new_zeros(())
+        )
         imagination_aux_loss = (
             self.cfg.imagination_stability_alpha * stability_loss
             + self.cfg.imagination_consistency_alpha * consistency_loss
             + self.cfg.imagination_norm_alpha * norm_loss
+            + self.cfg.imagination_contraction_alpha * contraction_loss
         ) * self.cfg.imagination_aux_alpha
 
         stats = {
@@ -232,6 +242,7 @@ class ThreePhasePCAModel(nn.Module):
             "final_latent_norm": float(latents.norm(dim=-1).mean().detach().item()),
             "self_attn_gate": float(torch.sigmoid(self.self_attn_gate).detach().item()),
             "ffn_gate": float(torch.sigmoid(self.ffn_gate).detach().item()),
+            "step_decay": float(self.cfg.imagination_step_decay),
             "step_delta_norms": [float(v.item()) for v in step_delta_norms],
             "convergence_ratio": float(
                 (step_delta_norms[-1] / (step_delta_norms[0] + 1e-8)).item()
@@ -251,6 +262,7 @@ class ThreePhasePCAModel(nn.Module):
             "imagination_stability_loss": stability_loss.to(dtype=latents.dtype),
             "imagination_consistency_loss": consistency_loss.to(dtype=latents.dtype),
             "imagination_norm_loss": norm_loss.to(dtype=latents.dtype),
+            "imagination_contraction_loss": contraction_loss.to(dtype=latents.dtype),
         }
         return latents, stats, aux
 

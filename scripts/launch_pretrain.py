@@ -144,6 +144,8 @@ def build_train_cmd(
     maybe_add(cmd, "--imagination-consistency-alpha", model.get("imagination_consistency_alpha", 0.025))
     maybe_add(cmd, "--imagination-norm-alpha", model.get("imagination_norm_alpha", 0.01))
     maybe_add(cmd, "--imagination-update-scale", model.get("imagination_update_scale", 0.25))
+    maybe_add(cmd, "--imagination-step-decay", model.get("imagination_step_decay", 0.85))
+    maybe_add(cmd, "--imagination-contraction-alpha", model.get("imagination_contraction_alpha", 0.02))
 
     # Training hyperparams
     maybe_add(cmd, "--optimizer", train.get("optimizer", "muon"))
