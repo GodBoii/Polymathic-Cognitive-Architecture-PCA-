@@ -146,6 +146,7 @@ def build_train_cmd(
     # Training hyperparams
     maybe_add(cmd, "--optimizer", train.get("optimizer", "muon"))
     maybe_add(cmd, "--micro-batch-size", train.get("micro_batch_size", 1))
+    maybe_add(cmd, "--seq-len", train.get("seq_len"))
     maybe_add(cmd, "--grad-accum-steps", train.get("grad_accum_steps", 1))
     maybe_add(cmd, "--lr", train.get("lr", 3e-4))
     maybe_add(cmd, "--warmup-steps", train.get("warmup_steps"))

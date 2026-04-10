@@ -7,11 +7,22 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class PackedSequenceDataset(Dataset):
-    def __init__(self, manifest_path: Path | str) -> None:
+    def __init__(
+        self,
+        manifest_path: Path | str,
+        sample_seq_len: int | None = None,
+        random_crop: bool = True,
+    ) -> None:
         self.manifest_path = Path(manifest_path)
         self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         self.shard_infos = self.manifest["shards"]
         self.seq_len = int(self.manifest["config"]["seq_len"])
+        self.sample_seq_len = self.seq_len if sample_seq_len is None else int(sample_seq_len)
+        self.random_crop = random_crop
+        if self.sample_seq_len <= 0:
+            raise ValueError("sample_seq_len must be > 0")
+        if self.sample_seq_len > self.seq_len:
+            raise ValueError("sample_seq_len cannot exceed manifest seq_len")
 
         self._shards = [np.load(self._resolve_shard_path(info), mmap_mode="r") for info in self.shard_infos]
         self._offsets = []
@@ -66,7 +77,15 @@ class PackedSequenceDataset(Dataset):
             raise IndexError(index)
 
         shard_idx, local_idx = self._locate(index)
-        tokens = self._shards[shard_idx][local_idx].astype(np.int64, copy=False)
+        tokens = self._shards[shard_idx][local_idx]
+        if self.sample_seq_len < self.seq_len:
+            max_start = self.seq_len - self.sample_seq_len
+            if self.random_crop:
+                start = int(np.random.randint(0, max_start + 1))
+            else:
+                start = max_start // 2
+            tokens = tokens[start : start + self.sample_seq_len]
+        tokens = tokens.astype(np.int64, copy=False)
         # Return unshifted labels; model performs the standard causal shift internally.
         x = torch.from_numpy(tokens.copy())
         y = torch.from_numpy(tokens.copy())
@@ -77,6 +96,8 @@ class PackedSequenceDataset(Dataset):
 def create_packed_dataloader(
     manifest_path: Path | str,
     batch_size: int,
+    sample_seq_len: int | None = None,
+    random_crop: bool = True,
     shuffle: bool = True,
     num_workers: int = 0,
     pin_memory: bool = True,
@@ -84,7 +105,11 @@ def create_packed_dataloader(
     prefetch_factor: int = 4,
     persistent_workers: bool = True,
 ) -> DataLoader:
-    dataset = PackedSequenceDataset(manifest_path=manifest_path)
+    dataset = PackedSequenceDataset(
+        manifest_path=manifest_path,
+        sample_seq_len=sample_seq_len,
+        random_crop=random_crop,
+    )
     kwargs = {}
     if num_workers > 0:
         kwargs["prefetch_factor"] = prefetch_factor
