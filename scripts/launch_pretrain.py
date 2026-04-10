@@ -13,6 +13,7 @@ import torch
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Launch long-run pretraining from a JSON preset.")
     parser.add_argument("--config", type=Path, required=True, help="Path to JSON config.")
+    parser.add_argument("--fresh-start", action="store_true", help="Ignore existing checkpoint auto-resume and start fresh.")
     return parser.parse_args()
 
 
@@ -213,9 +214,10 @@ def resolve_hardware_profile(hw: dict[str, Any]) -> dict[str, Any]:
     return resolved
 
 
-def launch_chunk(cmd: list[str], log_path: Path) -> tuple[int, dict[str, Any] | None]:
+def launch_chunk(cmd: list[str], log_path: Path) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     last_step_payload = None
+    final_status_payload = None
 
     with subprocess.Popen(
         cmd,
@@ -237,7 +239,9 @@ def launch_chunk(cmd: list[str], log_path: Path) -> tuple[int, dict[str, Any] | 
                     continue
                 if "step" in payload:
                     last_step_payload = payload
-        return proc.wait(), last_step_payload
+                if payload.get("status") == "done":
+                    final_status_payload = payload
+        return proc.wait(), last_step_payload, final_status_payload
 
 
 def main() -> None:
@@ -265,7 +269,7 @@ def main() -> None:
     current_step = 0
     resume_path = Path(paths["resume_from"]) if paths.get("resume_from") else None
 
-    if resume_path is None:
+    if resume_path is None and not args.fresh_start:
         last_ckpt = checkpoint_dir / "last.pt"
         if last_ckpt.exists():
             resume_path = last_ckpt
@@ -278,11 +282,18 @@ def main() -> None:
             cfg=cfg,
             resume_path=resume_path,
         )
-        rc, payload = launch_chunk(cmd, log_path=log_path)
+        rc, payload, final_status = launch_chunk(cmd, log_path=log_path)
         if rc != 0:
             print(f"[LAUNCHER] Child run failed with code {rc}.")
             break
         if payload is None:
+            if final_status is not None and "steps" in final_status:
+                current_step = int(final_status["steps"])
+                resume_path = checkpoint_dir / "last.pt"
+                enforce_retention(checkpoint_dir=checkpoint_dir, keep_last=keep_last)
+                if current_step >= total_steps:
+                    break
+                continue
             print("[LAUNCHER] No step payload found; aborting.")
             break
 
