@@ -134,6 +134,7 @@ class ThreePhasePCAModel(nn.Module):
             bias=False,
             dropout=cfg.dropout,
         )
+        self.summary_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.final_norm = RMSNorm(cfg.d_model, eps=cfg.rms_eps)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if tie_embeddings:
@@ -177,7 +178,7 @@ class ThreePhasePCAModel(nn.Module):
         self,
         encoder_states: torch.Tensor,
         encoder_padding_mask: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, dict]:
+    ) -> tuple[torch.Tensor, dict, dict]:
         latents = self.latent_seed.expand(encoder_states.size(0), -1, -1)
         latents = latents + self.token_to_latent(
             latents,
@@ -188,6 +189,8 @@ class ThreePhasePCAModel(nn.Module):
         )[0]
         anchor = latents
         avg_delta = torch.zeros((), device=encoder_states.device, dtype=encoder_states.dtype)
+        step_delta_norms: list[torch.Tensor] = []
+        step_delta_squares: list[torch.Tensor] = []
 
         for _ in range(max(self.cfg.imagination_steps, 1)):
             prev = latents
@@ -200,15 +203,47 @@ class ThreePhasePCAModel(nn.Module):
             )[0]
             latents = latents + self.latent_ffn(self.latent_norm_2(latents))
             latents = (1.0 - self.cfg.imagination_anchor_alpha) * latents + self.cfg.imagination_anchor_alpha * anchor
-            avg_delta = avg_delta + (latents - prev).norm(dim=-1).mean()
+            step_delta = latents - prev
+            step_delta_norm = step_delta.norm(dim=-1).mean()
+            avg_delta = avg_delta + step_delta_norm
+            step_delta_norms.append(step_delta_norm.detach())
+            step_delta_squares.append(step_delta.float().pow(2).mean())
+
+        summary = encoder_states.mean(dim=1)
+        summary_target = self.summary_proj(summary)
+        latent_summary = latents.mean(dim=1)
+        stability_loss = torch.stack(step_delta_squares).mean() if step_delta_squares else latents.new_zeros(())
+        consistency_loss = F.mse_loss(latent_summary.float(), summary_target.float())
+        imagination_aux_loss = (
+            self.cfg.imagination_stability_alpha * stability_loss
+            + self.cfg.imagination_consistency_alpha * consistency_loss
+        ) * self.cfg.imagination_aux_alpha
 
         stats = {
             "num_latents": float(self.cfg.imagination_num_latents),
             "num_steps": float(self.cfg.imagination_steps),
             "avg_delta_norm": float((avg_delta / max(self.cfg.imagination_steps, 1)).detach().item()),
             "final_latent_norm": float(latents.norm(dim=-1).mean().detach().item()),
+            "step_delta_norms": [float(v.item()) for v in step_delta_norms],
+            "convergence_ratio": float(
+                (step_delta_norms[-1] / (step_delta_norms[0] + 1e-8)).item()
+                if step_delta_norms
+                else 1.0
+            ),
+            "delta_monotonic_decrease": bool(
+                all(step_delta_norms[i] <= step_delta_norms[i - 1] for i in range(1, len(step_delta_norms)))
+            ),
         }
-        return latents, stats
+        aux = {
+            "total_aux_loss": imagination_aux_loss.to(dtype=latents.dtype),
+            "moe_aux_loss": latents.new_zeros(()),
+            "moe_load_balance_loss": latents.new_zeros(()),
+            "moe_entropy_reg_loss": latents.new_zeros(()),
+            "imagination_aux_loss": imagination_aux_loss.to(dtype=latents.dtype),
+            "imagination_stability_loss": stability_loss.to(dtype=latents.dtype),
+            "imagination_consistency_loss": consistency_loss.to(dtype=latents.dtype),
+        }
+        return latents, stats, aux
 
     def _run_decoder(
         self,
@@ -247,7 +282,7 @@ class ThreePhasePCAModel(nn.Module):
         encoder_padding_mask = self._key_padding_mask(attention_mask, seq_len=encoder_input_ids.size(1))
         encoder_states = self._run_encoder(encoder_states, key_padding_mask=encoder_padding_mask)
 
-        latents, imagination_stats = self._run_latent_workspace(
+        latents, imagination_stats, imagination_aux_losses = self._run_latent_workspace(
             encoder_states=encoder_states,
             encoder_padding_mask=encoder_padding_mask,
         )
@@ -268,12 +303,7 @@ class ThreePhasePCAModel(nn.Module):
             }
             out["imagination_stats"] = imagination_stats
         if return_aux_losses:
-            zero = logits.new_zeros(())
-            out["aux_losses"] = {
-                "moe_aux_loss": zero,
-                "moe_load_balance_loss": zero,
-                "moe_entropy_reg_loss": zero,
-            }
+            out["aux_losses"] = imagination_aux_losses
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

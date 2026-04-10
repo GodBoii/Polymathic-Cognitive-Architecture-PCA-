@@ -114,12 +114,14 @@ class PCAModel(nn.Module):
             if router_stats is None:
                 zero = logits.new_zeros(())
                 out["aux_losses"] = {
+                    "total_aux_loss": zero,
                     "moe_aux_loss": zero,
                     "moe_load_balance_loss": zero,
                     "moe_entropy_reg_loss": zero,
                 }
             else:
                 out["aux_losses"] = {
+                    "total_aux_loss": router_stats["moe_aux_loss"],
                     "moe_aux_loss": router_stats["moe_aux_loss"],
                     "moe_load_balance_loss": router_stats["moe_load_balance_loss"],
                     "moe_entropy_reg_loss": router_stats["moe_entropy_reg_loss"],
