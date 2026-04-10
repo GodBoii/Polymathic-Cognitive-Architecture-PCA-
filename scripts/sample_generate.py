@@ -82,6 +82,8 @@ def _cfg_from_payload(payload: dict) -> ModelConfig:
         "imagination_consistency_alpha",
         "imagination_norm_alpha",
         "imagination_update_scale",
+        "imagination_step_decay",
+        "imagination_contraction_alpha",
     }
     filtered = {k: v for k, v in raw.items() if k in allowed}
     return ModelConfig(**filtered)
