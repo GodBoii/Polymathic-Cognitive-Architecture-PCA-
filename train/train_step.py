@@ -106,6 +106,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imagination-heads", type=int, default=None)
     parser.add_argument("--imagination-ffn-dim", type=int, default=None)
     parser.add_argument("--imagination-anchor-alpha", type=float, default=0.1)
+    parser.add_argument("--imagination-aux-alpha", type=float, default=0.05)
+    parser.add_argument("--imagination-stability-alpha", type=float, default=0.025)
+    parser.add_argument("--imagination-consistency-alpha", type=float, default=0.025)
 
     parser.add_argument("--freeze-layers-below", type=int, default=0, help="Freeze transformer layers [0, N-1].")
     parser.add_argument("--freeze-embeddings", action="store_true")
@@ -160,6 +163,9 @@ def make_model_config(args: argparse.Namespace) -> ModelConfig:
         imagination_heads=args.imagination_heads,
         imagination_ffn_dim=args.imagination_ffn_dim,
         imagination_anchor_alpha=args.imagination_anchor_alpha,
+        imagination_aux_alpha=args.imagination_aux_alpha,
+        imagination_stability_alpha=args.imagination_stability_alpha,
+        imagination_consistency_alpha=args.imagination_consistency_alpha,
     )
 
 
@@ -353,8 +359,42 @@ def load_checkpoint(
         payload = torch.load(path, map_location=device, weights_only=True)
     except TypeError:
         payload = torch.load(path, map_location=device)
-    model.load_state_dict(payload["model_state"])
+    reset_training_state = False
+    try:
+        model.load_state_dict(payload["model_state"])
+    except RuntimeError as exc:
+        incompat = model.load_state_dict(payload["model_state"], strict=False)
+        reset_training_state = True
+        print(
+            json.dumps(
+                {
+                    "event": "checkpoint_partial_load",
+                    "checkpoint": str(path),
+                    "reason": "model_structure_changed",
+                    "missing_keys": list(incompat.missing_keys),
+                    "unexpected_keys": list(incompat.unexpected_keys),
+                    "message": str(exc).splitlines()[0],
+                }
+            )
+        )
     if load_optimizer_state:
+        if reset_training_state:
+            print(
+                json.dumps(
+                    {
+                        "event": "checkpoint_optimizer_reset",
+                        "checkpoint": str(path),
+                        "reason": "partial_model_load_requires_fresh_optimizer_state",
+                    }
+                )
+            )
+            return (
+                0,
+                0,
+                0,
+                payload.get("current_aux_alpha"),
+                payload.get("base_aux_alpha"),
+            )
         states = payload.get("optimizer_states")
         if states is None and "optimizer_state" in payload:
             states = [payload["optimizer_state"]]
@@ -510,6 +550,8 @@ def main() -> None:
         train_loader = create_packed_dataloader(
             manifest_path=args.train_manifest,
             batch_size=args.micro_batch_size,
+            sample_seq_len=args.seq_len,
+            random_crop=True,
             shuffle=True,
             num_workers=args.data_workers,
             pin_memory=device.startswith("cuda"),
@@ -537,6 +579,8 @@ def main() -> None:
         eval_loader = create_packed_dataloader(
             manifest_path=args.eval_manifest,
             batch_size=args.eval_batch_size,
+            sample_seq_len=args.seq_len,
+            random_crop=False,
             shuffle=False,
             num_workers=0,
             pin_memory=device.startswith("cuda"),
@@ -552,6 +596,9 @@ def main() -> None:
         running_moe_aux_loss = 0.0
         running_moe_lb_loss = 0.0
         running_moe_entropy_reg_loss = 0.0
+        running_imagination_aux_loss = 0.0
+        running_imagination_stability_loss = 0.0
+        running_imagination_consistency_loss = 0.0
         running_router_entropy = 0.0
         agg_expert_usage = None
         agg_co_activation = None
@@ -591,8 +638,9 @@ def main() -> None:
                     aux_alpha_override=current_aux_alpha,
                 )
                 main_loss = out["loss"]
+                total_aux_loss = out["aux_losses"].get("total_aux_loss", out["aux_losses"]["moe_aux_loss"])
                 moe_aux_loss = out["aux_losses"]["moe_aux_loss"]
-                total_loss = main_loss + moe_aux_loss
+                total_loss = main_loss + total_aux_loss
                 loss = total_loss / args.grad_accum_steps
 
             if scaler.is_enabled():
@@ -608,6 +656,10 @@ def main() -> None:
             running_moe_aux_loss += float(moe_aux_loss.item()) / args.grad_accum_steps
             running_moe_lb_loss += float(out["aux_losses"]["moe_load_balance_loss"].item()) / args.grad_accum_steps
             running_moe_entropy_reg_loss += float(out["aux_losses"]["moe_entropy_reg_loss"].item()) / args.grad_accum_steps
+            if "imagination_aux_loss" in out["aux_losses"]:
+                running_imagination_aux_loss += float(out["aux_losses"]["imagination_aux_loss"].item()) / args.grad_accum_steps
+                running_imagination_stability_loss += float(out["aux_losses"]["imagination_stability_loss"].item()) / args.grad_accum_steps
+                running_imagination_consistency_loss += float(out["aux_losses"]["imagination_consistency_loss"].item()) / args.grad_accum_steps
             if want_router_stats and "router_stats" in out:
                 router_stats = out["router_stats"]
                 if "avg_router_entropy" in router_stats:
@@ -648,6 +700,9 @@ def main() -> None:
                 "moe_aux_loss": running_moe_aux_loss,
                 "moe_load_balance_loss": running_moe_lb_loss,
                 "moe_entropy_reg_loss": running_moe_entropy_reg_loss,
+                "imagination_aux_loss": running_imagination_aux_loss,
+                "imagination_stability_loss": running_imagination_stability_loss,
+                "imagination_consistency_loss": running_imagination_consistency_loss,
                 "grad_norm": float(grad_norm.item()),
                 "lr": float(optimizers[0].param_groups[0]["lr"]),
                 "tokens_per_sec": tokens_per_sec,
@@ -673,6 +728,8 @@ def main() -> None:
                 )
                 payload["eval_loss"] = eval_loss
                 payload["eval_perplexity"] = eval_perplexity
+                payload["generalization_gap"] = eval_loss - running_main_loss
+                payload["generalization_gap_ratio"] = eval_loss / max(running_main_loss, 1e-12)
             if want_router_stats and "imagination_stats" in out:
                 payload["imagination_stats"] = out["imagination_stats"]
             if agg_expert_usage is not None:

@@ -83,6 +83,28 @@ Notes:
 - This uses a real encoder -> latent workspace -> decoder path.
 - It is the first structural implementation of the architecture discussed in `my_thoughts.md`.
 
+Stronger three-phase RTX 3050 4GB preset:
+
+```powershell
+python .\scripts\launch_pretrain.py --config .\train\presets\local_rtx3050_4gb_three_phase_v2.json
+```
+
+Notes:
+- Slightly larger hidden size and depth with latent stability/consistency auxiliary losses enabled.
+
+Recommended local evaluation workflow:
+
+```powershell
+python .\data_pipeline\create_manifest_split.py `
+  --source-manifest .\data_pipeline\artifacts\phase1_smoke\manifest.json `
+  --train-output-dir .\data_pipeline\artifacts\phase1_smoke_train `
+  --eval-output-dir .\data_pipeline\artifacts\phase1_smoke_eval `
+  --eval-ratio 0.2 `
+  --seed 42
+```
+
+Then point your local presets at the split manifests so train and eval are actually disjoint.
+
 Key metrics emitted each step as JSON:
 - `loss`
 - `main_loss`
