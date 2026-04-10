@@ -63,6 +63,26 @@ V5 MoE-reasoning preset flow:
 & .\lrm-matrix\Scripts\python.exe .\scripts\launch_pretrain.py --config .\train\presets\phase2_52l_v5.json
 ```
 
+Low-VRAM local preset for an RTX 3050 4GB:
+
+```powershell
+python .\scripts\launch_pretrain.py --config .\train\presets\local_rtx3050_4gb.json
+```
+
+Notes:
+- This preset keeps context at 128, enables activation checkpointing, and turns on a small latent imagination block.
+- Very long contexts with multiple full-attention layers will still OOM even on large GPUs without additional memory optimizations.
+
+Three-phase RTX 3050 4GB preset:
+
+```powershell
+python .\scripts\launch_pretrain.py --config .\train\presets\local_rtx3050_4gb_three_phase.json
+```
+
+Notes:
+- This uses a real encoder -> latent workspace -> decoder path.
+- It is the first structural implementation of the architecture discussed in `my_thoughts.md`.
+
 Key metrics emitted each step as JSON:
 - `loss`
 - `main_loss`

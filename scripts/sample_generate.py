@@ -10,8 +10,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from model_core import build_model
 from model_core.config import ModelConfig
-from model_core.model import PCAModel
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,11 +30,14 @@ def _cfg_from_payload(payload: dict) -> ModelConfig:
     raw = payload["model_config"]
     allowed = {
         "vocab_size",
+        "architecture_kind",
         "d_model",
         "n_layers",
         "n_heads",
         "n_kv_heads",
         "max_seq_len",
+        "encoder_layers",
+        "decoder_layers",
         "ffn_dim",
         "ffn_kind",
         "reasoning_start_layer",
@@ -50,6 +53,7 @@ def _cfg_from_payload(payload: dict) -> ModelConfig:
         "rms_eps",
         "rope_theta",
         "dropout",
+        "gradient_checkpointing",
         "bos_token_id",
         "eos_token_id",
         "pad_token_id",
@@ -67,6 +71,12 @@ def _cfg_from_payload(payload: dict) -> ModelConfig:
         "gqa_layers",
         "lightning_end_layer",
         "mla_latent_dim",
+        "use_imagination",
+        "imagination_num_latents",
+        "imagination_steps",
+        "imagination_heads",
+        "imagination_ffn_dim",
+        "imagination_anchor_alpha",
     }
     filtered = {k: v for k, v in raw.items() if k in allowed}
     return ModelConfig(**filtered)
@@ -74,16 +84,21 @@ def _cfg_from_payload(payload: dict) -> ModelConfig:
 
 @torch.no_grad()
 def generate(
-    model: PCAModel,
+    model,
     input_ids: torch.Tensor,
+    architecture_kind: str,
     max_new_tokens: int,
     temperature: float,
     top_k: int,
     eos_id: int,
 ) -> torch.Tensor:
+    source_ids = input_ids
     out = input_ids
     for _ in range(max_new_tokens):
-        logits = model(input_ids=out)["logits"][:, -1, :]
+        if architecture_kind == "three_phase":
+            logits = model(input_ids=source_ids, decoder_input_ids=out)["logits"][:, -1, :]
+        else:
+            logits = model(input_ids=out)["logits"][:, -1, :]
         if temperature <= 0:
             next_id = torch.argmax(logits, dim=-1, keepdim=True)
         else:
@@ -111,7 +126,7 @@ def main() -> None:
         payload = torch.load(args.checkpoint, map_location=args.device)
 
     cfg = _cfg_from_payload(payload)
-    model = PCAModel(cfg).to(args.device).eval()
+    model = build_model(cfg).to(args.device).eval()
     model.load_state_dict(payload["model_state"])
 
     sp = spm.SentencePieceProcessor(model_file=str(args.tokenizer_model))
@@ -123,6 +138,7 @@ def main() -> None:
     out_ids = generate(
         model=model,
         input_ids=input_ids,
+        architecture_kind=cfg.architecture_kind,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
