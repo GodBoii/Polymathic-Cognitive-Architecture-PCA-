@@ -174,8 +174,7 @@ cfg = ModelConfig(
 ## Training Details
 
 ### Optimizer
-- Muon optimizer for 2D parameters (embeddings, linear layers)
-- AdamW for 1D parameters (norms, biases)
+- Muon optimizer for all trainable parameters
 - Orthogonalization via Newton-Schulz iteration
 
 ### Loss Components

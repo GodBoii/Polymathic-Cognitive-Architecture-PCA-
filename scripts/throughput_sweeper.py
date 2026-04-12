@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-to-device", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
-    parser.add_argument("--optimizer", choices=["muon", "adamw"], default="muon")
+    parser.add_argument("--optimizer", choices=["muon"], default="muon")
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--n-heads", type=int, default=8)
