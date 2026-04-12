@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
-    parser.add_argument("--optimizer", choices=["muon", "adamw"], default="muon")
+    parser.add_argument("--optimizer", choices=["muon"], default="muon")
 
     parser.add_argument("--micro-batch-size", type=int, default=2)
     parser.add_argument("--seq-len", type=int, default=128)
@@ -265,48 +265,20 @@ def parameter_counts(model) -> tuple[int, int]:
     return trainable, total
 
 
-def _split_muon_param_groups(model) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
-    muon_params: list[torch.nn.Parameter] = []
-    adamw_params: list[torch.nn.Parameter] = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        is_embedding = "embed_tokens" in name or "lm_head" in name
-        if param.ndim == 2 and not is_embedding:
-            muon_params.append(param)
-        else:
-            adamw_params.append(param)
-    return muon_params, adamw_params
-
-
 def build_optimizers(model, args: argparse.Namespace) -> List[torch.optim.Optimizer]:
     if args.optimizer == "muon":
-        muon_params, adamw_params = _split_muon_param_groups(model)
-        optimizers: list[torch.optim.Optimizer] = []
-        if muon_params:
-            optimizers.append(
-                Muon(
-                    muon_params,
-                    lr=args.lr,
-                    weight_decay=args.weight_decay,
-                )
+        return [
+            Muon(
+                model.parameters(),
+                lr=args.lr,
+                weight_decay=args.weight_decay,
             )
-        if adamw_params:
-            optimizers.append(
-                torch.optim.AdamW(
-                    adamw_params,
-                    lr=args.lr,
-                    weight_decay=args.weight_decay,
-                    betas=(0.9, 0.95),
-                )
-            )
-        return optimizers
+        ]
     return [
-        torch.optim.AdamW(
+        Muon(
             model.parameters(),
             lr=args.lr,
             weight_decay=args.weight_decay,
-            betas=(0.9, 0.95),
         )
     ]
 
