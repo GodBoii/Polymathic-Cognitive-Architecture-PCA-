@@ -113,6 +113,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imagination-update-scale", type=float, default=0.25)
     parser.add_argument("--imagination-step-decay", type=float, default=0.85)
     parser.add_argument("--imagination-contraction-alpha", type=float, default=0.02)
+    parser.add_argument("--imagination-target-rms", type=float, default=1.0)
+    parser.add_argument("--imagination-rms-align-alpha", type=float, default=0.1)
+    parser.add_argument("--three-phase-encoder-causal", dest="three_phase_encoder_causal", action="store_true")
+    parser.add_argument("--no-three-phase-encoder-causal", dest="three_phase_encoder_causal", action="store_false")
+    parser.set_defaults(three_phase_encoder_causal=True)
+    parser.add_argument("--three-phase-causal-latent-workspace", dest="three_phase_causal_latent_workspace", action="store_true")
+    parser.add_argument("--no-three-phase-causal-latent-workspace", dest="three_phase_causal_latent_workspace", action="store_false")
+    parser.set_defaults(three_phase_causal_latent_workspace=True)
+    parser.add_argument("--three-phase-share-encoder-decoder", dest="three_phase_share_encoder_decoder", action="store_true")
+    parser.add_argument("--no-three-phase-share-encoder-decoder", dest="three_phase_share_encoder_decoder", action="store_false")
+    parser.set_defaults(three_phase_share_encoder_decoder=True)
 
     parser.add_argument("--freeze-layers-below", type=int, default=0, help="Freeze transformer layers [0, N-1].")
     parser.add_argument("--freeze-embeddings", action="store_true")
@@ -174,6 +185,11 @@ def make_model_config(args: argparse.Namespace) -> ModelConfig:
         imagination_update_scale=args.imagination_update_scale,
         imagination_step_decay=args.imagination_step_decay,
         imagination_contraction_alpha=args.imagination_contraction_alpha,
+        imagination_target_rms=args.imagination_target_rms,
+        imagination_rms_align_alpha=args.imagination_rms_align_alpha,
+        three_phase_encoder_causal=args.three_phase_encoder_causal,
+        three_phase_causal_latent_workspace=args.three_phase_causal_latent_workspace,
+        three_phase_share_encoder_decoder=args.three_phase_share_encoder_decoder,
     )
 
 
@@ -452,9 +468,9 @@ def run_eval(
     device: str,
     precision: str,
     max_batches: int,
-) -> tuple[float, float]:
+) -> tuple[float, float, bool]:
     if max_batches <= 0 or len(eval_loader) == 0:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), False
     model.eval()
     losses: list[float] = []
     eval_iter = iter(eval_loader)
@@ -477,8 +493,9 @@ def run_eval(
         losses.append(float(out["loss"].item()))
     model.train()
     eval_loss = sum(losses) / max(len(losses), 1)
-    eval_ppl = math.exp(min(eval_loss, 20.0))
-    return eval_loss, eval_ppl
+    capped_eval_loss = min(eval_loss, 20.0)
+    eval_ppl = math.exp(capped_eval_loss)
+    return eval_loss, eval_ppl, eval_loss > 20.0
 
 
 def main() -> None:
@@ -686,16 +703,36 @@ def main() -> None:
             for optimizer in optimizers:
                 scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad_norm)
+        grad_is_finite = bool(torch.isfinite(grad_norm).item())
 
+        optimizer_step_happened = grad_is_finite
         if scaler.is_enabled():
+            prev_scale = float(scaler.get_scale())
             for optimizer in optimizers:
                 scaler.step(optimizer)
             scaler.update()
+            curr_scale = float(scaler.get_scale())
+            # If scale decreased, GradScaler detected inf/NaN grads and skipped optimizer updates.
+            optimizer_step_happened = (curr_scale >= prev_scale) and grad_is_finite
         else:
-            for optimizer in optimizers:
-                optimizer.step()
-        for scheduler in schedulers:
-            scheduler.step()
+            if grad_is_finite:
+                for optimizer in optimizers:
+                    optimizer.step()
+
+        if optimizer_step_happened:
+            for scheduler in schedulers:
+                scheduler.step()
+        elif not grad_is_finite:
+            print(
+                json.dumps(
+                    {
+                        "event": "non_finite_gradients",
+                        "step": step + 1,
+                        "grad_norm": float(grad_norm.item()),
+                        "action": "skipped_optimizer_step",
+                    }
+                )
+            )
         for optimizer in optimizers:
             optimizer.zero_grad(set_to_none=True)
 
@@ -718,6 +755,8 @@ def main() -> None:
                 "imagination_norm_loss": running_imagination_norm_loss,
                 "imagination_contraction_loss": running_imagination_contraction_loss,
                 "grad_norm": float(grad_norm.item()),
+                "grad_finite": grad_is_finite,
+                "optimizer_step_happened": optimizer_step_happened,
                 "lr": float(optimizers[0].param_groups[0]["lr"]),
                 "tokens_per_sec": tokens_per_sec,
                 "total_tokens": total_tokens,
@@ -733,7 +772,7 @@ def main() -> None:
                 "current_aux_alpha": current_aux_alpha,
             }
             if eval_loader is not None and (step + 1) % args.eval_every == 0:
-                eval_loss, eval_perplexity = run_eval(
+                eval_loss, eval_perplexity, eval_perplexity_capped = run_eval(
                     model=model,
                     eval_loader=eval_loader,
                     device=device,
@@ -742,6 +781,7 @@ def main() -> None:
                 )
                 payload["eval_loss"] = eval_loss
                 payload["eval_perplexity"] = eval_perplexity
+                payload["eval_perplexity_capped"] = eval_perplexity_capped
                 payload["generalization_gap"] = eval_loss - running_main_loss
                 payload["generalization_gap_ratio"] = eval_loss / max(running_main_loss, 1e-12)
             if want_router_stats and "imagination_stats" in out:
