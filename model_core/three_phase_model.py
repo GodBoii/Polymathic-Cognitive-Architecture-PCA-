@@ -14,6 +14,12 @@ def _build_causal_bool_mask(seq_len: int, device: torch.device) -> torch.Tensor:
     return torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
 
 
+def _build_cross_causal_bool_mask(query_len: int, key_len: int, device: torch.device) -> torch.Tensor:
+    q_idx = torch.arange(query_len, device=device, dtype=torch.long).unsqueeze(1)
+    k_idx = torch.arange(key_len, device=device, dtype=torch.long).unsqueeze(0)
+    return k_idx > q_idx
+
+
 class EncoderBlock(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
@@ -33,12 +39,19 @@ class EncoderBlock(nn.Module):
             dropout=cfg.dropout,
         )
 
-    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+        causal: bool = False,
+    ) -> torch.Tensor:
         norm_x = self.attn_norm(x)
+        attn_mask = _build_causal_bool_mask(norm_x.size(1), device=norm_x.device) if causal else None
         attn_out = self.attn(
             norm_x,
             norm_x,
             norm_x,
+            attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )[0]
@@ -79,6 +92,7 @@ class DecoderBlock(nn.Module):
         latents: torch.Tensor,
         self_key_padding_mask: Optional[torch.Tensor],
         memory_key_padding_mask: Optional[torch.Tensor],
+        cross_causal: bool = False,
     ) -> torch.Tensor:
         norm_x = self.self_norm(x)
         causal_mask = _build_causal_bool_mask(norm_x.size(1), device=norm_x.device)
@@ -91,10 +105,20 @@ class DecoderBlock(nn.Module):
             need_weights=False,
         )[0]
         x = x + self_out
+        cross_mask = (
+            _build_cross_causal_bool_mask(
+                query_len=x.size(1),
+                key_len=latents.size(1),
+                device=x.device,
+            )
+            if cross_causal
+            else None
+        )
         cross_out = self.cross_attn(
             self.cross_norm(x),
             latents,
             latents,
+            attn_mask=cross_mask,
             key_padding_mask=memory_key_padding_mask,
             need_weights=False,
         )[0]
@@ -171,29 +195,22 @@ class ThreePhasePCAModel(nn.Module):
     def _run_encoder(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
         for block in self.encoder:
             def enc_forward(hidden_states: torch.Tensor, layer: EncoderBlock = block) -> torch.Tensor:
-                return layer(hidden_states, key_padding_mask=key_padding_mask)
+                return layer(
+                    hidden_states,
+                    key_padding_mask=key_padding_mask,
+                    causal=self.cfg.three_phase_encoder_causal,
+                )
 
             x = self._maybe_checkpoint(enc_forward, x, enabled=self.cfg.gradient_checkpointing and self.training)
         return x
 
-    def _run_latent_workspace(
+    def _refine_latents(
         self,
-        encoder_states: torch.Tensor,
-        encoder_padding_mask: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, dict, dict]:
-        latents = self.latent_seed.expand(encoder_states.size(0), -1, -1)
-        latents = latents + self.token_to_latent(
-            latents,
-            encoder_states,
-            encoder_states,
-            key_padding_mask=encoder_padding_mask,
-            need_weights=False,
-        )[0]
-        anchor = latents
-        avg_delta = torch.zeros((), device=encoder_states.device, dtype=encoder_states.dtype)
+        latents: torch.Tensor,
+        anchor: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
         step_delta_norms: list[torch.Tensor] = []
         step_delta_squares: list[torch.Tensor] = []
-
         for step_idx in range(max(self.cfg.imagination_steps, 1)):
             prev = latents
             latent_norm = self.latent_norm_1(latents)
@@ -209,25 +226,33 @@ class ThreePhasePCAModel(nn.Module):
             latents = latents + (torch.sigmoid(self.ffn_gate) * step_scale) * ffn_out
             latents = (1.0 - self.cfg.imagination_anchor_alpha) * latents + self.cfg.imagination_anchor_alpha * anchor
             step_delta = latents - prev
-            step_delta_norm = step_delta.norm(dim=-1).mean()
-            avg_delta = avg_delta + step_delta_norm
-            step_delta_norms.append(step_delta_norm.detach())
+            step_delta_norms.append(step_delta.norm(dim=-1).mean())
             step_delta_squares.append(step_delta.float().pow(2).mean())
+        return latents, step_delta_norms, step_delta_squares
 
+    def _build_imagination_outputs(
+        self,
+        latent_memory: torch.Tensor,
+        final_latents: torch.Tensor,
+        step_delta_norms: list[torch.Tensor],
+        step_delta_squares: list[torch.Tensor],
+        encoder_states: torch.Tensor,
+    ) -> tuple[dict, dict]:
         summary = encoder_states.mean(dim=1)
         summary_target = self.summary_proj(summary)
-        latent_summary = latents.mean(dim=1)
-        stability_loss = torch.stack(step_delta_squares).mean() if step_delta_squares else latents.new_zeros(())
-        consistency_loss = F.mse_loss(latent_summary.float(), summary_target.float())
-        norm_loss = latents.float().pow(2).mean()
+        latent_summary = latent_memory.mean(dim=1)
+        latent_summary_norm = F.normalize(latent_summary.float(), dim=-1, eps=1e-6)
+        summary_target_norm = F.normalize(summary_target.float(), dim=-1, eps=1e-6)
+        stability_loss = torch.stack(step_delta_squares).mean() if step_delta_squares else latent_memory.new_zeros(())
+        consistency_loss = F.mse_loss(latent_summary_norm, summary_target_norm)
+        latent_rms_sq = latent_memory.float().pow(2).mean()
+        latent_rms = torch.sqrt(latent_rms_sq + 1e-8)
+        target_rms = float(self.cfg.imagination_target_rms)
+        norm_loss = (latent_rms - target_rms) ** 2
         contraction_terms: list[torch.Tensor] = []
         for i in range(1, len(step_delta_squares)):
             contraction_terms.append(torch.relu(step_delta_squares[i] - step_delta_squares[i - 1]))
-        contraction_loss = (
-            torch.stack(contraction_terms).mean()
-            if contraction_terms
-            else latents.new_zeros(())
-        )
+        contraction_loss = torch.stack(contraction_terms).mean() if contraction_terms else latent_memory.new_zeros(())
         imagination_aux_loss = (
             self.cfg.imagination_stability_alpha * stability_loss
             + self.cfg.imagination_consistency_alpha * consistency_loss
@@ -238,39 +263,134 @@ class ThreePhasePCAModel(nn.Module):
         stats = {
             "num_latents": float(self.cfg.imagination_num_latents),
             "num_steps": float(self.cfg.imagination_steps),
-            "avg_delta_norm": float((avg_delta / max(self.cfg.imagination_steps, 1)).detach().item()),
-            "final_latent_norm": float(latents.norm(dim=-1).mean().detach().item()),
+            "avg_delta_norm": float(torch.stack(step_delta_norms).mean().detach().item()) if step_delta_norms else 0.0,
+            "final_latent_norm": float(final_latents.norm(dim=-1).mean().detach().item()),
             "self_attn_gate": float(torch.sigmoid(self.self_attn_gate).detach().item()),
             "ffn_gate": float(torch.sigmoid(self.ffn_gate).detach().item()),
             "step_decay": float(self.cfg.imagination_step_decay),
-            "step_delta_norms": [float(v.item()) for v in step_delta_norms],
+            "step_delta_norms": [float(v.detach().item()) for v in step_delta_norms],
             "convergence_ratio": float(
-                (step_delta_norms[-1] / (step_delta_norms[0] + 1e-8)).item()
+                (step_delta_norms[-1] / (step_delta_norms[0] + 1e-8)).detach().item()
                 if step_delta_norms
                 else 1.0
             ),
+            "latent_rms": float(latent_rms.detach().item()),
+            "target_rms": float(target_rms),
             "delta_monotonic_decrease": bool(
                 all(step_delta_norms[i] <= step_delta_norms[i - 1] for i in range(1, len(step_delta_norms)))
             ),
+            "workspace_mode": "causal_scan" if self.cfg.three_phase_causal_latent_workspace else "global",
         }
         aux = {
-            "total_aux_loss": imagination_aux_loss.to(dtype=latents.dtype),
-            "moe_aux_loss": latents.new_zeros(()),
-            "moe_load_balance_loss": latents.new_zeros(()),
-            "moe_entropy_reg_loss": latents.new_zeros(()),
-            "imagination_aux_loss": imagination_aux_loss.to(dtype=latents.dtype),
-            "imagination_stability_loss": stability_loss.to(dtype=latents.dtype),
-            "imagination_consistency_loss": consistency_loss.to(dtype=latents.dtype),
-            "imagination_norm_loss": norm_loss.to(dtype=latents.dtype),
-            "imagination_contraction_loss": contraction_loss.to(dtype=latents.dtype),
+            "total_aux_loss": imagination_aux_loss.to(dtype=latent_memory.dtype),
+            "moe_aux_loss": latent_memory.new_zeros(()),
+            "moe_load_balance_loss": latent_memory.new_zeros(()),
+            "moe_entropy_reg_loss": latent_memory.new_zeros(()),
+            "imagination_aux_loss": imagination_aux_loss.to(dtype=latent_memory.dtype),
+            "imagination_stability_loss": stability_loss.to(dtype=latent_memory.dtype),
+            "imagination_consistency_loss": consistency_loss.to(dtype=latent_memory.dtype),
+            "imagination_norm_loss": norm_loss.to(dtype=latent_memory.dtype),
+            "imagination_contraction_loss": contraction_loss.to(dtype=latent_memory.dtype),
         }
+        return stats, aux
+
+    def _run_latent_workspace(
+        self,
+        encoder_states: torch.Tensor,
+        encoder_padding_mask: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, dict, dict]:
+        if self.cfg.three_phase_causal_latent_workspace:
+            return self._run_latent_workspace_causal(
+                encoder_states=encoder_states,
+                encoder_padding_mask=encoder_padding_mask,
+            )
+
+        latents = self.latent_seed.expand(encoder_states.size(0), -1, -1)
+        latents = latents + self.token_to_latent(
+            latents,
+            encoder_states,
+            encoder_states,
+            key_padding_mask=encoder_padding_mask,
+            need_weights=False,
+        )[0]
+        anchor = latents
+        latents, step_delta_norms, step_delta_squares = self._refine_latents(latents=latents, anchor=anchor)
+        stats, aux = self._build_imagination_outputs(
+            latent_memory=latents,
+            final_latents=latents,
+            step_delta_norms=step_delta_norms,
+            step_delta_squares=step_delta_squares,
+            encoder_states=encoder_states,
+        )
         return latents, stats, aux
+
+    def _run_latent_workspace_causal(
+        self,
+        encoder_states: torch.Tensor,
+        encoder_padding_mask: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, dict, dict]:
+        bsz, seq_len, _ = encoder_states.shape
+        latents = self.latent_seed.expand(bsz, -1, -1)
+        latent_summaries: list[torch.Tensor] = []
+        step_delta_norm_sums = [torch.zeros((), device=encoder_states.device, dtype=encoder_states.dtype) for _ in range(max(self.cfg.imagination_steps, 1))]
+        step_delta_square_sums = [torch.zeros((), device=encoder_states.device, dtype=torch.float32) for _ in range(max(self.cfg.imagination_steps, 1))]
+        total_step_deltas: list[torch.Tensor] = []
+        total_step_squares: list[torch.Tensor] = []
+        rms_align_scale_sum = torch.zeros((), device=encoder_states.device, dtype=torch.float32)
+        rms_align_scale_count = 0
+
+        for token_idx in range(seq_len):
+            token_states = encoder_states[:, token_idx : token_idx + 1, :]
+            token_padding_mask = (
+                encoder_padding_mask[:, token_idx : token_idx + 1]
+                if encoder_padding_mask is not None
+                else None
+            )
+            latents = latents + self.token_to_latent(
+                latents,
+                token_states,
+                token_states,
+                key_padding_mask=token_padding_mask,
+                need_weights=False,
+            )[0]
+            latents, step_delta_norms, step_delta_squares = self._refine_latents(latents=latents, anchor=latents)
+            if self.cfg.imagination_rms_align_alpha > 0.0:
+                latents_float = latents.float()
+                curr_rms = torch.sqrt(latents_float.pow(2).mean() + 1e-8)
+                target_rms = float(self.cfg.imagination_target_rms)
+                scale = target_rms / (curr_rms + 1e-8)
+                mixed_scale = (1.0 - self.cfg.imagination_rms_align_alpha) + self.cfg.imagination_rms_align_alpha * scale
+                latents = latents * mixed_scale.to(dtype=latents.dtype)
+                rms_align_scale_sum = rms_align_scale_sum + mixed_scale.detach().float()
+                rms_align_scale_count += 1
+            for step_idx, step_norm in enumerate(step_delta_norms):
+                step_delta_norm_sums[step_idx] = step_delta_norm_sums[step_idx] + step_norm
+                step_delta_square_sums[step_idx] = step_delta_square_sums[step_idx] + step_delta_squares[step_idx].float()
+                total_step_deltas.append(step_norm)
+                total_step_squares.append(step_delta_squares[step_idx])
+            latent_summaries.append(latents.mean(dim=1, keepdim=True))
+
+        latent_memory = torch.cat(latent_summaries, dim=1) if latent_summaries else encoder_states.new_zeros((bsz, 0, encoder_states.size(-1)))
+        avg_step_deltas = [v / max(seq_len, 1) for v in step_delta_norm_sums]
+        avg_step_squares = [v / max(seq_len, 1) for v in step_delta_square_sums]
+        stats, aux = self._build_imagination_outputs(
+            latent_memory=latent_memory,
+            final_latents=latents,
+            step_delta_norms=avg_step_deltas if avg_step_deltas else total_step_deltas,
+            step_delta_squares=avg_step_squares if avg_step_squares else total_step_squares,
+            encoder_states=encoder_states,
+        )
+        stats["rms_align_alpha"] = float(self.cfg.imagination_rms_align_alpha)
+        stats["avg_rms_align_scale"] = float((rms_align_scale_sum / max(rms_align_scale_count, 1)).item())
+        return latent_memory, stats, aux
 
     def _run_decoder(
         self,
         x: torch.Tensor,
         latents: torch.Tensor,
         decoder_padding_mask: Optional[torch.Tensor],
+        memory_padding_mask: Optional[torch.Tensor],
+        cross_causal: bool,
     ) -> torch.Tensor:
         for block in self.decoder:
             def dec_forward(hidden_states: torch.Tensor, layer: DecoderBlock = block) -> torch.Tensor:
@@ -278,7 +398,8 @@ class ThreePhasePCAModel(nn.Module):
                     hidden_states,
                     latents=latents,
                     self_key_padding_mask=decoder_padding_mask,
-                    memory_key_padding_mask=None,
+                    memory_key_padding_mask=memory_padding_mask,
+                    cross_causal=cross_causal,
                 )
 
             x = self._maybe_checkpoint(dec_forward, x, enabled=self.cfg.gradient_checkpointing and self.training)
@@ -297,10 +418,13 @@ class ThreePhasePCAModel(nn.Module):
         decoder_attention_mask: Optional[torch.Tensor] = None,
     ) -> dict:
         del position_ids, aux_alpha_override
-        encoder_input_ids = input_ids
         decoder_input_ids = input_ids if decoder_input_ids is None else decoder_input_ids
+        encoder_input_ids = decoder_input_ids if self.cfg.three_phase_share_encoder_decoder else input_ids
+        encoder_attention_mask = (
+            decoder_attention_mask if (self.cfg.three_phase_share_encoder_decoder and decoder_attention_mask is not None) else attention_mask
+        )
         encoder_states = self._embed(encoder_input_ids)
-        encoder_padding_mask = self._key_padding_mask(attention_mask, seq_len=encoder_input_ids.size(1))
+        encoder_padding_mask = self._key_padding_mask(encoder_attention_mask, seq_len=encoder_input_ids.size(1))
         encoder_states = self._run_encoder(encoder_states, key_padding_mask=encoder_padding_mask)
 
         latents, imagination_stats, imagination_aux_losses = self._run_latent_workspace(
@@ -313,7 +437,15 @@ class ThreePhasePCAModel(nn.Module):
             decoder_attention_mask if decoder_attention_mask is not None else attention_mask,
             seq_len=decoder_input_ids.size(1),
         )
-        decoder_states = self._run_decoder(decoder_states, latents=latents, decoder_padding_mask=decoder_padding_mask)
+        cross_causal = self.cfg.three_phase_causal_latent_workspace and (latents.size(1) == decoder_states.size(1))
+        memory_padding_mask = decoder_padding_mask if cross_causal else None
+        decoder_states = self._run_decoder(
+            decoder_states,
+            latents=latents,
+            decoder_padding_mask=decoder_padding_mask,
+            memory_padding_mask=memory_padding_mask,
+            cross_causal=cross_causal,
+        )
         logits = self.lm_head(self.final_norm(decoder_states))
 
         out = {"logits": logits}

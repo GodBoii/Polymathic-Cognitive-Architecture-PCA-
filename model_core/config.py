@@ -66,6 +66,11 @@ class ModelConfig:
     imagination_update_scale: float = 0.25
     imagination_step_decay: float = 0.85
     imagination_contraction_alpha: float = 0.02
+    imagination_target_rms: float = 1.0
+    imagination_rms_align_alpha: float = 0.1
+    three_phase_encoder_causal: bool = True
+    three_phase_causal_latent_workspace: bool = True
+    three_phase_share_encoder_decoder: bool = True
 
     def __post_init__(self) -> None:
         if self.ffn_dim is None:
@@ -226,6 +231,16 @@ class ModelConfig:
             raise ValueError("imagination_step_decay must be in (0.0, 1.0]")
         if self.imagination_contraction_alpha < 0.0:
             raise ValueError("imagination_contraction_alpha must be >= 0.0")
+        if self.imagination_target_rms <= 0.0:
+            raise ValueError("imagination_target_rms must be > 0.0")
+        if self.imagination_rms_align_alpha < 0.0 or self.imagination_rms_align_alpha > 1.0:
+            raise ValueError("imagination_rms_align_alpha must be in [0.0, 1.0]")
+        if not isinstance(self.three_phase_encoder_causal, bool):
+            raise ValueError("three_phase_encoder_causal must be a bool")
+        if not isinstance(self.three_phase_causal_latent_workspace, bool):
+            raise ValueError("three_phase_causal_latent_workspace must be a bool")
+        if not isinstance(self.three_phase_share_encoder_decoder, bool):
+            raise ValueError("three_phase_share_encoder_decoder must be a bool")
 
     def ffn_kind_for_layer(self, layer_idx: int) -> str:
         if self.reasoning_start_layer is not None and layer_idx >= self.reasoning_start_layer:
