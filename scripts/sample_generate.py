@@ -84,6 +84,11 @@ def _cfg_from_payload(payload: dict) -> ModelConfig:
         "imagination_update_scale",
         "imagination_step_decay",
         "imagination_contraction_alpha",
+        "imagination_target_rms",
+        "imagination_rms_align_alpha",
+        "three_phase_encoder_causal",
+        "three_phase_causal_latent_workspace",
+        "three_phase_share_encoder_decoder",
     }
     filtered = {k: v for k, v in raw.items() if k in allowed}
     return ModelConfig(**filtered)
@@ -93,7 +98,7 @@ def _cfg_from_payload(payload: dict) -> ModelConfig:
 def generate(
     model,
     input_ids: torch.Tensor,
-    architecture_kind: str,
+    cfg: ModelConfig,
     max_new_tokens: int,
     temperature: float,
     top_k: int,
@@ -102,8 +107,9 @@ def generate(
     source_ids = input_ids
     out = input_ids
     for _ in range(max_new_tokens):
-        if architecture_kind == "three_phase":
-            logits = model(input_ids=source_ids, decoder_input_ids=out)["logits"][:, -1, :]
+        if cfg.architecture_kind == "three_phase":
+            encoder_ids = out if cfg.three_phase_share_encoder_decoder else source_ids
+            logits = model(input_ids=encoder_ids, decoder_input_ids=out)["logits"][:, -1, :]
         else:
             logits = model(input_ids=out)["logits"][:, -1, :]
         if temperature <= 0:
@@ -145,7 +151,7 @@ def main() -> None:
     out_ids = generate(
         model=model,
         input_ids=input_ids,
-        architecture_kind=cfg.architecture_kind,
+        cfg=cfg,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
