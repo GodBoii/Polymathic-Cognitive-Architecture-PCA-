@@ -14,13 +14,16 @@ from model_core.model import PCAModel
 
 def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    n_layers = 4
     cfg = ModelConfig(
         vocab_size=32000,
         d_model=2048,
-        n_layers=4,  # reduced for smoke-test speed
+        n_layers=n_layers,  # reduced for smoke-test speed
         n_heads=16,
         n_kv_heads=4,
         max_seq_len=512,
+        gqa_layers=min(2, n_layers),
+        lightning_end_layer=n_layers,
     )
     model = PCAModel(cfg).to(device)
     model.eval()
