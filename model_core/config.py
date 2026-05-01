@@ -71,6 +71,17 @@ class ModelConfig:
     three_phase_encoder_causal: bool = True
     three_phase_causal_latent_workspace: bool = True
     three_phase_share_encoder_decoder: bool = True
+    multimodal_max_image_patches: int = 256
+    multimodal_max_audio_patches: int = 512
+    multimodal_max_video_patches: int = 512
+    image_channels: int = 3
+    image_patch_size: int = 16
+    audio_channels: int = 1
+    audio_patch_size: int = 320
+    video_channels: int = 3
+    video_patch_size: int = 16
+    max_video_frames: int = 16
+    modality_vocab_size: int = 4
 
     def __post_init__(self) -> None:
         if self.ffn_dim is None:
@@ -88,7 +99,7 @@ class ModelConfig:
             decoder_layers = max(1, self.n_layers - encoder_layers)
             self.encoder_layers = encoder_layers if self.encoder_layers is None else self.encoder_layers
             self.decoder_layers = decoder_layers if self.decoder_layers is None else self.decoder_layers
-        if self.architecture_kind == "three_phase":
+        if self.architecture_kind in {"three_phase", "multimodal_pca"}:
             # Hybrid-attention boundaries are irrelevant for the dedicated three-phase path.
             self.gqa_layers = min(self.gqa_layers, self.n_layers)
             self.lightning_end_layer = min(self.lightning_end_layer, self.n_layers)
@@ -109,8 +120,8 @@ class ModelConfig:
     def validate(self) -> None:
         if self.vocab_size <= 0:
             raise ValueError("vocab_size must be > 0")
-        if self.architecture_kind not in {"autoregressive_pca", "three_phase"}:
-            raise ValueError("architecture_kind must be 'autoregressive_pca' or 'three_phase'")
+        if self.architecture_kind not in {"autoregressive_pca", "three_phase", "multimodal_pca"}:
+            raise ValueError("architecture_kind must be 'autoregressive_pca', 'three_phase', or 'multimodal_pca'")
         if self.d_model <= 0:
             raise ValueError("d_model must be > 0")
         if self.n_layers <= 0:
@@ -241,6 +252,20 @@ class ModelConfig:
             raise ValueError("three_phase_causal_latent_workspace must be a bool")
         if not isinstance(self.three_phase_share_encoder_decoder, bool):
             raise ValueError("three_phase_share_encoder_decoder must be a bool")
+        if self.multimodal_max_image_patches <= 0:
+            raise ValueError("multimodal_max_image_patches must be > 0")
+        if self.multimodal_max_audio_patches <= 0:
+            raise ValueError("multimodal_max_audio_patches must be > 0")
+        if self.multimodal_max_video_patches <= 0:
+            raise ValueError("multimodal_max_video_patches must be > 0")
+        if self.image_channels <= 0 or self.video_channels <= 0 or self.audio_channels <= 0:
+            raise ValueError("modality channel counts must be > 0")
+        if self.image_patch_size <= 0 or self.video_patch_size <= 0 or self.audio_patch_size <= 0:
+            raise ValueError("modality patch sizes must be > 0")
+        if self.max_video_frames <= 0:
+            raise ValueError("max_video_frames must be > 0")
+        if self.modality_vocab_size < 4:
+            raise ValueError("modality_vocab_size must be >= 4")
 
     def ffn_kind_for_layer(self, layer_idx: int) -> str:
         if self.reasoning_start_layer is not None and layer_idx >= self.reasoning_start_layer:
