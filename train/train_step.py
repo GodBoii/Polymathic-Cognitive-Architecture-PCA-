@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
 
     parser.add_argument("--vocab-size", type=int, default=32000)
-    parser.add_argument("--architecture-kind", choices=["autoregressive_pca", "three_phase"], default="autoregressive_pca")
+    parser.add_argument("--architecture-kind", choices=["autoregressive_pca", "three_phase", "multimodal_pca"], default="autoregressive_pca")
     parser.add_argument("--d-model", type=int, default=512)
     parser.add_argument("--n-layers", type=int, default=8)
     parser.add_argument("--n-heads", type=int, default=8)
@@ -124,6 +124,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--three-phase-share-encoder-decoder", dest="three_phase_share_encoder_decoder", action="store_true")
     parser.add_argument("--no-three-phase-share-encoder-decoder", dest="three_phase_share_encoder_decoder", action="store_false")
     parser.set_defaults(three_phase_share_encoder_decoder=True)
+    parser.add_argument("--multimodal-max-image-patches", type=int, default=256)
+    parser.add_argument("--multimodal-max-audio-patches", type=int, default=512)
+    parser.add_argument("--multimodal-max-video-patches", type=int, default=512)
+    parser.add_argument("--image-channels", type=int, default=3)
+    parser.add_argument("--image-patch-size", type=int, default=16)
+    parser.add_argument("--audio-channels", type=int, default=1)
+    parser.add_argument("--audio-patch-size", type=int, default=320)
+    parser.add_argument("--video-channels", type=int, default=3)
+    parser.add_argument("--video-patch-size", type=int, default=16)
+    parser.add_argument("--max-video-frames", type=int, default=16)
+    parser.add_argument("--modality-vocab-size", type=int, default=4)
 
     parser.add_argument("--freeze-layers-below", type=int, default=0, help="Freeze transformer layers [0, N-1].")
     parser.add_argument("--freeze-embeddings", action="store_true")
@@ -190,6 +201,17 @@ def make_model_config(args: argparse.Namespace) -> ModelConfig:
         three_phase_encoder_causal=args.three_phase_encoder_causal,
         three_phase_causal_latent_workspace=args.three_phase_causal_latent_workspace,
         three_phase_share_encoder_decoder=args.three_phase_share_encoder_decoder,
+        multimodal_max_image_patches=args.multimodal_max_image_patches,
+        multimodal_max_audio_patches=args.multimodal_max_audio_patches,
+        multimodal_max_video_patches=args.multimodal_max_video_patches,
+        image_channels=args.image_channels,
+        image_patch_size=args.image_patch_size,
+        audio_channels=args.audio_channels,
+        audio_patch_size=args.audio_patch_size,
+        video_channels=args.video_channels,
+        video_patch_size=args.video_patch_size,
+        max_video_frames=args.max_video_frames,
+        modality_vocab_size=args.modality_vocab_size,
     )
 
 
