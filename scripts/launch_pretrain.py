@@ -147,6 +147,17 @@ def build_train_cmd(
     maybe_add(cmd, "--imagination-update-scale", model.get("imagination_update_scale", 0.25))
     maybe_add(cmd, "--imagination-step-decay", model.get("imagination_step_decay", 0.85))
     maybe_add(cmd, "--imagination-contraction-alpha", model.get("imagination_contraction_alpha", 0.02))
+    maybe_add(cmd, "--multimodal-max-image-patches", model.get("multimodal_max_image_patches"))
+    maybe_add(cmd, "--multimodal-max-audio-patches", model.get("multimodal_max_audio_patches"))
+    maybe_add(cmd, "--multimodal-max-video-patches", model.get("multimodal_max_video_patches"))
+    maybe_add(cmd, "--image-channels", model.get("image_channels"))
+    maybe_add(cmd, "--image-patch-size", model.get("image_patch_size"))
+    maybe_add(cmd, "--audio-channels", model.get("audio_channels"))
+    maybe_add(cmd, "--audio-patch-size", model.get("audio_patch_size"))
+    maybe_add(cmd, "--video-channels", model.get("video_channels"))
+    maybe_add(cmd, "--video-patch-size", model.get("video_patch_size"))
+    maybe_add(cmd, "--max-video-frames", model.get("max_video_frames"))
+    maybe_add(cmd, "--modality-vocab-size", model.get("modality_vocab_size"))
 
     # Training hyperparams
     maybe_add(cmd, "--optimizer", train.get("optimizer", "muon"))

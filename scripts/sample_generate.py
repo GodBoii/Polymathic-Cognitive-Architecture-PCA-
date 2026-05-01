@@ -89,6 +89,17 @@ def _cfg_from_payload(payload: dict) -> ModelConfig:
         "three_phase_encoder_causal",
         "three_phase_causal_latent_workspace",
         "three_phase_share_encoder_decoder",
+        "multimodal_max_image_patches",
+        "multimodal_max_audio_patches",
+        "multimodal_max_video_patches",
+        "image_channels",
+        "image_patch_size",
+        "audio_channels",
+        "audio_patch_size",
+        "video_channels",
+        "video_patch_size",
+        "max_video_frames",
+        "modality_vocab_size",
     }
     filtered = {k: v for k, v in raw.items() if k in allowed}
     return ModelConfig(**filtered)
@@ -107,7 +118,7 @@ def generate(
     source_ids = input_ids
     out = input_ids
     for _ in range(max_new_tokens):
-        if cfg.architecture_kind == "three_phase":
+        if cfg.architecture_kind in {"three_phase", "multimodal_pca"}:
             encoder_ids = out if cfg.three_phase_share_encoder_decoder else source_ids
             logits = model(input_ids=encoder_ids, decoder_input_ids=out)["logits"][:, -1, :]
         else:
