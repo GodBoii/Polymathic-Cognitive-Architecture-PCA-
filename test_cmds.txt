@@ -1,0 +1,289 @@
+# test_cmds.txt
+# PowerShell command runbook for PCA validation, tokenizer/data prep, multimodal
+# smoke tests, overfit tests, and training.
+#
+# Run from repo root:
+# C:\Users\prajw\Downloads\Polymathic-Cognitive-Architecture-PCA-
+
+###############################################################################
+# 0) Environment
+###############################################################################
+
+cd C:\Users\prajw\Downloads\Polymathic-Cognitive-Architecture-PCA-
+.\pca\Scripts\python.exe --version
+.\pca\Scripts\python.exe .\scripts\check_torch_cuda.py
+.\pca\Scripts\python.exe -m compileall data_pipeline train model_core scripts
+New-Item -ItemType Directory -Force .\tmp | Out-Null
+New-Item -ItemType Directory -Force .\train\logs | Out-Null
+
+###############################################################################
+# 1) Required smoke tests
+###############################################################################
+
+.\pca\Scripts\python.exe .\scripts\smoke_test_task3.py
+.\pca\Scripts\python.exe .\scripts\smoke_test_task4.py
+.\pca\Scripts\python.exe .\scripts\smoke_test_task5.py
+.\pca\Scripts\python.exe .\scripts\smoke_test_task7.py
+.\pca\Scripts\python.exe .\scripts\smoke_test_task8.py
+.\pca\Scripts\python.exe .\scripts\smoke_test_task9.py
+.\pca\Scripts\python.exe .\scripts\smoke_test_task10_three_phase_causality.py
+.\pca\Scripts\python.exe .\scripts\smoke_test_multimodal_pca.py
+
+###############################################################################
+# 2) Tokenizer training
+###############################################################################
+
+.\pca\Scripts\python.exe .\tokenizer\train_sentencepiece.py `
+  --input-dir .\raw_data_corpus `
+  --output-dir .\tokenizer\artifacts `
+  --model-prefix pca_tokenizer `
+  --vocab-size 32000 `
+  --min-english-ratio 0.85 `
+  --ascii-only `
+  --input-sentence-size 2000000
+
+# If validation CLI differs, run --help first.
+.\pca\Scripts\python.exe .\tokenizer\validate_tokenizer.py --help
+
+###############################################################################
+# 3) Build packed text dataset and split
+###############################################################################
+
+.\pca\Scripts\python.exe .\data_pipeline\build_phase1_dataset.py `
+  --input-dir .\raw_data_corpus `
+  --tokenizer-model .\tokenizer\artifacts\pca_tokenizer.model `
+  --output-dir .\data_pipeline\artifacts\phase1_text_all `
+  --seq-len 2048 `
+  --shard-sequences 1024 `
+  --workers 8
+
+.\pca\Scripts\python.exe .\data_pipeline\create_manifest_split.py `
+  --source-manifest .\data_pipeline\artifacts\phase1_text_all\manifest.json `
+  --train-output-dir .\data_pipeline\artifacts\phase1_text_train `
+  --eval-output-dir .\data_pipeline\artifacts\phase1_text_eval `
+  --eval-ratio 0.05 `
+  --seed 42 `
+  --train-shard-sequences 1024 `
+  --eval-shard-sequences 256
+
+###############################################################################
+# 4) Build multimodal manifests
+###############################################################################
+
+# Expected raw multimodal layout:
+# raw_data_multimodal/images/train/*.jpg + matching *.txt sidecars
+# raw_data_multimodal/audio/train/*.wav + matching *.txt sidecars
+# raw_data_multimodal/video/train/*.npy + matching *.txt sidecars
+
+.\pca\Scripts\python.exe .\data_pipeline\build_multimodal_manifest.py `
+  --input-root .\raw_data_multimodal `
+  --output .\data_pipeline\artifacts\multimodal_train\manifest.jsonl `
+  --include-text-only
+
+# Optional separate eval root. Create raw_data_multimodal_eval first.
+.\pca\Scripts\python.exe .\data_pipeline\build_multimodal_manifest.py `
+  --input-root .\raw_data_multimodal_eval `
+  --output .\data_pipeline\artifacts\multimodal_eval\manifest.jsonl `
+  --include-text-only
+
+# Validate JSONL manifests.
+@'
+import json
+from pathlib import Path
+for p in [
+    Path("data_pipeline/artifacts/multimodal_train/manifest.jsonl"),
+    Path("data_pipeline/artifacts/multimodal_eval/manifest.jsonl"),
+    Path("data_pipeline/artifacts/multimodal_overfit16/manifest.jsonl"),
+]:
+    if not p.exists():
+        print(f"MISSING {p}")
+        continue
+    n = 0
+    for i, line in enumerate(p.open("r", encoding="utf-8"), start=1):
+        if not line.strip():
+            continue
+        json.loads(line)
+        n += 1
+    print(f"{p}: {n} rows")
+'@ | .\pca\Scripts\python.exe -
+
+###############################################################################
+# 5) One-step multimodal manifest-backed smoke
+###############################################################################
+
+.\pca\Scripts\python.exe .\train\train_multimodal_step.py `
+  --manifest .\data_pipeline\artifacts\multimodal_train\manifest.jsonl `
+  --tokenizer-model .\tokenizer\artifacts\pca_tokenizer.model `
+  --steps 1 `
+  --batch-size 1 `
+  --seq-len 32 `
+  --vocab-size 32000 `
+  --d-model 64 `
+  --n-layers 2 `
+  --encoder-layers 1 `
+  --decoder-layers 1 `
+  --n-heads 4 `
+  --n-kv-heads 2 `
+  --max-seq-len 64 `
+  --ffn-dim 128 `
+  --imagination-num-latents 4 `
+  --imagination-steps 1 `
+  --imagination-heads 4 `
+  --imagination-ffn-dim 128 `
+  --checkpoint-dir .\tmp\multimodal_train_smoke `
+  2>&1 | Tee-Object -FilePath .\train\logs\multimodal_train_smoke.log
+
+###############################################################################
+# 6) Overfit 16 examples
+###############################################################################
+
+# Create this file manually first:
+# data_pipeline/artifacts/multimodal_overfit16/manifest.jsonl
+#
+# It should contain 16 rows with known answers. Example row:
+# {"id":"overfit_text_001","task":"text","text":"What is 2+2?","target_text":"2+2 equals 4."}
+
+.\pca\Scripts\python.exe .\train\train_multimodal_step.py `
+  --manifest .\data_pipeline\artifacts\multimodal_overfit16\manifest.jsonl `
+  --tokenizer-model .\tokenizer\artifacts\pca_tokenizer.model `
+  --steps 500 `
+  --batch-size 2 `
+  --seq-len 128 `
+  --vocab-size 32000 `
+  --d-model 256 `
+  --n-layers 6 `
+  --encoder-layers 3 `
+  --decoder-layers 3 `
+  --n-heads 8 `
+  --n-kv-heads 2 `
+  --max-seq-len 256 `
+  --ffn-dim 1024 `
+  --imagination-num-latents 8 `
+  --imagination-steps 2 `
+  --imagination-heads 8 `
+  --imagination-ffn-dim 1024 `
+  --image-size 128 `
+  --audio-samples 16000 `
+  --video-frames 4 `
+  --video-frame-size 128 `
+  --checkpoint-dir .\train\checkpoints\multimodal_overfit16 `
+  2>&1 | Tee-Object -FilePath .\train\logs\multimodal_overfit16.log
+
+###############################################################################
+# 7) Text-only three-phase baseline
+###############################################################################
+
+.\pca\Scripts\python.exe .\scripts\launch_pretrain.py `
+  --config .\train\presets\local_rtx3050_4gb_three_phase_v5_split.json `
+  --fresh-start `
+  2>&1 | Tee-Object -FilePath .\train\logs\text_three_phase_local.log
+
+###############################################################################
+# 8) Tiny native multimodal debug run
+###############################################################################
+
+.\pca\Scripts\python.exe .\train\train_multimodal_step.py `
+  --manifest .\data_pipeline\artifacts\multimodal_train\manifest.jsonl `
+  --tokenizer-model .\tokenizer\artifacts\pca_tokenizer.model `
+  --steps 20 `
+  --batch-size 1 `
+  --seq-len 64 `
+  --vocab-size 32000 `
+  --d-model 128 `
+  --n-layers 4 `
+  --encoder-layers 2 `
+  --decoder-layers 2 `
+  --n-heads 4 `
+  --n-kv-heads 2 `
+  --max-seq-len 128 `
+  --ffn-dim 512 `
+  --imagination-num-latents 4 `
+  --imagination-steps 2 `
+  --imagination-heads 4 `
+  --imagination-ffn-dim 512 `
+  --checkpoint-dir .\tmp\multimodal_debug `
+  2>&1 | Tee-Object -FilePath .\train\logs\multimodal_debug.log
+
+###############################################################################
+# 9) H100 Linux command template: 150M-350M proof
+###############################################################################
+
+# On H100 Linux:
+# source .venv/bin/activate
+# python scripts/check_torch_cuda.py
+#
+# python train/train_multimodal_step.py \
+#   --manifest data_pipeline/artifacts/multimodal_train/manifest.jsonl \
+#   --tokenizer-model tokenizer/artifacts/pca_tokenizer.model \
+#   --steps 5000 \
+#   --batch-size 4 \
+#   --seq-len 512 \
+#   --vocab-size 32000 \
+#   --d-model 768 \
+#   --n-layers 12 \
+#   --encoder-layers 6 \
+#   --decoder-layers 6 \
+#   --n-heads 12 \
+#   --n-kv-heads 4 \
+#   --max-seq-len 1024 \
+#   --ffn-dim 3072 \
+#   --imagination-num-latents 16 \
+#   --imagination-steps 3 \
+#   --imagination-heads 12 \
+#   --imagination-ffn-dim 3072 \
+#   --image-size 224 \
+#   --audio-samples 32000 \
+#   --video-frames 4 \
+#   --video-frame-size 224 \
+#   --precision bf16 \
+#   --checkpoint-dir train/checkpoints/multimodal_150m \
+#   2>&1 | tee train/logs/multimodal_150m.log
+
+###############################################################################
+# 10) Metrics extraction
+###############################################################################
+
+@'
+import json
+from pathlib import Path
+for p in Path("train/logs").glob("*.log"):
+    last_step = None
+    final = None
+    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if "step" in obj:
+            last_step = obj
+        if obj.get("status") == "done":
+            final = obj
+    print(f"\n=== {p} ===")
+    if last_step:
+        for k in ["step", "loss", "main_loss", "aux_loss", "grad_norm", "tokens_per_sec"]:
+            if k in last_step:
+                print(f"{k}: {last_step[k]}")
+        imag = last_step.get("imagination_stats", {})
+        for k in ["avg_delta_norm", "final_latent_norm", "latent_rms", "convergence_ratio"]:
+            if k in imag:
+                print(f"imagination_stats.{k}: {imag[k]}")
+    else:
+        print("NO_STEP_PAYLOAD")
+    if final:
+        print(f"final: {final}")
+'@ | .\pca\Scripts\python.exe - | Tee-Object -FilePath .\tmp\metrics_summary.txt
+
+###############################################################################
+# 11) Notes before scaling
+###############################################################################
+
+# Do not start a 1B-3B run until:
+# 1. all smoke tests pass
+# 2. tokenizer exists
+# 3. multimodal manifest validates
+# 4. one-step multimodal smoke passes
+# 5. 16-example overfit loss drops clearly
+# 6. disjoint train/eval manifests exist
+# 7. Muon/AdamW parameter split is implemented for serious training
